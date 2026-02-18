@@ -3,11 +3,10 @@
  *
  * Ported from agent-runtime.mjs lines 3808-3955, 22340-22503.
  * Handles CLI parsing, dotenv loading, config creation, MemoryStore init,
- * IPC setup, WS client creation, RuntimeContext assembly, and
- * delegation to startRuntime().
+ * IPC setup, WS client creation, RuntimeContext assembly, manager bootstrap,
+ * and delegation to startRuntime().
  */
 
-import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -29,8 +28,31 @@ import {
   notifySupervisorBotTokenSet,
   notifySupervisorFatal,
 } from "./auth/bot-token.js";
+import { AuthManager } from "./auth/auth-manager.js";
+import { MintManager } from "./mint/mint-manager.js";
+import { GrantManager } from "./grants/grant-manager.js";
+import { SubscriptionManager } from "./ws/subscription-manager.js";
+import { EventsManager } from "./ipc/events-manager.js";
+import { DirectiveManager } from "./directives/directive-manager.js";
+import { QueueManager } from "./queue/queue-manager.js";
+import { OpenClawManager } from "./openclaw/openclaw-manager.js";
+import { ChatManager } from "./chat/chat-manager.js";
+import {
+  markWsActivity as markWsActivityFn,
+  writeDebugSnapshot,
+} from "./debug/ws-state.js";
 import type { KthxConfig } from "./types/config.js";
 import type { AnyRouter } from "@trpc/server";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const touchWake = async (wakePath: string): Promise<void> => {
+  await fs
+    .writeFile(wakePath, nowIso(), "utf8")
+    .catch(() => {});
+};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -220,11 +242,343 @@ const main = async (): Promise<void> => {
   ctx.openclaw.openClawWakeKey = trimEnv("MG_OPENCLAW_WAKE_KEY") ?? null;
   ctx.misc.controlKey = trimEnv("MG_AGENT_CONTROL_KEY") ?? null;
 
+  // =========================================================================
+  // Manager bootstrap
+  // =========================================================================
+
+  // -- AuthManager
+  const authManager = new AuthManager({
+    auth: ctx.auth,
+    config: { connectionId: config.connectionId },
+    debugSnapshot: ctx.debugSnapshot,
+    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+    misc: ctx.misc,
+    wsClient: wsClient as any,
+    writeDebugSnapshot: () => writeDebugSnapshot(ipcPaths, ctx.debugSnapshot),
+  });
+  ctx.authManager = authManager;
+
+  // -- GrantManager
+  const grantManager = new GrantManager({
+    ipcPaths: {
+      latestDirectorGrantPath: ipcPaths.latestDirectorGrantPath,
+      wakePath: ipcPaths.wakePath,
+    },
+    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+  });
+  ctx.grantManager = grantManager;
+
+  // -- EventsManager
+  const eventsManager = new EventsManager({
+    ipcPaths: { eventsPath: ipcPaths.eventsPath },
+    config: {
+      currentEventsMaxLines: config.currentEventsMaxLines,
+      tailMaxBytes: config.tailMaxBytes,
+    },
+    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+  });
+  await eventsManager.initialize();
+  ctx.eventsManager = eventsManager;
+
+  // -- OpenClawManager
+  const openClawManager = new OpenClawManager({
+    config: {
+      agentHomeDir: config.agentHomeDir,
+      stateDir: config.stateDir,
+      kthxConfigPath: config.kthxConfigPath,
+      chatRuntimeTextStreamEnabled: config.chatRuntimeTextStreamEnabled,
+      chatRuntimeTextStreamNativeEnabled: config.chatRuntimeTextStreamNativeEnabled,
+      openClawWakeDebounceMs: config.openClawWakeDebounceMs,
+      openClawWakeBatchMs: config.openClawWakeBatchMs,
+      openClawWakeIncludeSocketStateChange: config.openClawWakeIncludeSocketStateChange,
+      openClawWakeIncludeMediaPrepared: config.openClawWakeIncludeMediaPrepared,
+    },
+    openclaw: ctx.openclaw,
+    openclawConfig: () => {
+      const oc = ctx.kthxConfig.openclaw;
+      if (!oc || !oc.enabled) return null;
+      return {
+        enabled: oc.enabled,
+        agentName: oc.agentName,
+        listAgentsCommand: oc.listAgentsCommand,
+        promptCommand: oc.promptCommand,
+        scheduleCommand: oc.scheduleCommand,
+        wakeUrl: oc.wakeUrl,
+        wakeToken: oc.wakeToken,
+        wakeReasons: oc.wakeReasons,
+        allowCreateAgent: oc.allowCreateAgent,
+        createAgentCommand: oc.createAgentCommand,
+        timeoutMs: oc.timeoutMs,
+      };
+    },
+    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+    ipcPaths: {
+      hookRequestsPath: ipcPaths.hookRequestsPath,
+      hookWakePath: ipcPaths.hookWakePath,
+      wakePath: ipcPaths.wakePath,
+    },
+    touchWake,
+  });
+  ctx.openClawManager = openClawManager;
+
+  // -- MintManager
+  const mintManager = new MintManager({
+    mint: ctx.mint,
+    config: {
+      connectionId: config.connectionId,
+      challengeFileAnswersEnabled: config.challengeFileAnswersEnabled,
+      challengeRequireSig: config.challengeRequireSig,
+      challengeAnswerTimeoutMs: config.challengeAnswerTimeoutMs,
+      challengeAnswerMaxChars: config.challengeAnswerMaxChars,
+      mintChallengeUseOpenClaw: config.mintChallengeUseOpenClaw,
+      rejectMultipleChoiceChallenges: config.rejectMultipleChoiceChallenges,
+      mintChallengeAutoRetryEnabled: config.mintChallengeAutoRetryEnabled,
+      mintChallengeAutoRetryMaxAttempts: config.mintChallengeAutoRetryMaxAttempts,
+      mintRetryMinBackoffMs: config.mintRetryMinBackoffMs,
+      mintRetryMaxBackoffMs: config.mintRetryMaxBackoffMs,
+    },
+    ipcPaths: {
+      mintDebugPath: ipcPaths.mintDebugPath,
+      mintTracePath: ipcPaths.mintTracePath,
+      challengePromptsDir: ipcPaths.challengePromptsDir,
+      challengeRepliesDir: ipcPaths.challengeRepliesDir,
+      challengeProcessedDir: ipcPaths.challengeProcessedDir,
+      wakePath: ipcPaths.wakePath,
+    },
+    misc: { controlKey: ctx.misc.controlKey, subscriptionResyncRequested: ctx.misc.subscriptionResyncRequested, subscriptionResyncReason: ctx.misc.subscriptionResyncReason },
+    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+    trpc: trpc as any,
+    wsClient: wsClient as any,
+    runBackendCall: <T>(label: string, fn: () => Promise<T>) =>
+      runBackendCall(label, fn, ctx),
+    markWsActivity: (source: string) =>
+      markWsActivityFn(ctx.wsStateContext, source),
+    getRuntimeAttestation: (connectionId: string) => ({
+      connectionId,
+      runtimeType: "kthx-agent-services-ts",
+      at: nowIso(),
+    }),
+    runOpenClawPrompt: async (input: { prompt: string; purpose: string }) => {
+      const result = await openClawManager.prompt(input.prompt, { purpose: input.purpose });
+      return result;
+    },
+  });
+  await mintManager.initialize();
+  ctx.mintManager = mintManager;
+
+  // -- Envelope handler (dispatches subscription events to managers)
+  const handleEnvelope = async (envelope: {
+    receivedAt: string;
+    source: string;
+    topic: string;
+    payload: unknown;
+  }): Promise<void> => {
+    ctx.misc.lastEnvelopeAt = envelope.receivedAt;
+    ctx.debugSnapshot.lastEnvelopeAt = envelope.receivedAt;
+
+    const payload = isRecord(envelope.payload) ? envelope.payload : {};
+    const eventType =
+      typeof payload.type === "string" ? (payload.type as string) : "";
+
+    // Persist to events
+    await eventsManager.appendEvent({
+      ...envelope,
+      eventType,
+    }).catch(() => {});
+
+    // Auth state updates
+    if (eventType === "auth_state" && isRecord(payload.state)) {
+      ctx.debugSnapshot.auth = payload.state as Record<string, unknown>;
+      await writeDebugSnapshot(ipcPaths, ctx.debugSnapshot);
+    }
+
+    // Permission state updates
+    if (eventType === "permission_state" && isRecord(payload.state)) {
+      ctx.debugSnapshot.permission = payload.state as Record<string, unknown>;
+      await writeDebugSnapshot(ipcPaths, ctx.debugSnapshot);
+    }
+
+    // Director directives
+    if (
+      eventType === "director_directive" ||
+      eventType === "directive" ||
+      envelope.topic === "director"
+    ) {
+      await ctx.directiveManager?.intake(payload).catch(() => {});
+    }
+
+    // Grant events
+    if (eventType === "director_grant" && isRecord(payload.grant)) {
+      await grantManager.persistDirectorGrant(
+        payload.grant as Record<string, unknown>,
+        envelope.receivedAt,
+      );
+    }
+    if (eventType === "director_credit" && isRecord(payload.credit)) {
+      await grantManager.persistCreditsGrant(
+        payload.credit as Record<string, unknown>,
+        envelope.receivedAt,
+      );
+    }
+
+    // OpenClaw wake
+    await openClawManager.wakeFromEnvelope(envelope).catch(() => {});
+  };
+
+  // -- SubscriptionManager
+  const subscriptionManager = new SubscriptionManager({
+    config: {
+      subscribeGlobalFeed: config.subscribeGlobalFeed,
+      subscribeActivityFeed: config.subscribeActivityFeed,
+      autoSubscribeLenses: config.autoSubscribeLenses,
+      lensRefreshMinMs: config.lensRefreshMinMs,
+      heartbeatIntervalMs: config.heartbeatIntervalMs,
+      extraPublicTopics: config.extraPublicTopics,
+      extraUserTopics: config.extraUserTopics,
+    },
+    ws: ctx.ws,
+    misc: ctx.misc,
+    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+    debugSnapshot: ctx.debugSnapshot,
+    trpc: trpc as any,
+    writeDebugSnapshot: () => writeDebugSnapshot(ipcPaths, ctx.debugSnapshot),
+    markWsActivity: (source: string) =>
+      markWsActivityFn(ctx.wsStateContext, source),
+    handleEnvelope,
+    authManager,
+    runBackendCall: <T>(label: string, fn: () => Promise<T>) =>
+      runBackendCall(label, fn, ctx),
+  });
+  subscriptionManager.startHealLoop();
+  ctx.subscriptionManager = subscriptionManager;
+
+  // -- QueueManager
+  const queueManager = new QueueManager({
+    config: { terminalTriggerOnly: config.terminalTriggerOnly },
+    ipcPaths: {
+      queueStatePath: ipcPaths.queueStatePath,
+      inboxDir: ipcPaths.inboxDir,
+      wakePath: ipcPaths.wakePath,
+    },
+    kthxQueueConfig: () => ({
+      minSpacingSeconds: kthxConfig.queue.minSpacingSeconds,
+      maxSpacingSeconds: kthxConfig.queue.maxSpacingSeconds,
+      llmScheduleMinItems: kthxConfig.queue.llmScheduleMinItems,
+    }),
+    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+    queue: ctx.queue,
+    processCommandFile: async (_inboxFile: string) => {
+      // TODO: port full command execution engine
+      await memory.recordWrite({
+        type: "command_execution_stub",
+        at: nowIso(),
+        inboxFile: _inboxFile,
+        message: "Command execution engine not yet ported to v2.",
+      });
+      return false;
+    },
+    runMemoryCheckpoint: async (opts) => {
+      await memory
+        .refreshTemporalContext({
+          force: opts.force,
+          allowAgentCompression: opts.allowAgentCompression,
+        })
+        .catch(() => {});
+    },
+  });
+  ctx.queueManager = queueManager;
+
+  // -- DirectiveManager
+  const directiveManager = new DirectiveManager({
+    config: { terminalTriggerOnly: config.terminalTriggerOnly },
+    ipcPaths: {
+      inboxDir: ipcPaths.inboxDir,
+      wakePath: ipcPaths.wakePath,
+      pendingDir: ipcPaths.pendingDir,
+      currentDirectivePath: ipcPaths.currentDirectivePath,
+      resultsPath: ipcPaths.resultsPath,
+    },
+    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+    trpc: trpc as any,
+    commandSeal: ctx.commandSeal,
+    directive: ctx.directive,
+    misc: { controlKey: ctx.misc.controlKey },
+    ensureDirectiveInQueue: async (opts) => {
+      await queueManager.enqueue(opts);
+    },
+    planQueueWithOpenClaw: async (_opts) => {
+      // Queue planning via OpenClaw (optional; non-critical for boot)
+      return null;
+    },
+    touchWake,
+  });
+  ctx.directiveManager = directiveManager;
+
+  // -- ChatManager
+  const chatManager = new ChatManager({
+    config: {
+      chatRuntimeEnabled: config.chatRuntimeEnabled,
+      chatRuntimePollMs: config.chatRuntimePollMs,
+      chatRuntimeReadChunkBytes: config.chatRuntimeReadChunkBytes,
+      chatRuntimeSeenMessageLimit: config.chatRuntimeSeenMessageLimit,
+      chatRuntimeReplyMaxChars: config.chatRuntimeReplyMaxChars,
+      chatRuntimeOpenClawInputMaxChars: config.chatRuntimeOpenClawInputMaxChars,
+      chatRuntimeUseOpenClaw: config.chatRuntimeUseOpenClaw,
+      chatRuntimeReplayOnStart: config.chatRuntimeReplayOnStart,
+      chatRuntimeChannelRequireMention: config.chatRuntimeChannelRequireMention,
+      chatRuntimeMentionNames: config.chatRuntimeMentionNames,
+      chatRuntimeTextStreamEnabled: config.chatRuntimeTextStreamEnabled,
+      chatRuntimeTextStreamNativeEnabled: config.chatRuntimeTextStreamNativeEnabled,
+      chatRuntimeTextStreamNativeOnly: config.chatRuntimeTextStreamNativeOnly,
+      chatRuntimeTextStreamStepChars: config.chatRuntimeTextStreamStepChars,
+      chatRuntimeTextStreamStepMs: config.chatRuntimeTextStreamStepMs,
+      chatRuntimeTextStreamUpdateMinMs: config.chatRuntimeTextStreamUpdateMinMs,
+    },
+    ipcPaths: {
+      chatInboxPath: ipcPaths.chatInboxPath,
+      chatRuntimeStatePath: ipcPaths.chatRuntimeStatePath,
+    },
+    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+    chat: ctx.chat,
+    callAgentChatBridge: async (payload: unknown) => {
+      // The chat bridge runs as a separate process; communication
+      // is via the chat events JSONL. Write request to hook requests.
+      const { appendJsonLine } = await import("./lib/fs-helpers.js");
+      await appendJsonLine(ipcPaths.hookRequestsPath, {
+        at: nowIso(),
+        type: "chat_bridge_request",
+        payload,
+      });
+      await touchWake(ipcPaths.chatWakePath);
+      return null;
+    },
+    runOpenClawPrompt: async (opts) => {
+      const result = await openClawManager.prompt(opts.prompt, {
+        purpose: opts.purpose,
+        onTextDelta: opts.onTextDelta ?? null,
+      });
+      return result;
+    },
+    resolveOpenClawAgentName: () => openClawManager.resolveAgentName(),
+    runMemoryCheckpoint: async (opts) => {
+      await memory
+        .refreshTemporalContext({
+          force: opts.force,
+          allowAgentCompression: opts.allowAgentCompression,
+        })
+        .catch(() => {});
+    },
+  });
+  ctx.chatManager = chatManager;
+
   // -- Console manager (wired up but started by runtime.ts)
   const consoleManager = new ConsoleManager({
     ctx,
     hasInteractivePty,
-    ensureSocketBotToken: async (_reason: string) => null,
+    ensureSocketBotToken: async (reason: string) => {
+      await mintManager.attemptMint(reason).catch(() => {});
+      return getBotToken();
+    },
     sendHeartbeat: async () => {
       await runBackendCall(
         "agent.heartbeat.mutate",
@@ -241,6 +595,23 @@ const main = async (): Promise<void> => {
     at: nowIso(),
     runtimeSessionId: ctx.commandSeal.runtimeCommandSessionId,
   });
+
+  // -- Initial mint attempt (if no bootstrap token)
+  if (!bootstrapToken) {
+    await memory.recordWrite({
+      type: "runtime_initial_mint_attempt",
+      at: nowIso(),
+      reason: "no_bootstrap_token",
+    });
+    await mintManager.attemptMint("runtime_boot").catch((error: unknown) => {
+      const msg = error instanceof Error ? error.message : String(error);
+      void memory.recordWrite({
+        type: "runtime_initial_mint_failed",
+        at: nowIso(),
+        error: msg,
+      });
+    });
+  }
 
   // -- Start
   await startRuntime({

@@ -93,8 +93,15 @@ export const runBackendCall = async <T>(
 // ---------------------------------------------------------------------------
 
 const sendHeartbeat = async (ctx: RuntimeContext): Promise<void> => {
-  const token = await getBotToken();
-  if (!token) return;
+  let token = await getBotToken();
+  if (!token) {
+    // Attempt to mint a bot token if one is not available
+    if (ctx.mintManager) {
+      await ctx.mintManager.attemptMint("heartbeat_no_token").catch(() => {});
+      token = await getBotToken();
+    }
+    if (!token) return;
+  }
   try {
     await runBackendCall(
       "agent.heartbeat.mutate",
