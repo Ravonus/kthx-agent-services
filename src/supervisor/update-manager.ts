@@ -29,6 +29,7 @@ type RunCommandOptions = {
   timeoutMs: number;
   captureStdout?: boolean;
   env?: NodeJS.ProcessEnv;
+  shell?: boolean;
 };
 
 type RunCommandResult = {
@@ -90,21 +91,9 @@ const runCommand = async (
   options: RunCommandOptions,
 ): Promise<RunCommandResult> =>
   new Promise<RunCommandResult>((resolve) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: options.captureStdout ? ["ignore", "pipe", "inherit"] : "inherit",
-    });
-
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     let stdout = "";
     let finished = false;
-
-    if (options.captureStdout && child.stdout) {
-      child.stdout.on("data", (chunk: Buffer | string) => {
-        stdout += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-      });
-    }
 
     const finish = (
       payload: Omit<RunCommandResult, "stdout"> & { stdout?: string },
@@ -120,6 +109,32 @@ const runCommand = async (
         error: payload.error,
       });
     };
+
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        env: options.env,
+        stdio: options.captureStdout ? ["ignore", "pipe", "inherit"] : "inherit",
+        windowsHide: process.platform === "win32",
+        shell: options.shell ?? false,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      finish({
+        ok: false,
+        code: null,
+        signal: null,
+        error: message,
+      });
+      return;
+    }
+
+    if (options.captureStdout && child.stdout) {
+      child.stdout.on("data", (chunk: Buffer | string) => {
+        stdout += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+      });
+    }
 
     timeoutHandle = setTimeout(() => {
       child.kill("SIGTERM");
@@ -309,6 +324,7 @@ const runPackageManagerTask = async (input: {
       cwd: input.cwd,
       timeoutMs: input.timeoutMs,
       env,
+      shell: process.platform === "win32",
     });
     if (result.ok) return result;
 

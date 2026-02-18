@@ -56,6 +56,34 @@ const touchWake = async (wakePath: string): Promise<void> => {
     .catch(() => {});
 };
 
+const readSecretFromEnvOrFile = async (
+  envKey: string,
+  fileKey: string,
+): Promise<string | null> => {
+  const direct = trimEnv(envKey);
+  if (direct) return direct;
+  const filePath = trimEnv(fileKey);
+  if (!filePath) return null;
+  const raw = await fs.readFile(path.resolve(filePath), "utf8").catch(() => null);
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+const resolveChatApiBaseUrl = (realtimeWsUrl: string): string => {
+  const explicit =
+    trimEnv("MG_CHAT_HTTP_BASE_URL") ??
+    trimEnv("MG_BASE_URL") ??
+    trimEnv("MG_AGENT_HTTP_BASE_URL") ??
+    trimEnv("BETTER_AUTH_BASE_URL");
+  if (explicit) return explicit.replace(/\/+$/u, "");
+  const parsed = new URL(realtimeWsUrl);
+  parsed.protocol = parsed.protocol === "wss:" ? "https:" : "http:";
+  parsed.pathname = "";
+  parsed.search = "";
+  parsed.hash = "";
+  return parsed.toString().replace(/\/+$/u, "");
+};
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -156,6 +184,17 @@ const main = async (): Promise<void> => {
 
   // -- Config
   const config = createRuntimeConfig();
+  const chatApiBaseUrl = resolveChatApiBaseUrl(config.realtimeWsUrl);
+  const agentKeyBox = await readSecretFromEnvOrFile(
+    "MG_AGENT_KEY_BOX",
+    "MG_AGENT_KEY_BOX_FILE",
+  );
+  const agentKey = trimEnv("MG_AGENT_KEY");
+  if (!agentKeyBox && !agentKey) {
+    throw new Error(
+      "Missing agent auth. Set MG_AGENT_KEY_BOX (or MG_AGENT_KEY_BOX_FILE), or MG_AGENT_KEY.",
+    );
+  }
   const collectRuntimeHashes = createRuntimeHashCollector({
     runtimeFilePath: config.runtimeFilePath,
     rootDir: config.runtimeRootDir,
@@ -567,16 +606,31 @@ const main = async (): Promise<void> => {
     memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
     chat: ctx.chat,
     callAgentChatBridge: async (payload: unknown) => {
-      // The chat bridge runs as a separate process; communication
-      // is via the chat events JSONL. Write request to hook requests.
-      const { appendJsonLine } = await import("./lib/fs-helpers.js");
-      await appendJsonLine(ipcPaths.hookRequestsPath, {
-        at: nowIso(),
-        type: "chat_bridge_request",
-        payload,
+      const botToken = await getBotToken();
+      const response = await fetch(`${chatApiBaseUrl}/api/agent/chat`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(agentKeyBox
+            ? { "x-agent-key-box": agentKeyBox }
+            : { "x-agent-key": agentKey ?? "" }),
+          ...(botToken ? { "x-bot-session-token": botToken } : {}),
+        },
+        body: JSON.stringify(payload),
       });
-      await touchWake(ipcPaths.chatWakePath);
-      return null;
+      const body = (await response.json().catch(() => null)) as unknown;
+      if (
+        response.ok &&
+        isRecord(body) &&
+        body.ok === true
+      ) {
+        return body.data;
+      }
+      const errorMessage =
+        isRecord(body) && typeof body.error === "string"
+          ? body.error
+          : `HTTP ${response.status}`;
+      throw new Error(`agent chat bridge request failed: ${errorMessage}`);
     },
     runOpenClawPrompt: async (opts) => {
       const result = await openClawManager.prompt(opts.prompt, {
