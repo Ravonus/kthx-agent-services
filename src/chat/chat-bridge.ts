@@ -219,7 +219,9 @@ const main = async (): Promise<void> => {
   );
   const idleKeepManualTopics = parseBooleanEnv("MG_CHAT_AGENT_IDLE_KEEP_MANUAL_TOPICS", false);
   const autoSubDms = parseBooleanEnv("MG_CHAT_AGENT_AUTO_SUBSCRIBE_DMS", true);
+  const autoSubGroups = parseBooleanEnv("MG_CHAT_AGENT_AUTO_SUBSCRIBE_GROUPS", true);
   const autoSubServers = parseBooleanEnv("MG_CHAT_AGENT_AUTO_SUBSCRIBE_SERVERS", true);
+  const autoSubChannels = parseBooleanEnv("MG_CHAT_AGENT_AUTO_SUBSCRIBE_CHANNELS", true);
   const manualTopics = parseConfiguredTopics(trimEnv("MG_CHAT_AGENT_TOPICS"));
 
   let preferredTokenSource: string | null = null;
@@ -355,7 +357,7 @@ const main = async (): Promise<void> => {
 
     manualTopics.forEach((r) => add(r));
 
-    if (autoSubDms || autoSubServers) {
+    if (autoSubDms || autoSubGroups || autoSubServers || autoSubChannels) {
       const shell = await callBridge({ action: "shell" }) as Record<string, unknown> | null;
       const viewer = shell && isRecord(shell.viewer) ? shell.viewer as Record<string, unknown> : null;
       viewerMainUserId = viewer && typeof viewer.mainUserId === "string" ? viewer.mainUserId as string : null;
@@ -367,9 +369,43 @@ const main = async (): Promise<void> => {
           }
         }
       }
+      if (autoSubGroups) {
+        for (const conv of (Array.isArray(shell?.groups) ? shell.groups : []) as unknown[]) {
+          if (isRecord(conv) && typeof (conv as Record<string, unknown>).id === "string") {
+            add({
+              topicType: "conversation",
+              topicId: (conv as Record<string, unknown>).id as string,
+            });
+          }
+        }
+      }
       if (autoSubServers) {
         for (const srv of (Array.isArray(shell?.servers) ? shell.servers : []) as unknown[]) {
-          if (isRecord(srv) && typeof (srv as Record<string, unknown>).id === "string") add({ topicType: "server", topicId: (srv as Record<string, unknown>).id as string });
+          if (
+            isRecord(srv) &&
+            typeof (srv as Record<string, unknown>).id === "string"
+          ) {
+            add({
+              topicType: "server",
+              topicId: (srv as Record<string, unknown>).id as string,
+            });
+          }
+        }
+      }
+      if (autoSubChannels) {
+        for (const srv of (Array.isArray(shell?.servers) ? shell.servers : []) as unknown[]) {
+          if (!isRecord(srv) || !Array.isArray((srv as Record<string, unknown>).channels)) continue;
+          for (const channel of (srv as Record<string, unknown>).channels as unknown[]) {
+            if (
+              isRecord(channel) &&
+              typeof (channel as Record<string, unknown>).id === "string"
+            ) {
+              add({
+                topicType: "channel",
+                topicId: (channel as Record<string, unknown>).id as string,
+              });
+            }
+          }
         }
       }
     }
@@ -382,7 +418,17 @@ const main = async (): Promise<void> => {
     const eventType = typeof event.type === "string" ? event.type.trim() : "";
     if (eventType !== "message.created") return;
     const context = extractContext(topic, event);
-    if (!context) return;
+    if (!context) {
+      await appendJsonLine(eventsPath, {
+        at: nowIso(),
+        level: "warn",
+        source: "context_missing",
+        topic,
+        eventType,
+        message: "message.created event missing conversation/channel context",
+      }).catch(() => undefined);
+      return;
+    }
 
     const messageId = extractMessageId(event);
     const authorId = extractAuthorMainUserId(event);
@@ -390,15 +436,44 @@ const main = async (): Promise<void> => {
     if (messageId) trackId(messageId);
     if (viewerMainUserId && authorId === viewerMainUserId) return;
 
+    let listError: string | null = null;
     const latest = await callBridge({
       action: "list_messages",
       ...context,
       limit: messageId ? 8 : 1,
-    }).catch(() => null) as Record<string, unknown> | null;
+    }).catch((error) => {
+      listError = error instanceof Error ? error.message : String(error);
+      return null;
+    }) as Record<string, unknown> | null;
+    if (!latest && listError) {
+      await appendJsonLine(eventsPath, {
+        at: nowIso(),
+        level: "warn",
+        source: "list_messages_failed",
+        topic,
+        messageId,
+        context,
+        message: listError,
+      }).catch(() => undefined);
+      if (messageId) untrackId(messageId);
+      return;
+    }
 
     const items = latest && Array.isArray(latest.items) ? latest.items as Record<string, unknown>[] : [];
     const matched = messageId ? items.find((item) => isRecord(item) && isRecord((item as Record<string, unknown>).message) && ((item as Record<string, unknown>).message as Record<string, unknown>).id === messageId) : null;
-    if (messageId && !matched) { untrackId(messageId); return; }
+    if (messageId && !matched) {
+      untrackId(messageId);
+      await appendJsonLine(eventsPath, {
+        at: nowIso(),
+        level: "warn",
+        source: "message_lookup_miss",
+        topic,
+        messageId,
+        message:
+          "message.created event did not resolve to list_messages payload; skipping confirm",
+      }).catch(() => undefined);
+      return;
+    }
     const firstItem = matched ?? (messageId ? null : items[0] ?? null);
     if (!isRecord(firstItem)) return;
 
@@ -418,7 +493,17 @@ const main = async (): Promise<void> => {
         ...context,
         messageId: confirmedId,
         ...(clientMsgId ? { clientMessageId: clientMsgId } : {}),
-      }).catch(() => undefined);
+      }).catch(async (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        await appendJsonLine(eventsPath, {
+          at: nowIso(),
+          level: "warn",
+          source: "delivery_confirm_failed",
+          topic,
+          messageId: confirmedId,
+          message,
+        }).catch(() => undefined);
+      });
     }
 
     await touchWake("chat_message_received");
@@ -632,7 +717,9 @@ const main = async (): Promise<void> => {
     stateDir,
     tokenFile,
     autoSubscribeDms: autoSubDms,
+    autoSubscribeGroups: autoSubGroups,
     autoSubscribeServers: autoSubServers,
+    autoSubscribeChannels: autoSubChannels,
     idleEnabled,
     idleTimeoutMs,
     idleCheckMs,
