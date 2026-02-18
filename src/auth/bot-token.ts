@@ -47,10 +47,16 @@ const resolveBotSessionFileWriterMode = (): BotSessionFileWriterMode => {
 
 const shouldRuntimeWriteBotSessionFile = (): boolean => {
   const mode = resolveBotSessionFileWriterMode();
+  const hasSupervisorIpc =
+    typeof process.send === "function" && process.connected !== false;
   if (mode === "runtime") return true;
-  if (mode === "supervisor") return false;
+  if (mode === "supervisor") {
+    // Safety: if explicitly configured for supervisor writes but runtime is not
+    // actually running under supervisor IPC, fall back to runtime writes.
+    return !hasSupervisorIpc;
+  }
   // Auto mode: if running under supervisor IPC channel, let supervisor be the sole writer.
-  return !(typeof process.send === "function" && process.connected !== false);
+  return !hasSupervisorIpc;
 };
 
 const writeFileAtomic = async (

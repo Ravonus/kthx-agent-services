@@ -128,6 +128,13 @@ const isMissingBotTokenError = (message: string): boolean =>
 const payloadRequiresBotToken = (payload: Record<string, unknown>): boolean => {
   const action = typeof payload.action === "string" ? payload.action.trim() : "";
   return (
+    action === "gateway_session" ||
+    action === "gateway_ticket" ||
+    action === "shell" ||
+    action === "list_messages" ||
+    action === "find_user" ||
+    action === "find_post" ||
+    action === "find_comment" ||
     action === "send_message" ||
     action === "edit_message" ||
     action === "open_dm" ||
@@ -968,14 +975,17 @@ const main = async (): Promise<void> => {
         await updateStatus({
           state: "waiting_for_bot_token",
           connected: false,
-          lastError: `gateway_session_failed: ${message}`,
+          lastError: null,
           subscriptionMode: connectMode,
           lastActivityAt: getLastActivityAtIso(),
         });
+        await scheduleReconnect("waiting_for_bot_token", {
+          baseDelayMs: missingTokenRetryMs,
+          bumpAttempt: false,
+        });
+        return;
       }
-      await scheduleReconnect(`gateway_session_failed: ${message}`, missingToken
-        ? { baseDelayMs: missingTokenRetryMs, bumpAttempt: false }
-        : {});
+      await scheduleReconnect(`gateway_session_failed: ${message}`);
       return;
     }
 
