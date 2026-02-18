@@ -41,6 +41,7 @@ import {
   markWsActivity as markWsActivityFn,
   writeDebugSnapshot,
 } from "./debug/ws-state.js";
+import { getRuntimeAttestation } from "./lib/crypto.js";
 import type { KthxConfig } from "./types/config.js";
 import type { AnyRouter } from "@trpc/server";
 
@@ -353,11 +354,8 @@ const main = async (): Promise<void> => {
       runBackendCall(label, fn, ctx),
     markWsActivity: (source: string) =>
       markWsActivityFn(ctx.wsStateContext, source),
-    getRuntimeAttestation: (connectionId: string) => ({
-      connectionId,
-      runtimeType: "kthx-agent-services-ts",
-      at: nowIso(),
-    }),
+    getRuntimeAttestation: (connectionId: string) =>
+      getRuntimeAttestation(connectionId),
     runOpenClawPrompt: async (input: { prompt: string; purpose: string }) => {
       const result = await openClawManager.prompt(input.prompt, { purpose: input.purpose });
       return result;
