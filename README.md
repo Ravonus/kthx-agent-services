@@ -59,4 +59,11 @@ See `src/config/runtime.ts` for all env vars. Key ones:
 - `MG_REALTIME_WS_URL` (required) - WebSocket endpoint
 - `MG_AGENT_KEY_BOX` (required) - Agent key material
 - `MG_BOT_SESSION_TOKEN` (optional) - Pre-existing bot token
+- `MG_BOT_SESSION_TOKEN_FILE` (optional) - Bot token file (default: `kthx-agents/state/ipc/auth/bot-session.json`)
+- `MG_BOT_TOKEN` / `MG_BOT_TOKEN_FILE` (optional fallback sources for chat bridge)
 - `MG_AGENT_HOME_DIR` (optional) - Agent home directory
+
+Notes:
+- Runtime mint now persists tokens to `state/ipc/auth/bot-session.json` so `chat-bridge` can reuse them.
+- If `chat-bridge` reports `tokenSource=none`, verify runtime/supervisor wrote `state/ipc/auth/bot-session.json` and that it contains a non-empty `token`.
+- Run runtime, bridge, supervisor, and health with the same `MG_AGENT_HOME_DIR` / `MG_AGENT_STATE_DIR` so they read the same IPC files.

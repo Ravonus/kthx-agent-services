@@ -45,7 +45,14 @@ const parseIsoToMs = (v: unknown): number | null => { if (typeof v !== "string")
 const normalizeConnectionId = (v: unknown): string | null => { if (typeof v !== "string") return null; const t = v.trim(); if (!t.length || t.length > 200) return null; return /^[a-zA-Z0-9._:-]+$/u.test(t) ? t : null; };
 
 /* State-dir helpers (synchronous FS for supervisor resilience) */
-const resolveStateDir = (): string => { const c = trimEnv("MG_AGENT_STATE_DIR"); return c ? path.resolve(c) : path.resolve(process.cwd(), "kthx-agents", "state"); };
+const resolveStateDir = (): string => {
+  const configured = trimEnv("MG_AGENT_STATE_DIR");
+  if (configured) return path.resolve(configured);
+  const home = trimEnv("MG_AGENT_HOME_DIR")
+    ? path.resolve(trimEnv("MG_AGENT_HOME_DIR") ?? "kthx-agents")
+    : path.resolve(process.cwd(), "kthx-agents");
+  return path.resolve(home, "state");
+};
 const debugPath = (stateDir: string, name: string): string => path.join(stateDir, "ipc", "debug", name);
 const writeJsonSync = (filePath: string, payload: unknown): boolean => { try { fs.mkdirSync(path.dirname(filePath), { recursive: true }); fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8"); return true; } catch { return false; } };
 

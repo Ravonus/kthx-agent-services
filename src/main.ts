@@ -25,7 +25,7 @@ import { isRecord } from "./lib/guards.js";
 import { nowIso } from "./lib/text.js";
 import {
   getBotToken,
-  notifySupervisorBotTokenSet,
+  setBotTokenState,
   notifySupervisorFatal,
 } from "./auth/bot-token.js";
 import { AuthManager } from "./auth/auth-manager.js";
@@ -147,7 +147,7 @@ const main = async (): Promise<void> => {
   // -- Bootstrap token
   const bootstrapToken = await getBotToken();
   if (bootstrapToken) {
-    notifySupervisorBotTokenSet({
+    await setBotTokenState({
       token: bootstrapToken,
       expiresAt: trimEnv("MG_BOT_SESSION_EXPIRES_AT") ?? null,
     });

@@ -179,9 +179,12 @@ const main = async (): Promise<void> => {
   const agentKey = trimEnv("MG_AGENT_KEY");
   if (!agentKeyBox && !agentKey) throw new Error("Missing agent auth. Set MG_AGENT_KEY_BOX or MG_AGENT_KEY.");
 
-  const stateDir = path.resolve(trimEnv("MG_AGENT_STATE_DIR") ?? path.join("kthx-agents", "state"));
+  const agentHomeDir = path.resolve(trimEnv("MG_AGENT_HOME_DIR") ?? "kthx-agents");
+  const stateDir = path.resolve(trimEnv("MG_AGENT_STATE_DIR") ?? path.join(agentHomeDir, "state"));
   const defaultTokenFile = path.join(stateDir, "ipc", "auth", "bot-session.json");
+  const legacyWsTokenFile = path.join(stateDir, "secrets", "MG_BOT_SESSION_TOKEN.ws.txt");
   const tokenFile = path.resolve(trimEnv("MG_BOT_SESSION_TOKEN_FILE") ?? defaultTokenFile);
+  const botTokenFile = trimEnv("MG_BOT_TOKEN_FILE");
   const eventsPath = path.join(stateDir, "ipc", "chat", "events.jsonl");
   const inboxPath = path.join(stateDir, "ipc", "chat", "inbox.jsonl");
   const statusPath = path.join(stateDir, "ipc", "chat", "status.json");
@@ -204,8 +207,14 @@ const main = async (): Promise<void> => {
       if (t.length && !candidates.some((c) => c.token === t)) candidates.push({ source, token: t });
     };
     push("env:MG_BOT_SESSION_TOKEN", trimEnv("MG_BOT_SESSION_TOKEN"));
+    push("env:MG_BOT_TOKEN", trimEnv("MG_BOT_TOKEN"));
     push(`file:${tokenFile}`, await readBotTokenFromFile(tokenFile));
+    if (botTokenFile) {
+      const resolvedBotTokenFile = path.resolve(botTokenFile);
+      push(`file:${resolvedBotTokenFile}`, await readBotTokenFromFile(resolvedBotTokenFile));
+    }
     if (defaultTokenFile !== tokenFile) push(`file:${defaultTokenFile}`, await readBotTokenFromFile(defaultTokenFile));
+    push(`file:${legacyWsTokenFile}`, await readBotTokenFromFile(legacyWsTokenFile));
     if (preferredTokenValue && preferredTokenSource) {
       const idx = candidates.findIndex((c) => c.token === preferredTokenValue);
       if (idx > 0) { const [item] = candidates.splice(idx, 1); candidates.unshift(item!); }

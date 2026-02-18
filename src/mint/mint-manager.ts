@@ -12,7 +12,7 @@ import fs from "node:fs/promises";
 import { nowIso, toAnswerPreview, sanitizeChallengePromptText } from "../lib/text.js";
 import { isRecord } from "../lib/guards.js";
 import { appendJsonLine } from "../lib/fs-helpers.js";
-import { getBotToken } from "../auth/bot-token.js";
+import { getBotToken, setBotTokenState } from "../auth/bot-token.js";
 import {
   normalizeChallengeAnswerForSubmit, isMultipleChoiceChallengeInstruction,
   answerChallengeWithOpenClaw, waitForChallengeAnswerFromFile,
@@ -254,6 +254,13 @@ export class MintManager implements MintManagerLike {
     const tok = (io && typeof io.sessionToken === "string" ? (io.sessionToken as string).trim()
       : io && typeof io.token === "string" ? (io.token as string).trim() : "") || null;
     if (!tok) throw new Error("realtime.mintBotToken returned no token.");
+    const tokenExpiresAt =
+      io && typeof io.sessionExpiresAt === "string" && io.sessionExpiresAt.trim().length > 0
+        ? io.sessionExpiresAt.trim()
+        : io && typeof io.expiresAt === "string" && io.expiresAt.trim().length > 0
+          ? io.expiresAt.trim()
+          : null;
+    await setBotTokenState({ token: tok, expiresAt: tokenExpiresAt });
     return { token: tok, alreadyConnected: false };
   }
 

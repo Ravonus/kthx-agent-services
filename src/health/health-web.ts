@@ -65,7 +65,11 @@ const iso = (v: unknown): string | null => {
 
 const resolveStateDir = (): string => {
   const configured = trimEnv("MG_AGENT_STATE_DIR");
-  return configured ? path.resolve(configured) : path.resolve(process.cwd(), "kthx-agents", "state");
+  if (configured) return path.resolve(configured);
+  const agentHomeDir = trimEnv("MG_AGENT_HOME_DIR")
+    ? path.resolve(trimEnv("MG_AGENT_HOME_DIR") ?? "kthx-agents")
+    : path.resolve(process.cwd(), "kthx-agents");
+  return path.resolve(agentHomeDir, "state");
 };
 
 const readJsonRecord = async (p: string): Promise<Record<string, unknown> | null> => {
