@@ -14,18 +14,9 @@ import { nowIso, toAnswerPreview } from "../lib/text.js";
 import type { ChatInboxEntry } from "./chat-reply.js";
 import {
   truncateChatReply,
-  isStatusQuery,
-  isContentReferenceMessage,
-  isNaturalPresenceCheckMessage,
-  isDirectiveBoundaryActionRequest,
-  isHowAreYouMessage,
-  isThanksMessage,
   isCommandLikeChatAutoReply,
   sanitizeChatOpenClawDraftReply,
   parseChatOpenClawReply,
-  buildNaturalPresenceReply,
-  buildNaturalChatFallbackReply,
-  buildDirectiveBoundaryReply,
   buildIntentAndReplyPrompt,
   CHAT_INTENT_VALID,
 } from "./chat-reply.js";
@@ -156,66 +147,6 @@ export const classifyIntentAndDraftReply = async (
 };
 
 // ---------------------------------------------------------------------------
-// Route by classified intent
-// ---------------------------------------------------------------------------
-
-export const routeByIntent = (intent: string, entry: ChatInboxEntry, maxChars: number): string | null => {
-  if (intent === "greeting") return buildNaturalPresenceReply(entry, maxChars);
-  if (intent === "action_request") return buildDirectiveBoundaryReply(maxChars);
-  if (intent === "content_reference") {
-    return truncateChatReply("I can help with that. Which post or comment are you referring to? Give me an @handle or describe it.", maxChars);
-  }
-  return null;
-};
-
-// ---------------------------------------------------------------------------
-// Contextual fallback reply
-// ---------------------------------------------------------------------------
-
-export const buildContextualFallback = (
-  entry: ChatInboxEntry,
-  conversationHistory: unknown[],
-  maxChars: number,
-): string => {
-  const userBody = entry.body.trim().toLowerCase();
-  if (isHowAreYouMessage(userBody)) {
-    return truncateChatReply(
-      entry.channelId ? "Doing well and online. What do you want help with?" : "Doing well and here. What are you working on right now?",
-      maxChars,
-    );
-  }
-  if (isThanksMessage(entry.body)) {
-    return truncateChatReply(
-      entry.channelId ? "Anytime. Tag me when you want me to jump in." : "Anytime. I'm here when you need me.",
-      maxChars,
-    );
-  }
-  if (conversationHistory.length > 1) {
-    const reversed = [...conversationHistory].reverse();
-    const lastAgentMsg = reversed.find((item) => {
-      if (!isRecord(item)) return false;
-      const author = isRecord(item.author) ? item.author : null;
-      return author?.isAgent === true;
-    });
-    if (lastAgentMsg && isRecord(lastAgentMsg)) {
-      const agentBody = isRecord(lastAgentMsg.message) && typeof lastAgentMsg.message.body === "string"
-        ? (lastAgentMsg.message.body as string).trim() : "";
-      if (agentBody.includes("?")) {
-        if (/\b(repl(?:y|ying)|post|comment|gradient|image|photo)\b/iu.test(userBody)) {
-          return truncateChatReply("Got it, thanks for clarifying. I'll handle that as you described.", maxChars);
-        }
-        if (/\b(yes|yeah|yep|yup|sure|ok|okay|correct|right|exactly|no|nah|nope|not)\b/iu.test(userBody)) {
-          return truncateChatReply("Understood. I'll take that into account.", maxChars);
-        }
-        return truncateChatReply("Got it, thanks for the clarification. Let me work on that for you.", maxChars);
-      }
-      if (agentBody.length > 0) return truncateChatReply("Got it. What would you like me to do next?", maxChars);
-    }
-  }
-  return buildNaturalChatFallbackReply(entry, maxChars);
-};
-
-// ---------------------------------------------------------------------------
 // Build auto-reply orchestrator
 // ---------------------------------------------------------------------------
 
@@ -232,51 +163,61 @@ export const buildAutoReply = async (
   const messageBody = entry.body.trim();
   if (!messageBody.length) return "";
   const maxChars = opts.maxChars;
-
-  // Fast-path: status query
-  if (isStatusQuery(messageBody)) {
-    return truncateChatReply("Runtime status: checking... (status queries are handled by the runtime bridge).", maxChars);
-  }
-  const isContentRef = isContentReferenceMessage(messageBody);
-  const isPresence = !isContentRef && isNaturalPresenceCheckMessage(messageBody);
-  const isDirective = !isContentRef && !isPresence && isDirectiveBoundaryActionRequest(messageBody);
-  if (isPresence) return buildNaturalPresenceReply(entry, maxChars);
-  if (isDirective) return buildDirectiveBoundaryReply(maxChars);
-  if (isContentRef) {
-    return truncateChatReply("I can help with that. Which post or comment are you referring to? Give me an @handle or describe it.", maxChars);
-  }
-
   const conversationHistory = await opts.fetchConversationHistory(entry);
 
   if (!opts.useOpenClaw) {
-    await opts.recordWrite({ type: "chat_runtime_reply_fallback_used", at: nowIso(), reason: "openclaw_disabled", messageId: entry.messageId, bodyPreview: toAnswerPreview(messageBody, 140) }).catch(() => undefined);
-    return buildContextualFallback(entry, conversationHistory, maxChars);
+    await opts.recordWrite({
+      type: "chat_runtime_reply_suppressed",
+      at: nowIso(),
+      reason: "openclaw_disabled",
+      messageId: entry.messageId,
+      bodyPreview: toAnswerPreview(messageBody, 140),
+    }).catch(() => undefined);
+    return "";
   }
 
   const decided = await classifyIntentAndDraftReply(entry, conversationHistory, opts.runOpenClawPrompt);
   if (!decided) {
-    await opts.recordWrite({ type: "chat_runtime_reply_fallback_used", at: nowIso(), reason: "openclaw_no_result", messageId: entry.messageId, bodyPreview: toAnswerPreview(messageBody, 140) }).catch(() => undefined);
-    return buildContextualFallback(entry, conversationHistory, maxChars);
-  }
-  if (decided.intent) {
-    const routed = routeByIntent(decided.intent, entry, maxChars);
-    if (routed) return routed;
+    await opts.recordWrite({
+      type: "chat_runtime_reply_suppressed",
+      at: nowIso(),
+      reason: "openclaw_no_result",
+      messageId: entry.messageId,
+      bodyPreview: toAnswerPreview(messageBody, 140),
+    }).catch(() => undefined);
+    return "";
   }
   let drafted = decided.reply;
   if (!drafted.length && typeof decided.rawReply === "string" && decided.rawReply.trim().length > 0) {
     drafted = sanitizeChatOpenClawDraftReply(decided.rawReply);
   }
   if (!drafted.length) {
-    await opts.recordWrite({ type: "chat_runtime_reply_fallback_used", at: nowIso(), reason: "openclaw_empty_reply", messageId: entry.messageId, intent: decided.intent, bodyPreview: toAnswerPreview(messageBody, 140), rawPreview: toAnswerPreview(decided.rawReply, 140) }).catch(() => undefined);
-    return buildContextualFallback(entry, conversationHistory, maxChars);
+    await opts.recordWrite({
+      type: "chat_runtime_reply_suppressed",
+      at: nowIso(),
+      reason: "openclaw_empty_reply",
+      messageId: entry.messageId,
+      intent: decided.intent,
+      bodyPreview: toAnswerPreview(messageBody, 140),
+      rawPreview: toAnswerPreview(decided.rawReply, 140),
+    }).catch(() => undefined);
+    return "";
   }
   const normalized = truncateChatReply(drafted, maxChars);
-  if (isDirectiveBoundaryActionRequest(normalized)) return buildDirectiveBoundaryReply(maxChars);
+  if (!normalized.length) return "";
   if (isCommandLikeChatAutoReply(normalized)) {
     const cleaned = sanitizeChatOpenClawDraftReply(normalized);
     if (cleaned.length > 0 && !isCommandLikeChatAutoReply(cleaned)) return truncateChatReply(cleaned, maxChars);
-    await opts.recordWrite({ type: "chat_runtime_reply_fallback_used", at: nowIso(), reason: "openclaw_command_like_reply", messageId: entry.messageId, intent: decided.intent, bodyPreview: toAnswerPreview(messageBody, 140), rawPreview: toAnswerPreview(drafted, 160) }).catch(() => undefined);
-    return buildContextualFallback(entry, conversationHistory, maxChars);
+    await opts.recordWrite({
+      type: "chat_runtime_reply_suppressed",
+      at: nowIso(),
+      reason: "openclaw_command_like_reply",
+      messageId: entry.messageId,
+      intent: decided.intent,
+      bodyPreview: toAnswerPreview(messageBody, 140),
+      rawPreview: toAnswerPreview(drafted, 160),
+    }).catch(() => undefined);
+    return "";
   }
   return normalized;
 };

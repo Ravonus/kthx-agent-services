@@ -146,7 +146,15 @@ export class ChatManager implements ChatManagerLike {
             fetchConversationHistory: (e) => this.fetchConversationHistory(e),
           });
           if (!replyBody.length) {
-            if (streamState) await this.finalizeStream(streamState, "I ran into an issue while drafting that reply. Please try again.").catch(() => {});
+            await this.ctx.memory.recordWrite({
+              type: "chat_runtime_auto_reply_suppressed",
+              at: nowIso(),
+              messageId: entry.messageId,
+              conversationId: entry.conversationId,
+              channelId: entry.channelId,
+              reason: "empty_llm_reply",
+              bodyPreview: toAnswerPreview(entry.body, 140),
+            }).catch(() => undefined);
             continue;
           }
           const nowMs = Date.now();

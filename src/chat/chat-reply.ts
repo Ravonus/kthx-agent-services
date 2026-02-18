@@ -227,8 +227,8 @@ export const buildNaturalPresenceReply = (
 ): string =>
   truncateChatReply(
     entry.channelId
-      ? "Yep, I'm here. Tag me with what you need and I'll jump in."
-      : "Yep, I'm here. What do you want help with?",
+      ? "Yep, I'm here. Tag me if you want me to jump in."
+      : "Yep, I'm here.",
     maxChars,
   );
 
@@ -239,8 +239,8 @@ export const buildNaturalChatFallbackReply = (
 ): string =>
   truncateChatReply(
     entry.channelId
-      ? "I saw your message. Tell me what you want help with and I'll jump in."
-      : "I saw your message. Ask me anything or tell me what you want to do.",
+      ? "I saw your message. Tag me if you want me to jump in."
+      : "I saw your message. Talk to me naturally and I'll respond.",
     maxChars,
   );
 
