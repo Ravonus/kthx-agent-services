@@ -14,6 +14,7 @@ import { isRecord } from "./lib/guards.js";
 import { nowIso } from "./lib/text.js";
 import { appendJsonLine } from "./lib/fs.js";
 import { getBotToken } from "./auth/bot-token.js";
+import { trimEnv } from "./lib/env-parse.js";
 import {
   markWsActivity,
   refreshWsDebugSnapshot,
@@ -44,6 +45,29 @@ const touchWake = async (wakePath: string): Promise<void> => {
   await fs
     .writeFile(wakePath, nowIso(), "utf8")
     .catch(() => {});
+};
+
+const parseCompetingTunnelHeartbeatBackoffMs = (): number => {
+  const raw = trimEnv("MG_AGENT_COMPETING_TUNNEL_HEARTBEAT_BACKOFF_MS");
+  if (!raw) return 120_000;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return 120_000;
+  return Math.max(10_000, Math.min(900_000, parsed));
+};
+
+const COMPETING_TUNNEL_HEARTBEAT_BACKOFF_MS =
+  parseCompetingTunnelHeartbeatBackoffMs();
+
+let heartbeatCompetingTunnelBackoffUntilMs = 0;
+let lastCompetingTunnelBackoffLogAtMs = 0;
+
+const isCompetingTunnelError = (message: string): boolean => {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized.length) return false;
+  return (
+    normalized.includes("competing bot tunnel rejected") ||
+    normalized.includes("another tunnel for this bot is already active")
+  );
 };
 
 // ---------------------------------------------------------------------------
@@ -93,6 +117,18 @@ export const runBackendCall = async <T>(
 // ---------------------------------------------------------------------------
 
 const sendHeartbeat = async (ctx: RuntimeContext): Promise<void> => {
+  const nowMs = Date.now();
+  if (nowMs < heartbeatCompetingTunnelBackoffUntilMs) {
+    if (nowMs - lastCompetingTunnelBackoffLogAtMs >= 30_000) {
+      lastCompetingTunnelBackoffLogAtMs = nowMs;
+      await ctx.memory.recordWrite({
+        type: "heartbeat_competing_tunnel_backoff",
+        at: nowIso(),
+        retryAt: new Date(heartbeatCompetingTunnelBackoffUntilMs).toISOString(),
+      });
+    }
+    return;
+  }
   let token = await getBotToken();
   if (!token) {
     // Attempt to mint a bot token if one is not available
@@ -108,11 +144,18 @@ const sendHeartbeat = async (ctx: RuntimeContext): Promise<void> => {
       () => (ctx.trpc as Record<string, any>)?.agent?.heartbeat?.mutate?.({}),
       ctx,
     );
+    heartbeatCompetingTunnelBackoffUntilMs = 0;
+    lastCompetingTunnelBackoffLogAtMs = 0;
     markWsActivity(ctx.wsStateContext, "heartbeat");
     ctx.debugSnapshot.lastHeartbeatError = null;
   } catch (error: unknown) {
     const message =
       error instanceof Error ? error.message : String(error);
+    if (isCompetingTunnelError(message)) {
+      heartbeatCompetingTunnelBackoffUntilMs =
+        Date.now() + COMPETING_TUNNEL_HEARTBEAT_BACKOFF_MS;
+      ctx.subscriptionManager?.requestResync("competing_tunnel_backoff");
+    }
     ctx.debugSnapshot.lastHeartbeatError = {
       at: nowIso(),
       code: null,

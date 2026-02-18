@@ -18,7 +18,6 @@ import {
   truncateChatReply,
   shouldReplyToChatInboxEntry,
   buildMentionTokens,
-  computeStreamStepChars,
 } from "./chat-reply.js";
 import { normalizeInboxEntry, buildAutoReply } from "./chat-intent.js";
 
@@ -153,8 +152,8 @@ export class ChatManager implements ChatManagerLike {
           const nowMs = Date.now();
           if (this.ctx.chat.chatReplyThrottleUntilMs > nowMs) await sleep(this.ctx.chat.chatReplyThrottleUntilMs - nowMs);
           if (streamState) {
-            const hasNativeStream = streamState.nativeDeltaChars > 0;
-            if (!hasNativeStream && !this.ctx.config.chatRuntimeTextStreamNativeOnly) await this.simulateStream(streamState, replyBody);
+            // Do not emit partial placeholder edits unless native streaming actually
+            // provided deltas. Partial writes can get stuck if finalization fails.
             let finalized = await this.finalizeStream(streamState, replyBody);
             if (!finalized && typeof streamState.messageId === "string" && streamState.messageId.trim().length > 0) {
               const normalized = truncateChatReply(replyBody, this.ctx.config.chatRuntimeReplyMaxChars);
@@ -322,17 +321,6 @@ export class ChatManager implements ChatManagerLike {
     }
     state.currentBody = nextBody; state.lastUpdateAtMs = Date.now();
     return true;
-  }
-
-  private async simulateStream(state: StreamState, finalBody: string): Promise<void> {
-    const normalized = truncateChatReply(finalBody, this.ctx.config.chatRuntimeReplyMaxChars);
-    if (!normalized.length) return;
-    const stepChars = computeStreamStepChars(normalized.length, this.ctx.config.chatRuntimeTextStreamStepChars);
-    for (let cursor = stepChars; cursor < normalized.length; cursor += stepChars) {
-      state.targetBody = normalized.slice(0, cursor);
-      await this.flushStream(state, { force: true }).catch(() => {});
-      await sleep(this.ctx.config.chatRuntimeTextStreamStepMs);
-    }
   }
 
   private async finalizeStream(state: StreamState, finalBody: string): Promise<boolean> {

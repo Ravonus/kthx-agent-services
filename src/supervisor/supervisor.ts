@@ -471,7 +471,6 @@ const main = async (): Promise<void> => {
 
   const prepareRuntimeEnv = (env: NodeJS.ProcessEnv): { ok: boolean; error?: string } => {
     if (!env.MG_AGENT_CONSOLE?.trim()) env.MG_AGENT_CONSOLE = hasInteractivePty ? "1" : "0";
-    if (!env.MG_AGENT_CHALLENGE_FILE_ANSWERS?.trim()) env.MG_AGENT_CHALLENGE_FILE_ANSWERS = "0";
     // Single writer for bot-session token file to avoid runtime/supervisor races.
     if (!env.MG_AGENT_BOT_SESSION_FILE_WRITER?.trim()) env.MG_AGENT_BOT_SESSION_FILE_WRITER = "supervisor";
 

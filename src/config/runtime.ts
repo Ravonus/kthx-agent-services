@@ -89,10 +89,6 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     (trimEnv("MG_AGENT_CONSOLE_ALLOW_NON_TTY") ?? "0") === "1";
   const autoRequestGrantOnDefer =
     (trimEnv("MG_AGENT_AUTO_REQUEST_GRANT") ?? "0") !== "0";
-  const challengeFileAnswersEnabled =
-    (trimEnv("MG_AGENT_CHALLENGE_FILE_ANSWERS") ?? "0") !== "0";
-  const challengeRequireSig =
-    (trimEnv("MG_AGENT_CHALLENGE_REQUIRE_SIG") ?? "0") === "1";
   const mintConsoleDebugEnabled =
     (trimEnv("MG_AGENT_MINT_CONSOLE_DEBUG") ?? "1") !== "0";
   const mintChallengeUseOpenClaw =
@@ -162,10 +158,6 @@ export const createRuntimeConfig = (): RuntimeConfig => {
       10,
       parseIntEnv("MG_AGENT_MINT_CHALLENGE_AUTO_RETRY_MAX", 3),
     ),
-  );
-  const challengeAnswerTimeoutMs = Math.max(
-    30_000,
-    parseIntEnv("MG_AGENT_CHALLENGE_ANSWER_TIMEOUT_MS", 40_000),
   );
   const challengeAnswerMaxChars = Math.max(
     32,
@@ -336,14 +328,11 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     botSessionMaxUses,
     autoRequestGrantOnDefer,
     autoRequestGrantCooldownMs,
-    challengeFileAnswersEnabled,
-    challengeRequireSig,
     mintConsoleDebugEnabled,
     mintChallengeUseOpenClaw,
     rejectMultipleChoiceChallenges,
     mintChallengeAutoRetryEnabled,
     mintChallengeAutoRetryMaxAttempts,
-    challengeAnswerTimeoutMs,
     challengeAnswerMaxChars,
     wsUploadDataUriMaxBytes,
     allowSyntheticMediaFallback,

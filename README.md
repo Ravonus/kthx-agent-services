@@ -62,11 +62,17 @@ See `src/config/runtime.ts` for all env vars. Key ones:
 - `MG_BOT_SESSION_TOKEN` (optional) - Pre-existing bot token
 - `MG_BOT_SESSION_TOKEN_FILE` (optional) - Bot token file (default: `kthx-agents/state/ipc/auth/bot-session.json`)
 - `MG_BOT_TOKEN` / `MG_BOT_TOKEN_FILE` (optional fallback sources for chat bridge)
+- `MG_AGENT_MINT_CHALLENGE_USE_OPENCLAW` (optional, default `1`) - enable OpenClaw for mint challenge solving
+- `MG_AGENT_CHALLENGE_ANSWER_MAX_CHARS` (optional, default `128`) - max chars allowed for challenge answers
 - `MG_AGENT_HOME_DIR` (optional) - Agent home directory
 - `MG_CHAT_AGENT_IDLE_SUBSCRIPTIONS_ENABLED` (optional, default `1`) - downshift bridge to user-topic-only after inactivity
 - `MG_CHAT_AGENT_IDLE_TIMEOUT_MS` (optional, default `300000`) - inactivity threshold before downshift
 - `MG_CHAT_AGENT_IDLE_CHECK_MS` (optional) - idle check cadence
 - `MG_CHAT_AGENT_IDLE_KEEP_MANUAL_TOPICS` (optional, default `0`) - keep `MG_CHAT_AGENT_TOPICS` subscriptions while idle
+- `MG_CHAT_AGENT_TOKEN_POLL_MS` (optional, default `1000`) - bridge token-change polling interval
+- `MG_CHAT_AGENT_TOKEN_FAST_RETRY_MS` (optional, default `250`) - reconnect delay after token changes
+- `MG_AGENT_COMPETING_TUNNEL_COOLDOWN_MS` (optional, default `90000`) - pause subscription retry loops when another tunnel is active
+- `MG_AGENT_COMPETING_TUNNEL_HEARTBEAT_BACKOFF_MS` (optional, default `120000`) - heartbeat backoff while tunnel competition is detected
 - `MG_CHAT_AGENT_AUTO_SUBSCRIBE_DMS` (optional, default `1`) - auto-subscribe DM + agent DM conversations
 - `MG_CHAT_AGENT_AUTO_SUBSCRIBE_GROUPS` (optional, default `1`) - auto-subscribe group conversations
 - `MG_CHAT_AGENT_AUTO_SUBSCRIBE_SERVERS` (optional, default `1`) - auto-subscribe server topics

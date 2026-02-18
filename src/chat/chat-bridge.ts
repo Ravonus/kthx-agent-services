@@ -83,6 +83,7 @@ type BridgeStatus = {
 type ReconnectOptions = {
   baseDelayMs?: number;
   bumpAttempt?: boolean;
+  force?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -291,6 +292,14 @@ const main = async (): Promise<void> => {
   const maxTrackedIds = Math.max(100, parseIntEnv("MG_CHAT_AGENT_TRACKED_MESSAGE_IDS", 1200));
   const maxTopics = Math.max(5, parseIntEnv("MG_CHAT_AGENT_MAX_TOPICS", 180));
   const pingMs = Math.max(5_000, parseIntEnv("MG_CHAT_AGENT_PING_MS", 25_000));
+  const tokenPollMs = Math.max(
+    250,
+    Math.min(10_000, parseIntEnv("MG_CHAT_AGENT_TOKEN_POLL_MS", 1000)),
+  );
+  const tokenFastRetryMs = Math.max(
+    100,
+    Math.min(5_000, parseIntEnv("MG_CHAT_AGENT_TOKEN_FAST_RETRY_MS", 250)),
+  );
   const idleEnabled = parseBooleanEnv("MG_CHAT_AGENT_IDLE_SUBSCRIPTIONS_ENABLED", true);
   const idleTimeoutMs = Math.max(30_000, parseIntEnv("MG_CHAT_AGENT_IDLE_TIMEOUT_MS", 300_000));
   const idleCheckMs = Math.max(
@@ -463,7 +472,9 @@ const main = async (): Promise<void> => {
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let pingTimer: ReturnType<typeof setInterval> | null = null;
   let idleTimer: ReturnType<typeof setInterval> | null = null;
+  let tokenWatchTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectAttempt = 0;
+  let lastObservedTokenValue: string | null = null;
   let stopping = false;
   let viewerMainUserId: string | null = null;
   let desiredMode: SubscriptionMode = "full";
@@ -753,7 +764,13 @@ const main = async (): Promise<void> => {
 
   // Reconnect scheduler
   const scheduleReconnect = async (reason: string, options: ReconnectOptions = {}): Promise<void> => {
-    if (stopping || reconnectTimer) return;
+    if (stopping) return;
+    const force = options.force ?? false;
+    if (force && reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (reconnectTimer) return;
     const bumpAttempt = options.bumpAttempt ?? true;
     if (bumpAttempt) {
       reconnectAttempt += 1;
@@ -793,14 +810,26 @@ const main = async (): Promise<void> => {
     try {
       session = await callBridge({ action: "gateway_session" }) as Record<string, unknown>;
     } catch (e) {
-      await scheduleReconnect(`gateway_session_failed: ${e instanceof Error ? e.message : String(e)}`);
+      const message = e instanceof Error ? e.message : String(e);
+      const missingToken =
+        /bot token missing/iu.test(message) ||
+        /tokensource=none/iu.test(message);
+      await scheduleReconnect(`gateway_session_failed: ${message}`, missingToken
+        ? { baseDelayMs: tokenFastRetryMs, bumpAttempt: false }
+        : {});
       return;
     }
 
     if (!isRecord(session) || session.enabled !== true) { await scheduleReconnect("chat_gateway_disabled"); return; }
     const wsUrl = typeof session.wsUrl === "string" ? session.wsUrl : null;
     const authToken = typeof session.authToken === "string" ? session.authToken : null;
-    if (!wsUrl || !authToken) { await scheduleReconnect("missing_ws_credentials"); return; }
+    if (!wsUrl || !authToken) {
+      await scheduleReconnect("missing_ws_credentials", {
+        baseDelayMs: tokenFastRetryMs,
+        bumpAttempt: false,
+      });
+      return;
+    }
     await updateStatus({ gatewayWsUrl: wsUrl });
 
     let topicRequests: TopicRequest[];
@@ -1038,6 +1067,7 @@ const main = async (): Promise<void> => {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
     if (idleTimer) { clearInterval(idleTimer); idleTimer = null; }
+    if (tokenWatchTimer) { clearInterval(tokenWatchTimer); tokenWatchTimer = null; }
     const sock = activeSocket; activeSocket = null;
     if (sock && sock.readyState === WebSocket.OPEN) sock.close(1000, "shutdown");
     await updateStatus({ state: "stopped", connected: false, lastError: signal });
@@ -1079,6 +1109,11 @@ const main = async (): Promise<void> => {
     idleCheckMs,
     idleKeepManualTopics,
   });
+  {
+    const initialCandidates = await resolveBotTokenCandidates();
+    lastObservedTokenValue =
+      initialCandidates.length > 0 ? initialCandidates[0]!.token : null;
+  }
   if (idleEnabled) {
     idleTimer = setInterval(() => {
       if (stopping || desiredMode !== "full") return;
@@ -1087,6 +1122,35 @@ const main = async (): Promise<void> => {
       void requestMode("idle_user_only", `idle_timeout_${idleForMs}ms`);
     }, idleCheckMs);
   }
+  tokenWatchTimer = setInterval(() => {
+    void (async () => {
+      if (stopping) return;
+      const candidates = await resolveBotTokenCandidates();
+      const latest = candidates.length > 0 ? candidates[0]!.token : null;
+      if (latest === lastObservedTokenValue) return;
+      lastObservedTokenValue = latest;
+      if (!latest) return;
+      const socket = activeSocket;
+      if (socket && socket.readyState === WebSocket.OPEN) return;
+      await appendBridgeEvent({
+        at: nowIso(),
+        type: "bot_token_updated_detected",
+        tokenSource: candidates[0]?.source ?? null,
+      });
+      if (socket && socket.readyState === WebSocket.CONNECTING) {
+        try {
+          socket.close(1000, "bot_token_updated");
+        } catch {
+          // ignore
+        }
+      }
+      await scheduleReconnect("bot_token_updated", {
+        baseDelayMs: tokenFastRetryMs,
+        bumpAttempt: false,
+        force: true,
+      });
+    })().catch(() => undefined);
+  }, tokenPollMs);
   await connect();
 };
 

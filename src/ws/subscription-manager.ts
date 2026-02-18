@@ -62,6 +62,14 @@ interface TopicState { sub: SubHandle | null; started: boolean; createdAtMs: num
 const ACTIVATION_GRACE_MS = 2_000;
 const START_TIMEOUT_MS = 15_000;
 const CRITICAL = new Set(["agent_auth_state", "agent_permission_state"]);
+const parseCompetingTunnelCooldownMs = (): number => {
+  const raw = trimEnv("MG_AGENT_COMPETING_TUNNEL_COOLDOWN_MS");
+  if (!raw) return 90_000;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return 90_000;
+  return Math.max(10_000, Math.min(900_000, parsed));
+};
+const COMPETING_TUNNEL_COOLDOWN_MS = parseCompetingTunnelCooldownMs();
 
 // ---------------------------------------------------------------------------
 // SubscriptionManager
@@ -80,6 +88,9 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   private lensRefreshFlight = false;
   private lastLensRefreshMs = 0;
   private healTimer: ReturnType<typeof setInterval> | null = null;
+  private competingTunnelCooldownUntilMs = 0;
+  private competingTunnelResumeTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastCompetingTunnelNoticeAtMs = 0;
 
   constructor(ctx: SubscriptionManagerContext) {
     this.ctx = ctx;
@@ -97,6 +108,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   // -- Public API ----------------------------------------------------------
 
   async subscribeUserTopics(): Promise<void> {
+    if (this.isCompetingTunnelCoolingDown()) return;
     if (!(await this.hasAuth())) {
       const now = Date.now();
       if (now - this.lastWaitingAuthMs >= 30_000) {
@@ -112,10 +124,12 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   }
 
   async subscribePublicTopics(): Promise<void> {
+    if (this.isCompetingTunnelCoolingDown()) return;
     for (const t of this.publicTopics) this.subPublic(t);
   }
 
   async bootstrap(): Promise<void> {
+    if (this.isCompetingTunnelCoolingDown()) return;
     this.subHeartbeat();
     await this.subscribePublicTopics();
     await this.subscribeUserTopics();
@@ -145,12 +159,17 @@ export class SubscriptionManager implements SubscriptionManagerLike {
 
   dispose(): void {
     if (this.healTimer) { clearInterval(this.healTimer); this.healTimer = null }
+    if (this.competingTunnelResumeTimer) {
+      clearTimeout(this.competingTunnelResumeTimer);
+      this.competingTunnelResumeTimer = null;
+    }
     this.teardownAll();
   }
 
   // -- Subscribe helpers ---------------------------------------------------
 
   private subUser(topic: string): void {
+    if (this.isCompetingTunnelCoolingDown()) return;
     if (this.userSubs.has(topic) || !this.ctx.trpc) return;
     const st: TopicState = { sub: null, started: false, createdAtMs: Date.now(), lastDataAtMs: null };
     this.userSubs.set(topic, st);
@@ -168,6 +187,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
       },
       onError: (err: unknown) => {
         this.removeTopic(this.userSubs, topic);
+        if (this.handleCompetingTunnelError(err, "user", topic)) return;
         void this.logError("user", topic, err);
         void this.recoverUnauth(err);
         this.retry(() => { void (async () => { if (await this.hasAuth()) this.subUser(topic) })() });
@@ -177,6 +197,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   }
 
   private subPublic(topic: string): void {
+    if (this.isCompetingTunnelCoolingDown()) return;
     if (this.publicSubs.has(topic) || !this.ctx.trpc) return;
     const st: TopicState = { sub: null, started: false, createdAtMs: Date.now(), lastDataAtMs: null };
     this.publicSubs.set(topic, st);
@@ -194,6 +215,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
       },
       onError: (err: unknown) => {
         this.removeTopic(this.publicSubs, topic);
+        if (this.handleCompetingTunnelError(err, "public", topic)) return;
         void this.logError("public", topic, err);
         void this.recoverUnauth(err);
         this.retry(() => { this.subPublic(topic) });
@@ -203,6 +225,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   }
 
   private subHeartbeat(): void {
+    if (this.isCompetingTunnelCoolingDown()) return;
     if (this.heartbeatSub || !this.ctx.trpc) return;
     const sub = this.ctx.trpc.realtime.heartbeat.subscribe(
       { intervalMs: Math.min(30_000, Math.max(1_000, this.ctx.config.heartbeatIntervalMs)) },
@@ -210,6 +233,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
         onData: () => { this.ctx.markWsActivity("heartbeat_subscription") },
         onError: (err: unknown) => {
           this.heartbeatSub = null;
+          if (this.handleCompetingTunnelError(err, "core", "heartbeat")) return;
           void this.logError("core", "heartbeat", err);
           void this.recoverUnauth(err);
           this.retry(() => { this.subHeartbeat() }, 2_000);
@@ -223,6 +247,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   // -- Resync & heal -------------------------------------------------------
 
   private async runResync(): Promise<void> {
+    if (this.isCompetingTunnelCoolingDown()) return;
     if (!this.ctx.misc.subscriptionResyncRequested) return;
     const now = Date.now();
     if (now - this.ctx.misc.lastSubscriptionResyncAtMs < 2_000) return;
@@ -244,6 +269,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   }
 
   private async healTick(): Promise<void> {
+    if (this.isCompetingTunnelCoolingDown()) return;
     await this.runResync().catch(() => {});
     this.subHeartbeat();
     void this.subscribeUserTopics();
@@ -407,7 +433,88 @@ export class SubscriptionManager implements SubscriptionManagerLike {
     return Boolean(token || (key && key.trim().length > 0));
   }
 
-  private retry(fn: () => void, ms = 1_500): void { setTimeout(fn, ms) }
+  private retry(fn: () => void, ms = 1_500): void {
+    if (this.isCompetingTunnelCoolingDown()) return;
+    setTimeout(() => {
+      if (this.isCompetingTunnelCoolingDown()) return;
+      fn();
+    }, ms);
+  }
+
+  private isCompetingTunnelCoolingDown(): boolean {
+    return Date.now() < this.competingTunnelCooldownUntilMs;
+  }
+
+  private errMessage(err: unknown): string {
+    if (err instanceof Error && err.message.trim().length > 0) {
+      return err.message.trim();
+    }
+    if (typeof err === "string" && err.trim().length > 0) {
+      return err.trim();
+    }
+    const shape = isRecord(err) && isRecord(err.shape) ? err.shape : null;
+    if (shape && typeof shape.message === "string" && shape.message.trim().length > 0) {
+      return shape.message.trim();
+    }
+    return "subscription_error";
+  }
+
+  private isCompetingTunnelError(err: unknown): boolean {
+    const message = this.errMessage(err).toLowerCase();
+    if (!message.length) return false;
+    return (
+      message.includes("competing bot tunnel rejected") ||
+      message.includes("another tunnel for this bot is already active")
+    );
+  }
+
+  private handleCompetingTunnelError(
+    err: unknown,
+    scope: string,
+    topic: string,
+  ): boolean {
+    if (!this.isCompetingTunnelError(err)) return false;
+    const now = Date.now();
+    const cooldownUntil = now + COMPETING_TUNNEL_COOLDOWN_MS;
+    if (cooldownUntil > this.competingTunnelCooldownUntilMs) {
+      this.competingTunnelCooldownUntilMs = cooldownUntil;
+    }
+    this.teardownAll();
+    this.ctx.misc.subscriptionResyncRequested = true;
+    this.ctx.misc.subscriptionResyncReason = "competing_tunnel_cooldown_expired";
+    if (this.competingTunnelResumeTimer) {
+      clearTimeout(this.competingTunnelResumeTimer);
+      this.competingTunnelResumeTimer = null;
+    }
+    const remainingMs = Math.max(0, this.competingTunnelCooldownUntilMs - now);
+    this.competingTunnelResumeTimer = setTimeout(() => {
+      this.competingTunnelResumeTimer = null;
+      this.ctx.misc.subscriptionResyncRequested = true;
+      this.ctx.misc.subscriptionResyncReason = "competing_tunnel_cooldown_expired";
+      void this.runResync().catch(() => {});
+    }, remainingMs);
+    if (now - this.lastCompetingTunnelNoticeAtMs >= 30_000) {
+      this.lastCompetingTunnelNoticeAtMs = now;
+      const message = this.errMessage(err);
+      void this.ctx.memory.recordWrite({
+        type: "socket_competing_tunnel_cooldown",
+        at: nowIso(),
+        scope,
+        topic,
+        message,
+        cooldownMs: COMPETING_TUNNEL_COOLDOWN_MS,
+      });
+      this.ctx.debugSnapshot.lastSubscriptionError = {
+        at: nowIso(),
+        scope,
+        topic,
+        code: this.errCode(err),
+        message: `competing_tunnel_cooldown: ${message}`,
+      };
+      void this.ctx.writeDebugSnapshot();
+    }
+    return true;
+  }
 
   private errCode(err: unknown): string | null {
     if (!isRecord(err)) return null;

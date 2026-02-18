@@ -369,9 +369,6 @@ const main = async (): Promise<void> => {
     mint: ctx.mint,
     config: {
       connectionId: config.connectionId,
-      challengeFileAnswersEnabled: config.challengeFileAnswersEnabled,
-      challengeRequireSig: config.challengeRequireSig,
-      challengeAnswerTimeoutMs: config.challengeAnswerTimeoutMs,
       challengeAnswerMaxChars: config.challengeAnswerMaxChars,
       mintChallengeUseOpenClaw: config.mintChallengeUseOpenClaw,
       rejectMultipleChoiceChallenges: config.rejectMultipleChoiceChallenges,
@@ -383,12 +380,8 @@ const main = async (): Promise<void> => {
     ipcPaths: {
       mintDebugPath: ipcPaths.mintDebugPath,
       mintTracePath: ipcPaths.mintTracePath,
-      challengePromptsDir: ipcPaths.challengePromptsDir,
-      challengeRepliesDir: ipcPaths.challengeRepliesDir,
-      challengeProcessedDir: ipcPaths.challengeProcessedDir,
-      wakePath: ipcPaths.wakePath,
     },
-    misc: { controlKey: ctx.misc.controlKey, subscriptionResyncRequested: ctx.misc.subscriptionResyncRequested, subscriptionResyncReason: ctx.misc.subscriptionResyncReason },
+    misc: { subscriptionResyncRequested: ctx.misc.subscriptionResyncRequested, subscriptionResyncReason: ctx.misc.subscriptionResyncReason },
     memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
     trpc: trpc as any,
     wsClient: wsClient as any,

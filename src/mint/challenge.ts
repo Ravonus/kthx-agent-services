@@ -1,39 +1,23 @@
 /**
- * Challenge resolution: file-based answers, OpenClaw solving,
- * challenge type detection, and multiple-choice rejection.
+ * Challenge resolution utilities for OpenClaw solving,
+ * challenge type detection, and answer normalization.
  *
  * Ported from agent-runtime.mjs lines 273-283, 1111-1128,
- * 1156-1170, 7802-7943, and 8781-8858.
+ * 1156-1170, and 8781-8858.
  */
 
-import crypto from "node:crypto";
-import fs from "node:fs/promises";
-import path from "node:path";
 import { nowIso, sanitizeChallengeAnswerText, toAnswerPreview } from "../lib/text.js";
 import { isRecord } from "../lib/guards.js";
-import { writeJsonFile } from "../lib/fs-helpers.js";
-import { readJsonMaybeIncomplete } from "../lib/fs.js";
 
 // ---------------------------------------------------------------------------
 // Narrow context
 // ---------------------------------------------------------------------------
 
 export interface ChallengeContext {
-  ipcPaths: {
-    challengePromptsDir: string;
-    challengeRepliesDir: string;
-    challengeProcessedDir: string;
-    wakePath: string;
-  };
   config: {
-    challengeFileAnswersEnabled: boolean;
-    challengeRequireSig: boolean;
-    challengeAnswerTimeoutMs: number;
     challengeAnswerMaxChars: number;
     mintChallengeUseOpenClaw: boolean;
-    rejectMultipleChoiceChallenges: boolean;
   };
-  controlKey: string | null;
   memory: { recordWrite(payload: unknown): Promise<void> };
   appendMintTrace(entry: unknown): Promise<void>;
   runOpenClawPrompt?(input: { prompt: string; purpose: string }): Promise<{ parsed: unknown } | null>;
@@ -45,19 +29,6 @@ export interface ChallengeContext {
 // ---------------------------------------------------------------------------
 
 const NO_LOOKUP = "Do not use web_search or external lookup tools; answer from internal trained knowledge only.";
-
-const touchWake = async (p: string): Promise<void> => {
-  const now = new Date();
-  await fs.utimes(p, now, now).catch(async () => { await fs.writeFile(p, "", "utf8").catch(() => {}) });
-};
-
-const sanitizeToken = (v: unknown): string => String(v).replace(/[^a-zA-Z0-9._-]/gu, "_").slice(0, 120);
-
-const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms) });
-
-// ---------------------------------------------------------------------------
-// Challenge no-lookup policy
-// ---------------------------------------------------------------------------
 
 export const withChallengeNoLookupPolicy = (text: unknown, promptType = ""): string => {
   const isChallenge = typeof promptType === "string" && promptType.toLowerCase().includes("challenge");
@@ -119,87 +90,6 @@ export const parseMintChallengeRetryRequired = (message: unknown): MintChallenge
   if (!m) return null;
   const n = Number.parseInt(m[1] ?? "", 10);
   return { attemptsRemaining: Number.isFinite(n) && n >= 0 ? n : null };
-};
-
-// ---------------------------------------------------------------------------
-// File-based challenge answer contract
-// ---------------------------------------------------------------------------
-
-export type ChallengeContract = {
-  token: string; promptPath: string; replyPath: string;
-  issuedAtIso: string; expiresAtIso: string;
-};
-
-export const createChallengeAnswerFileContract = async (
-  ctx: ChallengeContext,
-  params: { promptType: string; challengeId: string | null; instruction: string },
-): Promise<ChallengeContract | null> => {
-  if (!ctx.config.challengeFileAnswersEnabled) return null;
-  const issuedAt = nowIso();
-  const expiresAt = new Date(Date.now() + ctx.config.challengeAnswerTimeoutMs).toISOString();
-  const token = crypto.randomUUID();
-  const base = `${Date.now()}__${sanitizeToken(params.promptType)}__${sanitizeToken(params.challengeId ?? "none")}__${token}`;
-  const promptPath = path.join(ctx.ipcPaths.challengePromptsDir, `${base}.json`);
-  const replyPath = path.join(ctx.ipcPaths.challengeRepliesDir, `${base}.json`);
-  const instr = withChallengeNoLookupPolicy(params.instruction, params.promptType);
-  await writeJsonFile(promptPath, {
-    type: "challenge_answer_request", token, promptType: params.promptType,
-    challengeId: params.challengeId ?? null, issuedAt, expiresAt, instruction: instr, replyPath,
-    expectedReply: { token, answer: "<string>", ...(ctx.config.challengeRequireSig && ctx.controlKey ? { sig: "hex-hmac-sha256" } : {}) },
-  });
-  await touchWake(ctx.ipcPaths.wakePath);
-  await ctx.memory.recordWrite({
-    type: "challenge_answer_file_issued", at: issuedAt, promptType: params.promptType,
-    challengeId: params.challengeId ?? null, token, promptPath, replyPath, expiresAt,
-    requireSig: ctx.config.challengeRequireSig && Boolean(ctx.controlKey),
-  });
-  return { token, promptPath, replyPath, issuedAtIso: issuedAt, expiresAtIso: expiresAt };
-};
-
-// ---------------------------------------------------------------------------
-// moveChallengeReplyToProcessed
-// ---------------------------------------------------------------------------
-
-const moveReply = async (dir: string, replyPath: string, status: string): Promise<string> => {
-  const target = path.join(dir, `${sanitizeToken(path.basename(replyPath))}.${sanitizeToken(status)}.${Date.now()}.json`);
-  await fs.rename(replyPath, target).catch(async () => { await fs.rm(replyPath, { force: true }).catch(() => {}) });
-  return target;
-};
-
-// ---------------------------------------------------------------------------
-// waitForChallengeAnswerFromFile
-// ---------------------------------------------------------------------------
-
-export const waitForChallengeAnswerFromFile = async (
-  ctx: ChallengeContext,
-  params: { promptType: string; challengeId: string | null; instruction: string; rejectConsoleCommandLike: boolean },
-): Promise<string | null> => {
-  const contract = await createChallengeAnswerFileContract(ctx, params);
-  if (!contract) return null;
-  const deadline = Date.now() + ctx.config.challengeAnswerTimeoutMs;
-  while (Date.now() < deadline) {
-    const read = await readJsonMaybeIncomplete(contract.replyPath);
-    if (read.status === "ok") {
-      const p = isRecord(read.value) ? read.value : null;
-      const tok = typeof p?.token === "string" ? (p.token as string).trim() : "";
-      const rawAns = typeof p?.answer === "string" ? (p.answer as string) : "";
-      const ans = sanitizeChallengeAnswerText(rawAns);
-      if (tok !== contract.token || !ans.length) {
-        const ip = await moveReply(ctx.ipcPaths.challengeProcessedDir, contract.replyPath, "invalid");
-        await ctx.memory.recordWrite({ type: "challenge_answer_file_rejected", at: nowIso(), promptType: params.promptType, challengeId: params.challengeId ?? null, reason: tok !== contract.token ? "token_mismatch" : "missing_answer", path: ip, answerPreview: toAnswerPreview(rawAns) });
-        await sleep(500); continue;
-      }
-      if (params.rejectConsoleCommandLike && isConsoleCommandLikeAnswer(ans)) {
-        const rp = await moveReply(ctx.ipcPaths.challengeProcessedDir, contract.replyPath, "rejected_command");
-        await ctx.memory.recordWrite({ type: "challenge_answer_file_rejected", at: nowIso(), promptType: params.promptType, challengeId: params.challengeId ?? null, reason: "console_command", path: rp, answerPreview: toAnswerPreview(ans) });
-        await sleep(500); continue;
-      }
-      await moveReply(ctx.ipcPaths.challengeProcessedDir, contract.replyPath, "accepted");
-      return ans;
-    }
-    await sleep(500);
-  }
-  return null;
 };
 
 // ---------------------------------------------------------------------------

@@ -15,8 +15,8 @@ import { appendJsonLine } from "../lib/fs-helpers.js";
 import { getBotToken, setBotTokenState } from "../auth/bot-token.js";
 import {
   normalizeChallengeAnswerForSubmit, isMultipleChoiceChallengeInstruction,
-  answerChallengeWithOpenClaw, waitForChallengeAnswerFromFile,
-  withChallengeNoLookupPolicy, parseMintChallengeRetryRequired,
+  answerChallengeWithOpenClaw,
+  parseMintChallengeRetryRequired,
 } from "./challenge.js";
 import type { ChallengeContext } from "./challenge.js";
 import type { MintManagerLike, MintTrackingState } from "../runtime-context.js";
@@ -29,9 +29,6 @@ export interface MintManagerContext {
   mint: MintTrackingState;
   config: {
     connectionId: string;
-    challengeFileAnswersEnabled: boolean;
-    challengeRequireSig: boolean;
-    challengeAnswerTimeoutMs: number;
     challengeAnswerMaxChars: number;
     mintChallengeUseOpenClaw: boolean;
     rejectMultipleChoiceChallenges: boolean;
@@ -43,12 +40,8 @@ export interface MintManagerContext {
   ipcPaths: {
     mintDebugPath: string;
     mintTracePath: string;
-    challengePromptsDir: string;
-    challengeRepliesDir: string;
-    challengeProcessedDir: string;
-    wakePath: string;
   };
-  misc: { controlKey: string | null; subscriptionResyncRequested: boolean; subscriptionResyncReason: string | null };
+  misc: { subscriptionResyncRequested: boolean; subscriptionResyncReason: string | null };
   memory: { recordWrite(payload: unknown): Promise<void> };
   trpc: { realtime: { mintBotToken: { mutate(input: unknown): Promise<unknown> } } } | null;
   wsClient: { activeConnection: { close(): Promise<void> } } | null;
@@ -200,7 +193,7 @@ export class MintManager implements MintManagerLike {
   private async mintOverSocket(reason: string): Promise<{ token: string; alreadyConnected: boolean } | null> {
     if (!this.ctx.trpc) throw new Error("tRPC client not available for mintBotToken.");
     const fresh = reason === "console_mint_retry";
-    let issued = await this.reqMint(null, null, null, fresh);
+    let issued = await this.reqMint(null, null, null, fresh, null);
     if (fresh) await this.trace({ type: "mint_fresh_challenge_explicit", reason });
     let answered = 0;
 
@@ -221,27 +214,49 @@ export class MintManager implements MintManagerLike {
         await this.ctx.memory.recordWrite({ type: "bot_token_mint_challenge_multiple_choice_compat", at: nowIso(), challengeId: cid, challengeAnswerType: ansType, instruction: toAnswerPreview(instr, 180) });
       }
       if (!cid) throw new Error("Socket mint challenge missing challengeId.");
-      if (!this.ctx.config.challengeFileAnswersEnabled && !this.ctx.config.mintChallengeUseOpenClaw) {
-        throw new Error(`Socket mint challenge required (challengeId=${cid}). Enable OpenClaw or file answers.`);
+      if (!this.ctx.config.mintChallengeUseOpenClaw) {
+        throw new Error(`Socket mint challenge required (challengeId=${cid}). Enable OpenClaw challenge solving.`);
       }
       await this.ctx.memory.recordWrite({ type: "bot_token_mint_challenge_required", reason, at: nowIso(), challengeId: cid, instruction: instr });
       const chCtx = this.chalCtx();
       const instrTok = cpt?.trim().length ? `${instr} [questionToken: ${cpt.trim()}]` : instr;
-      let answer = await answerChallengeWithOpenClaw(chCtx, { challengeId: cid, promptToken: cpt, instruction: instrTok, attemptsUsed: answered });
-      if (!answer) {
-        const pol = withChallengeNoLookupPolicy(instr, "mint_challenge");
-        const fa = await waitForChallengeAnswerFromFile(chCtx, { promptType: "mint_challenge", challengeId: cid, instruction: `${pol} Type answer only (max ${this.ctx.config.challengeAnswerMaxChars} chars).`, rejectConsoleCommandLike: true });
-        if (fa) answer = fa;
-      }
-      if (!answer) throw new Error("Mint challenge answer is required.");
+      const answer = await answerChallengeWithOpenClaw(chCtx, {
+        challengeId: cid,
+        promptToken: cpt,
+        instruction: instrTok,
+        attemptsUsed: answered,
+      });
+      if (!answer) throw new Error("Mint challenge answer is required from OpenClaw.");
       await this.trace({ type: "mint_answer_submitted", challengeId: cid, answerPreview: toAnswerPreview(answer) });
       answered += 1;
-      issued = await this.reqMint(cid, answer, cpt, false);
+      issued = await this.reqMint(cid, answer, cpt, false, instr);
       if (issued && (issued as Record<string, unknown>).challengeRequired) {
+        const attemptsRemainingRaw =
+          typeof (issued as Record<string, unknown>).attemptsRemaining === "number"
+            ? ((issued as Record<string, unknown>).attemptsRemaining as number)
+            : null;
+        const attemptsRemaining =
+          attemptsRemainingRaw !== null && Number.isFinite(attemptsRemainingRaw)
+            ? Math.max(0, Math.floor(attemptsRemainingRaw))
+            : null;
         const exhausted = !this.ctx.config.mintChallengeAutoRetryEnabled || answered >= this.ctx.config.mintChallengeAutoRetryMaxAttempts;
-        await this.ctx.memory.recordWrite({ type: "bot_token_mint_challenge_answer_rejected", at: nowIso(), challengeId: cid, submittedChallengeAnswers: answered, attemptsExhausted: exhausted });
+        const attemptsExhaustedByServer =
+          attemptsRemaining !== null && attemptsRemaining <= 0;
+        await this.ctx.memory.recordWrite({
+          type: "bot_token_mint_challenge_answer_rejected",
+          at: nowIso(),
+          challengeId: cid,
+          submittedChallengeAnswers: answered,
+          attemptsRemaining,
+          attemptsExhausted: exhausted || attemptsExhaustedByServer,
+        });
+        if (attemptsExhaustedByServer) {
+          throw new Error("Mint challenge attempts exhausted by server. Run `mint retry`.");
+        }
         if (exhausted) throw new Error(`Mint challenge not accepted after ${answered} attempt${answered === 1 ? "" : "s"}. Run \`mint retry\`.`);
-        issued = await this.reqMint(null, null, null, true);
+        if ((issued as Record<string, unknown>).retryRequired === true) {
+          issued = await this.reqMint(null, null, null, true, null);
+        }
       }
     }
     // Already-connected shortcut.
@@ -266,7 +281,13 @@ export class MintManager implements MintManagerLike {
 
   // -- Single mint request -------------------------------------------------
 
-  private async reqMint(cid: string | null, ans: string | null, pt: string | null, refresh: boolean): Promise<unknown> {
+  private async reqMint(
+    cid: string | null,
+    ans: string | null,
+    pt: string | null,
+    refresh: boolean,
+    challengeInstruction: string | null,
+  ): Promise<unknown> {
     if (!this.ctx.trpc) throw new Error("tRPC client not available.");
     const m = this.ctx.mint;
     const normAns = typeof ans === "string" ? normalizeChallengeAnswerForSubmit(ans, this.ctx.config.challengeAnswerMaxChars) : "";
@@ -307,7 +328,16 @@ export class MintManager implements MintManagerLike {
       }
       // Challenge retry required.
       const retry = cid && normAns && parseMintChallengeRetryRequired(msg);
-      if (retry) return { challengeRequired: true, challengeId: cid, promptToken: pt ?? null, attemptsRemaining: retry.attemptsRemaining };
+      if (retry) {
+        return {
+          challengeRequired: true,
+          challengeId: cid,
+          promptToken: pt ?? null,
+          attemptsRemaining: retry.attemptsRemaining,
+          retryRequired: true,
+          instruction: challengeInstruction ?? "Solve mint challenge",
+        };
+      }
       throw error;
     }
   }
@@ -324,8 +354,8 @@ export class MintManager implements MintManagerLike {
 
   private chalCtx(): ChallengeContext {
     return {
-      ipcPaths: this.ctx.ipcPaths, config: this.ctx.config,
-      controlKey: this.ctx.misc.controlKey, memory: this.ctx.memory,
+      config: this.ctx.config,
+      memory: this.ctx.memory,
       appendMintTrace: (e: unknown) => this.trace(e),
       ...(this.ctx.runOpenClawPrompt ? { runOpenClawPrompt: this.ctx.runOpenClawPrompt } : {}),
       ...(this.ctx.parseChatOpenClawReply ? { parseChatOpenClawReply: this.ctx.parseChatOpenClawReply } : {}),

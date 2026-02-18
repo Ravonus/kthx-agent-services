@@ -138,9 +138,6 @@ export type RuntimeConfig = {
   // Grant / challenge
   autoRequestGrantOnDefer: boolean;
   autoRequestGrantCooldownMs: number;
-  challengeFileAnswersEnabled: boolean;
-  challengeRequireSig: boolean;
-  challengeAnswerTimeoutMs: number;
   challengeAnswerMaxChars: number;
 
   // Mint
