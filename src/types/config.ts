@@ -69,6 +69,20 @@ export type KthxPathsConfig = {
   generatedDir: string;
 };
 
+export type KthxUpdatesConfig = {
+  enabled: boolean;
+  autoUpdateOnStart: boolean;
+  restartAfterUpdate: boolean;
+  haltOnFailure: boolean;
+  repoDir: string;
+  remote: string;
+  branch: string;
+  allowDirtyWorkingTree: boolean;
+  runInstall: boolean;
+  runBuild: boolean;
+  timeoutMs: number;
+};
+
 export type KthxConfig = {
   version: number;
   paths: KthxPathsConfig;
@@ -76,6 +90,7 @@ export type KthxConfig = {
   queue: KthxQueueConfig;
   memory: KthxMemoryConfig;
   image: KthxImageConfig;
+  updates: KthxUpdatesConfig;
 };
 
 // ---------------------------------------------------------------------------

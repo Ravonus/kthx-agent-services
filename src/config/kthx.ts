@@ -96,6 +96,19 @@ export const buildDefaultKthxConfig = (homeDir: string): KthxConfig => ({
     referenceLookback: 3,
     personas: DEFAULT_MEDIA_PERSONA_DEFINITIONS,
   },
+  updates: {
+    enabled: true,
+    autoUpdateOnStart: true,
+    restartAfterUpdate: true,
+    haltOnFailure: false,
+    repoDir: "",
+    remote: "origin",
+    branch: "main",
+    allowDirtyWorkingTree: false,
+    runInstall: true,
+    runBuild: true,
+    timeoutMs: 300_000,
+  },
 });
 
 // ---------------------------------------------------------------------------
@@ -141,6 +154,7 @@ export const normalizeKthxConfig = (
   const sourceQueue = isRecord(source.queue) ? source.queue : {};
   const sourceMemory = isRecord(source.memory) ? source.memory : {};
   const sourceImage = isRecord(source.image) ? source.image : {};
+  const sourceUpdates = isRecord(source.updates) ? source.updates : {};
 
   // -- numeric fields -------------------------------------------------------
   const openClawTimeoutRaw = safeFiniteInt(
@@ -249,6 +263,10 @@ export const normalizeKthxConfig = (
   const referenceLookbackRaw = safeFiniteInt(
     sourceImage.referenceLookback,
     defaults.image.referenceLookback,
+  );
+  const updatesTimeoutRaw = safeFiniteInt(
+    sourceUpdates.timeoutMs,
+    defaults.updates.timeoutMs,
   );
 
   const personas: PersonaDefinition[] = normalizePersonaDefinitions(
@@ -361,6 +379,43 @@ export const normalizeKthxConfig = (
       ),
       referenceLookback: Math.max(1, Math.min(8, referenceLookbackRaw)),
       personas,
+    },
+    updates: {
+      enabled:
+        typeof sourceUpdates.enabled === "boolean"
+          ? sourceUpdates.enabled
+          : defaults.updates.enabled,
+      autoUpdateOnStart:
+        typeof sourceUpdates.autoUpdateOnStart === "boolean"
+          ? sourceUpdates.autoUpdateOnStart
+          : defaults.updates.autoUpdateOnStart,
+      restartAfterUpdate:
+        typeof sourceUpdates.restartAfterUpdate === "boolean"
+          ? sourceUpdates.restartAfterUpdate
+          : defaults.updates.restartAfterUpdate,
+      haltOnFailure:
+        typeof sourceUpdates.haltOnFailure === "boolean"
+          ? sourceUpdates.haltOnFailure
+          : defaults.updates.haltOnFailure,
+      repoDir:
+        typeof sourceUpdates.repoDir === "string"
+          ? sourceUpdates.repoDir.trim()
+          : defaults.updates.repoDir,
+      remote: safeString(sourceUpdates.remote, defaults.updates.remote),
+      branch: safeString(sourceUpdates.branch, defaults.updates.branch),
+      allowDirtyWorkingTree:
+        typeof sourceUpdates.allowDirtyWorkingTree === "boolean"
+          ? sourceUpdates.allowDirtyWorkingTree
+          : defaults.updates.allowDirtyWorkingTree,
+      runInstall:
+        typeof sourceUpdates.runInstall === "boolean"
+          ? sourceUpdates.runInstall
+          : defaults.updates.runInstall,
+      runBuild:
+        typeof sourceUpdates.runBuild === "boolean"
+          ? sourceUpdates.runBuild
+          : defaults.updates.runBuild,
+      timeoutMs: Math.max(10_000, Math.min(900_000, updatesTimeoutRaw)),
     },
   };
 };

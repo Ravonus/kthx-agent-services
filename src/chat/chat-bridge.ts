@@ -35,6 +35,8 @@ import { appendJsonLine, writeJsonFile, ensureDir } from "../lib/fs-helpers.js";
 
 type TopicRequest = { topicType: string; topicId?: string };
 
+type SubscriptionMode = "full" | "idle_user_only";
+
 type BridgeStatus = {
   state: string;
   startedAt: string;
@@ -47,6 +49,16 @@ type BridgeStatus = {
   subscribedTopics: string[];
   lastError: string | null;
   viewerMainUserId: string | null;
+  subscriptionMode: SubscriptionMode;
+  idleEnabled: boolean;
+  idleTimeoutMs: number;
+  lastActivityAt: string | null;
+  lastModeChangeAt: string | null;
+};
+
+type ReconnectOptions = {
+  baseDelayMs?: number;
+  bumpAttempt?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -193,6 +205,19 @@ const main = async (): Promise<void> => {
   const maxTrackedIds = Math.max(100, parseIntEnv("MG_CHAT_AGENT_TRACKED_MESSAGE_IDS", 1200));
   const maxTopics = Math.max(5, parseIntEnv("MG_CHAT_AGENT_MAX_TOPICS", 180));
   const pingMs = Math.max(5_000, parseIntEnv("MG_CHAT_AGENT_PING_MS", 25_000));
+  const idleEnabled = parseBooleanEnv("MG_CHAT_AGENT_IDLE_SUBSCRIPTIONS_ENABLED", true);
+  const idleTimeoutMs = Math.max(30_000, parseIntEnv("MG_CHAT_AGENT_IDLE_TIMEOUT_MS", 300_000));
+  const idleCheckMs = Math.max(
+    5_000,
+    Math.min(
+      60_000,
+      parseIntEnv(
+        "MG_CHAT_AGENT_IDLE_CHECK_MS",
+        Math.max(5_000, Math.min(15_000, Math.floor(idleTimeoutMs / 3))),
+      ),
+    ),
+  );
+  const idleKeepManualTopics = parseBooleanEnv("MG_CHAT_AGENT_IDLE_KEEP_MANUAL_TOPICS", false);
   const autoSubDms = parseBooleanEnv("MG_CHAT_AGENT_AUTO_SUBSCRIBE_DMS", true);
   const autoSubServers = parseBooleanEnv("MG_CHAT_AGENT_AUTO_SUBSCRIBE_SERVERS", true);
   const manualTopics = parseConfiguredTopics(trimEnv("MG_CHAT_AGENT_TOPICS"));
@@ -276,7 +301,24 @@ const main = async (): Promise<void> => {
   };
 
   // Status management
-  let status: BridgeStatus = { state: "booting", startedAt: nowIso(), updatedAt: nowIso(), baseHttpUrl, gatewayWsUrl: null, botTokenSource: null, reconnectAttempt: 0, connected: false, subscribedTopics: [], lastError: null, viewerMainUserId: null };
+  let status: BridgeStatus = {
+    state: "booting",
+    startedAt: nowIso(),
+    updatedAt: nowIso(),
+    baseHttpUrl,
+    gatewayWsUrl: null,
+    botTokenSource: null,
+    reconnectAttempt: 0,
+    connected: false,
+    subscribedTopics: [],
+    lastError: null,
+    viewerMainUserId: null,
+    subscriptionMode: "full",
+    idleEnabled,
+    idleTimeoutMs,
+    lastActivityAt: nowIso(),
+    lastModeChangeAt: nowIso(),
+  };
   const updateStatus = async (patch: Partial<BridgeStatus>): Promise<void> => {
     status = { ...status, ...patch, updatedAt: nowIso() };
     await writeJsonFile(statusPath, status).catch(() => undefined);
@@ -286,18 +328,31 @@ const main = async (): Promise<void> => {
   let activeSocket: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let idleTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectAttempt = 0;
   let stopping = false;
   let viewerMainUserId: string | null = null;
+  let desiredMode: SubscriptionMode = "full";
+  let lastActivityAtMs = Date.now();
+
+  const getLastActivityAtIso = (): string => new Date(lastActivityAtMs).toISOString();
 
   // Topic collection
-  const collectTopics = async (): Promise<TopicRequest[]> => {
+  const collectTopics = async (mode: SubscriptionMode): Promise<TopicRequest[]> => {
     const map = new Map<string, TopicRequest>();
     const add = (r: TopicRequest): void => {
       const key = r.topicType === "user" ? "user" : `${r.topicType}:${r.topicId ?? ""}`;
       if (!map.has(key)) map.set(key, r);
     };
     add({ topicType: "user" });
+
+    if (mode === "idle_user_only") {
+      if (idleKeepManualTopics) {
+        manualTopics.forEach((r) => add(r));
+      }
+      return Array.from(map.values());
+    }
+
     manualTopics.forEach((r) => add(r));
 
     if (autoSubDms || autoSubServers) {
@@ -369,21 +424,82 @@ const main = async (): Promise<void> => {
     await touchWake("chat_message_received");
   };
 
+  const requestMode = async (nextMode: SubscriptionMode, reason: string): Promise<void> => {
+    if (!idleEnabled && nextMode !== "full") return;
+    if (desiredMode === nextMode) return;
+    desiredMode = nextMode;
+
+    await appendJsonLine(eventsPath, {
+      at: nowIso(),
+      type: "bridge_mode_switch_requested",
+      mode: nextMode,
+      reason,
+    });
+    await updateStatus({
+      subscriptionMode: nextMode,
+      lastModeChangeAt: nowIso(),
+      lastActivityAt: getLastActivityAtIso(),
+    });
+    await scheduleReconnect(`mode_switch:${reason}`, {
+      baseDelayMs: 120,
+      bumpAttempt: false,
+    });
+    const sock = activeSocket;
+    if (sock && (sock.readyState === WebSocket.OPEN || sock.readyState === WebSocket.CONNECTING)) {
+      try {
+        sock.close(1000, "mode_switch");
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  const noteActivity = (reason: string): void => {
+    lastActivityAtMs = Date.now();
+    void appendJsonLine(eventsPath, { at: nowIso(), type: "bridge_activity", reason }).catch(() => undefined);
+    void updateStatus({ lastActivityAt: getLastActivityAtIso() });
+    if (idleEnabled && desiredMode === "idle_user_only") {
+      void requestMode("full", `activity:${reason}`);
+    }
+  };
+
   // Reconnect scheduler
-  const scheduleReconnect = async (reason: string): Promise<void> => {
+  const scheduleReconnect = async (reason: string, options: ReconnectOptions = {}): Promise<void> => {
     if (stopping || reconnectTimer) return;
-    reconnectAttempt += 1;
-    const baseDelay = RECONNECT_DELAYS[Math.min(reconnectAttempt - 1, RECONNECT_DELAYS.length - 1)] ?? 30_000;
+    const bumpAttempt = options.bumpAttempt ?? true;
+    if (bumpAttempt) {
+      reconnectAttempt += 1;
+    }
+    const fallbackDelay = RECONNECT_DELAYS[
+      Math.min(Math.max(0, reconnectAttempt - 1), RECONNECT_DELAYS.length - 1)
+    ] ?? 30_000;
+    const baseDelay = options.baseDelayMs ?? fallbackDelay;
     const delay = jitterDelay(baseDelay);
     console.warn(`[agent-chat-bridge] reconnect in ${delay}ms (attempt ${reconnectAttempt}): ${reason}`);
-    await updateStatus({ state: "reconnecting", connected: false, reconnectAttempt, lastError: reason });
+    await updateStatus({
+      state: "reconnecting",
+      connected: false,
+      reconnectAttempt,
+      lastError: reason,
+      subscriptionMode: desiredMode,
+      lastActivityAt: getLastActivityAtIso(),
+    });
     reconnectTimer = setTimeout(() => { reconnectTimer = null; void connect(); }, delay);
   };
 
   // Connect
   const connect = async (): Promise<void> => {
     if (stopping) return;
-    await updateStatus({ state: "connecting", connected: false, gatewayWsUrl: null, reconnectAttempt, lastError: null });
+    const connectMode = desiredMode;
+    await updateStatus({
+      state: "connecting",
+      connected: false,
+      gatewayWsUrl: null,
+      reconnectAttempt,
+      lastError: null,
+      subscriptionMode: connectMode,
+      lastActivityAt: getLastActivityAtIso(),
+    });
 
     let session: Record<string, unknown>;
     try {
@@ -400,7 +516,7 @@ const main = async (): Promise<void> => {
     await updateStatus({ gatewayWsUrl: wsUrl });
 
     let topicRequests: TopicRequest[];
-    try { topicRequests = await collectTopics(); } catch (e) {
+    try { topicRequests = await collectTopics(connectMode); } catch (e) {
       await scheduleReconnect(`topic_collection_failed: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
@@ -423,9 +539,25 @@ const main = async (): Promise<void> => {
     activeSocket = socket;
 
     socket.on("open", () => {
+      if (connectMode !== desiredMode) {
+        socket.close(1000, "stale_mode");
+        return;
+      }
       reconnectAttempt = 0;
-      void updateStatus({ state: "connected", connected: true, gatewayWsUrl: wsUrl, botTokenSource: preferredTokenSource, reconnectAttempt, lastError: null, viewerMainUserId, subscribedTopics: Array.from(ticketMap.keys()) });
-      console.log(`[agent-chat-bridge] connected, subscribed to ${ticketMap.size} topic(s)`);
+      void updateStatus({
+        state: "connected",
+        connected: true,
+        gatewayWsUrl: wsUrl,
+        botTokenSource: preferredTokenSource,
+        reconnectAttempt,
+        lastError: null,
+        viewerMainUserId,
+        subscribedTopics: Array.from(ticketMap.keys()),
+        subscriptionMode: connectMode,
+        lastActivityAt: getLastActivityAtIso(),
+        lastModeChangeAt: nowIso(),
+      });
+      console.log(`[agent-chat-bridge] connected (${connectMode}), subscribed to ${ticketMap.size} topic(s)`);
       for (const ticket of ticketMap.values()) socket.send(JSON.stringify({ type: "subscribe", ticket }));
       if (pingTimer) clearInterval(pingTimer);
       pingTimer = setInterval(() => { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "ping" })); }, pingMs);
@@ -438,7 +570,17 @@ const main = async (): Promise<void> => {
       if (frame.type !== "event") return;
       const topic = typeof frame.topic === "string" ? frame.topic : "";
       const event = isRecord(frame.event) ? frame.event as Record<string, unknown> : null;
-      if (!event || event.type !== "message.created") return;
+      if (!event) return;
+      const eventType = typeof event.type === "string" ? event.type : "";
+      if (
+        eventType === "message.created" ||
+        eventType === "typing.started" ||
+        eventType === "typing.stopped" ||
+        eventType === "read.updated"
+      ) {
+        noteActivity(`${eventType}:${topic || "unknown"}`);
+      }
+      if (eventType !== "message.created") return;
       void enrichInbox(topic, event).catch(() => undefined);
     });
 
@@ -461,6 +603,7 @@ const main = async (): Promise<void> => {
     stopping = true;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    if (idleTimer) { clearInterval(idleTimer); idleTimer = null; }
     const sock = activeSocket; activeSocket = null;
     if (sock && sock.readyState === WebSocket.OPEN) sock.close(1000, "shutdown");
     await updateStatus({ state: "stopped", connected: false, lastError: signal });
@@ -471,8 +614,38 @@ const main = async (): Promise<void> => {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
   console.log(`[agent-chat-bridge] starting base=${baseHttpUrl} stateDir=${stateDir}`);
-  await updateStatus({ state: "starting", connected: false, subscribedTopics: [], lastError: null });
-  await appendJsonLine(eventsPath, { at: nowIso(), type: "bridge_start", baseHttpUrl, stateDir, tokenFile, autoSubscribeDms: autoSubDms, autoSubscribeServers: autoSubServers });
+  await updateStatus({
+    state: "starting",
+    connected: false,
+    subscribedTopics: [],
+    lastError: null,
+    subscriptionMode: desiredMode,
+    idleEnabled,
+    idleTimeoutMs,
+    lastActivityAt: getLastActivityAtIso(),
+    lastModeChangeAt: nowIso(),
+  });
+  await appendJsonLine(eventsPath, {
+    at: nowIso(),
+    type: "bridge_start",
+    baseHttpUrl,
+    stateDir,
+    tokenFile,
+    autoSubscribeDms: autoSubDms,
+    autoSubscribeServers: autoSubServers,
+    idleEnabled,
+    idleTimeoutMs,
+    idleCheckMs,
+    idleKeepManualTopics,
+  });
+  if (idleEnabled) {
+    idleTimer = setInterval(() => {
+      if (stopping || desiredMode !== "full") return;
+      const idleForMs = Date.now() - lastActivityAtMs;
+      if (idleForMs < idleTimeoutMs) return;
+      void requestMode("idle_user_only", `idle_timeout_${idleForMs}ms`);
+    }, idleCheckMs);
+  }
   await connect();
 };
 

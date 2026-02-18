@@ -11,6 +11,8 @@
     "test:watch": "vitest",
     "start": "node dist/main.js",
     "start:supervisor": "node dist/supervisor.js",
+    "start:supervisor:update": "node dist/supervisor.js --control update all",
+    "start:supervisor:status": "node dist/supervisor.js --control status all",
     "start:bridge": "node dist/chat-bridge.js",
     "start:health": "node dist/health-web.js",
     "start:wake": "node dist/wake-receiver.js"

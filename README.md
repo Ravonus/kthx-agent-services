@@ -62,8 +62,26 @@ See `src/config/runtime.ts` for all env vars. Key ones:
 - `MG_BOT_SESSION_TOKEN_FILE` (optional) - Bot token file (default: `kthx-agents/state/ipc/auth/bot-session.json`)
 - `MG_BOT_TOKEN` / `MG_BOT_TOKEN_FILE` (optional fallback sources for chat bridge)
 - `MG_AGENT_HOME_DIR` (optional) - Agent home directory
+- `MG_CHAT_AGENT_IDLE_SUBSCRIPTIONS_ENABLED` (optional, default `1`) - downshift bridge to user-topic-only after inactivity
+- `MG_CHAT_AGENT_IDLE_TIMEOUT_MS` (optional, default `300000`) - inactivity threshold before downshift
+- `MG_CHAT_AGENT_IDLE_CHECK_MS` (optional) - idle check cadence
+- `MG_CHAT_AGENT_IDLE_KEEP_MANUAL_TOPICS` (optional, default `0`) - keep `MG_CHAT_AGENT_TOPICS` subscriptions while idle
 
 Notes:
 - Runtime mint now persists tokens to `state/ipc/auth/bot-session.json` so `chat-bridge` can reuse them.
 - If `chat-bridge` reports `tokenSource=none`, verify runtime/supervisor wrote `state/ipc/auth/bot-session.json` and that it contains a non-empty `token`.
 - Run runtime, bridge, supervisor, and health with the same `MG_AGENT_HOME_DIR` / `MG_AGENT_STATE_DIR` so they read the same IPC files.
+- `chat/status.json.subscriptionMode` shows `full` vs `idle_user_only` so you can confirm idle downshift is working.
+
+## Agent Self-Update
+
+Supervisor now supports update orchestration:
+
+- `node dist/supervisor.js --control update all`
+
+And `kthx-agents/config.json` now includes an `updates` section (auto-created with defaults):
+
+- `updates.autoUpdateOnStart` (default `true`) runs update flow when supervisor boots.
+- `updates.remote` / `updates.branch` control git pull source.
+- `updates.runInstall` / `updates.runBuild` control post-pull steps.
+- `updates.restartAfterUpdate` controls whether managed processes are relaunched.

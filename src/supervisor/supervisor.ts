@@ -12,6 +12,7 @@
  *   node supervisor.js --script ./runtime.js
  *   node supervisor.js --script ./runtime.js --with-bridge --with-health
  *   node supervisor.js --control status all
+ *   node supervisor.js --control update all
  */
 
 import { spawn } from "node:child_process";
@@ -21,9 +22,12 @@ import path from "node:path";
 import process from "node:process";
 
 import { loadDotEnv } from "../config/dotenv.js";
+import { loadOrInitKthxConfig } from "../config/kthx.js";
 import { trimEnv, parseIntEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
 import { nowIso } from "../lib/text.js";
+import type { KthxUpdatesConfig } from "../types/config.js";
+import { runAgentServiceUpdate } from "./update-manager.js";
 
 /* Types */
 type ParsedRun = { kind: "run"; runtimeScript: string; runtimeArgs: string[]; bridgeScript: string; healthScript: string; withBridge: boolean; withHealth: boolean; maxRestarts: number | null; keepBotTokenEnv: boolean; stripBotTokenEnv: boolean };
@@ -33,7 +37,7 @@ type ManagedEntry = { name: string; script: string; args: string[]; desiredState
 
 /* Constants & helpers */
 const MANAGED_NAMES = new Set(["runtime", "bridge", "health", "all"]);
-const ACTIONS = new Set(["status", "start", "stop", "restart", "shutdown"]);
+const ACTIONS = new Set(["status", "start", "stop", "restart", "shutdown", "update"]);
 const BACKOFFS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 const parseBoolEnv = (v: unknown): boolean => typeof v === "string" && v.trim() === "1";
 const jitter = (ms: number): number => { const s = Math.floor(ms * 0.25); return Math.max(0, ms + Math.floor(Math.random() * (s * 2 + 1)) - s); };
@@ -52,6 +56,16 @@ const resolveStateDir = (): string => {
     ? path.resolve(trimEnv("MG_AGENT_HOME_DIR") ?? "kthx-agents")
     : path.resolve(process.cwd(), "kthx-agents");
   return path.resolve(home, "state");
+};
+const resolveAgentHomeDir = (): string => {
+  const configured = trimEnv("MG_AGENT_HOME_DIR");
+  if (configured) return path.resolve(configured);
+  return path.resolve(process.cwd(), "kthx-agents");
+};
+const resolveKthxConfigPath = (homeDir: string): string => {
+  const configured = trimEnv("MG_AGENT_KTHX_CONFIG_PATH");
+  if (configured) return path.resolve(configured);
+  return path.resolve(homeDir, "config.json");
 };
 const debugPath = (stateDir: string, name: string): string => path.join(stateDir, "ipc", "debug", name);
 const writeJsonSync = (filePath: string, payload: unknown): boolean => { try { fs.mkdirSync(path.dirname(filePath), { recursive: true }); fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8"); return true; } catch { return false; } };
@@ -100,12 +114,13 @@ const parseArgs = (argv: string[]): Parsed => {
   if (ctlIdx !== -1) {
     const actionRaw = rest[ctlIdx + 1];
     const action = typeof actionRaw === "string" ? actionRaw.trim().toLowerCase() : "";
-    if (!ACTIONS.has(action)) return { kind: "error", message: "Control action must be one of: status | start | stop | restart | shutdown" };
+    if (!ACTIONS.has(action)) return { kind: "error", message: "Control action must be one of: status | start | stop | restart | shutdown | update" };
     const target = action === "status" || action === "shutdown"
       ? normalizeTarget(rest[ctlIdx + 2] ?? "all")
       : normalizeTarget(rest[ctlIdx + 2] ?? "");
     if (!target) return { kind: "error", message: "Control target must be one of: runtime | bridge | health | all" };
     if (action === "shutdown" && target !== "all") return { kind: "error", message: "Control target for shutdown must be: all" };
+    if (action === "update" && target !== "all") return { kind: "error", message: "Control target for update must be: all" };
     return { kind: "control", action, target };
   }
 
@@ -175,7 +190,12 @@ const main = async (): Promise<void> => {
   await loadDotEnv();
 
   const parsed = parseArgs(process.argv);
-  if (parsed.kind === "help") { console.log("agent-ws-supervisor --script <path> [--with-bridge] [--with-health] [--all] [--control <action> <target>]"); return; }
+  if (parsed.kind === "help") {
+    console.log(
+      "agent-ws-supervisor --script <path> [--with-bridge] [--with-health] [--all] [--control <action> <target>] (actions: status|start|stop|restart|shutdown|update)",
+    );
+    return;
+  }
   if (parsed.kind === "error") { console.error(`[supervisor] ${parsed.message}`); process.exitCode = 2; return; }
   if (parsed.kind === "control") { runControlMode(parsed); return; }
 
@@ -184,11 +204,31 @@ const main = async (): Promise<void> => {
   const hasInteractivePty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
 
   const stateDir = resolveStateDir();
+  const homeDir = resolveAgentHomeDir();
+  const kthxConfigPath = resolveKthxConfigPath(homeDir);
   const botTokenPath = path.join(stateDir, "ipc", "auth", "bot-session.json");
   const connIdPath = debugPath(stateDir, "supervisor.connection-id");
   const controlPath = debugPath(stateDir, "supervisor-control.jsonl");
   const statusPath = debugPath(stateDir, "supervisor-status.json");
   const lockPath = debugPath(stateDir, "supervisor.lock.json");
+
+  const kthxConfigInfo = await loadOrInitKthxConfig({
+    configPath: kthxConfigPath,
+    homeDir,
+  }).catch(() => null);
+  const updatesConfig: KthxUpdatesConfig = kthxConfigInfo?.config?.updates ?? {
+    enabled: true,
+    autoUpdateOnStart: true,
+    restartAfterUpdate: true,
+    haltOnFailure: false,
+    repoDir: "",
+    remote: "origin",
+    branch: "main",
+    allowDirtyWorkingTree: false,
+    runInstall: true,
+    runBuild: true,
+    timeoutMs: 300_000,
+  };
 
   // Resolve stable connection id
   const configuredConnId = normalizeConnectionId(process.env.MG_REALTIME_CONNECTION_ID);
@@ -244,6 +284,12 @@ const main = async (): Promise<void> => {
   let botTokenExpiresAt: string | null = null;
   let fatalExitCode: number | null = null;
   let controlReadOffset = 0;
+  let updateRequested = false;
+  let updateInProgress = false;
+  let updateRestartTargets: string[] = [];
+  let lastUpdateAt: string | null = null;
+  let lastUpdateStatus: "idle" | "success" | "failed" | "running" = "idle";
+  let lastUpdateError: string | null = null;
   const seenControlIds = new Set<string>();
 
   try {
@@ -258,6 +304,16 @@ const main = async (): Promise<void> => {
     writeJsonSync(statusPath, {
       updatedAt: nowIso(), reason, pid: process.pid, connectionId: runtimeConnId,
       botToken: { present: typeof botToken === "string" && botToken.length > 0, expiresAt: botTokenExpiresAt },
+      updates: {
+        enabled: updatesConfig.enabled,
+        autoUpdateOnStart: updatesConfig.autoUpdateOnStart,
+        restartAfterUpdate: updatesConfig.restartAfterUpdate,
+        inProgress: updateInProgress,
+        requested: updateRequested,
+        lastUpdateAt,
+        lastUpdateStatus,
+        lastUpdateError,
+      },
       processes: Array.from(managed.values()).map((m) => ({
         name: m.name, script: m.script, pid: m.proc?.pid ?? null,
         desiredState: m.desiredState, running: Boolean(m.proc), restartCount: m.restartCount,
@@ -275,11 +331,72 @@ const main = async (): Promise<void> => {
     try { entry.proc.kill("SIGTERM"); } catch { /* ignore */ }
   };
 
+  const runConfiguredUpdate = async (reason: string): Promise<boolean> => {
+    if (!updatesConfig.enabled) {
+      console.log("[supervisor] update skipped: updates.enabled=false");
+      return true;
+    }
+
+    updateInProgress = true;
+    lastUpdateStatus = "running";
+    lastUpdateError = null;
+    writeStatus(`update_started:${reason}`);
+    console.log(
+      `[supervisor] running update reason=${reason} remote=${updatesConfig.remote} branch=${updatesConfig.branch}`,
+    );
+
+    const result = await runAgentServiceUpdate({
+      updates: updatesConfig,
+      runtimeScriptPath: parsed.runtimeScript,
+    });
+    updateInProgress = false;
+    lastUpdateAt = nowIso();
+
+    if (!result.ok) {
+      lastUpdateStatus = "failed";
+      lastUpdateError = result.error;
+      console.error(`[supervisor] update failed: ${result.error ?? "unknown error"}`);
+      writeStatus("update_failed");
+      return false;
+    }
+
+    lastUpdateStatus = "success";
+    lastUpdateError = null;
+    console.log(`[supervisor] update complete repo=${result.repoDir}`);
+    writeStatus("update_success");
+    return true;
+  };
+
+  const requestUpdate = (reason: string): void => {
+    if (!updatesConfig.enabled) {
+      console.log("[supervisor] update request ignored: updates.enabled=false");
+      return;
+    }
+    if (updateRequested || updateInProgress) {
+      console.log("[supervisor] update already pending/in-progress");
+      return;
+    }
+    updateRequested = true;
+    updateRestartTargets = Array.from(managed.values())
+      .filter((entry) => entry.desiredState === "running")
+      .map((entry) => entry.name);
+    for (const entry of managed.values()) {
+      entry.desiredState = "stopped";
+      entry.nextStartAtMs = Infinity;
+      stopEntry(entry, `update_requested:${reason}`);
+    }
+    writeStatus(`update_requested:${reason}`);
+  };
+
   const applyControl = (action: string, target: string): void => {
     if (action === "shutdown") {
       stopping = true;
       for (const e of managed.values()) { e.desiredState = "stopped"; e.nextStartAtMs = Infinity; stopEntry(e, "shutdown"); }
       writeStatus("control_shutdown");
+      return;
+    }
+    if (action === "update") {
+      requestUpdate("control");
       return;
     }
     const targets = target === "all" ? Array.from(managed.values()) : (managed.has(target) ? [managed.get(target)!] : []);
@@ -451,8 +568,38 @@ const main = async (): Promise<void> => {
   // Main loop
   try {
     writeStatus("boot");
+    if (updatesConfig.enabled && updatesConfig.autoUpdateOnStart) {
+      const updateOk = await runConfiguredUpdate("startup_auto");
+      if (!updateOk && updatesConfig.haltOnFailure) {
+        fatalExitCode = 2;
+        stopping = true;
+      }
+    }
     while (true) {
       if (!stopping) pollControl();
+      if (updateRequested && !updateInProgress) {
+        const allStopped = Array.from(managed.values()).every((entry) => !entry.proc);
+        if (allStopped) {
+          updateRequested = false;
+          const updateOk = await runConfiguredUpdate("control");
+          if (!updateOk && updatesConfig.haltOnFailure) {
+            fatalExitCode = 2;
+            stopping = true;
+          }
+          if (updatesConfig.restartAfterUpdate && !stopping) {
+            for (const name of updateRestartTargets) {
+              const entry = managed.get(name);
+              if (!entry) continue;
+              entry.desiredState = "running";
+              entry.immediateRestart = true;
+              entry.nextStartAtMs = Date.now();
+              entry.stopRequested = false;
+            }
+          }
+          updateRestartTargets = [];
+          writeStatus("update_cycle_finished");
+        }
+      }
       for (const e of managed.values()) {
         if (e.desiredState !== "running") { stopEntry(e, "desired_stopped"); continue; }
         if (!e.proc) startProcess(e);
