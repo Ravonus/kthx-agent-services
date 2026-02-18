@@ -1,14 +1,17 @@
 /**
  * Chat context utilities: extract, resolve, and inherit chat routing context
- * from command payloads, and build structured result messages for write
- * command outcomes (createPost, commentPost, createStory).
+ * from command payloads, build structured result messages for write command
+ * outcomes, and send result messages via the chat bridge.
  *
- * Ported from agent-runtime.mjs lines 12529-12681.
+ * Ported from agent-runtime.mjs lines 12529-12759.
  *
- * Pure functions module -- no class needed.
+ * Pure functions + one async sender that takes dependencies as params.
  */
 
+import crypto from "node:crypto";
+
 import { isRecord } from "../lib/guards.js";
+import { nowIso } from "../lib/text.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -260,6 +263,79 @@ export const buildChatResultMessageFromOutcome = ({
   }
 
   return null;
+};
+
+// ---------------------------------------------------------------------------
+// Dependencies for sendChatResultMessageFromOutcome
+// ---------------------------------------------------------------------------
+
+export interface ChatResultSenderDeps {
+  callAgentChatBridge: (payload: unknown) => Promise<unknown>;
+  memory: { recordWrite(payload: unknown): Promise<void> };
+}
+
+// ---------------------------------------------------------------------------
+// Send chat result message from write command outcome
+// ---------------------------------------------------------------------------
+
+export const sendChatResultMessageFromOutcome = async ({
+  command,
+  outcome,
+  chatTarget = null,
+  deps,
+}: {
+  command: Record<string, unknown> | null;
+  outcome: Record<string, unknown> | null;
+  chatTarget?: ChatTarget | null;
+  deps: ChatResultSenderDeps;
+}): Promise<void> => {
+  const resolvedTarget =
+    chatTarget ?? resolveChatTargetFromPayload(command?.payload ?? null);
+  if (!resolvedTarget) return;
+  const result = buildChatResultMessageFromOutcome({ command, outcome });
+  if (!result) return;
+  try {
+    await deps.callAgentChatBridge({
+      action: "send_message",
+      clientMessageId: `runtime_chat_result_${Date.now().toString(36)}_${crypto
+        .randomUUID()
+        .replaceAll("-", "")
+        .slice(0, 10)}`,
+      ...(typeof resolvedTarget.conversationId === "string"
+        ? { conversationId: resolvedTarget.conversationId }
+        : { channelId: resolvedTarget.channelId }),
+      body: clampPublishText(result.body, 1200),
+      format: "markdown",
+      metadata: result.metadata,
+    });
+    await deps.memory.recordWrite({
+      type: "chat_command_result_sent",
+      at: nowIso(),
+      commandId:
+        typeof command?.id === "string" ? command.id : null,
+      kind:
+        typeof command?.kind === "string" ? command.kind : null,
+      ok: outcome?.ok === true,
+      targetConversationId:
+        typeof resolvedTarget.conversationId === "string"
+          ? resolvedTarget.conversationId
+          : null,
+      targetChannelId:
+        typeof resolvedTarget.channelId === "string"
+          ? resolvedTarget.channelId
+          : null,
+    });
+  } catch (error: unknown) {
+    await deps.memory.recordWrite({
+      type: "chat_command_result_send_failed",
+      at: nowIso(),
+      commandId:
+        typeof command?.id === "string" ? command.id : null,
+      kind:
+        typeof command?.kind === "string" ? command.kind : null,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 };
 
 // ---------------------------------------------------------------------------
