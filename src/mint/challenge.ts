@@ -20,7 +20,11 @@ export interface ChallengeContext {
   };
   memory: { recordWrite(payload: unknown): Promise<void> };
   appendMintTrace(entry: unknown): Promise<void>;
-  runOpenClawPrompt?(input: { prompt: string; purpose: string }): Promise<{ parsed: unknown } | null>;
+  runOpenClawPrompt?(input: { prompt: string; purpose: string }): Promise<{
+    parsed: unknown;
+    payloadText?: string | null;
+    raw?: string | null;
+  } | null>;
   parseChatOpenClawReply?(response: unknown): string;
 }
 
@@ -112,9 +116,34 @@ export const answerChallengeWithOpenClaw = async (
   ].join("\n");
   const res = await ctx.runOpenClawPrompt({ prompt, purpose: "mint_challenge" });
   const parsed = isRecord(res?.parsed) ? res.parsed : null;
-  const raw = typeof parsed?.answer === "string" && (parsed.answer as string).trim().length > 0
-    ? (parsed.answer as string).trim()
-    : ctx.parseChatOpenClawReply ? ctx.parseChatOpenClawReply(res) : "";
+  const parsedAnswer =
+    typeof parsed?.answer === "string" && (parsed.answer as string).trim().length > 0
+      ? (parsed.answer as string).trim()
+      : "";
+  const parsedReply =
+    typeof parsed?.reply === "string" && (parsed.reply as string).trim().length > 0
+      ? (parsed.reply as string).trim()
+      : "";
+  const parsedText =
+    typeof parsed?.text === "string" && (parsed.text as string).trim().length > 0
+      ? (parsed.text as string).trim()
+      : "";
+  const payloadText =
+    typeof res?.payloadText === "string" && res.payloadText.trim().length > 0
+      ? res.payloadText.trim()
+      : "";
+  const rawText =
+    typeof res?.raw === "string" && res.raw.trim().length > 0
+      ? res.raw.trim()
+      : "";
+  const callbackText = ctx.parseChatOpenClawReply ? ctx.parseChatOpenClawReply(res) : "";
+  const raw =
+    parsedAnswer ||
+    callbackText ||
+    parsedReply ||
+    parsedText ||
+    payloadText ||
+    rawText;
   const norm = normalizeChallengeAnswerForSubmit(raw, ctx.config.challengeAnswerMaxChars);
   if (!norm.length || isConsoleCommandLikeAnswer(norm)) {
     await ctx.appendMintTrace({ type: "mint_answer_openclaw_unusable", challengeId: params.challengeId, promptToken: params.promptToken ?? null, answerPreview: toAnswerPreview(raw) });

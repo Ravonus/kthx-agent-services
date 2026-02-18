@@ -86,6 +86,27 @@ type ReconnectOptions = {
   force?: boolean;
 };
 
+class BridgeCallError extends Error {
+  readonly status: number | null;
+  readonly retryAfterMs: number | null;
+  readonly tokenSource: string | null;
+
+  constructor(
+    message: string,
+    options: {
+      status?: number | null;
+      retryAfterMs?: number | null;
+      tokenSource?: string | null;
+    } = {},
+  ) {
+    super(message);
+    this.name = "BridgeCallError";
+    this.status = options.status ?? null;
+    this.retryAfterMs = options.retryAfterMs ?? null;
+    this.tokenSource = options.tokenSource ?? null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -97,6 +118,57 @@ const parseBooleanEnv = (key: string, fallback = false): boolean => {
   if (["1", "true", "yes", "on"].includes(n)) return true;
   if (["0", "false", "no", "off"].includes(n)) return false;
   return fallback;
+};
+
+const isMissingBotTokenError = (message: string): boolean =>
+  /bot token missing/iu.test(message) ||
+  /x-bot-session-token/iu.test(message) ||
+  /tokensource=none/iu.test(message);
+
+const payloadRequiresBotToken = (payload: Record<string, unknown>): boolean => {
+  const action = typeof payload.action === "string" ? payload.action.trim() : "";
+  return (
+    action === "send_message" ||
+    action === "edit_message" ||
+    action === "open_dm" ||
+    action === "typing" ||
+    action === "delivery_confirmed"
+  );
+};
+
+const isBridgeCallError = (value: unknown): value is BridgeCallError =>
+  value instanceof BridgeCallError;
+
+const parseRetryAfterMs = (input: {
+  response: Response;
+  body: unknown;
+  fallbackMs: number;
+}) => {
+  const bodyRetryAfter =
+    isRecord(input.body) && typeof input.body.retryAfterMs === "number"
+      ? input.body.retryAfterMs
+      : isRecord(input.body) && typeof input.body.retryAfterMs === "string"
+        ? Number(input.body.retryAfterMs)
+        : null;
+  if (typeof bodyRetryAfter === "number" && Number.isFinite(bodyRetryAfter)) {
+    const ms = Math.floor(bodyRetryAfter);
+    if (ms > 0) return ms;
+  }
+
+  const retryAfterHeader = input.response.headers.get("retry-after")?.trim() ?? "";
+  if (retryAfterHeader.length > 0) {
+    const retrySeconds = Number(retryAfterHeader);
+    if (Number.isFinite(retrySeconds) && retrySeconds > 0) {
+      return Math.max(1000, Math.ceil(retrySeconds * 1000));
+    }
+    const retryDateMs = Date.parse(retryAfterHeader);
+    if (Number.isFinite(retryDateMs)) {
+      const delta = retryDateMs - Date.now();
+      if (delta > 0) return Math.max(1000, delta);
+    }
+  }
+
+  return Math.max(1000, input.fallbackMs);
 };
 
 const jitterDelay = (ms: number): number => {
@@ -300,6 +372,17 @@ const main = async (): Promise<void> => {
     100,
     Math.min(5_000, parseIntEnv("MG_CHAT_AGENT_TOKEN_FAST_RETRY_MS", 250)),
   );
+  const missingTokenRetryMs = Math.max(
+    2_000,
+    parseIntEnv(
+      "MG_CHAT_AGENT_MISSING_TOKEN_RETRY_MS",
+      Math.max(5_000, tokenPollMs * 5),
+    ),
+  );
+  const rateLimitedRetryFallbackMs = Math.max(
+    5_000,
+    parseIntEnv("MG_CHAT_AGENT_RATE_LIMIT_RETRY_FALLBACK_MS", 15_000),
+  );
   const idleEnabled = parseBooleanEnv("MG_CHAT_AGENT_IDLE_SUBSCRIPTIONS_ENABLED", true);
   const idleTimeoutMs = Math.max(30_000, parseIntEnv("MG_CHAT_AGENT_IDLE_TIMEOUT_MS", 300_000));
   const idleCheckMs = Math.max(
@@ -321,6 +404,8 @@ const main = async (): Promise<void> => {
 
   let preferredTokenSource: string | null = null;
   let preferredTokenValue: string | null = null;
+  let bridgeRateLimitedUntilMs = 0;
+  let bridgeRateLimitedReason: string | null = null;
 
   const resolveBotTokenCandidates = async (): Promise<Array<{ source: string; token: string | null }>> => {
     const candidates: Array<{ source: string; token: string }> = [];
@@ -351,9 +436,27 @@ const main = async (): Promise<void> => {
   });
 
   const callBridge = async (payload: Record<string, unknown>): Promise<unknown> => {
+    const nowMs = Date.now();
+    if (bridgeRateLimitedUntilMs > nowMs) {
+      throw new BridgeCallError(
+        bridgeRateLimitedReason ?? "bridge call is rate limited",
+        {
+          status: 429,
+          retryAfterMs: bridgeRateLimitedUntilMs - nowMs,
+          tokenSource: preferredTokenSource,
+        },
+      );
+    }
+
     const candidates = await resolveBotTokenCandidates();
+    if (payloadRequiresBotToken(payload) && candidates.length === 0) {
+      throw new BridgeCallError(
+        "Bot token missing. Provide x-bot-session-token. (tokenSource=none)",
+        { status: 401, tokenSource: "none" },
+      );
+    }
     const attempts = candidates.length > 0 ? candidates : [{ source: "none", token: null }];
-    let lastError: Error | null = null;
+    let lastError: BridgeCallError | null = null;
 
     for (let i = 0; i < attempts.length; i++) {
       const candidate = attempts[i]!;
@@ -366,10 +469,32 @@ const main = async (): Promise<void> => {
       if (res.ok && isRecord(body) && (body as Record<string, unknown>).ok === true) {
         preferredTokenSource = candidate.source;
         preferredTokenValue = candidate.token;
+        bridgeRateLimitedUntilMs = 0;
+        bridgeRateLimitedReason = null;
         return (body as Record<string, unknown>).data;
       }
       const errMsg = isRecord(body) && typeof (body as Record<string, unknown>).error === "string" ? (body as Record<string, unknown>).error as string : `HTTP ${res.status}`;
-      lastError = new Error(`${errMsg} (tokenSource=${candidate.source})`);
+      if (res.status === 429) {
+        const retryAfterMs = parseRetryAfterMs({
+          response: res,
+          body,
+          fallbackMs: rateLimitedRetryFallbackMs,
+        });
+        bridgeRateLimitedUntilMs = Math.max(
+          bridgeRateLimitedUntilMs,
+          Date.now() + retryAfterMs,
+        );
+        bridgeRateLimitedReason = errMsg;
+        throw new BridgeCallError(`${errMsg} (tokenSource=${candidate.source})`, {
+          status: 429,
+          retryAfterMs,
+          tokenSource: candidate.source,
+        });
+      }
+      lastError = new BridgeCallError(`${errMsg} (tokenSource=${candidate.source})`, {
+        status: res.status,
+        tokenSource: candidate.source,
+      });
       const isTokenMismatch = /bot token is invalid/iu.test(errMsg) || /bot token invalid/iu.test(errMsg);
       if (isTokenMismatch && i < attempts.length - 1) continue;
       throw lastError;
@@ -811,11 +936,45 @@ const main = async (): Promise<void> => {
       session = await callBridge({ action: "gateway_session" }) as Record<string, unknown>;
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
-      const missingToken =
-        /bot token missing/iu.test(message) ||
-        /tokensource=none/iu.test(message);
+      if (isBridgeCallError(e) && e.status === 429) {
+        const retryMs = Math.max(1000, e.retryAfterMs ?? rateLimitedRetryFallbackMs);
+        await appendBridgeEvent({
+          at: nowIso(),
+          type: "gateway_session_rate_limited",
+          retryMs,
+          message,
+        });
+        await updateStatus({
+          state: "rate_limited",
+          connected: false,
+          lastError: `gateway_session_rate_limited: ${message}`,
+          subscriptionMode: connectMode,
+          lastActivityAt: getLastActivityAtIso(),
+        });
+        await scheduleReconnect("gateway_session_rate_limited", {
+          baseDelayMs: retryMs,
+          bumpAttempt: false,
+        });
+        return;
+      }
+      const missingToken = isMissingBotTokenError(message);
+      if (missingToken) {
+        await appendBridgeEvent({
+          at: nowIso(),
+          type: "gateway_session_waiting_for_bot_token",
+          retryMs: missingTokenRetryMs,
+          message,
+        });
+        await updateStatus({
+          state: "waiting_for_bot_token",
+          connected: false,
+          lastError: `gateway_session_failed: ${message}`,
+          subscriptionMode: connectMode,
+          lastActivityAt: getLastActivityAtIso(),
+        });
+      }
       await scheduleReconnect(`gateway_session_failed: ${message}`, missingToken
-        ? { baseDelayMs: tokenFastRetryMs, bumpAttempt: false }
+        ? { baseDelayMs: missingTokenRetryMs, bumpAttempt: false }
         : {});
       return;
     }
@@ -856,6 +1015,7 @@ const main = async (): Promise<void> => {
     // Collect tickets
     const ticketMap = new Map<string, string>();
     const ticketFailures: TicketFailure[] = [];
+    let gatewayTicketRateLimitRetryMs: number | null = null;
     if (typeof session.userTopic === "string" && typeof session.userTopicTicket === "string" && (session.userTopic as string).length && (session.userTopicTicket as string).length) {
       ticketMap.set(session.userTopic as string, session.userTopicTicket as string);
     }
@@ -867,6 +1027,21 @@ const main = async (): Promise<void> => {
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (isBridgeCallError(error) && error.status === 429) {
+          gatewayTicketRateLimitRetryMs = Math.max(
+            gatewayTicketRateLimitRetryMs ?? 0,
+            Math.max(1000, error.retryAfterMs ?? rateLimitedRetryFallbackMs),
+          );
+          await appendBridgeEvent({
+            at: nowIso(),
+            type: "gateway_ticket_rate_limited",
+            topicType: req.topicType,
+            topicId: req.topicId ?? null,
+            message,
+            retryMs: gatewayTicketRateLimitRetryMs,
+          });
+          break;
+        }
         if (ticketFailures.length < 40) {
           ticketFailures.push({
             topicType: req.topicType,
@@ -882,6 +1057,21 @@ const main = async (): Promise<void> => {
           message,
         });
       }
+    }
+    if (gatewayTicketRateLimitRetryMs !== null) {
+      await updateStatus({
+        state: "rate_limited",
+        connected: false,
+        subscriptionMode: connectMode,
+        requestedTopicCounts,
+        subscribedTopicCounts: countSubscribedTopics(ticketMap.keys()),
+        lastShellSummary,
+      });
+      await scheduleReconnect("gateway_ticket_rate_limited", {
+        baseDelayMs: gatewayTicketRateLimitRetryMs,
+        bumpAttempt: false,
+      });
+      return;
     }
     const subscribedTopicCounts = countSubscribedTopics(ticketMap.keys());
     await appendBridgeEvent({
@@ -976,6 +1166,23 @@ const main = async (): Promise<void> => {
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
+          if (isBridgeCallError(error) && error.status === 429) {
+            const retryMs = Math.max(1000, error.retryAfterMs ?? rateLimitedRetryFallbackMs);
+            await appendBridgeEvent({
+              at: nowIso(),
+              type: "dynamic_topic_rate_limited",
+              topicType,
+              topicId,
+              topic: topicName,
+              message,
+              retryMs,
+            });
+            await scheduleReconnect("dynamic_topic_rate_limited", {
+              baseDelayMs: retryMs,
+              bumpAttempt: false,
+            });
+            return;
+          }
           await appendBridgeEvent({
             at: nowIso(),
             type: "dynamic_topic_subscribe_failed",

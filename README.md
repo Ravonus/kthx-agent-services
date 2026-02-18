@@ -71,6 +71,9 @@ See `src/config/runtime.ts` for all env vars. Key ones:
 - `MG_CHAT_AGENT_IDLE_KEEP_MANUAL_TOPICS` (optional, default `0`) - keep `MG_CHAT_AGENT_TOPICS` subscriptions while idle
 - `MG_CHAT_AGENT_TOKEN_POLL_MS` (optional, default `1000`) - bridge token-change polling interval
 - `MG_CHAT_AGENT_TOKEN_FAST_RETRY_MS` (optional, default `250`) - reconnect delay after token changes
+- `MG_CHAT_AGENT_MISSING_TOKEN_RETRY_MS` (optional, default `max(5000, MG_CHAT_AGENT_TOKEN_POLL_MS*5)`) - cooldown before retrying when `/api/agent/chat` fails with missing bot token
+- `MG_CHAT_AGENT_RATE_LIMIT_RETRY_FALLBACK_MS` (optional, default `15000`) - fallback cooldown if bridge receives HTTP 429 without explicit retry window
+- `MG_CHAT_RUNTIME_BRIDGE_RATE_LIMIT_RETRY_FALLBACK_MS` (optional, default `15000`) - runtime-side fallback cooldown for `/api/agent/chat` 429 responses
 - `MG_AGENT_COMPETING_TUNNEL_COOLDOWN_MS` (optional, default `90000`) - pause subscription retry loops when another tunnel is active
 - `MG_AGENT_COMPETING_TUNNEL_HEARTBEAT_BACKOFF_MS` (optional, default `120000`) - heartbeat backoff while tunnel competition is detected
 - `MG_CHAT_AGENT_AUTO_SUBSCRIBE_DMS` (optional, default `1`) - auto-subscribe DM + agent DM conversations

@@ -91,8 +91,9 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     (trimEnv("MG_AGENT_AUTO_REQUEST_GRANT") ?? "0") !== "0";
   const mintConsoleDebugEnabled =
     (trimEnv("MG_AGENT_MINT_CONSOLE_DEBUG") ?? "1") !== "0";
-  const mintChallengeUseOpenClaw =
-    (trimEnv("MG_AGENT_MINT_CHALLENGE_USE_OPENCLAW") ?? "1") !== "0";
+  // Mint challenge fallback paths were removed; challenge solving is now OpenClaw-only.
+  // Keep this effectively enabled even if stale env files still set "0".
+  const mintChallengeUseOpenClaw = true;
   const rejectMultipleChoiceChallenges =
     (trimEnv("MG_AGENT_REJECT_MULTIPLE_CHOICE_CHALLENGE") ?? "0") === "1";
   const mintChallengeAutoRetryEnabled =

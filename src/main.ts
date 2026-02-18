@@ -29,6 +29,12 @@ import {
   setBotTokenState,
   notifySupervisorFatal,
 } from "./auth/bot-token.js";
+import {
+  registerBot,
+  persistAgentKeyBox,
+  persistAgentIdentity,
+  readPersistedAgentKeyBox,
+} from "./auth/register.js";
 import { AuthManager } from "./auth/auth-manager.js";
 import { MintManager } from "./mint/mint-manager.js";
 import { GrantManager } from "./grants/grant-manager.js";
@@ -82,6 +88,38 @@ const resolveChatApiBaseUrl = (realtimeWsUrl: string): string => {
   parsed.search = "";
   parsed.hash = "";
   return parsed.toString().replace(/\/+$/u, "");
+};
+
+const parseRetryAfterMs = (input: {
+  response: Response;
+  body: unknown;
+  fallbackMs: number;
+}) => {
+  const bodyRetryAfter =
+    isRecord(input.body) && typeof input.body.retryAfterMs === "number"
+      ? input.body.retryAfterMs
+      : isRecord(input.body) && typeof input.body.retryAfterMs === "string"
+        ? Number(input.body.retryAfterMs)
+        : null;
+  if (typeof bodyRetryAfter === "number" && Number.isFinite(bodyRetryAfter)) {
+    const ms = Math.floor(bodyRetryAfter);
+    if (ms > 0) return ms;
+  }
+
+  const retryAfterHeader = input.response.headers.get("retry-after")?.trim() ?? "";
+  if (retryAfterHeader.length > 0) {
+    const retrySeconds = Number(retryAfterHeader);
+    if (Number.isFinite(retrySeconds) && retrySeconds > 0) {
+      return Math.max(1000, Math.ceil(retrySeconds * 1000));
+    }
+    const retryDateMs = Date.parse(retryAfterHeader);
+    if (Number.isFinite(retryDateMs)) {
+      const delta = retryDateMs - Date.now();
+      if (delta > 0) return Math.max(1000, delta);
+    }
+  }
+
+  return Math.max(1000, input.fallbackMs);
 };
 
 // ---------------------------------------------------------------------------
@@ -185,14 +223,82 @@ const main = async (): Promise<void> => {
   // -- Config
   const config = createRuntimeConfig();
   const chatApiBaseUrl = resolveChatApiBaseUrl(config.realtimeWsUrl);
-  const agentKeyBox = await readSecretFromEnvOrFile(
+  let agentKeyBox = await readSecretFromEnvOrFile(
     "MG_AGENT_KEY_BOX",
     "MG_AGENT_KEY_BOX_FILE",
   );
   const agentKey = trimEnv("MG_AGENT_KEY");
+
+  // Try reading a previously persisted agentKeyBox from state dir
+  if (!agentKeyBox && !agentKey) {
+    const persisted = await readPersistedAgentKeyBox(config.stateDir);
+    if (persisted) {
+      agentKeyBox = persisted;
+      process.env.MG_AGENT_KEY_BOX = persisted;
+      console.log("[agent-runtime] Loaded agentKeyBox from persisted state.");
+    }
+  }
+
+  // First-time registration via owner invite token
+  const ownerInviteToken = trimEnv("MG_OWNER_INVITE_TOKEN");
+  if (!agentKeyBox && !agentKey && ownerInviteToken) {
+    const handle = trimEnv("MG_AGENT_HANDLE") ?? undefined;
+    const agentName = trimEnv("MG_AGENT_NAME") ?? undefined;
+    const ownerHandle = trimEnv("MG_OWNER_HANDLE") ?? undefined;
+    const ownerName = trimEnv("MG_OWNER_NAME") ?? undefined;
+
+    if (handle) {
+      console.log(
+        `[agent-runtime] No agentKeyBox found. Registering as @${handle} via owner invite token...`,
+      );
+    } else {
+      console.log(
+        "[agent-runtime] No agentKeyBox found. Starting self-discovery registration via owner invite token...",
+      );
+    }
+
+    const result = await registerBot({
+      wsUrl: config.realtimeWsUrl,
+      ownerInviteToken,
+      handle,
+      name: agentName,
+      owner:
+        ownerHandle && ownerName
+          ? { handle: ownerHandle, name: ownerName }
+          : undefined,
+    });
+    agentKeyBox = result.agentKeyBox;
+    process.env.MG_AGENT_KEY_BOX = result.agentKeyBox;
+
+    // Persist credentials for future boots
+    const savedPath = await persistAgentKeyBox({
+      agentKeyBox: result.agentKeyBox,
+      stateDir: config.stateDir,
+    });
+    console.log(
+      `[agent-runtime] Registration complete. agentKeyBox saved to ${savedPath}`,
+    );
+    console.log(
+      `[agent-runtime] Registered as @${result.user.handle} (id: ${result.user.id})`,
+    );
+
+    // Persist identity metadata if self-discovery was used
+    if (result.identity) {
+      const identityPath = await persistAgentIdentity({
+        identity: result.identity,
+        stateDir: config.stateDir,
+      });
+      console.log(`[agent-runtime] Agent identity saved to ${identityPath}`);
+    }
+
+    console.log(
+      "[agent-runtime] You can remove MG_OWNER_INVITE_TOKEN from your env — it has been consumed.",
+    );
+  }
+
   if (!agentKeyBox && !agentKey) {
     throw new Error(
-      "Missing agent auth. Set MG_AGENT_KEY_BOX (or MG_AGENT_KEY_BOX_FILE), or MG_AGENT_KEY.",
+      "Missing agent auth. Set MG_AGENT_KEY_BOX (or MG_AGENT_KEY_BOX_FILE), MG_AGENT_KEY, or MG_OWNER_INVITE_TOKEN for first-time registration.",
     );
   }
   const collectRuntimeHashes = createRuntimeHashCollector({
@@ -573,6 +679,14 @@ const main = async (): Promise<void> => {
   ctx.directiveManager = directiveManager;
 
   // -- ChatManager
+  const chatBridgeRateLimitRetryFallbackMs = Math.max(
+    5_000,
+    Number.parseInt(
+      trimEnv("MG_CHAT_RUNTIME_BRIDGE_RATE_LIMIT_RETRY_FALLBACK_MS") ?? "15000",
+      10,
+    ) || 15_000,
+  );
+  let chatBridgeRateLimitedUntilMs = 0;
   const chatManager = new ChatManager({
     config: {
       chatRuntimeEnabled: config.chatRuntimeEnabled,
@@ -599,6 +713,12 @@ const main = async (): Promise<void> => {
     memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
     chat: ctx.chat,
     callAgentChatBridge: async (payload: unknown) => {
+      const nowMs = Date.now();
+      if (chatBridgeRateLimitedUntilMs > nowMs) {
+        throw new Error(
+          `agent chat bridge request rate-limited (${chatBridgeRateLimitedUntilMs - nowMs}ms remaining)`,
+        );
+      }
       const botToken = await getBotToken();
       const response = await fetch(`${chatApiBaseUrl}/api/agent/chat`, {
         method: "POST",
@@ -617,7 +737,26 @@ const main = async (): Promise<void> => {
         isRecord(body) &&
         body.ok === true
       ) {
+        chatBridgeRateLimitedUntilMs = 0;
         return body.data;
+      }
+      if (response.status === 429) {
+        const retryAfterMs = parseRetryAfterMs({
+          response,
+          body,
+          fallbackMs: chatBridgeRateLimitRetryFallbackMs,
+        });
+        chatBridgeRateLimitedUntilMs = Math.max(
+          chatBridgeRateLimitedUntilMs,
+          Date.now() + retryAfterMs,
+        );
+        const errorMessage =
+          isRecord(body) && typeof body.error === "string"
+            ? body.error
+            : "Too many requests";
+        throw new Error(
+          `agent chat bridge request rate-limited: ${errorMessage} (retryAfterMs=${retryAfterMs})`,
+        );
       }
       const errorMessage =
         isRecord(body) && typeof body.error === "string"
