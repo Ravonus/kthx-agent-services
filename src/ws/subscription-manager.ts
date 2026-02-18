@@ -115,9 +115,18 @@ export class SubscriptionManager implements SubscriptionManagerLike {
     for (const t of this.publicTopics) this.subPublic(t);
   }
 
+  async bootstrap(): Promise<void> {
+    this.subHeartbeat();
+    await this.subscribePublicTopics();
+    await this.subscribeUserTopics();
+    await this.refreshLens("startup");
+    await this.runResync();
+  }
+
   requestResync(reason: string): void {
     this.ctx.misc.subscriptionResyncRequested = true;
     this.ctx.misc.subscriptionResyncReason = reason;
+    void this.runResync().catch(() => {});
   }
 
   userSubscriptionsReady(): boolean {
@@ -236,7 +245,6 @@ export class SubscriptionManager implements SubscriptionManagerLike {
 
   private async healTick(): Promise<void> {
     await this.runResync().catch(() => {});
-    await this.refreshLens("periodic").catch(() => {});
     this.subHeartbeat();
     void this.subscribeUserTopics();
     for (const t of this.publicTopics) this.subPublic(t);

@@ -164,6 +164,19 @@ const buildPublicProjection = (
       connected: bool(chatBridge.connected),
       state: str(chatBridge.state),
       subscribedTopics: num(chatBridge.subscribedTopics),
+      subscriptionMode: str(chatBridge.subscriptionMode),
+      requestedTopicCounts: isRecord(chatBridge.requestedTopicCounts)
+        ? (chatBridge.requestedTopicCounts as Record<string, unknown>)
+        : null,
+      subscribedTopicCounts: isRecord(chatBridge.subscribedTopicCounts)
+        ? (chatBridge.subscribedTopicCounts as Record<string, unknown>)
+        : null,
+      lastShellSummary: isRecord(chatBridge.lastShellSummary)
+        ? (chatBridge.lastShellSummary as Record<string, unknown>)
+        : null,
+      lastTicketFailureCount: Array.isArray(chatBridge.lastTicketFailures)
+        ? chatBridge.lastTicketFailures.length
+        : null,
       lastError: str(chatBridge.lastError),
       updatedAt: iso(chatBridge.updatedAt),
       lastEventAt: iso(chatBridge.lastEventAt),
@@ -285,6 +298,19 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
     chatBridge: {
       connected: bool(chatStatus?.connected), state: str(chatStatus?.state), updatedAt: iso(chatStatus?.updatedAt),
       subscribedTopics: Array.isArray(chatStatus?.subscribedTopics) ? (chatStatus.subscribedTopics as unknown[]).length : 0,
+      subscriptionMode: str(chatStatus?.subscriptionMode),
+      requestedTopicCounts: isRecord(chatStatus?.requestedTopicCounts)
+        ? (chatStatus?.requestedTopicCounts as Record<string, unknown>)
+        : null,
+      subscribedTopicCounts: isRecord(chatStatus?.subscribedTopicCounts)
+        ? (chatStatus?.subscribedTopicCounts as Record<string, unknown>)
+        : null,
+      lastShellSummary: isRecord(chatStatus?.lastShellSummary)
+        ? (chatStatus?.lastShellSummary as Record<string, unknown>)
+        : null,
+      lastTicketFailures: Array.isArray(chatStatus?.lastTicketFailures)
+        ? (chatStatus?.lastTicketFailures as unknown[])
+        : [],
       lastError: str(chatStatus?.lastError), lastEventAt: iso(chatStatus?.lastEventAt),
       runtimeReadOffset: num(chatRuntimeState?.readOffset),
       runtimeLastProcessedMessageId: str(chatRuntimeState?.lastProcessedMessageId),
@@ -366,10 +392,12 @@ const esc=v=>String(v??'n/a').replaceAll('&','&amp;').replaceAll('<','&lt;').rep
 const badge=v=>{const s=(v??'').toString().toLowerCase();if(['open','ok','ready','true'].includes(s))return['ok',v??'ok'];if(['pending','connecting','reconnecting'].includes(s))return['warn',v??'pending'];if(!s||s==='null'||s==='undefined')return['neutral','n/a'];return['bad',v??'down']};
 const fmt=iso=>{if(!iso)return'n/a';const ms=Date.parse(iso);return Number.isFinite(ms)?new Date(ms).toLocaleString():'n/a'};
 const kv=obj=>Object.entries(obj).map(([k,v])=>'<div class="k">'+esc(k)+'</div><div>'+esc(v??'n/a')+'</div>').join('');
+const fmtTopicCounts=v=>{if(!v||typeof v!=='object')return'n/a';const o=v;return ['user','conversation','channel','server'].map(k=>k+':'+String(o[k]??0)).join(' · ')};
+const shellCounts=v=>{if(!v||typeof v!=='object')return'n/a';const c=v.counts; if(!c||typeof c!=='object')return'n/a'; return ['dms','agentDms','groups','servers','channels'].map(k=>k+':'+String(c[k]??0)).join(' · ')};
 const qs=new URLSearchParams(window.location.search);const k=(qs.get('key')??'').trim();const healthUrl=k?('/api/health/private?key='+encodeURIComponent(k)):'/api/health';
 const render=snap=>{if(!snap)return;document.getElementById('ts').textContent='updated '+fmt(snap.generatedAt)+(snap.available===false&&snap.reason?' · '+snap.reason:'');
 const[rC,rT]=badge(snap.runtime?.wsState);document.getElementById('rt').innerHTML='<div class="badge '+esc(rC)+'">'+esc(rT)+'</div><div class="kv" style="margin-top:8px">'+kv({auth:snap.runtime?.authEffective,permission:snap.runtime?.permissionState,wsTransport:snap.runtime?.wsTransportState,lastEnvelope:fmt(snap.runtime?.lastEnvelopeAt),lastPublish:fmt(snap.runtime?.lastPublishAt),publishError:snap.runtime?.lastPublishError??'none'})+'</div>';
-const[cC,cT]=badge(snap.chatBridge?.connected===true?'ready':(snap.chatBridge?.state??'unknown'));document.getElementById('cb').innerHTML='<div class="badge '+esc(cC)+'">'+esc(cT)+'</div><div class="kv" style="margin-top:8px">'+kv({connected:String(snap.chatBridge?.connected),topics:snap.chatBridge?.subscribedTopics,lastError:snap.chatBridge?.lastError??'none'})+'</div>';
+const[cC,cT]=badge(snap.chatBridge?.connected===true?'ready':(snap.chatBridge?.state??'unknown'));document.getElementById('cb').innerHTML='<div class="badge '+esc(cC)+'">'+esc(cT)+'</div><div class="kv" style="margin-top:8px">'+kv({connected:String(snap.chatBridge?.connected),mode:snap.chatBridge?.subscriptionMode,topics:snap.chatBridge?.subscribedTopics,requested:fmtTopicCounts(snap.chatBridge?.requestedTopicCounts),subscribed:fmtTopicCounts(snap.chatBridge?.subscribedTopicCounts),shell:shellCounts(snap.chatBridge?.lastShellSummary),ticketFailures:snap.chatBridge?.lastTicketFailureCount,lastError:snap.chatBridge?.lastError??'none'})+'</div>';
 document.getElementById('mm').innerHTML='<div class="kv">'+kv({mood:snap.memory?.moodPrimary,moodScore:snap.memory?.moodScore,tier24h:snap.memory?.tier24hEvents,tier7d:snap.memory?.tier7dEvents})+'</div>';
 document.getElementById('ac').innerHTML='<div class="kv">'+kv({publishOk:snap.activity?.publishSuccess,publishFail:snap.activity?.publishFailed,directives:snap.activity?.directivesExecuted,messages:snap.activity?.chatMessagesReceived,autoReplies:snap.activity?.chatAutoRepliesSent})+'</div>';
 const evts=Array.isArray(snap.activity?.recentEvents)?snap.activity.recentEvents:[];document.getElementById('events').innerHTML=evts.length?evts.map(e=>'<div class="evt"><strong>'+esc(e?.type)+'</strong><br/><span class="muted">'+esc(e?.detail??'-')+' · '+esc(fmt(e?.at))+'</span></div>').join(''):'<div class="muted">No recent events.</div>';

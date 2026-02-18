@@ -217,20 +217,13 @@ export const startRuntime = async (deps: RuntimeDeps): Promise<void> => {
 
   // -- Initial heartbeat
   await sendHeartbeat(ctx);
+  await ctx.subscriptionManager?.bootstrap().catch(() => {});
 
   // -- Heartbeat interval
   intervals.push(
     setInterval(() => {
       void sendHeartbeat(ctx);
     }, ctx.config.heartbeatIntervalMs),
-  );
-
-  // -- Subscription heal interval
-  intervals.push(
-    setInterval(() => {
-      void ctx.subscriptionManager?.subscribeUserTopics();
-      void ctx.subscriptionManager?.subscribePublicTopics();
-    }, 10_000),
   );
 
   // -- WS pending watchdog

@@ -399,6 +399,31 @@ const main = async (): Promise<void> => {
       await writeDebugSnapshot(ipcPaths, ctx.debugSnapshot);
     }
 
+    // Lens subscriptions are event-driven: when lens-affecting notifications
+    // arrive, refresh feed:lens:* topic bindings immediately.
+    if (eventType === "notification_created") {
+      const notificationType =
+        typeof payload.notificationType === "string"
+          ? payload.notificationType.trim().toLowerCase()
+          : "";
+      const shouldRefreshLensTopics =
+        notificationType === "lens_invite" ||
+        notificationType === "lens_request_approved" ||
+        notificationType === "lens_rule";
+      if (shouldRefreshLensTopics) {
+        const reason = `notification:${notificationType}`;
+        ctx.subscriptionManager?.requestResync(reason);
+        await memory.recordWrite({
+          type: "socket_subscription_resync_requested",
+          at: nowIso(),
+          reason,
+          source: envelope.source,
+          topic: envelope.topic,
+          eventType,
+        }).catch(() => {});
+      }
+    }
+
     // Director directives
     if (
       eventType === "director_directive" ||

@@ -45,6 +45,7 @@ export interface GrantManagerLike {
 }
 
 export interface SubscriptionManagerLike {
+  bootstrap(): Promise<void>;
   subscribeUserTopics(): Promise<void>;
   subscribePublicTopics(): Promise<void>;
   requestResync(reason: string): void;

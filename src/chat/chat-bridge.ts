@@ -37,6 +37,25 @@ import { createStateSqliteStoreFromEnv } from "../state/sqlite-state.js";
 type TopicRequest = { topicType: string; topicId?: string };
 
 type SubscriptionMode = "full" | "idle_user_only";
+type TopicType = "user" | "conversation" | "channel" | "server";
+type TopicCounts = Record<TopicType, number>;
+type ShellSummary = {
+  at: string;
+  mode: SubscriptionMode;
+  viewerMainUserId: string | null;
+  counts: {
+    dms: number;
+    agentDms: number;
+    groups: number;
+    servers: number;
+    channels: number;
+  };
+};
+type TicketFailure = {
+  topicType: string;
+  topicId: string | null;
+  message: string;
+};
 
 type BridgeStatus = {
   state: string;
@@ -55,6 +74,10 @@ type BridgeStatus = {
   idleTimeoutMs: number;
   lastActivityAt: string | null;
   lastModeChangeAt: string | null;
+  requestedTopicCounts: TopicCounts;
+  subscribedTopicCounts: TopicCounts;
+  lastShellSummary: ShellSummary | null;
+  lastTicketFailures: TicketFailure[];
 };
 
 type ReconnectOptions = {
@@ -176,6 +199,66 @@ const parseConfiguredTopics = (value: string | null): TopicRequest[] => {
     if (!topicId.length || !["conversation", "channel", "server"].includes(topicType)) return null;
     return { topicType, topicId };
   }).filter((e): e is TopicRequest => e !== null);
+};
+
+const recordId = (
+  value: unknown,
+  keys: string[],
+): string | null => {
+  if (!isRecord(value)) return null;
+  for (const key of keys) {
+    const direct = value[key];
+    if (typeof direct === "string" && direct.trim().length) {
+      return direct.trim();
+    }
+  }
+  for (const nestedKey of ["conversation", "channel", "server"]) {
+    const nested = value[nestedKey];
+    if (!isRecord(nested)) continue;
+    for (const key of keys) {
+      const nestedValue = nested[key];
+      if (typeof nestedValue === "string" && nestedValue.trim().length) {
+        return nestedValue.trim();
+      }
+    }
+  }
+  return null;
+};
+
+const emptyTopicCounts = (): TopicCounts => ({
+  user: 0,
+  conversation: 0,
+  channel: 0,
+  server: 0,
+});
+
+const toTopicType = (value: string): TopicType | null => {
+  if (value === "user" || value === "conversation" || value === "channel" || value === "server") {
+    return value;
+  }
+  if (value.startsWith("chat:user:")) return "user";
+  if (value.startsWith("chat:conversation:")) return "conversation";
+  if (value.startsWith("chat:channel:")) return "channel";
+  if (value.startsWith("chat:server:")) return "server";
+  return null;
+};
+
+const countTopicRequests = (requests: TopicRequest[]): TopicCounts => {
+  const counts = emptyTopicCounts();
+  for (const req of requests) {
+    const type = toTopicType(req.topicType);
+    if (type) counts[type] += 1;
+  }
+  return counts;
+};
+
+const countSubscribedTopics = (topics: Iterable<string>): TopicCounts => {
+  const counts = emptyTopicCounts();
+  for (const topic of topics) {
+    const type = toTopicType(topic);
+    if (type) counts[type] += 1;
+  }
+  return counts;
 };
 
 // ---------------------------------------------------------------------------
@@ -359,6 +442,10 @@ const main = async (): Promise<void> => {
     idleTimeoutMs,
     lastActivityAt: nowIso(),
     lastModeChangeAt: nowIso(),
+    requestedTopicCounts: emptyTopicCounts(),
+    subscribedTopicCounts: emptyTopicCounts(),
+    lastShellSummary: null,
+    lastTicketFailures: [],
   };
   const updateStatus = async (patch: Partial<BridgeStatus>): Promise<void> => {
     status = { ...status, ...patch, updatedAt: nowIso() };
@@ -381,6 +468,7 @@ const main = async (): Promise<void> => {
   let viewerMainUserId: string | null = null;
   let desiredMode: SubscriptionMode = "full";
   let lastActivityAtMs = Date.now();
+  let lastShellSummary: ShellSummary | null = null;
 
   const getLastActivityAtIso = (): string => new Date(lastActivityAtMs).toISOString();
 
@@ -406,48 +494,86 @@ const main = async (): Promise<void> => {
       const shell = await callBridge({ action: "shell" }) as Record<string, unknown> | null;
       const viewer = shell && isRecord(shell.viewer) ? shell.viewer as Record<string, unknown> : null;
       viewerMainUserId = viewer && typeof viewer.mainUserId === "string" ? viewer.mainUserId as string : null;
+      const dmCount = Array.isArray(shell?.dms) ? shell.dms.length : 0;
+      const agentDmCount = Array.isArray(shell?.agentChats) ? shell.agentChats.length : 0;
+      const groupCount = Array.isArray(shell?.groups) ? shell.groups.length : 0;
+      const servers = Array.isArray(shell?.servers) ? shell.servers : [];
+      const serverCount = servers.length;
+      const channelCount = servers.reduce((count, srv) => {
+        if (!isRecord(srv)) {
+          return count;
+        }
+        const channels = (srv as Record<string, unknown>).channels;
+        if (!Array.isArray(channels)) {
+          return count;
+        }
+        return count + channels.length;
+      }, 0);
+      const shellAt = nowIso();
+      lastShellSummary = {
+        at: shellAt,
+        mode,
+        viewerMainUserId,
+        counts: {
+          dms: dmCount,
+          agentDms: agentDmCount,
+          groups: groupCount,
+          servers: serverCount,
+          channels: channelCount,
+        },
+      };
+      await appendBridgeEvent({
+        at: shellAt,
+        type: "shell_summary",
+        mode,
+        viewerMainUserId,
+        counts: lastShellSummary.counts,
+      });
 
       if (autoSubDms) {
         for (const list of [Array.isArray(shell?.dms) ? shell.dms : [], Array.isArray(shell?.agentChats) ? shell.agentChats : []]) {
           for (const conv of list as unknown[]) {
-            if (isRecord(conv) && typeof (conv as Record<string, unknown>).id === "string") add({ topicType: "conversation", topicId: (conv as Record<string, unknown>).id as string });
+            const convId = recordId(conv, ["id", "conversationId"]);
+            if (convId) add({ topicType: "conversation", topicId: convId });
           }
         }
       }
       if (autoSubGroups) {
         for (const conv of (Array.isArray(shell?.groups) ? shell.groups : []) as unknown[]) {
-          if (isRecord(conv) && typeof (conv as Record<string, unknown>).id === "string") {
+          const convId = recordId(conv, ["id", "conversationId"]);
+          if (convId) {
             add({
               topicType: "conversation",
-              topicId: (conv as Record<string, unknown>).id as string,
+              topicId: convId,
             });
           }
         }
       }
       if (autoSubServers) {
         for (const srv of (Array.isArray(shell?.servers) ? shell.servers : []) as unknown[]) {
-          if (
-            isRecord(srv) &&
-            typeof (srv as Record<string, unknown>).id === "string"
-          ) {
+          const serverId = recordId(srv, ["id", "serverId"]);
+          if (serverId) {
             add({
               topicType: "server",
-              topicId: (srv as Record<string, unknown>).id as string,
+              topicId: serverId,
             });
           }
         }
       }
       if (autoSubChannels) {
-        for (const srv of (Array.isArray(shell?.servers) ? shell.servers : []) as unknown[]) {
-          if (!isRecord(srv) || !Array.isArray((srv as Record<string, unknown>).channels)) continue;
-          for (const channel of (srv as Record<string, unknown>).channels as unknown[]) {
-            if (
-              isRecord(channel) &&
-              typeof (channel as Record<string, unknown>).id === "string"
-            ) {
+        for (const srv of servers as unknown[]) {
+          if (!isRecord(srv)) continue;
+          const channelsRaw = Array.isArray((srv as Record<string, unknown>).channels)
+            ? (srv as Record<string, unknown>).channels
+            : Array.isArray((srv as Record<string, unknown>).channelList)
+              ? (srv as Record<string, unknown>).channelList
+              : [];
+          for (const channel of channelsRaw as unknown[]) {
+            const channelId = recordId(channel, ["id", "channelId"]);
+            if (channelId) {
               add({
                 topicType: "channel",
-                topicId: (channel as Record<string, unknown>).id as string,
+                topicId: channelId,
               });
             }
           }
@@ -455,6 +581,15 @@ const main = async (): Promise<void> => {
       }
     }
     const items = Array.from(map.values());
+    if (autoSubChannels && !items.some((item) => item.topicType === "channel")) {
+      await appendBridgeEvent({
+        at: nowIso(),
+        type: "channel_topics_none",
+        mode,
+        message:
+          "No channel topics discovered from shell response. Agent may not be a server member, or shell returned no channel list.",
+      });
+    }
     return items.length > maxTopics ? items.slice(0, maxTopics) : items;
   };
 
@@ -673,6 +808,7 @@ const main = async (): Promise<void> => {
     try { topicRequests = await collectTopics(connectMode); } catch (e) {
       topicCollectionError = e instanceof Error ? e.message : String(e);
       topicRequests = fallbackTopics(connectMode);
+      lastShellSummary = null;
       await appendBridgeEvent({
         at: nowIso(),
         type: "topic_collection_failed",
@@ -686,9 +822,11 @@ const main = async (): Promise<void> => {
         lastError: `topic_collection_failed: ${topicCollectionError}`,
       });
     }
+    const requestedTopicCounts = countTopicRequests(topicRequests);
 
     // Collect tickets
     const ticketMap = new Map<string, string>();
+    const ticketFailures: TicketFailure[] = [];
     if (typeof session.userTopic === "string" && typeof session.userTopicTicket === "string" && (session.userTopic as string).length && (session.userTopicTicket as string).length) {
       ticketMap.set(session.userTopic as string, session.userTopicTicket as string);
     }
@@ -700,6 +838,13 @@ const main = async (): Promise<void> => {
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (ticketFailures.length < 40) {
+          ticketFailures.push({
+            topicType: req.topicType,
+            topicId: req.topicId ?? null,
+            message,
+          });
+        }
         await appendBridgeEvent({
           at: nowIso(),
           type: "gateway_ticket_failed",
@@ -709,7 +854,29 @@ const main = async (): Promise<void> => {
         });
       }
     }
+    const subscribedTopicCounts = countSubscribedTopics(ticketMap.keys());
+    await appendBridgeEvent({
+      at: nowIso(),
+      type: "gateway_ticket_summary",
+      mode: connectMode,
+      requestedTopicCounts,
+      subscribedTopicCounts,
+      requestedTopicCount: topicRequests.length,
+      subscribedTopicCount: ticketMap.size,
+      failureCount: ticketFailures.length,
+      failureSample: ticketFailures.slice(0, 12),
+      shellSummary: lastShellSummary,
+    });
     if (ticketMap.size === 0) {
+      await updateStatus({
+        state: "connecting_degraded",
+        connected: false,
+        subscriptionMode: connectMode,
+        requestedTopicCounts,
+        subscribedTopicCounts,
+        lastShellSummary,
+        lastTicketFailures: ticketFailures.slice(0, 20),
+      });
       await appendBridgeEvent({
         at: nowIso(),
         type: "gateway_ticket_empty",
@@ -722,6 +889,77 @@ const main = async (): Promise<void> => {
       await scheduleReconnect("gateway_ticket_empty");
       return;
     }
+
+    const pendingDynamicTopicSubscriptions = new Set<string>();
+    const ensureContextTopicSubscription = (context: Record<string, string> | null): void => {
+      if (!context) return;
+      const topicType = typeof context.channelId === "string" && context.channelId.length
+        ? "channel"
+        : typeof context.conversationId === "string" && context.conversationId.length
+          ? "conversation"
+          : null;
+      const topicId =
+        topicType === "channel"
+          ? context.channelId ?? null
+          : topicType === "conversation"
+            ? context.conversationId ?? null
+            : null;
+      if (!topicType || !topicId) return;
+      const topicName = `chat:${topicType}:${topicId}`;
+      if (ticketMap.has(topicName) || pendingDynamicTopicSubscriptions.has(topicName)) {
+        return;
+      }
+      pendingDynamicTopicSubscriptions.add(topicName);
+      void (async () => {
+        try {
+          const ticket = await callBridge({
+            action: "gateway_ticket",
+            topicType,
+            topicId,
+          }) as Record<string, unknown>;
+          const issuedTopic = typeof ticket.topic === "string" ? ticket.topic : topicName;
+          const issuedTicket = typeof ticket.ticket === "string" ? ticket.ticket : "";
+          if (!issuedTicket.trim().length) {
+            await appendBridgeEvent({
+              at: nowIso(),
+              type: "dynamic_topic_ticket_empty",
+              topicType,
+              topicId,
+              topic: issuedTopic,
+            });
+            return;
+          }
+          ticketMap.set(issuedTopic, issuedTicket);
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: "subscribe", ticket: issuedTicket }));
+          }
+          const nextCounts = countSubscribedTopics(ticketMap.keys());
+          await appendBridgeEvent({
+            at: nowIso(),
+            type: "dynamic_topic_subscribed",
+            topicType,
+            topicId,
+            topic: issuedTopic,
+          });
+          await updateStatus({
+            subscribedTopics: Array.from(ticketMap.keys()),
+            subscribedTopicCounts: nextCounts,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          await appendBridgeEvent({
+            at: nowIso(),
+            type: "dynamic_topic_subscribe_failed",
+            topicType,
+            topicId,
+            topic: topicName,
+            message,
+          });
+        } finally {
+          pendingDynamicTopicSubscriptions.delete(topicName);
+        }
+      })();
+    };
 
     const socket = new WebSocket(`${wsUrl}?token=${encodeURIComponent(authToken)}`);
     activeSocket = socket;
@@ -744,6 +982,10 @@ const main = async (): Promise<void> => {
         subscriptionMode: connectMode,
         lastActivityAt: getLastActivityAtIso(),
         lastModeChangeAt: nowIso(),
+        requestedTopicCounts,
+        subscribedTopicCounts,
+        lastShellSummary,
+        lastTicketFailures: ticketFailures.slice(0, 20),
       });
       console.log(`[agent-chat-bridge] connected (${connectMode}), subscribed to ${ticketMap.size} topic(s)`);
       for (const ticket of ticketMap.values()) socket.send(JSON.stringify({ type: "subscribe", ticket }));
@@ -767,6 +1009,10 @@ const main = async (): Promise<void> => {
         eventType === "read.updated"
       ) {
         noteActivity(`${eventType}:${topic || "unknown"}`);
+      }
+      if (topic.startsWith("chat:user:")) {
+        const context = extractContext(topic, event);
+        ensureContextTopicSubscription(context);
       }
       if (eventType !== "message.created") return;
       void enrichInbox(topic, event).catch(() => undefined);
@@ -813,6 +1059,10 @@ const main = async (): Promise<void> => {
     idleTimeoutMs,
     lastActivityAt: getLastActivityAtIso(),
     lastModeChangeAt: nowIso(),
+    requestedTopicCounts: emptyTopicCounts(),
+    subscribedTopicCounts: emptyTopicCounts(),
+    lastShellSummary: null,
+    lastTicketFailures: [],
   });
   await appendBridgeEvent({
     at: nowIso(),
