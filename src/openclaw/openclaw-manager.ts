@@ -10,6 +10,7 @@
 
 import { spawn } from "node:child_process";
 
+import { trimEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
 import { nowIso, toAnswerPreview } from "../lib/text.js";
 import {
@@ -165,6 +166,19 @@ const resolveAgentFromListOutput = (output: unknown): string | null => {
   return null;
 };
 
+/**
+ * If MG_OPENCLAW_BIN (or OPENCLAW_BIN) is set, replace a bare `openclaw`
+ * at the start of a command string with the full path so the runtime
+ * respects the same override used by identity.ts / self-discovery.
+ */
+const applyOpenClawBinOverride = (command: string): string => {
+  const bin = trimEnv("MG_OPENCLAW_BIN") ?? trimEnv("OPENCLAW_BIN");
+  if (!bin) return command;
+  // Replace leading "openclaw " with the override path.
+  // Handles: `openclaw agent ...` but not `/usr/bin/openclaw ...` or `myopenclaw ...`
+  return command.replace(/^openclaw(?=\s)/u, bin);
+};
+
 /** Build a resolved shell command from a template with placeholder substitution. */
 const resolveTemplateCommand = (
   template: string, agentName: string | null,
@@ -182,6 +196,7 @@ const resolveTemplateCommand = (
     .replaceAll("{home}", config.agentHomeDir.replaceAll('"', '\\"'))
     .replaceAll("{state}", config.stateDir.replaceAll('"', '\\"'))
     .replaceAll("{config}", config.kthxConfigPath.replaceAll('"', '\\"'));
+  raw = applyOpenClawBinOverride(raw);
   return stripEmptyAgentFlag(raw);
 };
 
@@ -206,8 +221,10 @@ export class OpenClawManager implements OpenClawManagerLike {
     if (this.ctx.openclaw.resolvedOpenClawAgentName && Date.now() - this.ctx.openclaw.openClawAgentResolvedAtMs < 120_000) {
       return this.ctx.openclaw.resolvedOpenClawAgentName;
     }
-    const listCommand = typeof ocConfig.listAgentsCommand === "string" && ocConfig.listAgentsCommand.trim().length > 0
-      ? ocConfig.listAgentsCommand.trim() : "openclaw agents";
+    const listCommand = applyOpenClawBinOverride(
+      typeof ocConfig.listAgentsCommand === "string" && ocConfig.listAgentsCommand.trim().length > 0
+        ? ocConfig.listAgentsCommand.trim() : "openclaw agents",
+    );
     const timeoutMs = typeof ocConfig.timeoutMs === "number" && Number.isFinite(ocConfig.timeoutMs)
       ? Math.max(5_000, Math.floor(ocConfig.timeoutMs / 2)) : 60_000;
     const result = await this.runLockedShellCommand({ command: listCommand, timeoutMs });
