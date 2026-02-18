@@ -107,6 +107,8 @@ export const buildDefaultKthxConfig = (homeDir: string): KthxConfig => ({
     allowDirtyWorkingTree: false,
     runInstall: true,
     runBuild: true,
+    packageManagerExecutable: "pnpm",
+    packageManagerUseNpmExecFallback: true,
     timeoutMs: 300_000,
   },
 });
@@ -415,6 +417,14 @@ export const normalizeKthxConfig = (
         typeof sourceUpdates.runBuild === "boolean"
           ? sourceUpdates.runBuild
           : defaults.updates.runBuild,
+      packageManagerExecutable: safeString(
+        sourceUpdates.packageManagerExecutable,
+        defaults.updates.packageManagerExecutable,
+      ),
+      packageManagerUseNpmExecFallback:
+        typeof sourceUpdates.packageManagerUseNpmExecFallback === "boolean"
+          ? sourceUpdates.packageManagerUseNpmExecFallback
+          : defaults.updates.packageManagerUseNpmExecFallback,
       timeoutMs: Math.max(10_000, Math.min(900_000, updatesTimeoutRaw)),
     },
   };

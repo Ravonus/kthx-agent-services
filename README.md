@@ -28,6 +28,7 @@ src/
   chat/                      Chat inbox polling, auto-reply, bridge
   console/                   Interactive REPL for debugging
   ipc/                       Filesystem IPC paths, events persistence
+  state/                     SQLite state ledger (public/private visibility)
   debug/                     WS state tracking, debug snapshots
   supervisor/                Process supervisor with restart/health
   health/                    HTTP health dashboard
@@ -70,19 +71,26 @@ See `src/config/runtime.ts` for all env vars. Key ones:
 - `MG_CHAT_AGENT_AUTO_SUBSCRIBE_GROUPS` (optional, default `1`) - auto-subscribe group conversations
 - `MG_CHAT_AGENT_AUTO_SUBSCRIBE_SERVERS` (optional, default `1`) - auto-subscribe server topics
 - `MG_CHAT_AGENT_AUTO_SUBSCRIBE_CHANNELS` (optional, default `1`) - auto-subscribe channels returned by chat shell
+- `MG_AGENT_BOT_SESSION_FILE_WRITER` (optional, `auto|supervisor|runtime`, default `auto`) - select writer for `state/ipc/auth/bot-session.json`
+- `MG_AGENT_STATE_DB_ENABLED` (optional, default `1`) - enable SQLite state ledger
+- `MG_AGENT_STATE_DB_PATH` (optional, default `state/ipc/state.sqlite`) - SQLite file path
+- `MG_AGENT_HEALTH_PRIVATE_KEY` (optional) - enables `/api/health/private` auth via `?key=` or `x-agent-health-key`
 
 Notes:
 - Runtime mint now persists tokens to `state/ipc/auth/bot-session.json` so `chat-bridge` can reuse them.
+- When runtime is launched by supervisor, supervisor is now the default bot-session file writer to prevent write races.
 - If `chat-bridge` reports `tokenSource=none`, verify runtime/supervisor wrote `state/ipc/auth/bot-session.json` and that it contains a non-empty `token`.
 - Run runtime, bridge, supervisor, and health with the same `MG_AGENT_HOME_DIR` / `MG_AGENT_STATE_DIR` so they read the same IPC files.
 - `chat/status.json.subscriptionMode` shows `full` vs `idle_user_only` so you can confirm idle downshift is working.
 - Bridge debug events now include `list_messages_failed`, `context_missing`, and `message_lookup_miss` entries in `state/ipc/chat/events.jsonl` for delivery tracing.
+- `GET /api/health` now returns a public projection only; use `GET /api/health/private` for full internals.
 
 ## Agent Self-Update
 
 Supervisor now supports update orchestration:
 
 - `node dist/supervisor.js --control update all`
+- Programmatic equivalent: append a JSON command with `action: "update"` and `target: "all"` to `kthx-agents/state/ipc/debug/supervisor-control.jsonl`.
 
 And `kthx-agents/config.json` now includes an `updates` section (auto-created with defaults):
 
@@ -90,3 +98,11 @@ And `kthx-agents/config.json` now includes an `updates` section (auto-created wi
 - `updates.remote` / `updates.branch` control git pull source.
 - `updates.runInstall` / `updates.runBuild` control post-pull steps.
 - `updates.restartAfterUpdate` controls whether managed processes are relaunched.
+- `updates.packageManagerExecutable` (default `pnpm`) selects the executable used for install/build.
+- `updates.packageManagerUseNpmExecFallback` (default `true`) enables `npm exec pnpm` / `npx pnpm` fallback when direct `pnpm` is unavailable.
+
+Optional env overrides for app-managed startup:
+
+- `MG_AGENT_UPDATE_PACKAGE_MANAGER_EXECUTABLE`
+- `MG_AGENT_UPDATE_PACKAGE_MANAGER_USE_NPM_EXEC_FALLBACK`
+- `MG_AGENT_UPDATE_PATH_PREPEND`

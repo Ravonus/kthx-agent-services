@@ -5,6 +5,8 @@
  * mood/temporal types, MemoryStore field types, archive indexing).
  */
 
+import type { StateSqliteStore } from "../state/sqlite-state.js";
+
 // ---------------------------------------------------------------------------
 // Primitives
 // ---------------------------------------------------------------------------
@@ -287,4 +289,5 @@ export type MemoryStoreConfig = {
   rotateBytes: number;
   tailMaxBytes: number;
   tailMaxLines: number;
+  stateDb?: StateSqliteStore | null;
 };

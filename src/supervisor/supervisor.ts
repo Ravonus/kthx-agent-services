@@ -73,7 +73,28 @@ const writeJsonSync = (filePath: string, payload: unknown): boolean => { try { f
 const appendDebug = (stateDir: string, payload: Record<string, unknown>): void => {
   try { const dir = debugPath(stateDir, ""); fs.mkdirSync(dir, { recursive: true }); const rec = { at: nowIso(), ...payload }; fs.appendFileSync(path.join(dir, "supervisor-exit.jsonl"), `${JSON.stringify(rec)}\n`, "utf8"); fs.writeFileSync(path.join(dir, "supervisor-exit-latest.json"), JSON.stringify(rec, null, 2), "utf8"); } catch { /* best-effort */ }
 };
-const writeBotSessionFile = (filePath: string, payload: unknown): boolean => { try { fs.mkdirSync(path.dirname(filePath), { recursive: true }); fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 }); return true; } catch { return false; } };
+const writeBotSessionFile = (filePath: string, payload: unknown): boolean => {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tempPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random()
+      .toString(36)
+      .slice(2, 10)}`;
+    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    try {
+      fs.rmSync(filePath, { force: true });
+      fs.renameSync(tempPath, filePath);
+    } catch {
+      fs.rmSync(tempPath, { force: true });
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 /* Lock helpers */
 type LockRecord = { pid: number; script: string | null; connectionId: string | null; startedAt: string | null };
@@ -227,6 +248,8 @@ const main = async (): Promise<void> => {
     allowDirtyWorkingTree: false,
     runInstall: true,
     runBuild: true,
+    packageManagerExecutable: "pnpm",
+    packageManagerUseNpmExecFallback: true,
     timeoutMs: 300_000,
   };
 
@@ -449,6 +472,8 @@ const main = async (): Promise<void> => {
   const prepareRuntimeEnv = (env: NodeJS.ProcessEnv): { ok: boolean; error?: string } => {
     if (!env.MG_AGENT_CONSOLE?.trim()) env.MG_AGENT_CONSOLE = hasInteractivePty ? "1" : "0";
     if (!env.MG_AGENT_CHALLENGE_FILE_ANSWERS?.trim()) env.MG_AGENT_CHALLENGE_FILE_ANSWERS = "0";
+    // Single writer for bot-session token file to avoid runtime/supervisor races.
+    if (!env.MG_AGENT_BOT_SESSION_FILE_WRITER?.trim()) env.MG_AGENT_BOT_SESSION_FILE_WRITER = "supervisor";
 
     const forward = parsed.stripBotTokenEnv ? false : parsed.keepBotTokenEnv;
     if (!forward) { delete env.MG_BOT_SESSION_TOKEN; delete env.MG_BOT_SESSION_EXPIRES_AT; }

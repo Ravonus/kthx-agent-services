@@ -28,6 +28,7 @@ import { trimEnv, parseIntEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
 import { nowIso } from "../lib/text.js";
 import { appendJsonLine, writeJsonFile, ensureDir } from "../lib/fs-helpers.js";
+import { createStateSqliteStoreFromEnv } from "../state/sqlite-state.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -201,6 +202,8 @@ const main = async (): Promise<void> => {
   const inboxPath = path.join(stateDir, "ipc", "chat", "inbox.jsonl");
   const statusPath = path.join(stateDir, "ipc", "chat", "status.json");
   const wakePath = path.join(stateDir, "ipc", "wake-chat");
+  const stateDb = createStateSqliteStoreFromEnv(stateDir);
+  stateDb.init();
 
   const maxTrackedIds = Math.max(100, parseIntEnv("MG_CHAT_AGENT_TRACKED_MESSAGE_IDS", 1200));
   const maxTopics = Math.max(5, parseIntEnv("MG_CHAT_AGENT_MAX_TOPICS", 180));
@@ -287,6 +290,42 @@ const main = async (): Promise<void> => {
     await fs.writeFile(wakePath, JSON.stringify({ at: nowIso(), reason }), "utf8").catch(() => undefined);
   };
 
+  const appendBridgeEvent = async (payload: Record<string, unknown>): Promise<void> => {
+    await appendJsonLine(eventsPath, payload).catch(() => undefined);
+    const eventType =
+      typeof payload.type === "string" && payload.type.trim().length > 0
+        ? payload.type.trim()
+        : "event";
+    const at =
+      typeof payload.at === "string" && payload.at.trim().length > 0
+        ? payload.at.trim()
+        : nowIso();
+    stateDb.appendEvent({
+      source: "chat-bridge",
+      topic: "chat.bridge",
+      eventType,
+      visibility: "private",
+      at,
+      payload,
+    });
+  };
+
+  const appendInboxEvent = async (payload: Record<string, unknown>): Promise<void> => {
+    await appendJsonLine(inboxPath, payload).catch(() => undefined);
+    const at =
+      typeof payload.at === "string" && payload.at.trim().length > 0
+        ? payload.at.trim()
+        : nowIso();
+    stateDb.appendEvent({
+      source: "chat-bridge",
+      topic: "chat.inbox",
+      eventType: "message.created",
+      visibility: "private",
+      at,
+      payload,
+    });
+  };
+
   // Tracked message IDs (ring buffer)
   const trackedIds = new Set<string>();
   const trackedQueue: string[] = [];
@@ -324,6 +363,12 @@ const main = async (): Promise<void> => {
   const updateStatus = async (patch: Partial<BridgeStatus>): Promise<void> => {
     status = { ...status, ...patch, updatedAt: nowIso() };
     await writeJsonFile(statusPath, status).catch(() => undefined);
+    stateDb.upsertSnapshot({
+      scope: "chat.bridge.status",
+      visibility: "public",
+      at: status.updatedAt,
+      data: status,
+    });
   };
 
   // WebSocket state
@@ -413,13 +458,29 @@ const main = async (): Promise<void> => {
     return items.length > maxTopics ? items.slice(0, maxTopics) : items;
   };
 
+  const fallbackTopics = (mode: SubscriptionMode): TopicRequest[] => {
+    const map = new Map<string, TopicRequest>();
+    const add = (r: TopicRequest): void => {
+      const key = r.topicType === "user" ? "user" : `${r.topicType}:${r.topicId ?? ""}`;
+      if (!map.has(key)) map.set(key, r);
+    };
+    add({ topicType: "user" });
+    if (mode === "idle_user_only") {
+      if (idleKeepManualTopics) manualTopics.forEach((r) => add(r));
+    } else {
+      manualTopics.forEach((r) => add(r));
+    }
+    const items = Array.from(map.values());
+    return items.length > maxTopics ? items.slice(0, maxTopics) : items;
+  };
+
   // Inbox enrichment
   const enrichInbox = async (topic: string, event: Record<string, unknown>): Promise<void> => {
     const eventType = typeof event.type === "string" ? event.type.trim() : "";
     if (eventType !== "message.created") return;
     const context = extractContext(topic, event);
     if (!context) {
-      await appendJsonLine(eventsPath, {
+      await appendBridgeEvent({
         at: nowIso(),
         level: "warn",
         source: "context_missing",
@@ -446,7 +507,7 @@ const main = async (): Promise<void> => {
       return null;
     }) as Record<string, unknown> | null;
     if (!latest && listError) {
-      await appendJsonLine(eventsPath, {
+      await appendBridgeEvent({
         at: nowIso(),
         level: "warn",
         source: "list_messages_failed",
@@ -463,7 +524,7 @@ const main = async (): Promise<void> => {
     const matched = messageId ? items.find((item) => isRecord(item) && isRecord((item as Record<string, unknown>).message) && ((item as Record<string, unknown>).message as Record<string, unknown>).id === messageId) : null;
     if (messageId && !matched) {
       untrackId(messageId);
-      await appendJsonLine(eventsPath, {
+      await appendBridgeEvent({
         at: nowIso(),
         level: "warn",
         source: "message_lookup_miss",
@@ -481,7 +542,14 @@ const main = async (): Promise<void> => {
     const author = isRecord((firstItem as Record<string, unknown>).author) ? (firstItem as Record<string, unknown>).author as Record<string, unknown> : null;
     if (!authorId && viewerMainUserId && author && author.mainUserId === viewerMainUserId) return;
 
-    await appendJsonLine(inboxPath, { at: nowIso(), sourceContext: "CHAT", topic, eventType, context, message: firstItem });
+    await appendInboxEvent({
+      at: nowIso(),
+      sourceContext: "CHAT",
+      topic,
+      eventType,
+      context,
+      message: firstItem,
+    });
 
     // Delivery confirmation
     const msgRecord = isRecord((firstItem as Record<string, unknown>).message) ? (firstItem as Record<string, unknown>).message as Record<string, unknown> : null;
@@ -495,7 +563,7 @@ const main = async (): Promise<void> => {
         ...(clientMsgId ? { clientMessageId: clientMsgId } : {}),
       }).catch(async (error) => {
         const message = error instanceof Error ? error.message : String(error);
-        await appendJsonLine(eventsPath, {
+        await appendBridgeEvent({
           at: nowIso(),
           level: "warn",
           source: "delivery_confirm_failed",
@@ -514,7 +582,7 @@ const main = async (): Promise<void> => {
     if (desiredMode === nextMode) return;
     desiredMode = nextMode;
 
-    await appendJsonLine(eventsPath, {
+    await appendBridgeEvent({
       at: nowIso(),
       type: "bridge_mode_switch_requested",
       mode: nextMode,
@@ -541,7 +609,7 @@ const main = async (): Promise<void> => {
 
   const noteActivity = (reason: string): void => {
     lastActivityAtMs = Date.now();
-    void appendJsonLine(eventsPath, { at: nowIso(), type: "bridge_activity", reason }).catch(() => undefined);
+    void appendBridgeEvent({ at: nowIso(), type: "bridge_activity", reason }).catch(() => undefined);
     void updateStatus({ lastActivityAt: getLastActivityAtIso() });
     if (idleEnabled && desiredMode === "idle_user_only") {
       void requestMode("full", `activity:${reason}`);
@@ -601,9 +669,22 @@ const main = async (): Promise<void> => {
     await updateStatus({ gatewayWsUrl: wsUrl });
 
     let topicRequests: TopicRequest[];
+    let topicCollectionError: string | null = null;
     try { topicRequests = await collectTopics(connectMode); } catch (e) {
-      await scheduleReconnect(`topic_collection_failed: ${e instanceof Error ? e.message : String(e)}`);
-      return;
+      topicCollectionError = e instanceof Error ? e.message : String(e);
+      topicRequests = fallbackTopics(connectMode);
+      await appendBridgeEvent({
+        at: nowIso(),
+        type: "topic_collection_failed",
+        mode: connectMode,
+        message: topicCollectionError,
+        fallbackTopicCount: topicRequests.length,
+      });
+      await updateStatus({
+        state: "connecting_degraded",
+        connected: false,
+        lastError: `topic_collection_failed: ${topicCollectionError}`,
+      });
     }
 
     // Collect tickets
@@ -617,7 +698,29 @@ const main = async (): Promise<void> => {
         if (isRecord(ticket) && typeof ticket.topic === "string" && typeof ticket.ticket === "string") {
           ticketMap.set(ticket.topic as string, ticket.ticket as string);
         }
-      } catch { /* best-effort */ }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await appendBridgeEvent({
+          at: nowIso(),
+          type: "gateway_ticket_failed",
+          topicType: req.topicType,
+          topicId: req.topicId ?? null,
+          message,
+        });
+      }
+    }
+    if (ticketMap.size === 0) {
+      await appendBridgeEvent({
+        at: nowIso(),
+        type: "gateway_ticket_empty",
+        mode: connectMode,
+        requestedTopics: topicRequests.map((r) => ({
+          topicType: r.topicType,
+          topicId: r.topicId ?? null,
+        })),
+      });
+      await scheduleReconnect("gateway_ticket_empty");
+      return;
     }
 
     const socket = new WebSocket(`${wsUrl}?token=${encodeURIComponent(authToken)}`);
@@ -635,7 +738,7 @@ const main = async (): Promise<void> => {
         gatewayWsUrl: wsUrl,
         botTokenSource: preferredTokenSource,
         reconnectAttempt,
-        lastError: null,
+        lastError: topicCollectionError ? `topic_collection_failed: ${topicCollectionError}` : null,
         viewerMainUserId,
         subscribedTopics: Array.from(ticketMap.keys()),
         subscriptionMode: connectMode,
@@ -651,7 +754,7 @@ const main = async (): Promise<void> => {
     socket.on("message", (rawFrame) => {
       const frame = parseWsFrame(rawFrame);
       if (!frame) return;
-      void appendJsonLine(eventsPath, { at: nowIso(), frame });
+      void appendBridgeEvent({ at: nowIso(), type: "frame", frame });
       if (frame.type !== "event") return;
       const topic = typeof frame.topic === "string" ? frame.topic : "";
       const event = isRecord(frame.event) ? frame.event as Record<string, unknown> : null;
@@ -692,6 +795,7 @@ const main = async (): Promise<void> => {
     const sock = activeSocket; activeSocket = null;
     if (sock && sock.readyState === WebSocket.OPEN) sock.close(1000, "shutdown");
     await updateStatus({ state: "stopped", connected: false, lastError: signal });
+    stateDb.close();
     process.exit(0);
   };
 
@@ -710,7 +814,7 @@ const main = async (): Promise<void> => {
     lastActivityAt: getLastActivityAtIso(),
     lastModeChangeAt: nowIso(),
   });
-  await appendJsonLine(eventsPath, {
+  await appendBridgeEvent({
     at: nowIso(),
     type: "bridge_start",
     baseHttpUrl,

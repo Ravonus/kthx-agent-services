@@ -21,6 +21,10 @@ import path from "node:path";
 import { loadDotEnv } from "../config/dotenv.js";
 import { trimEnv, parseIntEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
+import {
+  createStateSqliteStoreFromEnv,
+  type StateSqliteStore,
+} from "../state/sqlite-state.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -72,6 +76,16 @@ const resolveStateDir = (): string => {
   return path.resolve(agentHomeDir, "state");
 };
 
+let stateDb: StateSqliteStore | null = null;
+
+const getStateDb = (): StateSqliteStore => {
+  if (stateDb) return stateDb;
+  const db = createStateSqliteStoreFromEnv(resolveStateDir());
+  db.init();
+  stateDb = db;
+  return db;
+};
+
 const readJsonRecord = async (p: string): Promise<Record<string, unknown> | null> => {
   try {
     const raw = await fs.readFile(p, "utf8");
@@ -116,6 +130,62 @@ const parseJsonLines = (lines: string[]): Record<string, unknown>[] => {
 
 const eventAt = (envelope: Record<string, unknown>, payload: Record<string, unknown> | null): string | null =>
   iso(envelope.receivedAt) ?? iso(payload?.at) ?? null;
+
+const buildPublicProjection = (
+  snapshot: Record<string, unknown>,
+): Record<string, unknown> => {
+  const runtime = isRecord(snapshot.runtime)
+    ? (snapshot.runtime as Record<string, unknown>)
+    : {};
+  const chatBridge = isRecord(snapshot.chatBridge)
+    ? (snapshot.chatBridge as Record<string, unknown>)
+    : {};
+  const memory = isRecord(snapshot.memory)
+    ? (snapshot.memory as Record<string, unknown>)
+    : {};
+  const activity = isRecord(snapshot.activity)
+    ? (snapshot.activity as Record<string, unknown>)
+    : {};
+
+  return {
+    generatedAt: iso(snapshot.generatedAt) ?? new Date().toISOString(),
+    available: bool(snapshot.available) ?? false,
+    reason: str(snapshot.reason),
+    runtime: {
+      wsState: str(runtime.wsState),
+      wsTransportState: str(runtime.wsTransportState),
+      authEffective: str(runtime.authEffective),
+      permissionState: str(runtime.permissionState),
+      lastEnvelopeAt: iso(runtime.lastEnvelopeAt),
+      lastPublishAt: iso(runtime.lastPublishAt),
+      lastPublishError: str(runtime.lastPublishError),
+    },
+    chatBridge: {
+      connected: bool(chatBridge.connected),
+      state: str(chatBridge.state),
+      subscribedTopics: num(chatBridge.subscribedTopics),
+      lastError: str(chatBridge.lastError),
+      updatedAt: iso(chatBridge.updatedAt),
+      lastEventAt: iso(chatBridge.lastEventAt),
+    },
+    memory: {
+      moodPrimary: str(memory.moodPrimary),
+      moodScore: num(memory.moodScore),
+      tier24hEvents: num(memory.tier24hEvents),
+      tier7dEvents: num(memory.tier7dEvents),
+    },
+    activity: {
+      publishSuccess: num(activity.publishSuccess),
+      publishFailed: num(activity.publishFailed),
+      directivesExecuted: num(activity.directivesExecuted),
+      chatMessagesReceived: num(activity.chatMessagesReceived),
+      chatAutoRepliesSent: num(activity.chatAutoRepliesSent),
+      recentEvents: Array.isArray(activity.recentEvents)
+        ? (activity.recentEvents as unknown[])
+        : [],
+    },
+  };
+};
 
 // ---------------------------------------------------------------------------
 // Snapshot builder
@@ -198,8 +268,7 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
   const t365d = tiers && isRecord(tiers["365d"]) ? tiers["365d"] as Record<string, unknown> : null;
 
   const available = Boolean(latestDebug || chatStatus || mood || temporal);
-
-  return {
+  const snapshot: Record<string, unknown> = {
     generatedAt: new Date().toISOString(),
     available,
     reason: available ? null : "No runtime state files found yet.",
@@ -237,6 +306,27 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
       recentEvents: recentEvents.slice(-12).reverse(),
     },
   };
+
+  const publicSnapshot = buildPublicProjection(snapshot);
+  try {
+    const db = getStateDb();
+    db.upsertSnapshot({
+      scope: "health.public.v1",
+      visibility: "public",
+      at: iso(snapshot.generatedAt) ?? null,
+      data: publicSnapshot,
+    });
+    db.upsertSnapshot({
+      scope: "health.private.v1",
+      visibility: "private",
+      at: iso(snapshot.generatedAt) ?? null,
+      data: snapshot,
+    });
+  } catch {
+    // best effort: keep file-based health available
+  }
+
+  return snapshot;
 };
 
 // ---------------------------------------------------------------------------
@@ -276,14 +366,15 @@ const esc=v=>String(v??'n/a').replaceAll('&','&amp;').replaceAll('<','&lt;').rep
 const badge=v=>{const s=(v??'').toString().toLowerCase();if(['open','ok','ready','true'].includes(s))return['ok',v??'ok'];if(['pending','connecting','reconnecting'].includes(s))return['warn',v??'pending'];if(!s||s==='null'||s==='undefined')return['neutral','n/a'];return['bad',v??'down']};
 const fmt=iso=>{if(!iso)return'n/a';const ms=Date.parse(iso);return Number.isFinite(ms)?new Date(ms).toLocaleString():'n/a'};
 const kv=obj=>Object.entries(obj).map(([k,v])=>'<div class="k">'+esc(k)+'</div><div>'+esc(v??'n/a')+'</div>').join('');
+const qs=new URLSearchParams(window.location.search);const k=(qs.get('key')??'').trim();const healthUrl=k?('/api/health/private?key='+encodeURIComponent(k)):'/api/health';
 const render=snap=>{if(!snap)return;document.getElementById('ts').textContent='updated '+fmt(snap.generatedAt)+(snap.available===false&&snap.reason?' · '+snap.reason:'');
 const[rC,rT]=badge(snap.runtime?.wsState);document.getElementById('rt').innerHTML='<div class="badge '+esc(rC)+'">'+esc(rT)+'</div><div class="kv" style="margin-top:8px">'+kv({auth:snap.runtime?.authEffective,permission:snap.runtime?.permissionState,wsTransport:snap.runtime?.wsTransportState,lastEnvelope:fmt(snap.runtime?.lastEnvelopeAt),lastPublish:fmt(snap.runtime?.lastPublishAt),publishError:snap.runtime?.lastPublishError??'none'})+'</div>';
 const[cC,cT]=badge(snap.chatBridge?.connected===true?'ready':(snap.chatBridge?.state??'unknown'));document.getElementById('cb').innerHTML='<div class="badge '+esc(cC)+'">'+esc(cT)+'</div><div class="kv" style="margin-top:8px">'+kv({connected:String(snap.chatBridge?.connected),topics:snap.chatBridge?.subscribedTopics,lastError:snap.chatBridge?.lastError??'none'})+'</div>';
 document.getElementById('mm').innerHTML='<div class="kv">'+kv({mood:snap.memory?.moodPrimary,moodScore:snap.memory?.moodScore,tier24h:snap.memory?.tier24hEvents,tier7d:snap.memory?.tier7dEvents})+'</div>';
 document.getElementById('ac').innerHTML='<div class="kv">'+kv({publishOk:snap.activity?.publishSuccess,publishFail:snap.activity?.publishFailed,directives:snap.activity?.directivesExecuted,messages:snap.activity?.chatMessagesReceived,autoReplies:snap.activity?.chatAutoRepliesSent})+'</div>';
 const evts=Array.isArray(snap.activity?.recentEvents)?snap.activity.recentEvents:[];document.getElementById('events').innerHTML=evts.length?evts.map(e=>'<div class="evt"><strong>'+esc(e?.type)+'</strong><br/><span class="muted">'+esc(e?.detail??'-')+' · '+esc(fmt(e?.at))+'</span></div>').join(''):'<div class="muted">No recent events.</div>';
-const files=snap.files&&typeof snap.files==='object'?snap.files:{};document.getElementById('paths').innerHTML=Object.entries(files).map(([k,v])=>'<div class="k">'+esc(k)+'</div><div><code>'+esc(v)+'</code></div>').join('')};
-const tick=async()=>{try{const r=await fetch('/api/health',{cache:'no-store'});render(await r.json())}catch(e){document.getElementById('ts').textContent='refresh failed: '+e}};
+const files=snap.files&&typeof snap.files==='object'?snap.files:{};const pathRows=Object.entries(files);document.getElementById('paths').innerHTML=pathRows.length?pathRows.map(([k,v])=>'<div class="k">'+esc(k)+'</div><div><code>'+esc(v)+'</code></div>').join(''):'<div class="muted">Public projection only. Add ?key=... for private view.</div>'};
+const tick=async()=>{try{const r=await fetch(healthUrl,{cache:'no-store'});render(await r.json())}catch(e){document.getElementById('ts').textContent='refresh failed: '+e}};
 void tick();setInterval(tick,3000);
 </script></body></html>`;
 
@@ -299,14 +390,59 @@ const json = (res: http.ServerResponse, code: number, value: unknown): void => {
 
 const main = async (): Promise<void> => {
   await loadDotEnv();
+  const db = getStateDb();
 
   const host = trimEnv("MG_AGENT_HEALTH_HOST") ?? "127.0.0.1";
   const port = Math.max(1, Math.min(65_535, parseIntEnv("MG_AGENT_HEALTH_PORT", 4278)));
+  const privateKey = trimEnv("MG_AGENT_HEALTH_PRIVATE_KEY");
+
+  const hasPrivateAccess = (req: http.IncomingMessage, url: URL): boolean => {
+    if (!privateKey) return true;
+    const fromQuery = (url.searchParams.get("key") ?? "").trim();
+    const fromHeader = (req.headers["x-agent-health-key"] ?? "").toString().trim();
+    return fromQuery === privateKey || fromHeader === privateKey;
+  };
 
   const server = http.createServer(async (req, res) => {
     if ((req.method ?? "GET").toUpperCase() !== "GET") { res.statusCode = 405; res.end("Method Not Allowed"); return; }
     const url = new URL(req.url ?? "/", `http://${host}:${port}`);
-    if (url.pathname === "/api/health") { json(res, 200, await buildSnapshot()); return; }
+    if (url.pathname === "/api/health") {
+      try {
+        const fresh = await buildSnapshot();
+        json(res, 200, buildPublicProjection(fresh));
+        return;
+      } catch {
+        const fromDb = db.getSnapshot<Record<string, unknown>>("health.public.v1");
+        if (fromDb && isRecord(fromDb)) {
+          json(res, 200, fromDb);
+          return;
+        }
+      }
+      json(res, 500, { ok: false, error: "health_unavailable" });
+      return;
+    }
+    if (url.pathname === "/api/health/private") {
+      if (!hasPrivateAccess(req, url)) {
+        json(res, 403, {
+          ok: false,
+          error: "forbidden",
+          message: "Missing or invalid health private key.",
+        });
+        return;
+      }
+      try {
+        json(res, 200, await buildSnapshot());
+        return;
+      } catch {
+        const fromDb = db.getSnapshot<Record<string, unknown>>("health.private.v1");
+        if (fromDb && isRecord(fromDb)) {
+          json(res, 200, fromDb);
+          return;
+        }
+      }
+      json(res, 500, { ok: false, error: "health_unavailable" });
+      return;
+    }
     if (url.pathname !== "/") { res.statusCode = 404; res.end("Not Found"); return; }
     res.statusCode = 200;
     res.setHeader("content-type", "text/html; charset=utf-8");
@@ -318,7 +454,10 @@ const main = async (): Promise<void> => {
     process.stdout.write(`[agent-health-web] stateDir=${resolveStateDir()}\n`);
   });
 
-  const shutdown = (): void => { server.close(() => process.exit(0)); };
+  const shutdown = (): void => {
+    db.close();
+    server.close(() => process.exit(0));
+  };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 };

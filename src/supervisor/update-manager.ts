@@ -28,6 +28,7 @@ type RunCommandOptions = {
   cwd: string;
   timeoutMs: number;
   captureStdout?: boolean;
+  env?: NodeJS.ProcessEnv;
 };
 
 type RunCommandResult = {
@@ -36,6 +37,12 @@ type RunCommandResult = {
   signal: string | null;
   stdout: string;
   error: string | null;
+};
+
+type PackageManagerCandidate = {
+  command: string;
+  args: string[];
+  label: string;
 };
 
 const hasRepoMarkers = (dirPath: string): boolean => {
@@ -85,6 +92,7 @@ const runCommand = async (
   new Promise<RunCommandResult>((resolve) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
+      env: options.env,
       stdio: options.captureStdout ? ["ignore", "pipe", "inherit"] : "inherit",
     });
 
@@ -151,6 +159,184 @@ const runCommand = async (
     });
   });
 
+const trimEnvValue = (name: string): string | null => {
+  const value = process.env[name];
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+const parseBool = (raw: string | null, fallback: boolean): boolean => {
+  if (!raw) return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+};
+
+const resolvePathKey = (env: NodeJS.ProcessEnv): string => {
+  const match = Object.keys(env).find(
+    (key) => key.toLowerCase() === "path",
+  );
+  if (match) return match;
+  return process.platform === "win32" ? "Path" : "PATH";
+};
+
+const normalizePathForComparison = (input: string): string =>
+  process.platform === "win32" ? input.toLowerCase() : input;
+
+const buildUpdateEnv = (): NodeJS.ProcessEnv => {
+  const env = { ...process.env };
+  const pathKey = resolvePathKey(env);
+  const currentRaw = typeof env[pathKey] === "string" ? env[pathKey] : "";
+  const current = currentRaw
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  const prepended: string[] = [];
+  const extraPathRaw = trimEnvValue("MG_AGENT_UPDATE_PATH_PREPEND");
+  if (extraPathRaw) {
+    prepended.push(
+      ...extraPathRaw
+        .split(path.delimiter)
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0),
+    );
+  }
+
+  if (process.platform === "win32") {
+    const appData =
+      trimEnvValue("APPDATA") ??
+      (trimEnvValue("USERPROFILE")
+        ? path.join(trimEnvValue("USERPROFILE")!, "AppData", "Roaming")
+        : null);
+    if (appData) {
+      prepended.push(path.join(appData, "npm"));
+    }
+  }
+
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const entry of [...prepended, ...current]) {
+    const key = normalizePathForComparison(path.resolve(entry));
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(entry);
+  }
+
+  env[pathKey] = merged.join(path.delimiter);
+  return env;
+};
+
+const commandLooksMissing = (result: RunCommandResult): boolean => {
+  if (!result.error) return false;
+  const msg = result.error.toLowerCase();
+  return (
+    msg.includes("enoent") ||
+    msg.includes("not found") ||
+    msg.includes("is not recognized")
+  );
+};
+
+const buildPackageManagerCandidates = (
+  updates: KthxUpdatesConfig,
+  args: string[],
+): PackageManagerCandidate[] => {
+  const configuredExecutable =
+    trimEnvValue("MG_AGENT_UPDATE_PACKAGE_MANAGER_EXECUTABLE") ??
+    updates.packageManagerExecutable.trim() ??
+    "pnpm";
+  const useNpmExecFallback = parseBool(
+    trimEnvValue("MG_AGENT_UPDATE_PACKAGE_MANAGER_USE_NPM_EXEC_FALLBACK"),
+    updates.packageManagerUseNpmExecFallback,
+  );
+
+  const specs: PackageManagerCandidate[] = [];
+  const seen = new Set<string>();
+  const push = (command: string, cmdArgs: string[], label: string): void => {
+    const normalizedCommand = command.trim();
+    if (!normalizedCommand) return;
+    const key = `${normalizePathForComparison(normalizedCommand)}::${cmdArgs.join("\u0000")}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    specs.push({ command: normalizedCommand, args: [...cmdArgs], label });
+  };
+
+  push(configuredExecutable, args, "configured");
+
+  if (process.platform === "win32") {
+    const appData =
+      trimEnvValue("APPDATA") ??
+      (trimEnvValue("USERPROFILE")
+        ? path.join(trimEnvValue("USERPROFILE")!, "AppData", "Roaming")
+        : null);
+    if (appData) {
+      push(
+        path.join(appData, "npm", "pnpm.cmd"),
+        args,
+        "windows_appdata_pnpm_cmd",
+      );
+      push(
+        path.join(appData, "npm", "pnpm.exe"),
+        args,
+        "windows_appdata_pnpm_exe",
+      );
+    }
+  }
+
+  if (useNpmExecFallback) {
+    push("npm", ["exec", "--yes", "pnpm", ...args], "npm_exec_pnpm");
+    push("npx", ["--yes", "pnpm", ...args], "npx_pnpm");
+  }
+
+  return specs;
+};
+
+const runPackageManagerTask = async (input: {
+  updates: KthxUpdatesConfig;
+  cwd: string;
+  timeoutMs: number;
+  args: string[];
+  taskLabel: string;
+}): Promise<RunCommandResult> => {
+  const env = buildUpdateEnv();
+  const candidates = buildPackageManagerCandidates(input.updates, input.args);
+  let lastResult: RunCommandResult | null = null;
+
+  for (const candidate of candidates) {
+    const result = await runCommand(candidate.command, candidate.args, {
+      cwd: input.cwd,
+      timeoutMs: input.timeoutMs,
+      env,
+    });
+    if (result.ok) return result;
+
+    lastResult = result;
+    if (!commandLooksMissing(result)) {
+      return {
+        ...result,
+        error:
+          result.error ??
+          `${candidate.command} ${candidate.args.join(" ")} failed`,
+      };
+    }
+  }
+
+  const attempts = candidates
+    .map((candidate) => `${candidate.command} ${candidate.args.join(" ")} [${candidate.label}]`)
+    .join(" | ");
+  return {
+    ok: false,
+    code: lastResult?.code ?? null,
+    signal: lastResult?.signal ?? null,
+    stdout: lastResult?.stdout ?? "",
+    error:
+      lastResult?.error ??
+      `${input.taskLabel} failed: no package manager command resolved (${attempts})`,
+  };
+};
+
 export const runAgentServiceUpdate = async (
   options: RunUpdateOptions,
 ): Promise<RunUpdateResult> => {
@@ -210,31 +396,35 @@ export const runAgentServiceUpdate = async (
   }
 
   if (options.updates.runInstall) {
-    const install = await runCommand(
-      "pnpm",
-      ["install"],
-      { cwd: repoDir, timeoutMs: options.updates.timeoutMs },
-    );
+    const install = await runPackageManagerTask({
+      updates: options.updates,
+      cwd: repoDir,
+      timeoutMs: options.updates.timeoutMs,
+      args: ["install"],
+      taskLabel: "install",
+    });
     if (!install.ok) {
       return {
         ok: false,
         repoDir,
-        error: install.error ?? "pnpm install failed",
+        error: install.error ?? "install failed",
       };
     }
   }
 
   if (options.updates.runBuild) {
-    const build = await runCommand(
-      "pnpm",
-      ["run", "build"],
-      { cwd: repoDir, timeoutMs: options.updates.timeoutMs },
-    );
+    const build = await runPackageManagerTask({
+      updates: options.updates,
+      cwd: repoDir,
+      timeoutMs: options.updates.timeoutMs,
+      args: ["run", "build"],
+      taskLabel: "build",
+    });
     if (!build.ok) {
       return {
         ok: false,
         repoDir,
-        error: build.error ?? "pnpm run build failed",
+        error: build.error ?? "build failed",
       };
     }
   }

@@ -14,6 +14,7 @@ import { loadDotEnv } from "./config/dotenv.js";
 import { createRuntimeConfig } from "./config/runtime.js";
 import { loadOrInitKthxConfig, normalizeKthxConfig } from "./config/kthx.js";
 import { MemoryStore } from "./memory/store.js";
+import { createStateSqliteStoreFromEnv } from "./state/sqlite-state.js";
 import { createIpcPaths, initIpc, resetExecutionArtifactsOnStart } from "./ipc/ipc-paths.js";
 import { createRealtimeClient } from "./ws/realtime-client.js";
 import { createRuntimeHashCollector } from "./lib/hash.js";
@@ -172,11 +173,13 @@ const main = async (): Promise<void> => {
     : normalizeKthxConfig({}, config.agentHomeDir);
 
   // -- MemoryStore
+  const stateDb = createStateSqliteStoreFromEnv(config.stateDir);
   const memory = new MemoryStore({
     stateDir: config.stateDir,
     rotateBytes: config.rotateBytes,
     tailMaxBytes: config.tailMaxBytes,
     tailMaxLines: config.tailMaxLines,
+    stateDb,
   });
   await memory.init();
   await memory.recordWrite({

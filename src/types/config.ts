@@ -80,6 +80,8 @@ export type KthxUpdatesConfig = {
   allowDirtyWorkingTree: boolean;
   runInstall: boolean;
   runBuild: boolean;
+  packageManagerExecutable: string;
+  packageManagerUseNpmExecFallback: boolean;
   timeoutMs: number;
 };
 

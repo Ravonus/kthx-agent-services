@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { MemoryStoreConfig, MemoryEnvelope, StreamName, StreamPathMap, ViewState, MoodState, TemporalContext, TierSummary, ContextRequest, ContextBundle, MemoryActivity, RetentionCleanupResult, RefreshTemporalOptions } from "~/types/memory.js";
 import type { KthxRetentionConfig } from "~/types/config.js";
+import type { StateSqliteStore } from "~/state/sqlite-state.js";
 import { isRecord } from "~/lib/guards.js";
 import { ensureDir, readJsonFile, writeJsonFile, appendJsonLine, readLastJsonLines } from "~/lib/fs-helpers.js";
 import { nowIso, normalizeIso, toShortLine, unique } from "~/lib/time.js";
@@ -29,6 +30,7 @@ export class MemoryStore {
   readonly tailMaxBytes: number;
   readonly tailMaxLines: number;
   readonly streamPaths: StreamPathMap;
+  readonly stateDb: StateSqliteStore | null;
 
   private readonly viewStatePath: string;
   private viewState: ViewState;
@@ -56,6 +58,7 @@ export class MemoryStore {
     this.rotateBytes = config.rotateBytes;
     this.tailMaxBytes = config.tailMaxBytes;
     this.tailMaxLines = config.tailMaxLines;
+    this.stateDb = config.stateDb ?? null;
 
     this.streamPaths = {
       director: path.join(this.stateDir, "director.jsonl"),
@@ -102,6 +105,7 @@ export class MemoryStore {
   // ---- init ---------------------------------------------------------------
 
   async init(): Promise<void> {
+    this.stateDb?.init();
     await ensureDir(this.stateDir);
     await ensureDir(this.memoryDir);
     await ensureDir(this.memoryContextDir);
@@ -151,6 +155,12 @@ export class MemoryStore {
     if (!this.viewStateDirty) return;
     this.viewState.updatedAt = nowIso();
     await writeJsonFile(this.viewStatePath, this.viewState);
+    this.stateDb?.upsertSnapshot({
+      scope: "memory.view_state",
+      visibility: "private",
+      at: this.viewState.updatedAt,
+      data: this.viewState,
+    });
     this.viewStateDirty = false;
   }
 
@@ -163,6 +173,12 @@ export class MemoryStore {
     if (!this.moodDirty) return;
     this.moodState.updatedAt = nowIso();
     await writeJsonFile(this.moodStatePath, this.moodState);
+    this.stateDb?.upsertSnapshot({
+      scope: "memory.mood_state",
+      visibility: "private",
+      at: this.moodState.updatedAt,
+      data: this.moodState,
+    });
     this.moodDirty = false;
   }
 
@@ -183,6 +199,12 @@ export class MemoryStore {
         await writeJsonFile(filePath, tierPayload);
       }),
     );
+    this.stateDb?.upsertSnapshot({
+      scope: "memory.temporal_context",
+      visibility: "private",
+      at: this.temporalContext.updatedAt,
+      data: this.temporalContext,
+    });
     this.temporalDirty = false;
   }
 
@@ -236,6 +258,14 @@ export class MemoryStore {
     const keys = extractKeysFromPayload(envelope.payload);
     const type = keys.type;
     const activityRecord = this.deriveMemoryActivity(envelope, keys);
+    this.stateDb?.appendEvent({
+      source: envelope.source,
+      topic: envelope.topic,
+      eventType: type ?? "unknown",
+      visibility: "private",
+      at: envelope.receivedAt,
+      payload: envelope,
+    });
 
     const streams: StreamName[] = [];
     if (type === "director_grant") streams.push("director");

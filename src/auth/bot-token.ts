@@ -35,6 +35,45 @@ const resolveBotSessionTokenFilePath = (): string => {
   return path.resolve(stateDir, "ipc", "auth", "bot-session.json");
 };
 
+type BotSessionFileWriterMode = "auto" | "runtime" | "supervisor";
+
+const resolveBotSessionFileWriterMode = (): BotSessionFileWriterMode => {
+  const raw = trimEnv("MG_AGENT_BOT_SESSION_FILE_WRITER");
+  const normalized = raw?.toLowerCase();
+  if (normalized === "runtime") return "runtime";
+  if (normalized === "supervisor") return "supervisor";
+  return "auto";
+};
+
+const shouldRuntimeWriteBotSessionFile = (): boolean => {
+  const mode = resolveBotSessionFileWriterMode();
+  if (mode === "runtime") return true;
+  if (mode === "supervisor") return false;
+  // Auto mode: if running under supervisor IPC channel, let supervisor be the sole writer.
+  return !(typeof process.send === "function" && process.connected !== false);
+};
+
+const writeFileAtomic = async (
+  filePath: string,
+  content: string,
+): Promise<void> => {
+  const dirPath = path.dirname(filePath);
+  const tempPath = path.join(
+    dirPath,
+    `${path.basename(filePath)}.tmp.${process.pid}.${Date.now()}.${Math.random()
+      .toString(36)
+      .slice(2, 10)}`,
+  );
+  await fs.writeFile(tempPath, content, { encoding: "utf8", mode: 0o600 });
+  try {
+    await fs.rm(filePath, { force: true });
+    await fs.rename(tempPath, filePath);
+  } catch {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw new Error(`atomic_write_failed:${filePath}`);
+  }
+};
+
 const writeBotSessionFile = async ({
   token,
   expiresAt,
@@ -46,28 +85,24 @@ const writeBotSessionFile = async ({
   state: "active" | "cleared";
   reason?: string;
 }): Promise<void> => {
+  if (!shouldRuntimeWriteBotSessionFile()) return;
   const filePath = resolveBotSessionTokenFilePath();
   await fs.mkdir(path.dirname(filePath), { recursive: true }).catch(() => {});
-  await fs
-    .writeFile(
-      filePath,
-      `${JSON.stringify(
-        {
-          updatedAt: nowIso(),
-          source: "agent-runtime",
-          token,
-          expiresAt,
-          state,
-          ...(typeof reason === "string" && reason.trim().length > 0
-            ? { reason: reason.trim() }
-            : {}),
-        },
-        null,
-        2,
-      )}\n`,
-      "utf8",
-    )
-    .catch(() => {});
+  const payload = `${JSON.stringify(
+    {
+      updatedAt: nowIso(),
+      source: "agent-runtime",
+      token,
+      expiresAt,
+      state,
+      ...(typeof reason === "string" && reason.trim().length > 0
+        ? { reason: reason.trim() }
+        : {}),
+    },
+    null,
+    2,
+  )}\n`;
+  await writeFileAtomic(filePath, payload).catch(() => {});
 };
 
 // ---------------------------------------------------------------------------
