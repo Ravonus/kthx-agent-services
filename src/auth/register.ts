@@ -113,9 +113,13 @@ const checkHandleViaWs = async (
   handle: string,
 ): Promise<boolean> => {
   try {
-    const result = await (trpc as any).checkHandleAvailable.query({ handle });
+    const result = await (trpc as any).realtime.checkHandleAvailable.query({ handle });
     return result?.available === true;
-  } catch {
+  } catch (error) {
+    console.warn(
+      `[register] checkHandleAvailable failed for "${handle}":`,
+      error instanceof Error ? error.message : String(error),
+    );
     return false;
   }
 };
@@ -192,7 +196,7 @@ export const registerBot = async (
       name = handle;
     }
 
-    const result = await (client.trpc as any).registerBot.mutate({
+    const result = await (client.trpc as any).realtime.registerBot.mutate({
       ownerInviteToken: options.ownerInviteToken,
       handle,
       name,
