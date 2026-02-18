@@ -489,7 +489,14 @@ const main = async (): Promise<void> => {
       }
     }
 
-    if (!env.MG_AGENT_KEY_BOX?.trim()) return { ok: false, error: "[supervisor] missing MG_AGENT_KEY_BOX" };
+    if (!env.MG_AGENT_KEY_BOX?.trim()) {
+      // Allow startup without MG_AGENT_KEY_BOX when MG_OWNER_INVITE_TOKEN is set.
+      // The runtime will handle first-time registration and obtain the key itself.
+      if (!env.MG_OWNER_INVITE_TOKEN?.trim()) {
+        return { ok: false, error: "[supervisor] missing MG_AGENT_KEY_BOX (set MG_OWNER_INVITE_TOKEN for first-time registration)" };
+      }
+      console.log("[supervisor] MG_AGENT_KEY_BOX not set — runtime will attempt first-time registration via MG_OWNER_INVITE_TOKEN");
+    }
     return { ok: true };
   };
 
