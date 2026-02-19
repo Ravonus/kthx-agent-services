@@ -262,7 +262,36 @@ export class MintManager implements MintManagerLike {
     // Already-connected shortcut.
     const ir = issued as Record<string, unknown> | null;
     if (ir && ir.challengeRequired === false && (ir.alreadyConnected === true || ir.done === true || ir.status === "already_connected")) {
-      await this.ctx.memory.recordWrite({ type: "bot_token_mint_skipped_already_connected", reason, at: nowIso() });
+      const issuedToken =
+        typeof ir.sessionToken === "string" && ir.sessionToken.trim().length > 0
+          ? ir.sessionToken.trim()
+          : typeof ir.token === "string" && ir.token.trim().length > 0
+            ? ir.token.trim()
+            : null;
+      const issuedExpiresAt =
+        typeof ir.sessionExpiresAt === "string" && ir.sessionExpiresAt.trim().length > 0
+          ? ir.sessionExpiresAt.trim()
+          : typeof ir.expiresAt === "string" && ir.expiresAt.trim().length > 0
+            ? ir.expiresAt.trim()
+            : null;
+      if (issuedToken) {
+        await setBotTokenState({
+          token: issuedToken,
+          expiresAt: issuedExpiresAt,
+        });
+        await this.ctx.memory.recordWrite({
+          type: "bot_token_mint_reissued_from_already_connected",
+          reason,
+          at: nowIso(),
+          expiresAt: issuedExpiresAt,
+        });
+        return { token: issuedToken, alreadyConnected: true };
+      }
+      await this.ctx.memory.recordWrite({
+        type: "bot_token_mint_skipped_already_connected",
+        reason,
+        at: nowIso(),
+      });
       return { token: (await getBotToken()) ?? "", alreadyConnected: true };
     }
     const io = isRecord(issued) ? issued : null;

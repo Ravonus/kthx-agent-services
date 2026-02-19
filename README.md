@@ -24,7 +24,7 @@ src/
   ws/                        tRPC/WS client, subscription management
   directives/                Command seal, directive intake/staging
   queue/                     Queue state, deterministic scheduling
-  openclaw/                  OpenClaw agent integration, wake receiver
+  openclaw/                  OpenClaw agent integration (optional wake receiver)
   chat/                      Chat inbox polling, auto-reply, bridge
   console/                   Interactive REPL for debugging
   ipc/                       Filesystem IPC paths, events persistence
@@ -51,7 +51,7 @@ pnpm run test        # vitest
 | `dist/supervisor.js` | `agent-ws-supervisor.mjs` | Process supervisor |
 | `dist/chat-bridge.js` | `agent-chat-bridge.mjs` | Chat WS bridge |
 | `dist/health-web.js` | `agent-health-web.mjs` | Health dashboard |
-| `dist/wake-receiver.js` | `openclaw-wake-receiver.mjs` | OpenClaw wake webhook |
+| `dist/wake-receiver.js` | `openclaw-wake-receiver.mjs` | Optional OpenClaw wake webhook |
 
 ## Environment
 
@@ -90,6 +90,7 @@ Notes:
 - When runtime is launched by supervisor, supervisor is now the default bot-session file writer to prevent write races.
 - If `chat-bridge` reports `tokenSource=none`, verify runtime/supervisor wrote `state/ipc/auth/bot-session.json` and that it contains a non-empty `token`.
 - Run runtime, bridge, supervisor, and health with the same `MG_AGENT_HOME_DIR` / `MG_AGENT_STATE_DIR` so they read the same IPC files.
+- OpenClaw wake webhook config is optional. Without `MG_OPENCLAW_WAKE_URL`, runtime still writes local wake/hook files and continues normal CLI-driven operation.
 - `chat/status.json.subscriptionMode` shows `full` vs `idle_user_only` so you can confirm idle downshift is working.
 - Bridge debug events now include `list_messages_failed`, `context_missing`, and `message_lookup_miss` entries in `state/ipc/chat/events.jsonl` for delivery tracing.
 - `GET /api/health` now returns a public projection only; use `GET /api/health/private` for full internals.

@@ -42,6 +42,7 @@ import { SubscriptionManager } from "./ws/subscription-manager.js";
 import { EventsManager } from "./ipc/events-manager.js";
 import { DirectiveManager } from "./directives/directive-manager.js";
 import { QueueManager } from "./queue/queue-manager.js";
+import { CommandExecutor } from "./commands/command-executor.js";
 import { OpenClawManager } from "./openclaw/openclaw-manager.js";
 import { ChatManager } from "./chat/chat-manager.js";
 import {
@@ -386,9 +387,33 @@ const main = async (): Promise<void> => {
   ctx.trpc = trpc;
   ctx.collectRuntimeHashes = collectRuntimeHashes;
 
-  // -- OpenClaw env overrides
-  ctx.openclaw.openClawWakeUrl = trimEnv("MG_OPENCLAW_WAKE_URL") ?? null;
-  ctx.openclaw.openClawWakeKey = trimEnv("MG_OPENCLAW_WAKE_KEY") ?? null;
+  // -- OpenClaw wake config
+  // CLI/local wake signaling is always available through hook files.
+  // MG_OPENCLAW_WAKE_URL / MG_OPENCLAW_WAKE_KEY (or config openclaw.wake*) are
+  // optional and only enable outbound webhook forwarding.
+  const configWakeUrl =
+    typeof kthxConfig.openclaw.wakeUrl === "string" &&
+    kthxConfig.openclaw.wakeUrl.trim().length > 0
+      ? kthxConfig.openclaw.wakeUrl.trim()
+      : null;
+  const configWakeKey =
+    typeof kthxConfig.openclaw.wakeToken === "string" &&
+    kthxConfig.openclaw.wakeToken.trim().length > 0
+      ? kthxConfig.openclaw.wakeToken.trim()
+      : null;
+  const envWakeUrl = trimEnv("MG_OPENCLAW_WAKE_URL");
+  const envWakeKey =
+    trimEnv("MG_OPENCLAW_WAKE_KEY") ?? trimEnv("MG_OPENCLAW_WAKE_TOKEN");
+  ctx.openclaw.openClawWakeUrl = envWakeUrl ?? configWakeUrl;
+  ctx.openclaw.openClawWakeKey = envWakeKey ?? configWakeKey;
+  const wakeReasons = Array.isArray(kthxConfig.openclaw.wakeReasons)
+    ? kthxConfig.openclaw.wakeReasons
+        .filter((reason): reason is string => typeof reason === "string")
+        .map((reason) => reason.trim())
+        .filter((reason) => reason.length > 0)
+    : [];
+  ctx.openclaw.openClawWakeReasonSet =
+    wakeReasons.length > 0 ? new Set(wakeReasons) : null;
   ctx.misc.controlKey = trimEnv("MG_AGENT_CONTROL_KEY") ?? null;
 
   // =========================================================================
@@ -570,7 +595,40 @@ const main = async (): Promise<void> => {
       eventType === "directive" ||
       envelope.topic === "director"
     ) {
-      await ctx.directiveManager?.intake(payload).catch(() => {});
+      try {
+        await ctx.directiveManager?.intake(payload);
+      } catch (error: unknown) {
+        const directiveId =
+          typeof payload.id === "string" && payload.id.trim().length > 0
+            ? payload.id.trim()
+            : null;
+        const kind =
+          typeof payload.kind === "string" && payload.kind.trim().length > 0
+            ? payload.kind.trim()
+            : null;
+        const message = error instanceof Error ? error.message : String(error);
+        await memory.recordWrite({
+          type: "directive_intake_failed",
+          at: nowIso(),
+          directiveId,
+          kind,
+          source: envelope.source,
+          topic: envelope.topic,
+          eventType,
+          error: message,
+        }).catch(() => {});
+        console.warn(
+          "[agent-runtime] directive intake failed",
+          JSON.stringify({
+            directiveId,
+            kind,
+            source: envelope.source,
+            topic: envelope.topic,
+            eventType,
+            error: message,
+          }),
+        );
+      }
     }
 
     // Grant events
@@ -618,6 +676,91 @@ const main = async (): Promise<void> => {
   subscriptionManager.startHealLoop();
   ctx.subscriptionManager = subscriptionManager;
 
+  const chatBridgeRateLimitRetryFallbackMs = Math.max(
+    5_000,
+    Number.parseInt(
+      trimEnv("MG_CHAT_RUNTIME_BRIDGE_RATE_LIMIT_RETRY_FALLBACK_MS") ?? "15000",
+      10,
+    ) || 15_000,
+  );
+  let chatBridgeRateLimitedUntilMs = 0;
+  const callAgentChatBridge = async (payload: unknown): Promise<unknown> => {
+    const nowMs = Date.now();
+    if (chatBridgeRateLimitedUntilMs > nowMs) {
+      throw new Error(
+        `agent chat bridge request rate-limited (${chatBridgeRateLimitedUntilMs - nowMs}ms remaining)`,
+      );
+    }
+    const botToken = await getBotToken();
+    const response = await fetch(`${chatApiBaseUrl}/api/agent/chat`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(agentKeyBox
+          ? { "x-agent-key-box": agentKeyBox }
+          : { "x-agent-key": agentKey ?? "" }),
+        ...(botToken ? { "x-bot-session-token": botToken } : {}),
+      },
+      body: JSON.stringify(payload),
+    });
+    const body = (await response.json().catch(() => null)) as unknown;
+    if (
+      response.ok &&
+      isRecord(body) &&
+      body.ok === true
+    ) {
+      chatBridgeRateLimitedUntilMs = 0;
+      return body.data;
+    }
+    if (response.status === 429) {
+      const retryAfterMs = parseRetryAfterMs({
+        response,
+        body,
+        fallbackMs: chatBridgeRateLimitRetryFallbackMs,
+      });
+      chatBridgeRateLimitedUntilMs = Math.max(
+        chatBridgeRateLimitedUntilMs,
+        Date.now() + retryAfterMs,
+      );
+      const errorMessage =
+        isRecord(body) && typeof body.error === "string"
+          ? body.error
+          : "Too many requests";
+      throw new Error(
+        `agent chat bridge request rate-limited: ${errorMessage} (retryAfterMs=${retryAfterMs})`,
+      );
+    }
+    const errorMessage =
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : `HTTP ${response.status}`;
+    throw new Error(`agent chat bridge request failed: ${errorMessage}`);
+  };
+
+  const commandExecutor = new CommandExecutor({
+    config: {
+      imageGenerateCmd: config.imageGenerateCmd,
+      imageGenerateTimeoutMs: config.imageGenerateTimeoutMs,
+    },
+    ipcPaths: {
+      inboxDir: ipcPaths.inboxDir,
+      processedDir: ipcPaths.processedDir,
+      generatedDir: ipcPaths.generatedDir,
+      queueStatePath: ipcPaths.queueStatePath,
+      resultsPath: ipcPaths.resultsPath,
+    },
+    memory: {
+      recordWrite: (p: unknown) => memory.recordWrite(p),
+    },
+    trpc: trpc as unknown as {
+      agent: Record<string, { mutate: (input: Record<string, unknown>) => Promise<unknown> }>;
+    },
+    commandSeal: ctx.commandSeal,
+    controlKey: ctx.misc.controlKey,
+    queue: ctx.queue,
+    callAgentChatBridge,
+  });
+
   // -- QueueManager
   const queueManager = new QueueManager({
     config: { terminalTriggerOnly: config.terminalTriggerOnly },
@@ -633,15 +776,8 @@ const main = async (): Promise<void> => {
     }),
     memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
     queue: ctx.queue,
-    processCommandFile: async (_inboxFile: string) => {
-      // TODO: port full command execution engine
-      await memory.recordWrite({
-        type: "command_execution_stub",
-        at: nowIso(),
-        inboxFile: _inboxFile,
-        message: "Command execution engine not yet ported to v2.",
-      });
-      return false;
+    processCommandFile: async (inboxFile: string) => {
+      return commandExecutor.processCommandFile(inboxFile);
     },
     runMemoryCheckpoint: async (opts) => {
       await memory
@@ -681,14 +817,6 @@ const main = async (): Promise<void> => {
   ctx.directiveManager = directiveManager;
 
   // -- ChatManager
-  const chatBridgeRateLimitRetryFallbackMs = Math.max(
-    5_000,
-    Number.parseInt(
-      trimEnv("MG_CHAT_RUNTIME_BRIDGE_RATE_LIMIT_RETRY_FALLBACK_MS") ?? "15000",
-      10,
-    ) || 15_000,
-  );
-  let chatBridgeRateLimitedUntilMs = 0;
   const chatManager = new ChatManager({
     config: {
       chatRuntimeEnabled: config.chatRuntimeEnabled,
@@ -717,58 +845,7 @@ const main = async (): Promise<void> => {
       buildContext: (request) => memory.buildContext(request),
     },
     chat: ctx.chat,
-    callAgentChatBridge: async (payload: unknown) => {
-      const nowMs = Date.now();
-      if (chatBridgeRateLimitedUntilMs > nowMs) {
-        throw new Error(
-          `agent chat bridge request rate-limited (${chatBridgeRateLimitedUntilMs - nowMs}ms remaining)`,
-        );
-      }
-      const botToken = await getBotToken();
-      const response = await fetch(`${chatApiBaseUrl}/api/agent/chat`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(agentKeyBox
-            ? { "x-agent-key-box": agentKeyBox }
-            : { "x-agent-key": agentKey ?? "" }),
-          ...(botToken ? { "x-bot-session-token": botToken } : {}),
-        },
-        body: JSON.stringify(payload),
-      });
-      const body = (await response.json().catch(() => null)) as unknown;
-      if (
-        response.ok &&
-        isRecord(body) &&
-        body.ok === true
-      ) {
-        chatBridgeRateLimitedUntilMs = 0;
-        return body.data;
-      }
-      if (response.status === 429) {
-        const retryAfterMs = parseRetryAfterMs({
-          response,
-          body,
-          fallbackMs: chatBridgeRateLimitRetryFallbackMs,
-        });
-        chatBridgeRateLimitedUntilMs = Math.max(
-          chatBridgeRateLimitedUntilMs,
-          Date.now() + retryAfterMs,
-        );
-        const errorMessage =
-          isRecord(body) && typeof body.error === "string"
-            ? body.error
-            : "Too many requests";
-        throw new Error(
-          `agent chat bridge request rate-limited: ${errorMessage} (retryAfterMs=${retryAfterMs})`,
-        );
-      }
-      const errorMessage =
-        isRecord(body) && typeof body.error === "string"
-          ? body.error
-          : `HTTP ${response.status}`;
-      throw new Error(`agent chat bridge request failed: ${errorMessage}`);
-    },
+    callAgentChatBridge,
     runOpenClawPrompt: async (opts) => {
       const result = await openClawManager.prompt(opts.prompt, {
         purpose: opts.purpose,
