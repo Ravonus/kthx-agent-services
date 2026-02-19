@@ -137,6 +137,7 @@ type AgentRouterLike = {
 
 type TrpcLike = {
   agent: Record<string, AgentMutator>;
+  realtime?: Record<string, AgentMutator>;
 };
 
 type CommandOutcome = {
@@ -581,7 +582,7 @@ export class CommandExecutor {
         asNonEmptyString(payload.prompt),
       ],
     });
-    const result = await this.agent().updateAvatar.mutate({
+    const result = await this.updateAvatarWithFallback({
       target,
       imageUrl: media.mediaUrl,
       ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
@@ -886,7 +887,7 @@ export class CommandExecutor {
           : 1;
       const summary = truncateText(prompt, 220);
       if (avatarRequest) {
-        const avatarResult = await this.agent().updateAvatar.mutate({
+        const avatarResult = await this.updateAvatarWithFallback({
           target: avatarTarget,
           imageUrl: media.mediaUrl,
           ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
@@ -1878,6 +1879,67 @@ export class CommandExecutor {
         },
       },
     });
+  }
+
+  private isMissingMutationPathError(error: unknown, path: string): boolean {
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : "";
+    if (!message.trim().length) return false;
+    return (
+      message.includes(`No "mutation"-procedure on path "${path}"`) ||
+      message.includes(`No "mutation"-procedure on path '${path}'`) ||
+      message.includes(`No mutation-procedure on path ${path}`)
+    );
+  }
+
+  private async updateAvatarWithFallback(
+    input: Record<string, unknown> & { target: string; imageUrl: string },
+  ): Promise<unknown> {
+    try {
+      return await this.agent().updateAvatar.mutate(input);
+    } catch (error) {
+      if (!this.isMissingMutationPathError(error, "agent.updateAvatar")) {
+        throw error;
+      }
+      const target = asNonEmptyString(input.target)?.toLowerCase() ?? "agent";
+      if (target !== "agent") {
+        throw new Error(
+          'Owner avatar update requires backend support for "agent.updateAvatar". Update server and retry.',
+        );
+      }
+
+      const fallbackMutator = this.ctx.trpc?.realtime?.updateBotProfile;
+      if (!fallbackMutator || typeof fallbackMutator.mutate !== "function") {
+        throw new Error(
+          'Avatar update fallback unavailable. Missing "realtime.updateBotProfile".',
+        );
+      }
+
+      const imageUrl = asNonEmptyString(input.imageUrl);
+      if (!imageUrl) {
+        throw new Error("Avatar update fallback failed: missing image URL.");
+      }
+
+      const updated = await fallbackMutator.mutate({ image: imageUrl });
+      const fallbackUser = isRecord(updated) ? updated : null;
+      return {
+        ok: true,
+        source: "realtime.updateBotProfile",
+        user: fallbackUser
+          ? {
+              id: asNonEmptyString(fallbackUser.id),
+              handle: asNonEmptyString(fallbackUser.handle),
+              name: asNonEmptyString(fallbackUser.name),
+              image: asNonEmptyString(fallbackUser.image),
+              banner: asNonEmptyString(fallbackUser.banner),
+            }
+          : null,
+      };
+    }
   }
 
   private successOutcome(command: Command, data: unknown): CommandOutcome {
