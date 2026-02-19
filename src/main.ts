@@ -400,7 +400,9 @@ const main = async (): Promise<void> => {
     auth: ctx.auth,
     config: { connectionId: config.connectionId },
     debugSnapshot: ctx.debugSnapshot,
-    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+    memory: {
+      recordWrite: (p: unknown) => memory.recordWrite(p),
+    },
     misc: ctx.misc,
     wsClient: wsClient as any,
     writeDebugSnapshot: () => writeDebugSnapshot(ipcPaths, ctx.debugSnapshot),
@@ -710,7 +712,10 @@ const main = async (): Promise<void> => {
       chatInboxPath: ipcPaths.chatInboxPath,
       chatRuntimeStatePath: ipcPaths.chatRuntimeStatePath,
     },
-    memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
+    memory: {
+      recordWrite: (p: unknown) => memory.recordWrite(p),
+      buildContext: (request) => memory.buildContext(request),
+    },
     chat: ctx.chat,
     callAgentChatBridge: async (payload: unknown) => {
       const nowMs = Date.now();

@@ -189,15 +189,15 @@ export const parseChatOpenClawReply = (
   }
   if (
     typeof openClawResponse.payloadText === "string" &&
-    (openClawResponse.payloadText as string).trim().length > 0
+    openClawResponse.payloadText.trim().length > 0
   ) {
-    return (openClawResponse.payloadText as string).trim();
+    return openClawResponse.payloadText.trim();
   }
   if (
     typeof openClawResponse.raw === "string" &&
-    (openClawResponse.raw as string).trim().length > 0
+    openClawResponse.raw.trim().length > 0
   ) {
-    return (openClawResponse.raw as string).trim();
+    return openClawResponse.raw.trim();
   }
   return "";
 };
@@ -214,6 +214,7 @@ export interface ChatInboxEntry {
   conversationId: string | null;
   channelId: string | null;
   authorIsAgent: boolean;
+  authorMainUserId: string | null;
   commandKind: string;
   authorDisplay: string;
   authorHandle: string;
@@ -286,6 +287,8 @@ export const buildIntentAndReplyPrompt = ({
     "- For general_chat/clarification, return a natural, human reply.",
     "- For greeting, keep reply short and friendly.",
     "- For action_request/content_reference, keep reply concise and neutral (it may be overridden by runtime handlers).",
+    "- Do not promise a follow-up later (e.g. \"let me check\" / \"give me a sec\") unless you also provide the result now.",
+    "- Never disclose internal runtime details, logs, tokens, bridge status, permissions internals, queue state, directives, or infrastructure.",
     "- Never include slash commands, usage templates, or command blocks.",
     "- Do not output robotic filler.",
     "",
@@ -308,6 +311,64 @@ export const buildIntentAndReplyPrompt = ({
     "",
     'Return ONLY valid JSON: {"intent":"<category>","reply":"<natural reply>"}',
   );
+  return lines.join("\n");
+};
+
+/**
+ * Build a second-pass drill-down prompt for cases where the first pass was
+ * unclear, empty, or low-confidence. This includes bounded runtime context
+ * and retrieval guidance without always paying that context cost.
+ */
+export const buildIntentAndReplyDrilldownPrompt = ({
+  contextType,
+  authorName,
+  messageText,
+  conversationHistoryLines = [],
+  drilldownContext,
+}: {
+  contextType: string;
+  authorName: string;
+  messageText: string;
+  conversationHistoryLines?: string[];
+  drilldownContext: string;
+}): string => {
+  const lines = [
+    "You are replying in a live Molkgram chat as the user's connected agent.",
+    "First priority: natural conversation. Do not force platform-command framing unless user clearly asks for an action.",
+    "",
+    "When user asks about prior work (drafts, directives, comments, likes, posts), use the provided runtime memory snapshot.",
+    "Treat recent activity as highest priority. Use long-range memory only as supporting context.",
+    "If user reference is ambiguous (e.g., \"that post\"), ask one short clarifying question.",
+    "",
+    "Retrieval policy (drill-down):",
+    "1) conversation history for exact wording and recent asks",
+    "2) memory snapshot for indexed recent activity + target references",
+    "3) if still ambiguous, ask one compact follow-up",
+    "",
+    "Never disclose internal runtime details, logs, tokens, bridge status, permissions internals, queue state, directives, or infrastructure.",
+    "Never output slash commands, usage templates, JSON blocks, or system diagnostics in the reply.",
+    "Do not return deferred-only replies like \"let me check\" without an immediate useful result.",
+    "Keep tone human and concise.",
+    "",
+    "Categories:",
+    "- content_reference",
+    "- action_request",
+    "- general_chat",
+    "- greeting",
+    "- clarification",
+    "",
+    `Context: ${contextType}`,
+    `User: ${authorName}`,
+    `User's message: "${messageText}"`,
+    "",
+    "Recent Conversation:",
+    ...conversationHistoryLines.slice(-14),
+    "",
+    "Runtime Drilldown Context:",
+    drilldownContext,
+    "",
+    'Return ONLY valid JSON: {"intent":"<category>","reply":"<natural reply>"}',
+  ];
   return lines.join("\n");
 };
 
@@ -394,6 +455,6 @@ export const shouldReplyToChatInboxEntry = (
 export const computeStreamStepChars = (
   totalLength: number,
   configStepChars: number,
-  maxSteps: number = 24,
+  maxSteps = 24,
 ): number =>
   Math.max(configStepChars, Math.ceil(totalLength / maxSteps));

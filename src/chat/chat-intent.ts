@@ -18,6 +18,7 @@ import {
   sanitizeChatOpenClawDraftReply,
   parseChatOpenClawReply,
   buildIntentAndReplyPrompt,
+  buildIntentAndReplyDrilldownPrompt,
   CHAT_INTENT_VALID,
 } from "./chat-reply.js";
 
@@ -43,10 +44,14 @@ export const normalizeInboxEntry = (value: unknown): ChatInboxEntry | null => {
     : typeof message.conversationId === "string" ? message.conversationId : "";
   const channelIdRaw = typeof context?.channelId === "string" ? context.channelId
     : typeof message.channelId === "string" ? message.channelId : "";
-  const conversationId = (conversationIdRaw as string).trim();
-  const channelId = (channelIdRaw as string).trim();
+  const conversationId = conversationIdRaw.trim();
+  const channelId = channelIdRaw.trim();
   if (!conversationId.length && !channelId.length) return null;
   const author = messageEnvelope && isRecord(messageEnvelope.author) ? messageEnvelope.author : null;
+  const authorMainUserId =
+    typeof author?.mainUserId === "string" && author.mainUserId.trim().length > 0
+      ? author.mainUserId.trim()
+      : null;
   return {
     messageId, body,
     topic: typeof value.topic === "string" ? value.topic : null,
@@ -54,9 +59,10 @@ export const normalizeInboxEntry = (value: unknown): ChatInboxEntry | null => {
     conversationId: conversationId.length > 0 ? conversationId : null,
     channelId: channelId.length > 0 ? channelId : null,
     authorIsAgent: author?.isAgent === true,
+    authorMainUserId,
     commandKind,
-    authorDisplay: typeof author?.displayCache === "string" ? (author.displayCache as string) : "",
-    authorHandle: typeof author?.handleCache === "string" ? (author.handleCache as string) : "",
+    authorDisplay: typeof author?.displayCache === "string" ? author.displayCache : "",
+    authorHandle: typeof author?.handleCache === "string" ? author.handleCache : "",
     receivedAt: typeof value.at === "string" && value.at.trim().length > 0 ? value.at.trim() : nowIso(),
   };
 };
@@ -83,6 +89,130 @@ export interface OpenClawPromptResponse {
   envelope: Record<string, unknown> | null;
 }
 
+type SystemProbeReason =
+  | "system_disclosure_request_blocked"
+  | "system_disclosure_reply_blocked";
+
+const LOW_CONFIDENCE_REPLY_PATTERNS: RegExp[] = [
+  /\btell me what you want to do\b/iu,
+  /\bwhat do you want help with\b/iu,
+  /\bi(?:'| a)m here.*\bwhat do you want\b/iu,
+  /\bgreat choice\b/iu,
+  /\bart direction\b/iu,
+  /\bprepare the exact prompt flow\b/iu,
+  /\bfor image\/carousel posts\b/iu,
+];
+
+const DEFERRED_FOLLOWUP_PATTERN =
+  /\b(let me check|give me a sec|one sec|hold on|i(?:'|’)ll check|checking (?:that|now)|i(?:'|’)ll look into|i(?:'|’)ll dig)\b/iu;
+
+const DEFERRED_REPLY_RESULT_PATTERN =
+  /\b(found|looks like|error|failed|status|because|here(?:'|’)s|result|working|healthy|unhealthy|offline|online)\b/iu;
+
+const SYSTEM_DISCLOSURE_REQUEST_PATTERN =
+  /\b(runtime|bridge|openclaw|bot token|session token|agent key|directive|queue|mint|challenge|permission(?:s)?(?:\s+state)?|no_grant|health endpoint|port\s*\d{3,5}|api\/agent\/chat|websocket|socket\s+(?:status|server)|system prompt|developer message|internal (?:log|logs|debug)|debug (?:log|logs)|secret(?:s)?|credential(?:s)?)\b/iu;
+
+const SYSTEM_DISCLOSURE_REPLY_PATTERN =
+  /\b(runtime|bridge|openclaw|bot token|session token|agent key|directive|queue|mint|challenge|permission(?:s)?(?:\s+state)?|no_grant|port\s*\d{3,5}|api\/agent\/chat|websocket|socket\s+(?:status|server)|health check|subscribed to \d+ topics|system prompt|developer message|internal (?:log|logs|debug)|debug (?:log|logs)|secret(?:s)?|credential(?:s)?)\b/iu;
+
+const SYSTEM_DISCLOSURE_IDENTIFIER_PATTERN =
+  /\b(userId|ownerId|agentId|directiveId|grantId|connectionId|chatUserId|sessionId)\b/u;
+
+const STRUCTURED_INTERNAL_DUMP_PATTERN =
+  /(?:^|[\s`])\{[\s\S]{0,600}"(?:type|directive|grant|token|status|payload|error|connectionId|agentId)"[\s\S]{0,600}\}/u;
+
+const isSystemDisclosureRequest = (value: string): boolean =>
+  SYSTEM_DISCLOSURE_REQUEST_PATTERN.test(value.trim().toLowerCase());
+
+const isSystemDisclosureReply = (value: string): boolean => {
+  const normalized = value.trim();
+  if (!normalized.length) return false;
+  if (SYSTEM_DISCLOSURE_REPLY_PATTERN.test(normalized.toLowerCase())) return true;
+  if (SYSTEM_DISCLOSURE_IDENTIFIER_PATTERN.test(normalized)) return true;
+  return STRUCTURED_INTERNAL_DUMP_PATTERN.test(normalized);
+};
+
+const buildSystemBoundaryReply = (
+  entry: ChatInboxEntry,
+  maxChars: number,
+): string =>
+  truncateChatReply(
+    entry.channelId
+      ? "I can't discuss internal runtime or account details in chat. I can still help with posts, replies, and content tasks."
+      : "I can't share internal runtime or account details here. I can still help with posts, replies, and content tasks.",
+    maxChars,
+  );
+
+const isLowConfidenceAutoReply = (
+  candidate: IntentClassificationResult,
+  userMessage: string,
+): boolean => {
+  const reply = candidate.reply.trim().toLowerCase();
+  if (!reply.length) return true;
+  if (LOW_CONFIDENCE_REPLY_PATTERNS.some((pattern) => pattern.test(reply))) {
+    return true;
+  }
+  const user = userMessage.trim().toLowerCase();
+  const userLooksActionable =
+    /\b(generate|create|make|post|reply|comment|draft|image|video|gif|pdf|file|send|find|look|search|show)\b/iu.test(
+      user,
+    );
+  const replyAsksToRestateRequest =
+    /\b(tell me|let me know|share)\b[\s\S]{0,40}\b(what you want|what to do|details|art direction|direction)\b/iu.test(
+      reply,
+    );
+  if (userLooksActionable && replyAsksToRestateRequest) return true;
+  if (
+    userLooksActionable &&
+    DEFERRED_FOLLOWUP_PATTERN.test(reply) &&
+    !DEFERRED_REPLY_RESULT_PATTERN.test(reply)
+  ) {
+    return true;
+  }
+  if (candidate.intent === "greeting" && user.split(/\s+/u).length >= 6) {
+    return true;
+  }
+  return false;
+};
+
+const parseIntentAndReplyFromPromptResult = (
+  result: OpenClawPromptResponse,
+): IntentClassificationResult => {
+  const parsed = isRecord(result.parsed) ? result.parsed : null;
+  const intentRaw =
+    parsed && typeof parsed.intent === "string"
+      ? parsed.intent.trim().toLowerCase()
+      : null;
+  let intent = intentRaw && CHAT_INTENT_VALID.has(intentRaw) ? intentRaw : null;
+  let draftedReply =
+    parsed &&
+    typeof parsed.reply === "string" &&
+    parsed.reply.trim().length > 0
+      ? parsed.reply.trim()
+      : parsed && typeof parsed.text === "string" && parsed.text.trim().length > 0
+        ? parsed.text.trim()
+        : "";
+  if (typeof result.payloadText === "string") {
+    if (!intent) {
+      const match = /"intent"\s*:\s*"(\w+)"/u.exec(result.payloadText);
+      if (match?.[1]) {
+        const fallback = match[1].toLowerCase();
+        if (CHAT_INTENT_VALID.has(fallback)) intent = fallback;
+      }
+    }
+    if (!draftedReply.length) {
+      const replyMatch = /"reply"\s*:\s*"([\s\S]*?)"/u.exec(result.payloadText);
+      if (replyMatch?.[1]) draftedReply = replyMatch[1].trim();
+    }
+  }
+  if (!draftedReply.length) draftedReply = parseChatOpenClawReply(result);
+  return {
+    intent,
+    reply: sanitizeChatOpenClawDraftReply(draftedReply),
+    rawReply: draftedReply,
+  };
+};
+
 // ---------------------------------------------------------------------------
 // Intent classification via OpenClaw
 // ---------------------------------------------------------------------------
@@ -101,7 +231,10 @@ export const classifyIntentAndDraftReply = async (
     const msg = isRecord(item.message) ? item.message : null;
     const author = isRecord(item.author) ? item.author : null;
     if (!msg || !author) continue;
-    const display = (author.displayCache || author.handleCache || "Unknown") as string;
+    const displaySource = author.displayCache ?? author.handleCache;
+    const display = typeof displaySource === "string" && displaySource.trim().length > 0
+      ? displaySource
+      : "Unknown";
     const body = typeof msg.body === "string" ? msg.body.trim() : "";
     if (!body.length) continue;
     historyLines.push(`${display}: ${body}`);
@@ -126,24 +259,51 @@ export const classifyIntentAndDraftReply = async (
   });
   const result = await runOpenClawPrompt({ prompt, purpose: "chat_reply" });
   if (!result) return null;
-  const parsed = isRecord(result.parsed) ? result.parsed : null;
-  const intentRaw = parsed && typeof parsed.intent === "string" ? parsed.intent.trim().toLowerCase() : null;
-  let intent = intentRaw && CHAT_INTENT_VALID.has(intentRaw) ? intentRaw : null;
-  let draftedReply = parsed && typeof parsed.reply === "string" && parsed.reply.trim().length > 0
-    ? parsed.reply.trim()
-    : parsed && typeof parsed.text === "string" && parsed.text.trim().length > 0 ? parsed.text.trim() : "";
-  if (typeof result.payloadText === "string") {
-    if (!intent) {
-      const match = result.payloadText.match(/"intent"\s*:\s*"(\w+)"/u);
-      if (match?.[1]) { const fallback = match[1].toLowerCase(); if (CHAT_INTENT_VALID.has(fallback)) intent = fallback; }
-    }
-    if (!draftedReply.length) {
-      const replyMatch = result.payloadText.match(/"reply"\s*:\s*"([\s\S]*?)"/u);
-      if (replyMatch?.[1]) draftedReply = replyMatch[1].trim();
-    }
+  return parseIntentAndReplyFromPromptResult(result);
+};
+
+const classifyIntentAndDraftReplyWithDrilldown = async (input: {
+  entry: ChatInboxEntry;
+  conversationHistory: unknown[];
+  runOpenClawPrompt: (opts: { prompt: string; purpose: string }) => Promise<OpenClawPromptResponse | null>;
+  drilldownContext: string;
+}): Promise<IntentClassificationResult | null> => {
+  const messageBody = input.entry.body.trim();
+  if (!messageBody.length) return null;
+  const historyLines: string[] = [];
+  for (const item of input.conversationHistory) {
+    if (!isRecord(item)) continue;
+    const msg = isRecord(item.message) ? item.message : null;
+    const author = isRecord(item.author) ? item.author : null;
+    if (!msg || !author) continue;
+    const displaySource = author.displayCache ?? author.handleCache;
+    const display = typeof displaySource === "string" && displaySource.trim().length > 0
+      ? displaySource
+      : "Unknown";
+    const body = typeof msg.body === "string" ? msg.body.trim() : "";
+    if (!body.length) continue;
+    historyLines.push(`${display}: ${body}`);
   }
-  if (!draftedReply.length) draftedReply = parseChatOpenClawReply(result);
-  return { intent, reply: sanitizeChatOpenClawDraftReply(draftedReply), rawReply: draftedReply };
+  const authorName =
+    input.entry.authorDisplay.length > 0
+      ? input.entry.authorDisplay
+      : input.entry.authorHandle.length > 0
+        ? input.entry.authorHandle
+        : "user";
+  const contextType = input.entry.conversationId ? "dm" : "channel";
+  const prompt = buildIntentAndReplyDrilldownPrompt({
+    contextType,
+    authorName,
+    messageText: messageBody.slice(0, 360),
+    conversationHistoryLines: historyLines,
+    drilldownContext: input.drilldownContext,
+  });
+  const result = await input.runOpenClawPrompt({
+    prompt,
+    purpose: "chat_reply_drilldown",
+  });
+  if (!result) return null;
+  return parseIntentAndReplyFromPromptResult(result);
 };
 
 // ---------------------------------------------------------------------------
@@ -158,12 +318,39 @@ export const buildAutoReply = async (
     recordWrite: (payload: unknown) => Promise<void>;
     runOpenClawPrompt: (opts: { prompt: string; purpose: string }) => Promise<OpenClawPromptResponse | null>;
     fetchConversationHistory: (entry: ChatInboxEntry) => Promise<unknown[]>;
+    loadDrilldownContext?: (
+      entry: ChatInboxEntry,
+      conversationHistory: unknown[],
+    ) => Promise<string | null>;
+    reportSystemProbe?: (input: {
+      entry: ChatInboxEntry;
+      reason: SystemProbeReason;
+    }) => Promise<void>;
   },
 ): Promise<string> => {
   const messageBody = entry.body.trim();
   if (!messageBody.length) return "";
   const maxChars = opts.maxChars;
   const conversationHistory = await opts.fetchConversationHistory(entry);
+
+  if (isSystemDisclosureRequest(messageBody)) {
+    await opts
+      .reportSystemProbe?.({
+        entry,
+        reason: "system_disclosure_request_blocked",
+      })
+      .catch(() => undefined);
+    await opts
+      .recordWrite({
+        type: "chat_runtime_reply_guarded",
+        at: nowIso(),
+        reason: "system_disclosure_request_blocked",
+        messageId: entry.messageId,
+        bodyPreview: toAnswerPreview(messageBody, 160),
+      })
+      .catch(() => undefined);
+    return buildSystemBoundaryReply(entry, maxChars);
+  }
 
   if (!opts.useOpenClaw) {
     await opts.recordWrite({
@@ -176,48 +363,142 @@ export const buildAutoReply = async (
     return "";
   }
 
-  const decided = await classifyIntentAndDraftReply(entry, conversationHistory, opts.runOpenClawPrompt);
-  if (!decided) {
+  const preloadedDrilldownContext = await opts.loadDrilldownContext
+    ?.(
+      entry,
+      conversationHistory,
+    )
+    .catch(() => null);
+  const usingPreloadedDrilldown =
+    typeof preloadedDrilldownContext === "string" &&
+    preloadedDrilldownContext.trim().length > 0;
+  const decided = usingPreloadedDrilldown
+    ? await classifyIntentAndDraftReplyWithDrilldown({
+        entry,
+        conversationHistory,
+        runOpenClawPrompt: opts.runOpenClawPrompt,
+        drilldownContext: preloadedDrilldownContext,
+      })
+    : await classifyIntentAndDraftReply(
+        entry,
+        conversationHistory,
+        opts.runOpenClawPrompt,
+      );
+  let replySuppressedForSystemDisclosure = false;
+  const normalizeCandidate = (
+    candidate: IntentClassificationResult | null,
+  ): string | null => {
+    if (!candidate) return null;
+    let drafted = candidate.reply;
+    if (!drafted.length && typeof candidate.rawReply === "string" && candidate.rawReply.trim().length > 0) {
+      drafted = sanitizeChatOpenClawDraftReply(candidate.rawReply);
+    }
+    if (!drafted.length) return null;
+    const normalized = truncateChatReply(drafted, maxChars);
+    if (!normalized.length) return null;
+    if (isSystemDisclosureReply(normalized)) {
+      replySuppressedForSystemDisclosure = true;
+      return null;
+    }
+    if (isCommandLikeChatAutoReply(normalized)) {
+      const cleaned = sanitizeChatOpenClawDraftReply(normalized);
+      if (cleaned.length > 0 && !isCommandLikeChatAutoReply(cleaned)) {
+        return truncateChatReply(cleaned, maxChars);
+      }
+      return null;
+    }
+    return normalized;
+  };
+
+  const firstPassReply = normalizeCandidate(decided);
+  const firstPassNeedsDrilldown = Boolean(
+    !usingPreloadedDrilldown &&
+    decided &&
+      firstPassReply &&
+      (decided.intent === null || isLowConfidenceAutoReply(
+        {
+          intent: decided.intent,
+          rawReply: decided.rawReply,
+          reply: firstPassReply,
+        },
+        messageBody,
+      )),
+  );
+  if (firstPassReply && !firstPassNeedsDrilldown) {
+    return firstPassReply;
+  }
+
+  const shouldAttemptDrilldown =
+    !usingPreloadedDrilldown && (!firstPassReply || firstPassNeedsDrilldown);
+  if (!shouldAttemptDrilldown) return "";
+
+  const drilldownContext = await opts.loadDrilldownContext
+    ?.(
+      entry,
+      conversationHistory,
+    )
+    .catch(() => null);
+  if (drilldownContext && drilldownContext.trim().length > 0) {
     await opts.recordWrite({
-      type: "chat_runtime_reply_suppressed",
+      type: "chat_runtime_reply_drilldown_attempted",
       at: nowIso(),
-      reason: "openclaw_no_result",
       messageId: entry.messageId,
       bodyPreview: toAnswerPreview(messageBody, 140),
+      firstIntent: decided?.intent ?? null,
+      firstRawPreview: decided ? toAnswerPreview(decided.rawReply, 160) : null,
+      firstPassNeedsDrilldown,
     }).catch(() => undefined);
-    return "";
+    const drilldown = await classifyIntentAndDraftReplyWithDrilldown({
+      entry,
+      conversationHistory,
+      runOpenClawPrompt: opts.runOpenClawPrompt,
+      drilldownContext,
+    });
+    const secondPassReply = normalizeCandidate(drilldown);
+    if (secondPassReply) {
+      return secondPassReply;
+    }
   }
-  let drafted = decided.reply;
-  if (!drafted.length && typeof decided.rawReply === "string" && decided.rawReply.trim().length > 0) {
-    drafted = sanitizeChatOpenClawDraftReply(decided.rawReply);
+
+  if (replySuppressedForSystemDisclosure) {
+    await opts
+      .reportSystemProbe?.({
+        entry,
+        reason: "system_disclosure_reply_blocked",
+      })
+      .catch(() => undefined);
+    await opts
+      .recordWrite({
+        type: "chat_runtime_reply_guarded",
+        at: nowIso(),
+        reason: "system_disclosure_reply_blocked",
+        messageId: entry.messageId,
+        bodyPreview: toAnswerPreview(messageBody, 160),
+      })
+      .catch(() => undefined);
+    return buildSystemBoundaryReply(entry, maxChars);
   }
-  if (!drafted.length) {
+
+  if (firstPassReply) {
     await opts.recordWrite({
-      type: "chat_runtime_reply_suppressed",
+      type: "chat_runtime_reply_drilldown_fallback",
       at: nowIso(),
-      reason: "openclaw_empty_reply",
       messageId: entry.messageId,
-      intent: decided.intent,
       bodyPreview: toAnswerPreview(messageBody, 140),
-      rawPreview: toAnswerPreview(decided.rawReply, 140),
+      firstIntent: decided?.intent ?? null,
+      replyPreview: toAnswerPreview(firstPassReply, 160),
     }).catch(() => undefined);
-    return "";
+    return firstPassReply;
   }
-  const normalized = truncateChatReply(drafted, maxChars);
-  if (!normalized.length) return "";
-  if (isCommandLikeChatAutoReply(normalized)) {
-    const cleaned = sanitizeChatOpenClawDraftReply(normalized);
-    if (cleaned.length > 0 && !isCommandLikeChatAutoReply(cleaned)) return truncateChatReply(cleaned, maxChars);
-    await opts.recordWrite({
-      type: "chat_runtime_reply_suppressed",
-      at: nowIso(),
-      reason: "openclaw_command_like_reply",
-      messageId: entry.messageId,
-      intent: decided.intent,
-      bodyPreview: toAnswerPreview(messageBody, 140),
-      rawPreview: toAnswerPreview(drafted, 160),
-    }).catch(() => undefined);
-    return "";
-  }
-  return normalized;
+
+  await opts.recordWrite({
+    type: "chat_runtime_reply_suppressed",
+    at: nowIso(),
+    reason: decided ? "openclaw_unusable_after_drilldown" : "openclaw_no_result",
+    messageId: entry.messageId,
+    intent: decided?.intent ?? null,
+    bodyPreview: toAnswerPreview(messageBody, 140),
+    rawPreview: decided ? toAnswerPreview(decided.rawReply, 160) : null,
+  }).catch(() => undefined);
+  return "";
 };

@@ -13,6 +13,7 @@ import { isRecord } from "../lib/guards.js";
 import { nowIso, toAnswerPreview } from "../lib/text.js";
 import { readJsonFile, writeJsonFile } from "../lib/fs.js";
 import type { ChatManagerLike } from "../runtime-context.js";
+import type { ContextBundle, ContextRequest } from "../types/memory.js";
 import type { ChatInboxEntry } from "./chat-reply.js";
 import {
   truncateChatReply,
@@ -48,7 +49,10 @@ export interface ChatManagerContext {
     chatInboxPath: string;
     chatRuntimeStatePath: string;
   };
-  memory: { recordWrite(payload: unknown): Promise<void> };
+  memory: {
+    recordWrite(payload: unknown): Promise<void>;
+    buildContext?: (request: ContextRequest) => Promise<ContextBundle>;
+  };
   chat: ChatTrackingState;
   callAgentChatBridge: (payload: unknown) => Promise<unknown>;
   runOpenClawPrompt: (opts: {
@@ -96,10 +100,91 @@ const extractSentMessageId = (response: unknown): string | null => {
   if (!isRecord(response)) return null;
   const primary = isRecord(response.primary) ? response.primary : null;
   const message = isRecord(primary?.message) ? primary.message : null;
-  if (typeof message?.id === "string" && (message.id as string).trim().length > 0) return (message.id as string).trim();
-  if (typeof response.messageId === "string" && (response.messageId as string).trim().length > 0) return (response.messageId as string).trim();
-  if (typeof response.id === "string" && (response.id as string).trim().length > 0) return (response.id as string).trim();
+  if (typeof message?.id === "string" && message.id.trim().length > 0) return message.id.trim();
+  if (typeof response.messageId === "string" && response.messageId.trim().length > 0) return response.messageId.trim();
+  if (typeof response.id === "string" && response.id.trim().length > 0) return response.id.trim();
   return null;
+};
+
+const parsePostAndCommentHints = (text: string): {
+  postId?: number;
+  commentId?: number;
+} => {
+  const normalized = text.trim();
+  if (!normalized.length) return {};
+  const postMatch =
+    /\bpost(?:\s+number)?\s*#?\s*(\d+)\b/iu.exec(normalized) ??
+    /(?:^|\s)#(\d{1,10})(?:\s|$)/u.exec(normalized);
+  const commentMatch =
+    /\bcomment(?:\s+number)?\s*#?\s*(\d+)\b/iu.exec(normalized);
+  const postIdRaw = postMatch?.[1];
+  const commentIdRaw = commentMatch?.[1];
+  const postId = postIdRaw ? Number.parseInt(postIdRaw, 10) : NaN;
+  const commentId = commentIdRaw ? Number.parseInt(commentIdRaw, 10) : NaN;
+  return {
+    ...(Number.isFinite(postId) && postId > 0 ? { postId } : {}),
+    ...(Number.isFinite(commentId) && commentId > 0 ? { commentId } : {}),
+  };
+};
+
+const MEMORY_INTERNAL_BULLET_PATTERN =
+  /\b(openclaw|bot token|session token|agent key|directive|queue|runtime|bridge|heartbeat|mint|challenge|permission(?:s)?(?:\s+state)?|no_grant|api\/agent\/chat|port\s*\d{3,5}|websocket|socket|postgres|database|sql|migration|column\s+\w+)\b/iu;
+
+const isSafeMemoryBullet = (value: string): boolean =>
+  !MEMORY_INTERNAL_BULLET_PATTERN.test(value.trim().toLowerCase());
+
+const buildDrilldownMemorySummary = (bundle: ContextBundle): string => {
+  const lines: string[] = [];
+  lines.push("## Memory Snapshot");
+  lines.push(`generatedAt=${bundle.generatedAt}`);
+  if (bundle.mood) {
+    lines.push(
+      `mood=${bundle.mood.primary} score=${Number.parseFloat(String(bundle.mood.score)).toFixed(2)}`,
+    );
+  }
+
+  if (isRecord(bundle.temporal?.tiers)) {
+    lines.push("temporal:");
+    for (const tierKey of ["24h", "7d", "30d", "365d"]) {
+      const tier = bundle.temporal.tiers[tierKey];
+      if (!isRecord(tier)) continue;
+      const bullets = Array.isArray(tier.bullets)
+        ? tier.bullets
+            .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+            .filter((entry) => isSafeMemoryBullet(entry))
+            .slice(0, tierKey === "24h" ? 3 : 1)
+            .map((entry) => entry.trim())
+        : [];
+      const eventCount =
+        typeof tier.eventCount === "number" && Number.isFinite(tier.eventCount)
+          ? tier.eventCount
+          : 0;
+      lines.push(`- ${tierKey} events=${eventCount}`);
+      for (const bullet of bullets) {
+        lines.push(`  - ${bullet}`);
+      }
+    }
+  }
+
+  if (bundle.target.postId || bundle.target.commentId) {
+    lines.push("target:");
+    lines.push(
+      `- postId=${bundle.target.postId ?? "null"} commentId=${bundle.target.commentId ?? "null"} targetEvents=${bundle.target.events.length}`,
+    );
+    const focusBullets = Array.isArray(bundle.target.focus?.bullets)
+      ? bundle.target.focus.bullets
+          .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+          .filter((entry) => isSafeMemoryBullet(entry))
+          .slice(0, 4)
+          .map((entry) => entry.trim())
+      : [];
+    for (const bullet of focusBullets) {
+      lines.push(`  - ${bullet}`);
+    }
+  }
+
+  lines.push("retrievalPolicy=prefer_recent_first_then_targeted_archive_then_single_clarifying_question");
+  return lines.join("\n");
 };
 
 // ---------------------------------------------------------------------------
@@ -131,7 +216,13 @@ export class ChatManager implements ChatManagerLike {
         }).catch(() => undefined);
         const mentionTokens = await this.resolveMentionTokens();
         if (!shouldReplyToChatInboxEntry(entry, { channelRequireMention: this.ctx.config.chatRuntimeChannelRequireMention, mentionTokens })) continue;
-        await this.ctx.runMemoryCheckpoint({ force: true, source: "chat_runtime_interaction", allowAgentCompression: true }).catch(() => {});
+        await this.ctx
+          .runMemoryCheckpoint({
+            force: true,
+            source: "chat_runtime_interaction",
+            allowAgentCompression: true,
+          })
+          .catch(() => undefined);
         let typingSent = false;
         try {
           await this.setTyping(entry, true).catch(() => undefined);
@@ -144,6 +235,10 @@ export class ChatManager implements ChatManagerLike {
             recordWrite: (p) => this.ctx.memory.recordWrite(p),
             runOpenClawPrompt: (o) => this.ctx.runOpenClawPrompt(o),
             fetchConversationHistory: (e) => this.fetchConversationHistory(e),
+            loadDrilldownContext: (e, conversationHistory) =>
+              this.loadDrilldownContext(e, conversationHistory),
+            reportSystemProbe: ({ entry: flaggedEntry, reason }) =>
+              this.reportSystemProbe(flaggedEntry, reason),
           });
           if (!replyBody.length) {
             await this.ctx.memory.recordWrite({
@@ -167,7 +262,9 @@ export class ChatManager implements ChatManagerLike {
               const normalized = truncateChatReply(replyBody, this.ctx.config.chatRuntimeReplyMaxChars);
               try { await this.editMessage(streamState.messageId, normalized); streamState.currentBody = normalized; streamState.lastUpdateAtMs = Date.now(); finalized = true; } catch { finalized = streamState.currentBody === normalized; }
             }
-            if (!finalized && (!streamState.messageId || !streamState.messageId.trim().length)) await this.sendReply(entry, replyBody);
+            if (!finalized && !streamState.messageId?.trim().length) {
+              await this.sendReply(entry, replyBody);
+            }
           } else {
             await this.sendReply(entry, replyBody);
           }
@@ -209,11 +306,15 @@ export class ChatManager implements ChatManagerLike {
       this.ctx.chat.chatInboxReadOffset = 0;
       this.ctx.chat.chatInboxPartialLine = "";
     } else {
-      const savedOffset = state && typeof state.readOffset === "number" && Number.isFinite(state.readOffset)
-        ? Math.max(0, Math.floor(state.readOffset as number)) : null;
+      const savedOffset =
+        state && typeof state.readOffset === "number" && Number.isFinite(state.readOffset)
+          ? Math.max(0, Math.floor(state.readOffset))
+          : null;
       this.ctx.chat.chatInboxReadOffset = savedOffset === null ? fileBytes : Math.min(savedOffset, fileBytes);
-      this.ctx.chat.chatInboxPartialLine = state && typeof state.partialLine === "string" && (state.partialLine as string).length <= 4096
-        ? (state.partialLine as string) : "";
+      this.ctx.chat.chatInboxPartialLine =
+        state && typeof state.partialLine === "string" && state.partialLine.length <= 4096
+          ? state.partialLine
+          : "";
     }
     if (state && Array.isArray(state.seenMessageIds)) {
       for (const entry of state.seenMessageIds) {
@@ -335,7 +436,7 @@ export class ChatManager implements ChatManagerLike {
     const normalized = truncateChatReply(finalBody, this.ctx.config.chatRuntimeReplyMaxChars);
     if (!normalized.length) return false;
     state.targetBody = normalized;
-    await this.flushStream(state, { force: true }).catch(() => {});
+    await this.flushStream(state, { force: true }).catch(() => undefined);
     return state.currentBody === normalized;
   }
 
@@ -386,5 +487,114 @@ export class ChatManager implements ChatManagerLike {
       if (isRecord(result) && Array.isArray(result.items)) return (result.items as unknown[]).slice(0, 10).reverse();
       return [];
     } catch { return []; }
+  }
+
+  private async reportSystemProbe(
+    entry: ChatInboxEntry,
+    reason:
+      | "system_disclosure_request_blocked"
+      | "system_disclosure_reply_blocked",
+  ): Promise<void> {
+    const targetMainUserId = entry.authorMainUserId?.trim() ?? "";
+    if (!targetMainUserId.length) return;
+    const contextPayload = entry.conversationId
+      ? { conversationId: entry.conversationId }
+      : entry.channelId
+        ? { channelId: entry.channelId }
+        : null;
+    if (!contextPayload) return;
+    try {
+      const payload = {
+        action: "report_system_probe",
+        targetMainUserId,
+        ...(entry.messageId ? { messageId: entry.messageId } : {}),
+        ...contextPayload,
+        reason,
+      };
+      const response = await this.ctx.callAgentChatBridge(payload);
+      await this.ctx.memory
+        .recordWrite({
+          type: "chat_runtime_system_probe_reported",
+          at: nowIso(),
+          reason,
+          messageId: entry.messageId,
+          targetMainUserId,
+          response: isRecord(response) ? response : null,
+        })
+        .catch(() => undefined);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.ctx.memory
+        .recordWrite({
+          type: "chat_runtime_system_probe_report_failed",
+          at: nowIso(),
+          reason,
+          messageId: entry.messageId,
+          targetMainUserId,
+          error: toAnswerPreview(message, 240),
+        })
+        .catch(() => undefined);
+    }
+  }
+
+  private async loadDrilldownContext(
+    entry: ChatInboxEntry,
+    conversationHistory: unknown[],
+  ): Promise<string | null> {
+    if (typeof this.ctx.memory.buildContext !== "function") return null;
+    try {
+      const hints = parsePostAndCommentHints(entry.body);
+      const audience = entry.channelId ? "chat_channel" : "chat_dm";
+      const bundle = await this.ctx.memory.buildContext({
+        mode: "chat",
+        audience,
+        maxRecentEvents: 120,
+        maxArchiveEvents: 30,
+        ...hints,
+      });
+      const summary = buildDrilldownMemorySummary(bundle);
+
+      const historyLines = conversationHistory
+        .map((item) => {
+          if (!isRecord(item)) return "";
+          const message = isRecord(item.message) ? item.message : null;
+          const author = isRecord(item.author) ? item.author : null;
+          const body =
+            message && typeof message.body === "string"
+              ? message.body.trim()
+              : "";
+          if (!body.length) return "";
+          const display =
+            author && typeof author.displayCache === "string"
+              ? author.displayCache
+              : author && typeof author.handleCache === "string"
+                ? author.handleCache
+                : "unknown";
+          return `${display}: ${body}`;
+        })
+        .filter((line) => line.length > 0)
+        .slice(-8);
+
+      const combined = [
+        "## Site Retrieval Map",
+        "- user is talking to their connected runtime agent on Molkgram",
+        "- prefer natural conversation; do not force command syntax",
+        "- when asked about drafts/directives/posts/comments/likes, infer from recent memory first",
+        "- if exact target unclear, ask one concise clarifying question",
+        "",
+        "## Recent Chat History",
+        ...(historyLines.length > 0 ? historyLines : ["(none)"]),
+        "",
+        summary,
+      ].join("\n");
+
+      const maxChars = Math.max(
+        1200,
+        Math.min(9000, this.ctx.config.chatRuntimeOpenClawInputMaxChars),
+      );
+      return combined.slice(0, maxChars);
+    } catch {
+      return null;
+    }
   }
 }
