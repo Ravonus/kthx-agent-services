@@ -388,24 +388,18 @@ const main = async (): Promise<void> => {
   ctx.collectRuntimeHashes = collectRuntimeHashes;
 
   // -- OpenClaw wake config
-  // CLI/local wake signaling is always available through hook files.
-  // MG_OPENCLAW_WAKE_URL / MG_OPENCLAW_WAKE_KEY (or config openclaw.wake*) are
-  // optional and only enable outbound webhook forwarding.
-  const configWakeUrl =
-    typeof kthxConfig.openclaw.wakeUrl === "string" &&
-    kthxConfig.openclaw.wakeUrl.trim().length > 0
-      ? kthxConfig.openclaw.wakeUrl.trim()
-      : null;
-  const configWakeKey =
-    typeof kthxConfig.openclaw.wakeToken === "string" &&
-    kthxConfig.openclaw.wakeToken.trim().length > 0
-      ? kthxConfig.openclaw.wakeToken.trim()
-      : null;
+  // v2 runtime is local-only for wake signaling (hook files + queue runner tick).
+  // We intentionally ignore outbound wake webhook URL/token.
   const envWakeUrl = trimEnv("MG_OPENCLAW_WAKE_URL");
   const envWakeKey =
     trimEnv("MG_OPENCLAW_WAKE_KEY") ?? trimEnv("MG_OPENCLAW_WAKE_TOKEN");
-  ctx.openclaw.openClawWakeUrl = envWakeUrl ?? configWakeUrl;
-  ctx.openclaw.openClawWakeKey = envWakeKey ?? configWakeKey;
+  if (envWakeUrl || envWakeKey) {
+    console.log(
+      "[agent-runtime] Ignoring MG_OPENCLAW_WAKE_URL / MG_OPENCLAW_WAKE_KEY; wake is local-only in v2.",
+    );
+  }
+  ctx.openclaw.openClawWakeUrl = null;
+  ctx.openclaw.openClawWakeKey = null;
   const wakeReasons = Array.isArray(kthxConfig.openclaw.wakeReasons)
     ? kthxConfig.openclaw.wakeReasons
         .filter((reason): reason is string => typeof reason === "string")

@@ -93,6 +93,10 @@ export class QueueManager implements QueueManagerLike {
 
   setRunnerEnabled(enabled: boolean): void {
     this.ctx.queue.queueRunnerEnabled = enabled;
+    void this.mutateQueueState((state) => ({
+      ...state,
+      runnerEnabled: enabled,
+    }));
   }
 
   isRunnerEnabled(): boolean {

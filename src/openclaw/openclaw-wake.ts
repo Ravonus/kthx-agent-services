@@ -11,7 +11,6 @@ import crypto from "node:crypto";
 
 import { isRecord } from "../lib/guards.js";
 import { nowIso } from "../lib/text.js";
-import { hmacSha256Hex } from "../lib/crypto.js";
 import { appendJsonLine } from "../lib/fs.js";
 
 // ---------------------------------------------------------------------------
@@ -27,6 +26,8 @@ export interface WakeInput {
   hint: string | null;
   inboxFiles?: string[];
 }
+
+let wakeUrlIgnoredLogged = false;
 
 // ---------------------------------------------------------------------------
 // Wake classification
@@ -213,8 +214,6 @@ export const isActionableWake = (
 // Wake delivery
 // ---------------------------------------------------------------------------
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
-
 export const deliverWakeBody = async (
   bodyPayload: unknown,
   opts: {
@@ -229,26 +228,10 @@ export const deliverWakeBody = async (
     console.warn("[agent-runtime] hook request append failed (non-fatal)", error instanceof Error ? error.message : error);
   });
   await opts.touchWake(opts.hookWakePath);
-  if (!opts.wakeUrl) return;
-  const rawBody = JSON.stringify(bodyPayload);
-  const retryDelaysMs = [250, 1000, 5000];
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < retryDelaysMs.length; attempt += 1) {
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (opts.wakeKey) {
-      const ts = String(Date.now());
-      headers["x-mg-wake-ts"] = ts;
-      headers["x-mg-wake-sig"] = hmacSha256Hex(opts.wakeKey, `${ts}.${rawBody}`);
-    }
-    try {
-      const response = await fetch(opts.wakeUrl, { method: "POST", headers, body: rawBody });
-      if (response.ok) return;
-      lastError = new Error(`wake receiver returned ${response.status}`);
-    } catch (error: unknown) {
-      lastError = error;
-    }
-    const delay = retryDelaysMs[attempt];
-    if (attempt < retryDelaysMs.length - 1 && typeof delay === "number") await sleep(delay);
+  if (opts.wakeUrl && !wakeUrlIgnoredLogged) {
+    wakeUrlIgnoredLogged = true;
+    console.log(
+      "[agent-runtime] Ignoring MG_OPENCLAW_WAKE_URL; wake is local-only in v2.",
+    );
   }
-  console.warn("[agent-runtime] OpenClaw wake POST failed (non-fatal)", lastError instanceof Error ? lastError.message : lastError);
 };
