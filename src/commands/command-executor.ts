@@ -128,6 +128,7 @@ type AgentRouterLike = {
   createStory: AgentMutator;
   commentPost: AgentMutator;
   updateAvatar: AgentMutator;
+  updateBanner: AgentMutator;
   votePost: AgentMutator;
   repostPost: AgentMutator;
   generate: AgentMutator;
@@ -178,6 +179,9 @@ type CommandExecutorContext = {
   queue: QueueTrackingStateLike;
   callAgentChatBridge: ((payload: unknown) => Promise<unknown>) | null;
   callAgentUploadChunk: ((payload: unknown) => Promise<unknown>) | null;
+  runOpenClawPrompt:
+    | ((input: { prompt: string; purpose: string }) => Promise<OpenClawPromptExecutionResult | null>)
+    | null;
 };
 
 type ExecuteResult = {
@@ -201,6 +205,13 @@ type GeneratedDraft = {
 };
 
 type GeneratedAssetType = "image" | "gif" | "pdf" | "csv" | "code" | "file" | "txt" | "md";
+type OpenClawPromptExecutionResult = {
+  parsed: unknown;
+  raw: string;
+  agentName: string | null;
+  payloadText: string | null;
+  envelope: Record<string, unknown> | null;
+};
 type DraftPreviewPayload = {
   body: string;
   summary: string;
@@ -248,6 +259,7 @@ export class CommandExecutor {
       createStory: requireMutator("createStory"),
       commentPost: requireMutator("commentPost"),
       updateAvatar: requireMutator("updateAvatar"),
+      updateBanner: requireMutator("updateBanner"),
       votePost: requireMutator("votePost"),
       repostPost: requireMutator("repostPost"),
       generate: requireMutator("generate"),
@@ -405,6 +417,10 @@ export class CommandExecutor {
     }
     if (kind === "write.updateavatar") {
       const outcome = await this.executeWriteUpdateAvatar(command);
+      return { processed: true, outcome };
+    }
+    if (kind === "write.updatebanner") {
+      const outcome = await this.executeWriteUpdateBanner(command);
       return { processed: true, outcome };
     }
     if (kind === "write.commentpost" || kind === "write.comment") {
@@ -585,6 +601,49 @@ export class CommandExecutor {
     const result = await this.updateAvatarWithFallback({
       target,
       imageUrl: media.mediaUrl,
+      ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
+      ...(media.mediaOptimizedUrl ? { optimizedUrl: media.mediaOptimizedUrl } : {}),
+      ...(media.mediaContentHash ? { contentHash: media.mediaContentHash } : {}),
+      ...(media.mediaIpfsCid ? { ipfsCid: media.mediaIpfsCid } : {}),
+      ...(typeof media.mediaSizeBytes === "number" ? { sizeBytes: media.mediaSizeBytes } : {}),
+      ...(provenance ? { provenance } : {}),
+      ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
+      ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
+    });
+    return this.successOutcome(command, result);
+  }
+
+  private async executeWriteUpdateBanner(command: Command): Promise<CommandOutcome> {
+    const payload = isRecord(command.payload) ? command.payload : null;
+    if (!payload) {
+      return this.failedOutcome(command, "Invalid payload for write.updateBanner.");
+    }
+    const targetRaw = asNonEmptyString(payload.target)?.toLowerCase();
+    const target =
+      targetRaw === "owner" || targetRaw === "for-me" || targetRaw === "for_owner" || targetRaw === "me"
+        ? "owner"
+        : "agent";
+    const provenance = asNonEmptyString(payload.provenance);
+    const sourceDirectiveId =
+      asNonEmptyString(payload.sourceDirectiveId) ??
+      command.sourceDirectiveId ??
+      null;
+    const sourceDirectiveActionNonce =
+      asNonEmptyString(payload.sourceDirectiveActionNonce) ??
+      command.actionNonce ??
+      null;
+
+    const media = await this.resolveMediaUpload({
+      payload,
+      promptFallbacks: [
+        asNonEmptyString(payload.mediaPrompt),
+        asNonEmptyString(payload.imagePrompt),
+        asNonEmptyString(payload.prompt),
+      ],
+    });
+    const result = await this.updateBannerWithFallback({
+      target,
+      bannerUrl: media.mediaUrl,
       ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
       ...(media.mediaOptimizedUrl ? { optimizedUrl: media.mediaOptimizedUrl } : {}),
       ...(media.mediaContentHash ? { contentHash: media.mediaContentHash } : {}),
@@ -837,22 +896,34 @@ export class CommandExecutor {
       );
     }
 
+    const requestedAction = asNonEmptyString(payload.requestedAction)?.toLowerCase() ?? "";
     const avatarRequest =
-      payload.avatarRequest === true ||
-      asNonEmptyString(payload.requestedAction)?.toLowerCase() === "avatar";
+      payload.avatarRequest === true || requestedAction === "avatar";
+    const bannerRequest =
+      !avatarRequest && (payload.bannerRequest === true || requestedAction === "banner");
     const avatarTargetRaw = asNonEmptyString(payload.avatarTarget)?.toLowerCase();
     const avatarTarget = avatarTargetRaw === "owner" ? "owner" : "agent";
+    const bannerTargetRaw = asNonEmptyString(payload.bannerTarget)?.toLowerCase();
+    const bannerTarget = bannerTargetRaw === "owner" ? "owner" : "agent";
     const defaultAvatarPrompt =
       avatarTarget === "owner"
         ? "Create a profile avatar for my account on this social app."
         : "Create a profile avatar for your account on this social app.";
+    const defaultBannerPrompt =
+      bannerTarget === "owner"
+        ? "Create a profile banner for my account on this social app."
+        : "Create a profile banner for your account on this social app.";
     const basePrompt =
       asNonEmptyString(payload.mediaPrompt) ??
       asNonEmptyString(payload.imagePrompt) ??
       asNonEmptyString(payload.prompt) ??
       asNonEmptyString(payload.topic) ??
       asNonEmptyString(payload.requestText) ??
-      (avatarRequest ? defaultAvatarPrompt : null);
+      (avatarRequest
+        ? defaultAvatarPrompt
+        : bannerRequest
+          ? defaultBannerPrompt
+          : null);
     if (!basePrompt) {
       return this.failedOutcome(
         command,
@@ -898,9 +969,21 @@ export class CommandExecutor {
       null;
 
     const generatedAssetType = this.resolveGeneratedAssetType(payload.generatedAssetType);
-    const generatedLabel = generatedAssetType === "gif" ? "GIF" : "image";
+    const generatedLabel =
+      bannerRequest
+        ? "banner"
+        : generatedAssetType === "gif"
+          ? "GIF"
+          : "image";
     try {
-      const media = await this.generateAndUploadMediaFromPrompt(prompt);
+      const media = await this.generateAndUploadMediaFromPrompt(prompt, {
+        generatedAssetType: avatarRequest || bannerRequest ? "image" : generatedAssetType,
+        mode: avatarRequest
+          ? "chat_avatar_update"
+          : bannerRequest
+            ? "chat_banner_update"
+            : "chat_literal_generate",
+      });
       const mimeType = this.resolveGeneratedAttachmentMimeType({
         generatedAssetType,
         mediaUrl: media.mediaUrl,
@@ -996,6 +1079,87 @@ export class CommandExecutor {
           updateResult: avatarResult,
         });
       }
+      if (bannerRequest) {
+        const bannerResult = await this.updateBannerWithFallback({
+          target: bannerTarget,
+          bannerUrl: media.mediaUrl,
+          ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
+          ...(media.mediaOptimizedUrl ? { optimizedUrl: media.mediaOptimizedUrl } : {}),
+          ...(media.mediaContentHash ? { contentHash: media.mediaContentHash } : {}),
+          ...(media.mediaIpfsCid ? { ipfsCid: media.mediaIpfsCid } : {}),
+          ...(typeof media.mediaSizeBytes === "number"
+            ? { sizeBytes: media.mediaSizeBytes }
+            : {}),
+          ...(provenance ? { provenance } : {}),
+          ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
+          ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
+        });
+        const bannerData = isRecord(bannerResult) ? bannerResult : null;
+        const bannerUser = isRecord(bannerData?.user) ? bannerData.user : null;
+        const bannerHandle = asNonEmptyString(bannerUser?.handle);
+        const bannerUserId = asNonEmptyString(bannerUser?.id);
+        const completionText =
+          bannerTarget === "owner"
+            ? "Done. Here is your new banner."
+            : "Done. Here is my new banner.";
+        await this.ctx.callAgentChatBridge({
+          action: "send_message",
+          clientMessageId: `runtime_banner_result_${Date.now().toString(36)}_${crypto
+            .randomUUID()
+            .replaceAll("-", "")
+            .slice(0, 10)}`,
+          ...(chatTarget.conversationId
+            ? { conversationId: chatTarget.conversationId }
+            : { channelId: chatTarget.channelId }),
+          body: completionText,
+          format: "markdown",
+          attachments: [
+            {
+              url: media.mediaUrl,
+              mimeType,
+              sizeBytes,
+              metadata: {
+                source: "runtime.banner",
+                generatedAssetType: "banner",
+              },
+            },
+          ],
+          metadata: {
+            automated: true,
+            sourceContext: "CHAT",
+            actionPreview: {
+              type: "banner",
+              status: "success",
+              title: "Profile banner updated",
+              summary,
+              href: media.mediaUrl,
+              hrefLabel: "Open banner image",
+              bannerTarget,
+              ...(bannerHandle ? { handle: bannerHandle } : {}),
+              ...(bannerUserId ? { userId: bannerUserId } : {}),
+            },
+          },
+        });
+        await this.ctx.memory.recordWrite({
+          type: "chat_banner_updated",
+          at: nowIso(),
+          commandId: command.id,
+          bannerTarget,
+          mediaUrl: media.mediaUrl,
+          prompt: summary,
+          userId: bannerUserId,
+          handle: bannerHandle,
+          targetConversationId: chatTarget.conversationId ?? null,
+          targetChannelId: chatTarget.channelId ?? null,
+        });
+        return this.successOutcome(command, {
+          mode: "chat_banner_update",
+          bannerTarget,
+          mediaUrl: media.mediaUrl,
+          prompt: summary,
+          updateResult: bannerResult,
+        });
+      }
 
       await this.ctx.callAgentChatBridge({
         action: "send_message",
@@ -1050,6 +1214,7 @@ export class CommandExecutor {
       });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
+      const isPromptCurationFailure = /prompt_curation_/iu.test(message);
       await this.ctx.callAgentChatBridge({
         action: "send_message",
         clientMessageId: `runtime_generate_error_${Date.now().toString(36)}_${crypto
@@ -1061,17 +1226,26 @@ export class CommandExecutor {
           : { channelId: chatTarget.channelId }),
         body: avatarRequest
           ? "I could not update that avatar right now. Please retry in a moment."
-          : `I could not generate that ${generatedLabel} right now. Please retry in a moment.`,
+          : bannerRequest
+            ? "I could not update that banner right now. Please retry in a moment."
+          : isPromptCurationFailure
+            ? `I could not prepare a generation prompt for that ${generatedLabel} right now. Please retry in a moment.`
+            : `I could not generate that ${generatedLabel} right now. Please retry in a moment.`,
         format: "markdown",
         metadata: {
           automated: true,
           sourceContext: "CHAT",
           actionPreview: {
-            type: avatarRequest ? "persona" : generatedAssetType,
+            type: avatarRequest ? "persona" : bannerRequest ? "banner" : generatedAssetType,
             status: "failed",
-            title: avatarRequest
-              ? "Avatar update failed"
-              : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
+            title:
+              avatarRequest
+                ? "Avatar update failed"
+                : bannerRequest
+                  ? "Banner update failed"
+                : isPromptCurationFailure
+                  ? "Prompt curation failed"
+                  : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
             error: truncateText(message, 240),
           },
         },
@@ -1082,14 +1256,21 @@ export class CommandExecutor {
         commandId: command.id,
         generatedAssetType,
         avatarRequest,
+        bannerRequest,
         error: message,
       });
       return this.failedOutcome(
         command,
         avatarRequest
           ? `Avatar update failed: ${message}`
+          : bannerRequest
+            ? `Banner update failed: ${message}`
           : `Literal generate failed: ${message}`,
-        avatarRequest ? "avatar_update_failed" : "literal_generate_failed",
+        avatarRequest
+          ? "avatar_update_failed"
+          : bannerRequest
+            ? "banner_update_failed"
+            : "literal_generate_failed",
       );
     }
   }
@@ -1099,6 +1280,7 @@ export class CommandExecutor {
     if (kind === "write.createpost") return this.executeWriteCreatePost(command);
     if (kind === "write.createstory") return this.executeWriteCreateStory(command);
     if (kind === "write.updateavatar") return this.executeWriteUpdateAvatar(command);
+    if (kind === "write.updatebanner") return this.executeWriteUpdateBanner(command);
     if (kind === "write.commentpost" || kind === "write.comment") {
       return this.executeWriteComment(command);
     }
@@ -1159,6 +1341,7 @@ export class CommandExecutor {
 
   private mapGoalToGenerateKind(goal: string): string {
     if (goal === "avatar") return "media";
+    if (goal === "banner") return "media";
     if (goal === "story") return "story";
     if (goal === "thread") return "thread";
     if (goal === "comment" || goal === "reply") return "comment";
@@ -1236,9 +1419,11 @@ export class CommandExecutor {
           ? "write.commentPost"
           : action === "avatar"
             ? "write.updateAvatar"
-          : action === "like"
-            ? "write.votePost"
-            : action === "post"
+            : action === "banner"
+              ? "write.updateBanner"
+            : action === "like"
+              ? "write.votePost"
+              : action === "post"
               ? "write.createPost"
               : null;
     if (!mappedKind) return null;
@@ -1304,7 +1489,10 @@ export class CommandExecutor {
     if (!prompt) {
       throw new Error("no_media_url");
     }
-    return this.generateAndUploadMediaFromPrompt(prompt);
+    return this.generateAndUploadMediaFromPrompt(prompt, {
+      generatedAssetType: this.resolveGeneratedAssetType(payload.generatedAssetType),
+      mode: "write_media_generate",
+    });
   }
 
   private async uploadResolvedMediaSource(source: string): Promise<ResolvedMediaUpload> {
@@ -1445,7 +1633,158 @@ export class CommandExecutor {
     return result;
   }
 
-  private async generateAndUploadMediaFromPrompt(prompt: string): Promise<ResolvedMediaUpload> {
+  private normalizeCuratedMediaPrompt(value: string): string {
+    const unfenced = value
+      .replace(/^```(?:json|text|markdown)?\s*/iu, "")
+      .replace(/```$/u, "")
+      .trim();
+    const unquoted = unfenced.replace(/^["'`]|["'`]$/gu, "").trim();
+    const withoutLabel = unquoted.replace(
+      /^(?:prompt|image prompt|media prompt)\s*:\s*/iu,
+      "",
+    );
+    const withoutGenerationVerb = withoutLabel.replace(
+      /^(?:please\s+)?(?:generate|create|make|draw|render)\s+(?:an?\s+)?(?:image|gif|avatar|file|video|audio|pdf|csv|code|markdown|md|txt)\s*(?:of|for)?\s*:?\s*/iu,
+      "",
+    );
+    return withoutGenerationVerb.trim();
+  }
+
+  private extractCuratedMediaPromptFromUnknown(value: unknown): string | null {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed.length) return null;
+      const parsed = parseJsonFromMixedText(trimmed);
+      if (parsed !== null && parsed !== value) {
+        const fromParsed = this.extractCuratedMediaPromptFromUnknown(parsed);
+        if (fromParsed) return fromParsed;
+      }
+      const normalized = this.normalizeCuratedMediaPrompt(trimmed);
+      return normalized.length > 0 ? normalized : null;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        const extracted = this.extractCuratedMediaPromptFromUnknown(entry);
+        if (extracted) return extracted;
+      }
+      return null;
+    }
+    if (!isRecord(value)) return null;
+
+    const directPromptKeys = [
+      "prompt",
+      "mediaPrompt",
+      "imagePrompt",
+      "filePrompt",
+      "text",
+      "output",
+      "result",
+      "content",
+    ] as const;
+    for (const key of directPromptKeys) {
+      const extracted = this.extractCuratedMediaPromptFromUnknown(value[key]);
+      if (extracted) return extracted;
+    }
+    return null;
+  }
+
+  private buildMediaPromptCurationRequest(input: {
+    sourcePrompt: string;
+    generatedAssetType: GeneratedAssetType;
+    mode: string;
+  }): string {
+    const assetLabel =
+      input.generatedAssetType === "gif"
+        ? "animated GIF"
+        : input.generatedAssetType === "pdf"
+          ? "PDF file"
+          : input.generatedAssetType === "csv"
+            ? "CSV file"
+            : input.generatedAssetType === "code"
+              ? "code file"
+              : input.generatedAssetType === "md"
+                ? "markdown file"
+                : input.generatedAssetType === "txt"
+                  ? "text file"
+                  : input.generatedAssetType === "file"
+                    ? "file"
+                    : "image";
+    return [
+      "You are Clawdbot prompt-crafter for media/file generation.",
+      `Target output type: ${assetLabel}.`,
+      `Execution mode: ${input.mode}.`,
+      "Rewrite the user request into one high-quality generator prompt.",
+      "Return strict JSON only with exactly this shape: {\"prompt\":\"...\"}.",
+      "Rules:",
+      "- Do not include wrappers like \"Generate an image of\".",
+      "- Do not mention social-app internals, APIs, tools, or instructions.",
+      "- Keep it concrete, visual/technical, and production-ready.",
+      "- Preserve user intent and style.",
+      `User request: ${input.sourcePrompt}`,
+    ].join("\n");
+  }
+
+  private async curateMediaPromptWithOpenClaw(input: {
+    sourcePrompt: string;
+    generatedAssetType: GeneratedAssetType;
+    mode: string;
+  }): Promise<string> {
+    const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
+    if (!runOpenClawPrompt) {
+      throw new Error("prompt_curation_unavailable");
+    }
+    const curationPrompt = this.buildMediaPromptCurationRequest(input);
+    const result = await runOpenClawPrompt({
+      prompt: curationPrompt,
+      purpose: "media_prompt_curation",
+    });
+    const curatedPrompt =
+      (result
+        ? this.extractCuratedMediaPromptFromUnknown(result.parsed) ??
+          this.extractCuratedMediaPromptFromUnknown(result.payloadText) ??
+          this.extractCuratedMediaPromptFromUnknown(result.raw)
+        : null) ?? null;
+    if (!curatedPrompt || curatedPrompt.trim().length < 8) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "media_prompt_curation_failed",
+          at: nowIso(),
+          mode: input.mode,
+          generatedAssetType: input.generatedAssetType,
+          sourcePrompt: truncateText(input.sourcePrompt, 220),
+          reason: "openclaw_no_usable_prompt",
+        })
+        .catch(() => undefined);
+      throw new Error("prompt_curation_failed");
+    }
+    await this.ctx.memory
+      .recordWrite({
+        type: "media_prompt_curated",
+        at: nowIso(),
+        mode: input.mode,
+        generatedAssetType: input.generatedAssetType,
+        sourcePrompt: truncateText(input.sourcePrompt, 220),
+        curatedPrompt: truncateText(curatedPrompt, 360),
+      })
+      .catch(() => undefined);
+    return curatedPrompt;
+  }
+
+  private async generateAndUploadMediaFromPrompt(
+    prompt: string,
+    opts?: { generatedAssetType?: GeneratedAssetType; mode?: string },
+  ): Promise<ResolvedMediaUpload> {
+    const sourcePrompt = prompt.trim();
+    if (!sourcePrompt.length) {
+      throw new Error("missing_prompt");
+    }
+    const generatedAssetType = opts?.generatedAssetType ?? "image";
+    const mode = opts?.mode ?? "media_generation";
+    const curatedPrompt = await this.curateMediaPromptWithOpenClaw({
+      sourcePrompt,
+      generatedAssetType,
+      mode,
+    });
     const template = this.ctx.config.imageGenerateCmd;
     if (!template?.trim().length) {
       throw new Error("image_generator_unconfigured");
@@ -1458,7 +1797,7 @@ export class CommandExecutor {
 
     const promptFilePath = path.join(requestDir, "prompt.txt");
     const outputPath = path.join(requestDir, "output.png");
-    await fs.writeFile(promptFilePath, `${prompt}\n`, "utf8").catch(() => undefined);
+    await fs.writeFile(promptFilePath, `${curatedPrompt}\n`, "utf8").catch(() => undefined);
 
     const refs =
       process.platform === "win32"
@@ -1491,12 +1830,15 @@ export class CommandExecutor {
       type: "image_generation_invoked",
       at: nowIso(),
       provider: "command",
-      promptChars: prompt.length,
+      mode,
+      generatedAssetType,
+      sourcePromptChars: sourcePrompt.length,
+      promptChars: curatedPrompt.length,
       commandPreview: command.slice(0, 240),
     }).catch(() => undefined);
 
     const execResult = await this.runShellCommand(command, {
-      MG_IMAGE_PROMPT: prompt,
+      MG_IMAGE_PROMPT: curatedPrompt,
       MG_IMAGE_PROMPT_DIR: requestDir,
       MG_IMAGE_OUTPUT: outputPath,
       MG_IMAGE_PROMPT_FILE: promptFilePath,
@@ -1954,6 +2296,52 @@ export class CommandExecutor {
       }
 
       const updated = await fallbackMutator.mutate({ image: imageUrl });
+      const fallbackUser = isRecord(updated) ? updated : null;
+      return {
+        ok: true,
+        source: "realtime.updateBotProfile",
+        user: fallbackUser
+          ? {
+              id: asNonEmptyString(fallbackUser.id),
+              handle: asNonEmptyString(fallbackUser.handle),
+              name: asNonEmptyString(fallbackUser.name),
+              image: asNonEmptyString(fallbackUser.image),
+              banner: asNonEmptyString(fallbackUser.banner),
+            }
+          : null,
+      };
+    }
+  }
+
+  private async updateBannerWithFallback(
+    input: Record<string, unknown> & { target: string; bannerUrl: string },
+  ): Promise<unknown> {
+    try {
+      return await this.agent().updateBanner.mutate(input);
+    } catch (error) {
+      if (!this.isMissingMutationPathError(error, "agent.updateBanner")) {
+        throw error;
+      }
+      const target = asNonEmptyString(input.target)?.toLowerCase() ?? "agent";
+      if (target !== "agent") {
+        throw new Error(
+          'Owner banner update requires backend support for "agent.updateBanner". Update server and retry.',
+        );
+      }
+
+      const fallbackMutator = this.ctx.trpc?.realtime?.updateBotProfile;
+      if (!fallbackMutator || typeof fallbackMutator.mutate !== "function") {
+        throw new Error(
+          'Banner update fallback unavailable. Missing "realtime.updateBotProfile".',
+        );
+      }
+
+      const bannerUrl = asNonEmptyString(input.bannerUrl);
+      if (!bannerUrl) {
+        throw new Error("Banner update fallback failed: missing banner URL.");
+      }
+
+      const updated = await fallbackMutator.mutate({ banner: bannerUrl });
       const fallbackUser = isRecord(updated) ? updated : null;
       return {
         ok: true,

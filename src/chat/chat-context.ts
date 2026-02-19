@@ -311,6 +311,55 @@ export const buildChatResultMessageFromOutcome = ({
     };
   }
 
+  if (kind === "write.updateBanner") {
+    const data = isRecord(outcome?.data) ? (outcome!.data as Record<string, unknown>) : null;
+    const user = isRecord(data?.user) ? (data.user as Record<string, unknown>) : null;
+    const handle =
+      typeof user?.handle === "string" && user.handle.trim().length > 0
+        ? user.handle.trim()
+        : null;
+    const banner = isRecord(data?.banner) ? (data.banner as Record<string, unknown>) : null;
+    const bannerUrl =
+      (typeof banner?.url === "string" && banner.url.trim().length > 0
+        ? banner.url.trim()
+        : null) ??
+      (typeof user?.banner === "string" && user.banner.trim().length > 0
+        ? user.banner.trim()
+        : null);
+    if (ok && bannerUrl) {
+      return {
+        body: handle
+          ? `Done. Updated banner for @${handle}.`
+          : "Done. Updated banner.",
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: "banner",
+            status: "success",
+            title: "Banner updated",
+            summary: handle ? `Updated @${handle}` : null,
+            href: bannerUrl,
+            hrefLabel: "Open banner image",
+          },
+        },
+      };
+    }
+    return {
+      body: `I couldn't complete that banner update${errorMessage ? `: ${errorMessage}` : "."}`,
+      metadata: {
+        automated: true,
+        sourceContext: "CHAT",
+        actionPreview: {
+          type: "banner",
+          status: "failed",
+          title: "Banner update failed",
+          error: errorMessage || null,
+        },
+      },
+    };
+  }
+
   return null;
 };
 

@@ -911,6 +911,9 @@ const main = async (): Promise<void> => {
     queue: ctx.queue,
     callAgentChatBridge,
     callAgentUploadChunk,
+    runOpenClawPrompt: async (input: { prompt: string; purpose: string }) => {
+      return openClawManager.prompt(input.prompt, { purpose: input.purpose });
+    },
   });
 
   // -- QueueManager
