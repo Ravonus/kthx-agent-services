@@ -589,16 +589,21 @@ const main = async (): Promise<void> => {
       eventType === "directive" ||
       envelope.topic === "director"
     ) {
+      const directivePayload = isRecord(payload.directive)
+        ? payload.directive
+        : payload;
       try {
-        await ctx.directiveManager?.intake(payload);
+        await ctx.directiveManager?.intake(directivePayload);
       } catch (error: unknown) {
         const directiveId =
-          typeof payload.id === "string" && payload.id.trim().length > 0
-            ? payload.id.trim()
+          typeof directivePayload.id === "string" &&
+          directivePayload.id.trim().length > 0
+            ? directivePayload.id.trim()
             : null;
         const kind =
-          typeof payload.kind === "string" && payload.kind.trim().length > 0
-            ? payload.kind.trim()
+          typeof directivePayload.kind === "string" &&
+          directivePayload.kind.trim().length > 0
+            ? directivePayload.kind.trim()
             : null;
         const message = error instanceof Error ? error.message : String(error);
         await memory.recordWrite({
