@@ -846,20 +846,47 @@ export class CommandExecutor {
       avatarTarget === "owner"
         ? "Create a profile avatar for my account on this social app."
         : "Create a profile avatar for your account on this social app.";
-    const prompt =
+    const basePrompt =
       asNonEmptyString(payload.mediaPrompt) ??
       asNonEmptyString(payload.imagePrompt) ??
       asNonEmptyString(payload.prompt) ??
       asNonEmptyString(payload.topic) ??
       asNonEmptyString(payload.requestText) ??
       (avatarRequest ? defaultAvatarPrompt : null);
-    if (!prompt) {
+    if (!basePrompt) {
       return this.failedOutcome(
         command,
         "No prompt provided for literal generate request.",
         "missing_prompt",
       );
     }
+    const recentGeneratedAsset = isRecord(payload.recentGeneratedAsset)
+      ? payload.recentGeneratedAsset
+      : null;
+    const recentGeneratedAssetType =
+      asNonEmptyString(recentGeneratedAsset?.type)?.toLowerCase() ?? "";
+    const recentGeneratedAssetSummary = asNonEmptyString(
+      recentGeneratedAsset?.summary,
+    );
+    const recentGeneratedAssetHref = asNonEmptyString(recentGeneratedAsset?.href);
+    const shouldReusePersonaReference =
+      avatarRequest &&
+      (recentGeneratedAssetType === "persona" ||
+        recentGeneratedAssetType === "avatar");
+    const prompt = shouldReusePersonaReference
+      ? [
+          basePrompt,
+          "Maintain visual persona continuity with the previous avatar.",
+          recentGeneratedAssetSummary
+            ? `Previous persona summary: ${recentGeneratedAssetSummary}`
+            : null,
+          recentGeneratedAssetHref
+            ? `Previous persona reference URL: ${recentGeneratedAssetHref}`
+            : null,
+        ]
+          .filter((entry): entry is string => Boolean(entry))
+          .join("\n")
+      : basePrompt;
     const provenance = asNonEmptyString(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
@@ -885,7 +912,7 @@ export class CommandExecutor {
         media.mediaSizeBytes > 0
           ? Math.max(1, Math.floor(media.mediaSizeBytes))
           : 1;
-      const summary = truncateText(prompt, 220);
+      const summary = truncateText(basePrompt, 220);
       if (avatarRequest) {
         const avatarResult = await this.updateAvatarWithFallback({
           target: avatarTarget,
@@ -927,7 +954,8 @@ export class CommandExecutor {
               sizeBytes,
               metadata: {
                 source: "runtime.avatar",
-                generatedAssetType: "image",
+                generatedAssetType: "persona",
+                personaType: "persona",
               },
             },
           ],
@@ -935,9 +963,9 @@ export class CommandExecutor {
             automated: true,
             sourceContext: "CHAT",
             actionPreview: {
-              type: "avatar",
+              type: "persona",
               status: "success",
-              title: "Avatar updated",
+              title: "Persona avatar updated",
               summary,
               href: media.mediaUrl,
               hrefLabel: "Open avatar image",
@@ -948,16 +976,17 @@ export class CommandExecutor {
           },
         });
         await this.ctx.memory.recordWrite({
-          type: "chat_avatar_updated",
-          at: nowIso(),
-          commandId: command.id,
-          avatarTarget,
-          mediaUrl: media.mediaUrl,
-          prompt: summary,
-          userId: avatarUserId,
-          handle: avatarHandle,
-          targetConversationId: chatTarget.conversationId ?? null,
-          targetChannelId: chatTarget.channelId ?? null,
+            type: "chat_avatar_updated",
+            at: nowIso(),
+            commandId: command.id,
+            avatarTarget,
+            mediaUrl: media.mediaUrl,
+            prompt: summary,
+            personaType: "persona",
+            userId: avatarUserId,
+            handle: avatarHandle,
+            targetConversationId: chatTarget.conversationId ?? null,
+            targetChannelId: chatTarget.channelId ?? null,
         });
         return this.successOutcome(command, {
           mode: "chat_avatar_update",
@@ -1038,7 +1067,7 @@ export class CommandExecutor {
           automated: true,
           sourceContext: "CHAT",
           actionPreview: {
-            type: avatarRequest ? "avatar" : generatedAssetType,
+            type: avatarRequest ? "persona" : generatedAssetType,
             status: "failed",
             title: avatarRequest
               ? "Avatar update failed"

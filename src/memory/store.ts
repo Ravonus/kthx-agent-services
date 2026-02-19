@@ -312,7 +312,17 @@ export class MemoryStore {
     }
 
     const at = activityRecord.activityType;
-    if (at === "read" || at === "comment" || at === "publish_result" || at === "directive_executed") {
+    const shouldRefreshTemporalContext =
+      at === "read" ||
+      at === "comment" ||
+      at === "publish_result" ||
+      at === "directive_executed" ||
+      type === "notification_created" ||
+      type === "post_created" ||
+      (envelope.source === "public" &&
+        typeof envelope.topic === "string" &&
+        envelope.topic.startsWith("feed:"));
+    if (shouldRefreshTemporalContext) {
       void this.refreshTemporalContext({ force: false, allowAgentCompression: false }).catch(() => {});
     }
   }

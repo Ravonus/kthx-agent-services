@@ -123,6 +123,17 @@ const parseRetryAfterMs = (input: {
   return Math.max(1000, input.fallbackMs);
 };
 
+const parseSocketDigestIntervalMs = (
+  envKey: string,
+  fallbackMs: number,
+): number => {
+  const raw = trimEnv(envKey);
+  if (!raw) return fallbackMs;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return fallbackMs;
+  return Math.max(15_000, Math.min(30 * 60_000, Math.floor(parsed)));
+};
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -527,9 +538,65 @@ const main = async (): Promise<void> => {
   ctx.mintManager = mintManager;
 
   // -- Envelope handler (dispatches subscription events to managers)
+  const socketNotificationDigestMinMs = parseSocketDigestIntervalMs(
+    "MG_AGENT_SOCKET_NOTIFICATION_DIGEST_MS",
+    120_000,
+  );
+  const socketFeedDigestMinMs = parseSocketDigestIntervalMs(
+    "MG_AGENT_SOCKET_FEED_DIGEST_MS",
+    180_000,
+  );
+  let lastNotificationDigestAtMs = 0;
+  let lastFeedDigestAtMs = 0;
+  let socketDigestInFlight = false;
+  const maybeRunSocketDigest = (
+    kind: "notifications" | "feed",
+    envelope: {
+      source: "user" | "public";
+      topic: string;
+    },
+    eventType: string,
+  ): void => {
+    const nowMs = Date.now();
+    if (kind === "notifications") {
+      if (
+        socketDigestInFlight ||
+        nowMs - lastNotificationDigestAtMs < socketNotificationDigestMinMs
+      ) {
+        return;
+      }
+      lastNotificationDigestAtMs = nowMs;
+    } else {
+      if (socketDigestInFlight || nowMs - lastFeedDigestAtMs < socketFeedDigestMinMs) {
+        return;
+      }
+      lastFeedDigestAtMs = nowMs;
+    }
+    socketDigestInFlight = true;
+    void memory
+      .refreshTemporalContext({
+        force: false,
+        allowAgentCompression: false,
+      })
+      .then(async () => {
+        await memory.recordWrite({
+          type: "socket_memory_digest_refreshed",
+          at: nowIso(),
+          digestKind: kind,
+          source: envelope.source,
+          topic: envelope.topic,
+          eventType,
+        });
+      })
+      .catch(() => {})
+      .finally(() => {
+        socketDigestInFlight = false;
+      });
+  };
+
   const handleEnvelope = async (envelope: {
     receivedAt: string;
-    source: string;
+    source: "user" | "public";
     topic: string;
     payload: unknown;
   }): Promise<void> => {
@@ -545,6 +612,41 @@ const main = async (): Promise<void> => {
       ...envelope,
       eventType,
     }).catch(() => {});
+
+    const topic = envelope.topic.trim().toLowerCase();
+    const isNotificationEnvelope =
+      eventType === "notification_created" ||
+      topic === "notifications" ||
+      topic.endsWith(":notifications");
+    const isFeedEnvelope =
+      eventType === "post_created" || topic.startsWith("feed:");
+    const isDirectorEnvelope =
+      eventType === "director_directive" ||
+      eventType === "directive" ||
+      eventType === "director_grant" ||
+      eventType === "director_credit" ||
+      topic === "director";
+    const shouldIngestSocketEnvelope =
+      isNotificationEnvelope || isFeedEnvelope || isDirectorEnvelope;
+    if (shouldIngestSocketEnvelope) {
+      // Persist socket envelopes into memory streams so chat replies can drill
+      // into recent notifications/feed activity without extra polling.
+      await memory
+        .ingest({
+          receivedAt: envelope.receivedAt,
+          source: envelope.source,
+          topic: envelope.topic,
+          payload: envelope.payload,
+        })
+        .catch(() => {});
+    }
+
+    if (isNotificationEnvelope) {
+      maybeRunSocketDigest("notifications", envelope, eventType);
+    }
+    if (isFeedEnvelope) {
+      maybeRunSocketDigest("feed", envelope, eventType);
+    }
 
     // Auth state updates
     if (eventType === "auth_state" && isRecord(payload.state)) {

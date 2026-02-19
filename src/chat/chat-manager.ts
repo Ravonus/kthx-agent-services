@@ -19,6 +19,7 @@ import {
   truncateChatReply,
   shouldReplyToChatInboxEntry,
   buildMentionTokens,
+  buildNaturalChatFallbackReply,
 } from "./chat-reply.js";
 import { normalizeInboxEntry, buildAutoReply } from "./chat-intent.js";
 
@@ -241,14 +242,32 @@ export class ChatManager implements ChatManagerLike {
               this.reportSystemProbe(flaggedEntry, reason),
           });
           if (!replyBody.length) {
+            const fallbackReply = buildNaturalChatFallbackReply(
+              entry,
+              this.ctx.config.chatRuntimeReplyMaxChars,
+            );
+            if (!fallbackReply.length) {
+              await this.ctx.memory.recordWrite({
+                type: "chat_runtime_auto_reply_suppressed",
+                at: nowIso(),
+                messageId: entry.messageId,
+                conversationId: entry.conversationId,
+                channelId: entry.channelId,
+                reason: "empty_llm_reply",
+                bodyPreview: toAnswerPreview(entry.body, 140),
+              }).catch(() => undefined);
+              continue;
+            }
+            await this.sendReply(entry, fallbackReply).catch(() => undefined);
+            this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
             await this.ctx.memory.recordWrite({
-              type: "chat_runtime_auto_reply_suppressed",
+              type: "chat_runtime_auto_reply_fallback_sent",
               at: nowIso(),
               messageId: entry.messageId,
               conversationId: entry.conversationId,
               channelId: entry.channelId,
               reason: "empty_llm_reply",
-              bodyPreview: toAnswerPreview(entry.body, 140),
+              replyPreview: toAnswerPreview(fallbackReply, 220),
             }).catch(() => undefined);
             continue;
           }
@@ -275,6 +294,33 @@ export class ChatManager implements ChatManagerLike {
             sourceContext: "CHAT", topic: entry.topic, replyPreview: toAnswerPreview(replyBody, 220),
             replyStreamed: Boolean(streamState), replyStreamNative: Boolean(streamState) && (streamState?.nativeDeltaChars ?? 0) > 0,
           });
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          await this.ctx.memory.recordWrite({
+            type: "chat_runtime_auto_reply_failed",
+            at: nowIso(),
+            message,
+            messageId: entry.messageId,
+            conversationId: entry.conversationId,
+            channelId: entry.channelId,
+            bodyPreview: toAnswerPreview(entry.body, 140),
+          }).catch(() => undefined);
+          const failureReply = truncateChatReply(
+            "I hit a snag handling that right now. Please try again in a moment.",
+            this.ctx.config.chatRuntimeReplyMaxChars,
+          );
+          if (failureReply.length > 0) {
+            await this.sendReply(entry, failureReply).catch(() => undefined);
+            this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
+            await this.ctx.memory.recordWrite({
+              type: "chat_runtime_auto_reply_error_sent",
+              at: nowIso(),
+              messageId: entry.messageId,
+              conversationId: entry.conversationId,
+              channelId: entry.channelId,
+              error: toAnswerPreview(message, 220),
+            }).catch(() => undefined);
+          }
         } finally {
           if (typingSent) await this.setTyping(entry, false).catch(() => undefined);
         }
