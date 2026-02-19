@@ -415,7 +415,10 @@ export class SubscriptionManager implements SubscriptionManagerLike {
 
   private async recoverUnauth(err: unknown): Promise<void> {
     if (this.errCode(err) === "UNAUTHORIZED" && this.ctx.authManager) {
-      await this.ctx.authManager.refreshIfNeeded();
+      await this.ctx.authManager.handleUnauthorized(
+        "subscription_unauthorized",
+        err,
+      );
     }
   }
 

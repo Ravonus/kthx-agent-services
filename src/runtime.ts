@@ -70,6 +70,41 @@ const isCompetingTunnelError = (message: string): boolean => {
   );
 };
 
+const extractErrorCode = (value: unknown): string | null => {
+  if (!isRecord(value)) return null;
+  if (typeof value.code === "string" && value.code.trim().length > 0) {
+    return value.code.trim();
+  }
+  const data = isRecord(value.data) ? value.data : null;
+  if (data && typeof data.code === "string" && data.code.trim().length > 0) {
+    return data.code.trim();
+  }
+  const shape = isRecord(value.shape) ? value.shape : null;
+  if (shape && typeof shape.code === "number") {
+    // tRPC numeric code for UNAUTHORIZED
+    if (shape.code === -32001) return "UNAUTHORIZED";
+  }
+  if (shape && isRecord(shape.data) && typeof shape.data.code === "string") {
+    const code = shape.data.code.trim();
+    if (code.length > 0) return code;
+  }
+  return null;
+};
+
+const isUnauthorizedError = (value: unknown, message: string): boolean => {
+  const code = extractErrorCode(value);
+  if (code === "UNAUTHORIZED") return true;
+  const normalized = message.trim().toLowerCase();
+  if (!normalized.length) return false;
+  return (
+    normalized.includes("unauthorized") ||
+    normalized.includes("bot token invalid") ||
+    normalized.includes("bot token expired") ||
+    normalized.includes("bot token missing") ||
+    normalized.includes("x-bot-session-token")
+  );
+};
+
 // ---------------------------------------------------------------------------
 // Backend call serialization gate
 // ---------------------------------------------------------------------------
@@ -155,6 +190,11 @@ const sendHeartbeat = async (ctx: RuntimeContext): Promise<void> => {
       heartbeatCompetingTunnelBackoffUntilMs =
         Date.now() + COMPETING_TUNNEL_HEARTBEAT_BACKOFF_MS;
       ctx.subscriptionManager?.requestResync("competing_tunnel_backoff");
+    }
+    if (isUnauthorizedError(error, message)) {
+      await ctx.authManager
+        ?.handleUnauthorized("heartbeat_unauthorized", error)
+        .catch(() => {});
     }
     ctx.debugSnapshot.lastHeartbeatError = {
       at: nowIso(),

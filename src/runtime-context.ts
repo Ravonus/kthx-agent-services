@@ -24,7 +24,7 @@ import type { AnyRouter } from "@trpc/server";
 // ---------------------------------------------------------------------------
 
 export interface AuthManagerLike {
-  handleUnauthorized(reason?: string): Promise<void>;
+  handleUnauthorized(reason?: string, error?: unknown): Promise<void>;
   refreshIfNeeded(): Promise<void>;
   getAuthStateValue(): string;
   dispose(): void;

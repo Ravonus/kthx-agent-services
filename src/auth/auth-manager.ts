@@ -124,17 +124,20 @@ export class AuthManager implements AuthManagerLike {
     const errorMessage = error ? getTrpcErrorMessage(error) : null;
 
     const shouldTrackStreak =
-      reason === "heartbeat_unauthorized" || reason === "command_unauthorized";
+      reason === "heartbeat_unauthorized" ||
+      reason === "command_unauthorized" ||
+      reason === "subscription_unauthorized";
     if (shouldTrackStreak) {
       this.ctx.auth.unauthorizedStreak += 1;
     }
 
-    // Hard-invalidate the token after 2+ consecutive heartbeat UNAUTHORIZED
-    // responses with a hard-invalid message.
+    // Hard-invalidate immediately when server says the bot token is invalid/
+    // expired/missing. Avoids heartbeat loops with a stale token.
     const invalidateToken =
-      reason === "heartbeat_unauthorized" &&
       isBotTokenHardInvalidMessage(errorMessage) &&
-      this.ctx.auth.unauthorizedStreak >= 2;
+      (reason === "heartbeat_unauthorized" ||
+        reason === "command_unauthorized" ||
+        reason === "subscription_unauthorized");
 
     await this.ctx.memory.recordWrite({
       type: "auth_unauthorized",
