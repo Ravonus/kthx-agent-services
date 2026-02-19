@@ -60,6 +60,31 @@ const extToMime = (filePath: string): string => {
   return "application/octet-stream";
 };
 
+const mimeToExt = (mime: string): string => {
+  const normalized = mime.trim().toLowerCase();
+  if (normalized === "image/png") return "png";
+  if (normalized === "image/jpeg") return "jpg";
+  if (normalized === "image/webp") return "webp";
+  if (normalized === "image/gif") return "gif";
+  if (normalized === "image/svg+xml") return "svg";
+  if (normalized === "video/mp4") return "mp4";
+  if (normalized === "video/quicktime") return "mov";
+  if (normalized === "video/webm") return "webm";
+  return "bin";
+};
+
+const parseDataUriPayload = (
+  value: string,
+): { mime: string; data: string } | null => {
+  const trimmed = value.trim();
+  const match = /^data:([^;]+);base64,(.+)$/iu.exec(trimmed);
+  if (!match) return null;
+  const mime = match[1]?.trim().toLowerCase() ?? "";
+  const data = match[2]?.trim() ?? "";
+  if (!mime.length || !data.length) return null;
+  return { mime, data };
+};
+
 const buildExecutionDigest = (command: Command, ok: boolean, error: string | null): string =>
   crypto
     .createHash("sha256")
@@ -131,6 +156,7 @@ type CommandExecutorContext = {
   controlKey: string | null;
   queue: QueueTrackingStateLike;
   callAgentChatBridge: ((payload: unknown) => Promise<unknown>) | null;
+  callAgentUploadChunk: ((payload: unknown) => Promise<unknown>) | null;
 };
 
 type ExecuteResult = {
@@ -577,8 +603,7 @@ export class CommandExecutor {
     }
 
     const executedOutcomes: CommandOutcome[] = [];
-    for (let index = 0; index < drafts.length; index += 1) {
-      const draft = drafts[index];
+    for (const draft of drafts) {
       if (!draft) continue;
       const draftCommand = this.mapDraftToWriteCommand({
         draft,
@@ -588,7 +613,6 @@ export class CommandExecutor {
         provenance,
       });
       if (!draftCommand) continue;
-      // eslint-disable-next-line no-await-in-loop
       const outcome = await this.executeCommandFromMappedDraft(draftCommand);
       executedOutcomes.push(outcome);
       if (!outcome.ok) {
@@ -827,6 +851,18 @@ export class CommandExecutor {
   private async uploadResolvedMediaSource(source: string): Promise<ResolvedMediaUpload> {
     const trimmed = source.trim();
     if (isDataUri(trimmed)) {
+      const parsed = parseDataUriPayload(trimmed);
+      if (parsed) {
+        const bytes = Buffer.from(parsed.data, "base64");
+        if (bytes.byteLength > 0) {
+          const uploadedByChunk = await this.uploadBytesViaChunkRoute({
+            bytes,
+            mimeType: parsed.mime,
+            filename: `upload-${Date.now()}.${mimeToExt(parsed.mime)}`,
+          });
+          if (uploadedByChunk) return uploadedByChunk;
+        }
+      }
       const uploaded = await this.agent().uploadDataUri.mutate({ dataUri: trimmed });
       return this.mapUploadResult(uploaded);
     }
@@ -840,9 +876,82 @@ export class CommandExecutor {
       throw new Error("media_source_empty");
     }
     const mime = extToMime(localPath);
+    const uploadedByChunk = await this.uploadBytesViaChunkRoute({
+      bytes,
+      mimeType: mime,
+      filename: path.basename(localPath) || `upload-${Date.now()}.${mimeToExt(mime)}`,
+    });
+    if (uploadedByChunk) return uploadedByChunk;
     const dataUri = `data:${mime};base64,${bytes.toString("base64")}`;
     const uploaded = await this.agent().uploadDataUri.mutate({ dataUri });
     return this.mapUploadResult(uploaded);
+  }
+
+  private async uploadBytesViaChunkRoute(input: {
+    bytes: Buffer;
+    mimeType: string;
+    filename: string;
+  }): Promise<ResolvedMediaUpload | null> {
+    const callAgentUploadChunk = this.ctx.callAgentUploadChunk;
+    if (!callAgentUploadChunk) return null;
+    const totalBytes = input.bytes.byteLength;
+    if (!totalBytes) return null;
+    let uploadId: string | null = null;
+    try {
+      const started = await callAgentUploadChunk({
+        op: "start",
+        filename: input.filename,
+        mimeType: input.mimeType,
+        totalBytes,
+      });
+      if (!isRecord(started) || typeof started.uploadId !== "string") {
+        throw new Error("chunk_upload_start_invalid");
+      }
+      uploadId = started.uploadId.trim();
+      if (!uploadId.length) {
+        throw new Error("chunk_upload_start_missing_id");
+      }
+      const chunkMaxBytes =
+        typeof started.chunkMaxBytes === "number" &&
+        Number.isFinite(started.chunkMaxBytes)
+          ? Math.max(64 * 1024, Math.floor(started.chunkMaxBytes))
+          : 256 * 1024;
+      let chunkIndex = 0;
+      for (let offset = 0; offset < totalBytes; offset += chunkMaxBytes) {
+        const end = Math.min(totalBytes, offset + chunkMaxBytes);
+        const chunk = input.bytes.subarray(offset, end);
+        await callAgentUploadChunk({
+          op: "append",
+          uploadId,
+          chunkIndex,
+          chunkBase64: chunk.toString("base64"),
+        });
+        chunkIndex += 1;
+      }
+      const completed = await callAgentUploadChunk({
+        op: "complete",
+        uploadId,
+      });
+      return this.mapUploadResult(completed);
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "chunk_upload_failed",
+          at: nowIso(),
+          filename: input.filename,
+          sizeBytes: totalBytes,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      if (uploadId) {
+        await callAgentUploadChunk({
+          op: "abort",
+          uploadId,
+        })
+          .catch(() => undefined);
+      }
+      return null;
+    }
   }
 
   private mapUploadResult(uploaded: unknown): ResolvedMediaUpload {
@@ -879,7 +988,7 @@ export class CommandExecutor {
 
   private async generateAndUploadMediaFromPrompt(prompt: string): Promise<ResolvedMediaUpload> {
     const template = this.ctx.config.imageGenerateCmd;
-    if (!template || !template.trim().length) {
+    if (!template?.trim().length) {
       throw new Error("image_generator_unconfigured");
     }
     const requestDir = path.join(
@@ -1178,7 +1287,7 @@ export class CommandExecutor {
     outcome: CommandOutcome,
   ): Promise<void> {
     const directiveId = command.sourceDirectiveId ?? command.id;
-    if (!directiveId || !directiveId.trim().length) return;
+    if (!directiveId?.trim().length) return;
     const executionDigest = buildExecutionDigest(
       command,
       outcome.ok,

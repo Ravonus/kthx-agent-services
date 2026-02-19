@@ -683,6 +683,7 @@ const main = async (): Promise<void> => {
     ) || 15_000,
   );
   let chatBridgeRateLimitedUntilMs = 0;
+  let chunkUploadRateLimitedUntilMs = 0;
   const callAgentChatBridge = async (payload: unknown): Promise<unknown> => {
     const nowMs = Date.now();
     if (chatBridgeRateLimitedUntilMs > nowMs) {
@@ -736,6 +737,55 @@ const main = async (): Promise<void> => {
     throw new Error(`agent chat bridge request failed: ${errorMessage}`);
   };
 
+  const callAgentUploadChunk = async (payload: unknown): Promise<unknown> => {
+    const nowMs = Date.now();
+    if (chunkUploadRateLimitedUntilMs > nowMs) {
+      throw new Error(
+        `agent chunk upload request rate-limited (${chunkUploadRateLimitedUntilMs - nowMs}ms remaining)`,
+      );
+    }
+    const botToken = await getBotToken();
+    const response = await fetch(`${chatApiBaseUrl}/api/agent/upload/chunk`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(agentKeyBox
+          ? { "x-agent-key-box": agentKeyBox }
+          : { "x-agent-key": agentKey ?? "" }),
+        ...(botToken ? { "x-bot-session-token": botToken } : {}),
+      },
+      body: JSON.stringify(payload),
+    });
+    const body = (await response.json().catch(() => null)) as unknown;
+    if (response.ok) {
+      chunkUploadRateLimitedUntilMs = 0;
+      return body;
+    }
+    if (response.status === 429) {
+      const retryAfterMs = parseRetryAfterMs({
+        response,
+        body,
+        fallbackMs: chatBridgeRateLimitRetryFallbackMs,
+      });
+      chunkUploadRateLimitedUntilMs = Math.max(
+        chunkUploadRateLimitedUntilMs,
+        Date.now() + retryAfterMs,
+      );
+      const errorMessage =
+        isRecord(body) && typeof body.error === "string"
+          ? body.error
+          : "Too many requests";
+      throw new Error(
+        `agent chunk upload request rate-limited: ${errorMessage} (retryAfterMs=${retryAfterMs})`,
+      );
+    }
+    const errorMessage =
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : `HTTP ${response.status}`;
+    throw new Error(`agent chunk upload request failed: ${errorMessage}`);
+  };
+
   const commandExecutor = new CommandExecutor({
     config: {
       imageGenerateCmd: config.imageGenerateCmd,
@@ -758,6 +808,7 @@ const main = async (): Promise<void> => {
     controlKey: ctx.misc.controlKey,
     queue: ctx.queue,
     callAgentChatBridge,
+    callAgentUploadChunk,
   });
 
   // -- QueueManager

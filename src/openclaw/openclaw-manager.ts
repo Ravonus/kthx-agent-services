@@ -100,6 +100,17 @@ export interface OpenClawPromptResult {
 // ---------------------------------------------------------------------------
 
 const OPENCLAW_ANSI_PATTERN = /\u001b\[[0-9;]*[A-Za-z]/gu;
+const DEFAULT_MINT_CHALLENGE_TIMEOUT_MS = 25_000;
+
+const parseMintChallengeTimeoutMs = (): number => {
+  const raw = trimEnv("MG_AGENT_MINT_CHALLENGE_OPENCLAW_TIMEOUT_MS");
+  if (!raw) return DEFAULT_MINT_CHALLENGE_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_MINT_CHALLENGE_TIMEOUT_MS;
+  return Math.max(8_000, Math.min(60_000, parsed));
+};
+
+const MINT_CHALLENGE_TIMEOUT_MS = parseMintChallengeTimeoutMs();
 
 const stripEmptyAgentFlag = (command: string): string =>
   command
@@ -241,6 +252,7 @@ export class OpenClawManager implements OpenClawManagerLike {
     opts?: { purpose?: string; onTextDelta?: ((delta: string) => void) | null },
   ): Promise<OpenClawPromptResult | null> {
     const purpose = opts?.purpose ?? "general";
+    const isMintChallenge = purpose === "mint_challenge";
     const onTextDelta = opts?.onTextDelta ?? null;
     const ocConfig = this.ctx.openclawConfig();
     if (!ocConfig || !ocConfig.enabled) {
@@ -252,7 +264,9 @@ export class OpenClawManager implements OpenClawManagerLike {
       await this.ctx.memory.recordWrite({ type: "openclaw_prompt_skipped", at: nowIso(), purpose, reason: "missing_template" });
       return null;
     }
-    const agentName = await this.resolveAgentName();
+    // Mint challenge solving is latency-sensitive and should not wait on
+    // shared agent resolution. Use a direct subprocess with no --agent pin.
+    const agentName = isMintChallenge ? null : await this.resolveAgentName();
     const resolvedPrompt = typeof input === "string" ? input.trim() : "";
     if (!resolvedPrompt.length) {
       await this.ctx.memory.recordWrite({ type: "openclaw_prompt_skipped", at: nowIso(), purpose, reason: "empty_prompt" });
@@ -263,19 +277,28 @@ export class OpenClawManager implements OpenClawManagerLike {
       template.replaceAll("{prompt}", promptForCommand),
       agentName, this.ctx.config,
     );
-    const timeoutMs = typeof ocConfig.timeoutMs === "number" && Number.isFinite(ocConfig.timeoutMs)
-      ? Math.max(15_000, Math.floor(ocConfig.timeoutMs)) : 120_000;
+    const configuredTimeoutMs =
+      typeof ocConfig.timeoutMs === "number" && Number.isFinite(ocConfig.timeoutMs)
+        ? Math.max(15_000, Math.floor(ocConfig.timeoutMs))
+        : 120_000;
+    const timeoutMs = isMintChallenge
+      ? Math.min(configuredTimeoutMs, MINT_CHALLENGE_TIMEOUT_MS)
+      : configuredTimeoutMs;
     const allowNativeTextStreaming = purpose === "chat_reply"
       && this.ctx.config.chatRuntimeTextStreamEnabled
       && this.ctx.config.chatRuntimeTextStreamNativeEnabled
       && typeof onTextDelta === "function";
-    const result = await this.runLockedShellCommand({
+    const runCommand = isMintChallenge
+      ? this.runShellCommand.bind(this)
+      : this.runLockedShellCommand.bind(this);
+    const result = await runCommand({
       command, timeoutMs,
       ...(allowNativeTextStreaming ? { onStdoutData: (chunk: string) => { const delta = parseOpenClawStdoutDelta(chunk); if (delta.length) onTextDelta(delta); } } : {}),
     });
     await this.ctx.memory.recordWrite({
       type: "openclaw_prompt_result", at: nowIso(), purpose, ok: result.ok,
       code: result.code, agentName: agentName ?? null,
+      executionMode: isMintChallenge ? "direct_subprocess" : "locked_subprocess",
       commandPreview: toAnswerPreview(command, 180), stderrPreview: toAnswerPreview(result.stderr, 180),
     });
     if (!result.ok) return null;
