@@ -683,6 +683,7 @@ export class CommandExecutor {
       ...(provenance ? { provenance } : {}),
       ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
       ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
+      ...(command.grantId ? { grantId: command.grantId } : {}),
     });
     return this.successOutcome(command, result);
   }
@@ -1347,6 +1348,7 @@ export class CommandExecutor {
       ...(provenance ? { provenance } : {}),
       ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
       ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
+      ...(command.grantId ? { grantId: command.grantId } : {}),
     };
   }
 
