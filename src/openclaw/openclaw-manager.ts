@@ -100,14 +100,14 @@ export interface OpenClawPromptResult {
 // ---------------------------------------------------------------------------
 
 const OPENCLAW_ANSI_PATTERN = /\u001b\[[0-9;]*[A-Za-z]/gu;
-const DEFAULT_MINT_CHALLENGE_TIMEOUT_MS = 25_000;
+const DEFAULT_MINT_CHALLENGE_TIMEOUT_MS = 45_000;
 
 const parseMintChallengeTimeoutMs = (): number => {
   const raw = trimEnv("MG_AGENT_MINT_CHALLENGE_OPENCLAW_TIMEOUT_MS");
   if (!raw) return DEFAULT_MINT_CHALLENGE_TIMEOUT_MS;
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed)) return DEFAULT_MINT_CHALLENGE_TIMEOUT_MS;
-  return Math.max(8_000, Math.min(60_000, parsed));
+  return Math.max(10_000, Math.min(90_000, parsed));
 };
 
 const MINT_CHALLENGE_TIMEOUT_MS = parseMintChallengeTimeoutMs();

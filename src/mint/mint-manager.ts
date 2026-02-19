@@ -68,6 +68,13 @@ const errCode = (e: unknown): string | null => {
 const errMsg = (e: unknown): string =>
   e instanceof Error ? e.message : typeof e === "string" ? e : "unknown error";
 
+const MINT_CHALLENGE_SOLVER_MAX_ATTEMPTS = 3;
+const MINT_CHALLENGE_SOLVER_RETRY_DELAY_MS = 800;
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
 interface MintDebug {
   updatedAt: string; inFlight: boolean; reason: string | null;
   challengeId: string | null; promptToken: string | null;
@@ -209,6 +216,13 @@ export class MintManager implements MintManagerLike {
       const instr = sanitizeChallengePromptText(rawInstr) || "Solve mint challenge";
       const ansType = isRecord(r.challenge) && typeof (r.challenge as Record<string, unknown>).answerType === "string"
         ? ((r.challenge as Record<string, unknown>).answerType as string).trim().toLowerCase() : null;
+      await this.trace({
+        type: "mint_challenge_received",
+        challengeId: cid,
+        promptToken: cpt ?? null,
+        answerType: ansType,
+        attemptsUsed: answered,
+      });
       if (ansType === "multiple_choice" || isMultipleChoiceChallengeInstruction(instr)) {
         if (this.ctx.config.rejectMultipleChoiceChallenges) throw new Error("Multiple-choice challenges rejected by runtime config.");
         await this.ctx.memory.recordWrite({ type: "bot_token_mint_challenge_multiple_choice_compat", at: nowIso(), challengeId: cid, challengeAnswerType: ansType, instruction: toAnswerPreview(instr, 180) });
@@ -220,16 +234,63 @@ export class MintManager implements MintManagerLike {
       await this.ctx.memory.recordWrite({ type: "bot_token_mint_challenge_required", reason, at: nowIso(), challengeId: cid, instruction: instr });
       const chCtx = this.chalCtx();
       const instrTok = cpt?.trim().length ? `${instr} [questionToken: ${cpt.trim()}]` : instr;
-      const answer = await answerChallengeWithOpenClaw(chCtx, {
-        challengeId: cid,
-        promptToken: cpt,
-        instruction: instrTok,
-        attemptsUsed: answered,
-      });
-      if (!answer) throw new Error("Mint challenge answer is required from OpenClaw.");
+      let answer: string | null = null;
+      for (
+        let solverAttempt = 1;
+        solverAttempt <= MINT_CHALLENGE_SOLVER_MAX_ATTEMPTS && !answer;
+        solverAttempt += 1
+      ) {
+        await this.trace({
+          type: "mint_answer_generate_attempt",
+          challengeId: cid,
+          solverAttempt,
+          attemptsUsed: answered,
+        });
+        answer = await answerChallengeWithOpenClaw(chCtx, {
+          challengeId: cid,
+          promptToken: cpt,
+          instruction: instrTok,
+          attemptsUsed: answered,
+        });
+        if (answer) {
+          await this.trace({
+            type: "mint_answer_generate_success",
+            challengeId: cid,
+            solverAttempt,
+            answerPreview: toAnswerPreview(answer),
+          });
+          break;
+        }
+        await this.trace({
+          type: "mint_answer_generate_empty",
+          challengeId: cid,
+          solverAttempt,
+        });
+        if (solverAttempt < MINT_CHALLENGE_SOLVER_MAX_ATTEMPTS) {
+          await sleep(MINT_CHALLENGE_SOLVER_RETRY_DELAY_MS);
+        }
+      }
+      if (!answer) {
+        throw new Error(
+          "Mint challenge answer unavailable from OpenClaw after solver retries.",
+        );
+      }
       await this.trace({ type: "mint_answer_submitted", challengeId: cid, answerPreview: toAnswerPreview(answer) });
       answered += 1;
+      await this.trace({
+        type: "mint_verify_request",
+        challengeId: cid,
+        promptToken: cpt ?? null,
+        hasAnswer: true,
+      });
       issued = await this.reqMint(cid, answer, cpt, false, instr);
+      await this.trace({
+        type: "mint_verify_response",
+        challengeId: cid,
+        challengeRequired: Boolean(
+          isRecord(issued) && (issued as Record<string, unknown>).challengeRequired,
+        ),
+      });
       if (issued && (issued as Record<string, unknown>).challengeRequired) {
         const attemptsRemainingRaw =
           typeof (issued as Record<string, unknown>).attemptsRemaining === "number"
@@ -255,7 +316,9 @@ export class MintManager implements MintManagerLike {
         }
         if (exhausted) throw new Error(`Mint challenge not accepted after ${answered} attempt${answered === 1 ? "" : "s"}. Run \`mint retry\`.`);
         if ((issued as Record<string, unknown>).retryRequired === true) {
-          issued = await this.reqMint(null, null, null, true, null);
+          // Server asks for explicit retry; keep the current challenge flow
+          // instead of forcing a new challenge issuance.
+          issued = await this.reqMint(null, null, null, false, null);
         }
       }
     }
@@ -329,7 +392,16 @@ export class MintManager implements MintManagerLike {
       attestation: this.ctx.getRuntimeAttestation(this.ctx.config.connectionId),
     });
     const serial = ++m.mintAttemptSerial;
-    await this.trace({ type: "mint_request", requestSerial: serial, challengeId: cid, hasAnswer: normAns.length > 0, refreshChallenge: refresh });
+    await this.trace({
+      type: "mint_request",
+      requestSerial: serial,
+      challengeId: cid,
+      hasAnswer: normAns.length > 0,
+      answerLength: normAns.length,
+      hasPromptToken:
+        Boolean(cid && normAns.length > 0 && typeof pt === "string" && pt.trim().length > 0),
+      refreshChallenge: refresh,
+    });
     try {
       const res = await this.ctx.runBackendCall("realtime.mintBotToken.mutate", () => this.ctx.trpc!.realtime.mintBotToken.mutate(input()));
       this.ctx.markWsActivity("mint_response");

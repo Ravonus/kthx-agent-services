@@ -106,54 +106,93 @@ export const answerChallengeWithOpenClaw = async (
 ): Promise<string | null> => {
   if (!ctx.config.mintChallengeUseOpenClaw || !ctx.runOpenClawPrompt) return null;
   const qt = typeof params.promptToken === "string" && params.promptToken.trim().length > 0 ? params.promptToken.trim() : "n/a";
-  const prompt = [
-    "You are solving a Molkgram bot-session mint challenge.", "Rules:",
-    "- Solve from provided prompt text only.", "- No web lookup, browsing, or external tool use.",
-    `- Return answer with at most ${ctx.config.challengeAnswerMaxChars} characters.`,
-    "- Do not ask follow-up questions.",
-    "- Do not explain your reasoning.",
-    "- If uncertain, return your single best short answer immediately.",
-    '- Return JSON only: {"answer":"<challenge answer>"}', "",
-    `challengeId=${params.challengeId}`, `questionToken=${qt}`,
-    `attempt=${params.attemptsUsed + 1}`, `instruction=${params.instruction}`,
-  ].join("\n");
-  const res = await ctx.runOpenClawPrompt({ prompt, purpose: "mint_challenge" });
-  const parsed = isRecord(res?.parsed) ? res.parsed : null;
-  const parsedAnswer =
-    typeof parsed?.answer === "string" && (parsed.answer as string).trim().length > 0
-      ? (parsed.answer as string).trim()
-      : "";
-  const parsedReply =
-    typeof parsed?.reply === "string" && (parsed.reply as string).trim().length > 0
-      ? (parsed.reply as string).trim()
-      : "";
-  const parsedText =
-    typeof parsed?.text === "string" && (parsed.text as string).trim().length > 0
-      ? (parsed.text as string).trim()
-      : "";
-  const payloadText =
-    typeof res?.payloadText === "string" && res.payloadText.trim().length > 0
-      ? res.payloadText.trim()
-      : "";
-  const rawText =
-    typeof res?.raw === "string" && res.raw.trim().length > 0
-      ? res.raw.trim()
-      : "";
-  const callbackText = ctx.parseChatOpenClawReply ? ctx.parseChatOpenClawReply(res) : "";
-  const raw =
-    parsedAnswer ||
-    callbackText ||
-    parsedReply ||
-    parsedText ||
-    payloadText ||
-    rawText;
-  const norm = normalizeChallengeAnswerForSubmit(raw, ctx.config.challengeAnswerMaxChars);
-  if (!norm.length || isConsoleCommandLikeAnswer(norm)) {
-    await ctx.appendMintTrace({ type: "mint_answer_openclaw_unusable", challengeId: params.challengeId, promptToken: params.promptToken ?? null, answerPreview: toAnswerPreview(raw) });
-    await ctx.memory.recordWrite({ type: "bot_token_mint_challenge_openclaw_unusable", at: nowIso(), challengeId: params.challengeId, answerPreview: toAnswerPreview(raw) });
-    return null;
+  const prompts = [
+    [
+      "You are solving a Molkgram bot-session mint challenge.", "Rules:",
+      "- Solve from provided prompt text only.", "- No web lookup, browsing, or external tool use.",
+      `- Return answer with at most ${ctx.config.challengeAnswerMaxChars} characters.`,
+      "- Do not ask follow-up questions.",
+      "- Do not explain your reasoning.",
+      "- If uncertain, return your single best short answer immediately.",
+      '- Return JSON only: {"answer":"<challenge answer>"}', "",
+      `challengeId=${params.challengeId}`, `questionToken=${qt}`,
+      `attempt=${params.attemptsUsed + 1}`, `instruction=${params.instruction}`,
+    ].join("\n"),
+    [
+      "Molkgram mint challenge retry.", "Return only final answer text (no JSON, no explanation).",
+      `Max chars: ${ctx.config.challengeAnswerMaxChars}.`,
+      `challengeId=${params.challengeId}`,
+      `questionToken=${qt}`,
+      `instruction=${params.instruction}`,
+    ].join("\n"),
+  ];
+
+  let lastRaw = "";
+  for (let i = 0; i < prompts.length; i += 1) {
+    const prompt = prompts[i]!;
+    const res = await ctx.runOpenClawPrompt({ prompt, purpose: "mint_challenge" });
+    const parsed = isRecord(res?.parsed) ? res.parsed : null;
+    const parsedAnswer =
+      typeof parsed?.answer === "string" && (parsed.answer as string).trim().length > 0
+        ? (parsed.answer as string).trim()
+        : typeof parsed?.answer === "number" && Number.isFinite(parsed.answer)
+          ? String(parsed.answer)
+          : "";
+    const parsedReply =
+      typeof parsed?.reply === "string" && (parsed.reply as string).trim().length > 0
+        ? (parsed.reply as string).trim()
+        : "";
+    const parsedText =
+      typeof parsed?.text === "string" && (parsed.text as string).trim().length > 0
+        ? (parsed.text as string).trim()
+        : "";
+    const payloadText =
+      typeof res?.payloadText === "string" && res.payloadText.trim().length > 0
+        ? res.payloadText.trim()
+        : "";
+    const rawText =
+      typeof res?.raw === "string" && res.raw.trim().length > 0
+        ? res.raw.trim()
+        : "";
+    const callbackText = ctx.parseChatOpenClawReply ? ctx.parseChatOpenClawReply(res) : "";
+    const raw =
+      parsedAnswer ||
+      callbackText ||
+      parsedReply ||
+      parsedText ||
+      payloadText ||
+      rawText;
+    lastRaw = raw;
+    const norm = normalizeChallengeAnswerForSubmit(raw, ctx.config.challengeAnswerMaxChars);
+    if (norm.length > 0 && !isConsoleCommandLikeAnswer(norm)) {
+      await ctx.appendMintTrace({
+        type: "mint_answer_openclaw_generated",
+        challengeId: params.challengeId,
+        promptToken: params.promptToken ?? null,
+        solverAttempt: i + 1,
+        answerPreview: toAnswerPreview(norm),
+      });
+      await ctx.memory.recordWrite({
+        type: "bot_token_mint_challenge_openclaw_generated",
+        at: nowIso(),
+        challengeId: params.challengeId,
+        solverAttempt: i + 1,
+        answerPreview: toAnswerPreview(norm),
+      });
+      return norm;
+    }
   }
-  await ctx.appendMintTrace({ type: "mint_answer_openclaw_generated", challengeId: params.challengeId, promptToken: params.promptToken ?? null, answerPreview: toAnswerPreview(norm) });
-  await ctx.memory.recordWrite({ type: "bot_token_mint_challenge_openclaw_generated", at: nowIso(), challengeId: params.challengeId, answerPreview: toAnswerPreview(norm) });
-  return norm;
+  await ctx.appendMintTrace({
+    type: "mint_answer_openclaw_unusable",
+    challengeId: params.challengeId,
+    promptToken: params.promptToken ?? null,
+    answerPreview: toAnswerPreview(lastRaw),
+  });
+  await ctx.memory.recordWrite({
+    type: "bot_token_mint_challenge_openclaw_unusable",
+    at: nowIso(),
+    challengeId: params.challengeId,
+    answerPreview: toAnswerPreview(lastRaw),
+  });
+  return null;
 };
