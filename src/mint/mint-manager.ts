@@ -70,6 +70,9 @@ const errMsg = (e: unknown): string =>
 
 const MINT_CHALLENGE_SOLVER_MAX_ATTEMPTS = 3;
 const MINT_CHALLENGE_SOLVER_RETRY_DELAY_MS = 800;
+const MINT_MAX_CHALLENGE_STEPS_PER_FLOW = 12;
+const MINT_MAX_SOLVER_FLOW_FAILS_PER_CHALLENGE = 3;
+const MINT_PENDING_CHALLENGE_EXPIRY_SKEW_MS = 1_000;
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -78,10 +81,27 @@ const sleep = (ms: number): Promise<void> =>
 interface MintDebug {
   updatedAt: string; inFlight: boolean; reason: string | null;
   challengeId: string | null; promptToken: string | null;
+  pendingChallengeId: string | null; pendingPromptToken: string | null;
+  pendingChallengeExpiresAt: string | null;
+  pendingChallengeInstruction: string | null;
+  pendingChallengeAnswerType: string | null;
+  pendingChallengeAttemptsRemaining: number | null;
+  pendingChallengeSolverFailures: number;
   attemptSerial: number; attemptsInCurrentFlow: number;
   lastRequest: Record<string, unknown> | null;
   lastResponse: Record<string, unknown> | null;
   lastError: Record<string, unknown> | null;
+}
+
+interface PendingMintChallenge {
+  challengeId: string;
+  promptToken: string | null;
+  instruction: string;
+  answerType: string | null;
+  attemptsRemaining: number | null;
+  expiresAt: string | null;
+  expiresAtMs: number | null;
+  solverFailures: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -93,12 +113,19 @@ export class MintManager implements MintManagerLike {
   private readonly dbg: MintDebug = {
     updatedAt: nowIso(), inFlight: false, reason: null,
     challengeId: null, promptToken: null, attemptSerial: 0,
+    pendingChallengeId: null, pendingPromptToken: null, pendingChallengeExpiresAt: null,
+    pendingChallengeInstruction: null, pendingChallengeAnswerType: null,
+    pendingChallengeAttemptsRemaining: null, pendingChallengeSolverFailures: 0,
     attemptsInCurrentFlow: 0, lastRequest: null, lastResponse: null, lastError: null,
   };
+  private pendingChallenge: PendingMintChallenge | null = null;
 
   constructor(ctx: MintManagerContext) { this.ctx = ctx }
 
-  async initialize(): Promise<void> { await this.writeDbg() }
+  async initialize(): Promise<void> {
+    await this.restorePendingChallengeFromDebug();
+    await this.writeDbg();
+  }
 
   // -- Public API ----------------------------------------------------------
 
@@ -142,6 +169,7 @@ export class MintManager implements MintManagerLike {
     m.activeMintChallengeId = null;
     m.activeMintPromptToken = null;
     m.activeMintReason = null;
+    this.clearPendingChallenge();
   }
 
   dispose(): void { this.cancelActiveMint() }
@@ -200,11 +228,44 @@ export class MintManager implements MintManagerLike {
   private async mintOverSocket(reason: string): Promise<{ token: string; alreadyConnected: boolean } | null> {
     if (!this.ctx.trpc) throw new Error("tRPC client not available for mintBotToken.");
     const fresh = reason === "console_mint_retry";
-    let issued = await this.reqMint(null, null, null, fresh, null);
+    if (fresh) {
+      this.clearPendingChallenge();
+    }
+    let issued: unknown;
+    const resumableChallenge = fresh ? null : this.getResumablePendingChallenge();
+    if (resumableChallenge) {
+      issued = {
+        challengeRequired: true,
+        challengeId: resumableChallenge.challengeId,
+        promptToken: resumableChallenge.promptToken,
+        instruction: resumableChallenge.instruction,
+        challenge: resumableChallenge.answerType
+          ? { answerType: resumableChallenge.answerType }
+          : undefined,
+        attemptsRemaining: resumableChallenge.attemptsRemaining,
+      };
+      await this.trace({
+        type: "mint_challenge_resume_local",
+        reason,
+        challengeId: resumableChallenge.challengeId,
+        promptToken: resumableChallenge.promptToken,
+        expiresAt: resumableChallenge.expiresAt,
+        attemptsRemaining: resumableChallenge.attemptsRemaining,
+      });
+    } else {
+      issued = await this.reqMint(null, null, null, fresh, null);
+    }
     if (fresh) await this.trace({ type: "mint_fresh_challenge_explicit", reason });
     let answered = 0;
+    let challengeSteps = 0;
 
     while (issued && (issued as Record<string, unknown>).challengeRequired) {
+      challengeSteps += 1;
+      if (challengeSteps > MINT_MAX_CHALLENGE_STEPS_PER_FLOW) {
+        throw new Error(
+          `Mint challenge flow exceeded guard limit (${MINT_MAX_CHALLENGE_STEPS_PER_FLOW} steps). Run \`mint retry\`.`,
+        );
+      }
       const r = issued as Record<string, unknown>;
       const cid = typeof r.challengeId === "string" ? r.challengeId : null;
       const cpt = typeof r.promptToken === "string" ? r.promptToken
@@ -216,6 +277,17 @@ export class MintManager implements MintManagerLike {
       const instr = sanitizeChallengePromptText(rawInstr) || "Solve mint challenge";
       const ansType = isRecord(r.challenge) && typeof (r.challenge as Record<string, unknown>).answerType === "string"
         ? ((r.challenge as Record<string, unknown>).answerType as string).trim().toLowerCase() : null;
+      this.capturePendingChallenge({
+        challengeId: cid,
+        promptToken: cpt,
+        instruction: instr,
+        answerType: ansType,
+        attemptsRemaining:
+          typeof r.attemptsRemaining === "number" && Number.isFinite(r.attemptsRemaining)
+            ? Math.max(0, Math.floor(r.attemptsRemaining))
+            : null,
+        expiresAt: typeof r.expiresAt === "string" ? r.expiresAt : null,
+      });
       await this.trace({
         type: "mint_challenge_received",
         challengeId: cid,
@@ -271,10 +343,24 @@ export class MintManager implements MintManagerLike {
         }
       }
       if (!answer) {
+        const solverFailures = this.bumpPendingSolverFailure(cid);
+        await this.trace({
+          type: "mint_answer_solver_guard",
+          challengeId: cid,
+          solverFailures,
+          maxSolverFailures: MINT_MAX_SOLVER_FLOW_FAILS_PER_CHALLENGE,
+        });
+        if (solverFailures >= MINT_MAX_SOLVER_FLOW_FAILS_PER_CHALLENGE) {
+          this.clearPendingChallenge();
+          throw new Error(
+            "Mint challenge solver failed repeatedly for active challenge. Run `mint retry`.",
+          );
+        }
         throw new Error(
           "Mint challenge answer unavailable from OpenClaw after solver retries.",
         );
       }
+      this.resetPendingSolverFailure(cid);
       await this.trace({ type: "mint_answer_submitted", challengeId: cid, answerPreview: toAnswerPreview(answer) });
       answered += 1;
       await this.trace({
@@ -312,6 +398,7 @@ export class MintManager implements MintManagerLike {
           attemptsExhausted: exhausted || attemptsExhaustedByServer,
         });
         if (attemptsExhaustedByServer) {
+          this.clearPendingChallenge();
           throw new Error("Mint challenge attempts exhausted by server. Run `mint retry`.");
         }
         if (exhausted) throw new Error(`Mint challenge not accepted after ${answered} attempt${answered === 1 ? "" : "s"}. Run \`mint retry\`.`);
@@ -322,6 +409,7 @@ export class MintManager implements MintManagerLike {
         }
       }
     }
+    this.clearPendingChallenge();
     // Already-connected shortcut.
     const ir = issued as Record<string, unknown> | null;
     if (ir && ir.challengeRequired === false && (ir.alreadyConnected === true || ir.done === true || ir.status === "already_connected")) {
@@ -383,6 +471,20 @@ export class MintManager implements MintManagerLike {
     if (!this.ctx.trpc) throw new Error("tRPC client not available.");
     const m = this.ctx.mint;
     const normAns = typeof ans === "string" ? normalizeChallengeAnswerForSubmit(ans, this.ctx.config.challengeAnswerMaxChars) : "";
+    const hasVerifyPayload = Boolean(cid && normAns.length > 0);
+    if (!hasVerifyPayload && !refresh) {
+      const pending = this.getResumablePendingChallenge();
+      if (pending) {
+        await this.trace({
+          type: "mint_request_guard_reuse_pending",
+          challengeId: pending.challengeId,
+          promptToken: pending.promptToken,
+          attemptsRemaining: pending.attemptsRemaining,
+          expiresAt: pending.expiresAt,
+        });
+        return this.toPendingChallengeIssued(pending);
+      }
+    }
     const input = (): Record<string, unknown> => ({
       tokenTtlSeconds: m.runtimeMintTokenTtlSeconds,
       ...(typeof m.runtimeMintMaxUses === "number" ? { maxUses: m.runtimeMintMaxUses } : {}),
@@ -450,7 +552,9 @@ export class MintManager implements MintManagerLike {
     if (parseMintChallengeRetryRequired(m)) return false;
     if (/competing bot tunnel rejected/iu.test(m) || /another tunnel for this bot is already active/iu.test(m)) return true;
     return /\bRun `mint retry`\b/iu.test(m) || /Mint challenge expired before answer entry/iu.test(m)
-      || /Socket mint challenge required\./iu.test(m) || /Mint challenge missing challengeId/iu.test(m);
+      || /Socket mint challenge required\./iu.test(m) || /Mint challenge missing challengeId/iu.test(m)
+      || /Mint challenge solver failed repeatedly/iu.test(m)
+      || /Mint challenge flow exceeded guard limit/iu.test(m);
   }
 
   private chalCtx(): ChallengeContext {
@@ -465,7 +569,172 @@ export class MintManager implements MintManagerLike {
 
   private async writeDbg(): Promise<void> {
     this.dbg.updatedAt = nowIso();
+    this.dbg.pendingChallengeId = this.pendingChallenge?.challengeId ?? null;
+    this.dbg.pendingPromptToken = this.pendingChallenge?.promptToken ?? null;
+    this.dbg.pendingChallengeExpiresAt = this.pendingChallenge?.expiresAt ?? null;
+    this.dbg.pendingChallengeInstruction = this.pendingChallenge?.instruction ?? null;
+    this.dbg.pendingChallengeAnswerType = this.pendingChallenge?.answerType ?? null;
+    this.dbg.pendingChallengeAttemptsRemaining = this.pendingChallenge?.attemptsRemaining ?? null;
+    this.dbg.pendingChallengeSolverFailures = this.pendingChallenge?.solverFailures ?? 0;
     await fs.writeFile(this.ctx.ipcPaths.mintDebugPath, JSON.stringify(this.dbg, null, 2), "utf8").catch(() => {});
+  }
+
+  private capturePendingChallenge(input: {
+    challengeId: string | null;
+    promptToken: string | null;
+    instruction: string;
+    answerType: string | null;
+    attemptsRemaining: number | null;
+    expiresAt: string | null;
+  }): void {
+    if (!input.challengeId) return;
+    const previous = this.pendingChallenge;
+    const expiresAtTrimmed =
+      typeof input.expiresAt === "string" && input.expiresAt.trim().length > 0
+        ? input.expiresAt.trim()
+        : null;
+    const parsedExpiresAtMs =
+      expiresAtTrimmed && Number.isFinite(Date.parse(expiresAtTrimmed))
+        ? Date.parse(expiresAtTrimmed)
+        : null;
+    this.pendingChallenge = {
+      challengeId: input.challengeId,
+      promptToken: input.promptToken,
+      instruction: input.instruction,
+      answerType: input.answerType,
+      attemptsRemaining: input.attemptsRemaining,
+      expiresAt: expiresAtTrimmed,
+      expiresAtMs: parsedExpiresAtMs,
+      solverFailures:
+        previous && previous.challengeId === input.challengeId
+          ? previous.solverFailures
+          : 0,
+    };
+  }
+
+  private clearPendingChallenge(): void {
+    this.pendingChallenge = null;
+  }
+
+  private getResumablePendingChallenge(): PendingMintChallenge | null {
+    const pending = this.pendingChallenge;
+    if (!pending) return null;
+    if (
+      pending.expiresAtMs !== null &&
+      Date.now() >= pending.expiresAtMs - MINT_PENDING_CHALLENGE_EXPIRY_SKEW_MS
+    ) {
+      this.pendingChallenge = null;
+      return null;
+    }
+    if (pending.attemptsRemaining !== null && pending.attemptsRemaining <= 0) {
+      this.pendingChallenge = null;
+      return null;
+    }
+    return pending;
+  }
+
+  private toPendingChallengeIssued(
+    pending: PendingMintChallenge,
+  ): Record<string, unknown> {
+    return {
+      challengeRequired: true,
+      challengeId: pending.challengeId,
+      promptToken: pending.promptToken,
+      instruction: pending.instruction,
+      attemptsRemaining: pending.attemptsRemaining,
+      expiresAt: pending.expiresAt,
+      challenge: pending.answerType
+        ? { answerType: pending.answerType }
+        : undefined,
+    };
+  }
+
+  private bumpPendingSolverFailure(challengeId: string | null): number {
+    if (!challengeId || !this.pendingChallenge) return 0;
+    if (this.pendingChallenge.challengeId !== challengeId) return 0;
+    this.pendingChallenge.solverFailures += 1;
+    return this.pendingChallenge.solverFailures;
+  }
+
+  private resetPendingSolverFailure(challengeId: string | null): void {
+    if (!challengeId || !this.pendingChallenge) return;
+    if (this.pendingChallenge.challengeId !== challengeId) return;
+    this.pendingChallenge.solverFailures = 0;
+  }
+
+  private async restorePendingChallengeFromDebug(): Promise<void> {
+    const raw = await fs.readFile(this.ctx.ipcPaths.mintDebugPath, "utf8").catch(() => null);
+    if (!raw || !raw.trim().length) return;
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!isRecord(parsed)) return;
+    const challengeId =
+      typeof parsed.pendingChallengeId === "string" && parsed.pendingChallengeId.trim().length > 0
+        ? parsed.pendingChallengeId.trim()
+        : null;
+    if (!challengeId) return;
+    const instruction =
+      typeof parsed.pendingChallengeInstruction === "string" &&
+      parsed.pendingChallengeInstruction.trim().length > 0
+        ? parsed.pendingChallengeInstruction.trim()
+        : null;
+    if (!instruction) return;
+    const promptToken =
+      typeof parsed.pendingPromptToken === "string" && parsed.pendingPromptToken.trim().length > 0
+        ? parsed.pendingPromptToken.trim()
+        : null;
+    const answerType =
+      typeof parsed.pendingChallengeAnswerType === "string" &&
+      parsed.pendingChallengeAnswerType.trim().length > 0
+        ? parsed.pendingChallengeAnswerType.trim()
+        : null;
+    const attemptsRemaining =
+      typeof parsed.pendingChallengeAttemptsRemaining === "number" &&
+      Number.isFinite(parsed.pendingChallengeAttemptsRemaining)
+        ? Math.max(0, Math.floor(parsed.pendingChallengeAttemptsRemaining))
+        : null;
+    const expiresAt =
+      typeof parsed.pendingChallengeExpiresAt === "string" &&
+      parsed.pendingChallengeExpiresAt.trim().length > 0
+        ? parsed.pendingChallengeExpiresAt.trim()
+        : null;
+    const expiresAtMs =
+      expiresAt && Number.isFinite(Date.parse(expiresAt))
+        ? Date.parse(expiresAt)
+        : null;
+    if (
+      expiresAtMs !== null &&
+      Date.now() >= expiresAtMs - MINT_PENDING_CHALLENGE_EXPIRY_SKEW_MS
+    ) {
+      return;
+    }
+    const solverFailures =
+      typeof parsed.pendingChallengeSolverFailures === "number" &&
+      Number.isFinite(parsed.pendingChallengeSolverFailures)
+        ? Math.max(0, Math.floor(parsed.pendingChallengeSolverFailures))
+        : 0;
+    this.pendingChallenge = {
+      challengeId,
+      promptToken,
+      instruction,
+      answerType,
+      attemptsRemaining,
+      expiresAt,
+      expiresAtMs,
+      solverFailures,
+    };
+    await this.trace({
+      type: "mint_challenge_restored_from_debug",
+      challengeId,
+      promptToken,
+      attemptsRemaining,
+      expiresAt,
+      solverFailures,
+    });
   }
 
   private async trace(payload: unknown): Promise<void> {
