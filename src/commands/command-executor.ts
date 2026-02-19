@@ -17,6 +17,7 @@ import path from "node:path";
 
 import {
   inheritChatContextIntoPayload,
+  resolveChatTargetFromPayload,
   sendChatResultMessageFromOutcome,
 } from "../chat/chat-context.js";
 import { verifyRuntimeCommandSeal } from "../directives/command-seal.js";
@@ -71,6 +72,23 @@ const mimeToExt = (mime: string): string => {
   if (normalized === "video/quicktime") return "mov";
   if (normalized === "video/webm") return "webm";
   return "bin";
+};
+
+const inferMimeTypeFromUrl = (value: string): string | null => {
+  const trimmed = value.trim();
+  if (!trimmed.length) return null;
+  try {
+    const parsed = new URL(trimmed);
+    return extToMime(parsed.pathname);
+  } catch {
+    return extToMime(trimmed);
+  }
+};
+
+const truncateText = (value: string, maxChars: number): string => {
+  const text = value.trim();
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(8, maxChars - 1))}…`;
 };
 
 const parseDataUriPayload = (
@@ -178,6 +196,8 @@ type GeneratedDraft = {
   action: string;
   payload: Record<string, unknown>;
 };
+
+type GeneratedAssetType = "image" | "gif" | "pdf" | "csv" | "code" | "file" | "txt" | "md";
 
 export class CommandExecutor {
   private readonly ctx: CommandExecutorContext;
@@ -579,6 +599,10 @@ export class CommandExecutor {
       return this.failedOutcome(command, "Invalid payload for generate-and-queue command.");
     }
 
+    if (payload.chatLiteralGenerate === true) {
+      return this.executeChatLiteralGenerate(command, payload);
+    }
+
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
       command.sourceDirectiveId ??
@@ -600,6 +624,35 @@ export class CommandExecutor {
         : this.extractGeneratedDrafts(generatedResult);
     if (drafts.length === 0) {
       return this.failedOutcome(command, "generate returned no executable drafts.", "no_drafts");
+    }
+
+    const requireExplicitPublishVerb = payload.requireExplicitPublishVerb === true;
+    const explicitPublishRequested = payload.explicitPublishRequested === true;
+    if (requireExplicitPublishVerb && !explicitPublishRequested) {
+      const blockedDraftCount = drafts.filter((draft) => {
+        const action = draft.action.trim().toLowerCase();
+        return (
+          action === "post" ||
+          action === "comment" ||
+          action === "story" ||
+          action === "like"
+        );
+      }).length;
+      if (blockedDraftCount > 0) {
+        await this.ctx.memory.recordWrite({
+          type: "publish_blocked_missing_explicit_request",
+          at: nowIso(),
+          commandId: command.id,
+          commandKind: command.kind,
+          blockedDraftCount,
+          sourceDirectiveId: command.sourceDirectiveId ?? null,
+        }).catch(() => undefined);
+        return this.failedOutcome(
+          command,
+          "Publish action blocked: explicit post/publish/share/comment/story request required.",
+          "publish_verb_required",
+        );
+      }
     }
 
     const executedOutcomes: CommandOutcome[] = [];
@@ -637,6 +690,176 @@ export class CommandExecutor {
         ok: entry.ok,
       })),
     });
+  }
+
+  private resolveGeneratedAssetType(value: unknown): GeneratedAssetType {
+    const normalized = asNonEmptyString(value)?.toLowerCase() ?? "image";
+    if (normalized === "gif") return "gif";
+    if (normalized === "pdf") return "pdf";
+    if (normalized === "csv") return "csv";
+    if (normalized === "code") return "code";
+    if (normalized === "file") return "file";
+    if (normalized === "txt") return "txt";
+    if (normalized === "md") return "md";
+    return "image";
+  }
+
+  private resolveGeneratedAttachmentMimeType(input: {
+    generatedAssetType: GeneratedAssetType;
+    mediaUrl: string;
+    mediaType?: "image" | "video";
+  }): string {
+    const fromUrl = inferMimeTypeFromUrl(input.mediaUrl);
+    if (fromUrl && fromUrl !== "application/octet-stream") return fromUrl;
+    if (input.generatedAssetType === "gif") return "image/gif";
+    if (input.generatedAssetType === "pdf") return "application/pdf";
+    if (input.generatedAssetType === "csv") return "text/csv";
+    if (input.generatedAssetType === "md") return "text/markdown";
+    if (input.generatedAssetType === "txt") return "text/plain";
+    if (input.generatedAssetType === "code") return "text/plain";
+    if (input.mediaType === "video") return "video/mp4";
+    return "image/png";
+  }
+
+  private async executeChatLiteralGenerate(
+    command: Command,
+    payload: Record<string, unknown>,
+  ): Promise<CommandOutcome> {
+    const chatTarget = resolveChatTargetFromPayload(payload);
+    if (!chatTarget) {
+      return this.failedOutcome(
+        command,
+        "Missing chat context for literal generate request.",
+        "chat_context_missing",
+      );
+    }
+    if (!this.ctx.callAgentChatBridge) {
+      return this.failedOutcome(
+        command,
+        "Chat bridge unavailable for literal generate request.",
+        "chat_bridge_unavailable",
+      );
+    }
+
+    const prompt =
+      asNonEmptyString(payload.mediaPrompt) ??
+      asNonEmptyString(payload.imagePrompt) ??
+      asNonEmptyString(payload.prompt) ??
+      asNonEmptyString(payload.topic) ??
+      asNonEmptyString(payload.requestText) ??
+      null;
+    if (!prompt) {
+      return this.failedOutcome(
+        command,
+        "No prompt provided for literal generate request.",
+        "missing_prompt",
+      );
+    }
+
+    const generatedAssetType = this.resolveGeneratedAssetType(payload.generatedAssetType);
+    const generatedLabel = generatedAssetType === "gif" ? "GIF" : "image";
+    try {
+      const media = await this.generateAndUploadMediaFromPrompt(prompt);
+      const mimeType = this.resolveGeneratedAttachmentMimeType({
+        generatedAssetType,
+        mediaUrl: media.mediaUrl,
+        mediaType: media.mediaType,
+      });
+      const sizeBytes =
+        typeof media.mediaSizeBytes === "number" &&
+        Number.isFinite(media.mediaSizeBytes) &&
+        media.mediaSizeBytes > 0
+          ? Math.max(1, Math.floor(media.mediaSizeBytes))
+          : 1;
+      const summary = truncateText(prompt, 220);
+      await this.ctx.callAgentChatBridge({
+        action: "send_message",
+        clientMessageId: `runtime_generate_result_${Date.now().toString(36)}_${crypto
+          .randomUUID()
+          .replaceAll("-", "")
+          .slice(0, 10)}`,
+        ...(chatTarget.conversationId
+          ? { conversationId: chatTarget.conversationId }
+          : { channelId: chatTarget.channelId }),
+        body: `Generated ${generatedLabel} for "${summary}".`,
+        format: "markdown",
+        attachments: [
+          {
+            url: media.mediaUrl,
+            mimeType,
+            sizeBytes,
+            metadata: {
+              source: "runtime.generate",
+              generatedAssetType,
+            },
+          },
+        ],
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: generatedAssetType,
+            status: "success",
+            title: `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generated`,
+            summary,
+            href: media.mediaUrl,
+            hrefLabel: `Open ${generatedLabel}`,
+          },
+        },
+      });
+      await this.ctx.memory.recordWrite({
+        type: "chat_literal_generate_sent",
+        at: nowIso(),
+        commandId: command.id,
+        generatedAssetType,
+        mediaUrl: media.mediaUrl,
+        prompt: summary,
+        targetConversationId: chatTarget.conversationId ?? null,
+        targetChannelId: chatTarget.channelId ?? null,
+      });
+      return this.successOutcome(command, {
+        generatedAssetType,
+        mediaUrl: media.mediaUrl,
+        prompt: summary,
+        mode: "chat_literal_generate",
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.ctx.callAgentChatBridge({
+        action: "send_message",
+        clientMessageId: `runtime_generate_error_${Date.now().toString(36)}_${crypto
+          .randomUUID()
+          .replaceAll("-", "")
+          .slice(0, 10)}`,
+        ...(chatTarget.conversationId
+          ? { conversationId: chatTarget.conversationId }
+          : { channelId: chatTarget.channelId }),
+        body: `I could not generate that ${generatedLabel} right now. Please retry in a moment.`,
+        format: "markdown",
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: generatedAssetType,
+            status: "failed",
+            title: `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
+            error: truncateText(message, 240),
+          },
+        },
+      }).catch(() => undefined);
+      await this.ctx.memory.recordWrite({
+        type: "chat_literal_generate_failed",
+        at: nowIso(),
+        commandId: command.id,
+        generatedAssetType,
+        error: message,
+      });
+      return this.failedOutcome(
+        command,
+        `Literal generate failed: ${message}`,
+        "literal_generate_failed",
+      );
+    }
   }
 
   private async executeCommandFromMappedDraft(command: Command): Promise<CommandOutcome> {

@@ -41,8 +41,10 @@ export interface DirectiveManagerContext {
     recordWrite(payload: unknown): Promise<void>;
   };
   trpc: {
-    agentAckDirective: {
-      mutate(input: unknown): Promise<unknown>;
+    agent?: {
+      ackDirective?: {
+        mutate(input: unknown): Promise<unknown>;
+      };
     };
   } | null;
   commandSeal: CommandSealState;
@@ -318,7 +320,11 @@ export class DirectiveManager implements DirectiveManagerLike {
   }): Promise<void> {
     if (!this.ctx.trpc) return;
     try {
-      await this.ctx.trpc.agentAckDirective.mutate({
+      const ackDirectiveMutator = this.ctx.trpc.agent?.ackDirective;
+      if (!ackDirectiveMutator || typeof ackDirectiveMutator.mutate !== "function") {
+        return;
+      }
+      await ackDirectiveMutator.mutate({
         directiveId: opts.directiveId, status: opts.status,
         kind: opts.kind ?? undefined, error: opts.error ?? undefined,
         actionNonce: opts.actionNonce ?? undefined, executionDigest: opts.executionDigest ?? undefined,
