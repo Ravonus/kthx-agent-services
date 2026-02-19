@@ -238,6 +238,23 @@ export const createRuntimeConfig = (): RuntimeConfig => {
       parseIntEnv("MG_CHAT_RUNTIME_TEXT_STREAM_UPDATE_MIN_MS", 180),
     ),
   );
+  const chatRuntimeStaleReplyMaxAgeMs = Math.max(
+    60_000,
+    Math.min(
+      7 * 24 * 60 * 60 * 1000,
+      parseIntEnv("MG_CHAT_RUNTIME_STALE_REPLY_MAX_AGE_MS", 30 * 60 * 1000),
+    ),
+  );
+  const chatRuntimeStaleReplyMaxAgeImportantMs = Math.max(
+    chatRuntimeStaleReplyMaxAgeMs,
+    Math.min(
+      14 * 24 * 60 * 60 * 1000,
+      parseIntEnv(
+        "MG_CHAT_RUNTIME_STALE_REPLY_MAX_AGE_IMPORTANT_MS",
+        3 * 60 * 60 * 1000,
+      ),
+    ),
+  );
 
   // -- execution / queue / ws -----------------------------------------------
   const autoRetryPendingMs = Math.max(
@@ -358,6 +375,8 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     chatRuntimeTextStreamStepChars,
     chatRuntimeTextStreamStepMs,
     chatRuntimeTextStreamUpdateMinMs,
+    chatRuntimeStaleReplyMaxAgeMs,
+    chatRuntimeStaleReplyMaxAgeImportantMs,
     autoRetryPendingMs,
     terminalTriggerOnly: false,
     queueRunnerDefaultEnabled,

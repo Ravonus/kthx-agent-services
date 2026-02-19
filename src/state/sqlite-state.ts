@@ -35,6 +35,8 @@ type EventRow = {
 type StateDbConfig = {
   enabled: boolean;
   dbPath: string;
+  busyTimeoutMs: number;
+  busyRetryCount: number;
 };
 
 const parseBool = (value: string | null, fallback: boolean): boolean => {
@@ -43,6 +45,13 @@ const parseBool = (value: string | null, fallback: boolean): boolean => {
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   return fallback;
+};
+
+const parseIntEnv = (value: string | null, fallback: number): number => {
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value.trim(), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return parsed;
 };
 
 const safeJsonStringify = (value: unknown): string => {
@@ -64,9 +73,12 @@ const safeJsonParse = (raw: string): unknown => {
 export class StateSqliteStore {
   readonly enabled: boolean;
   readonly dbPath: string;
+  readonly busyTimeoutMs: number;
+  readonly busyRetryCount: number;
 
   private db: DatabaseSync | null;
   private initialized: boolean;
+  private lastBusyWarnAtMs: number;
 
   private upsertSnapshotStmt: StatementSync | null;
   private insertEventStmt: StatementSync | null;
@@ -76,8 +88,11 @@ export class StateSqliteStore {
   constructor(config: StateDbConfig) {
     this.enabled = config.enabled;
     this.dbPath = path.resolve(config.dbPath);
+    this.busyTimeoutMs = Math.max(0, Math.floor(config.busyTimeoutMs));
+    this.busyRetryCount = Math.max(0, Math.floor(config.busyRetryCount));
     this.db = null;
     this.initialized = false;
+    this.lastBusyWarnAtMs = 0;
     this.upsertSnapshotStmt = null;
     this.insertEventStmt = null;
     this.getSnapshotStmt = null;
@@ -95,6 +110,7 @@ export class StateSqliteStore {
     }
     db.exec("PRAGMA journal_mode=WAL;");
     db.exec("PRAGMA synchronous=NORMAL;");
+    db.exec(`PRAGMA busy_timeout=${this.busyTimeoutMs};`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS state_snapshots (
         scope TEXT PRIMARY KEY,
@@ -143,6 +159,43 @@ export class StateSqliteStore {
     this.initialized = true;
   }
 
+  private isBusyOrLockedError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const text = error.message.toLowerCase();
+    return (
+      text.includes("database is locked") ||
+      text.includes("database is busy") ||
+      text.includes("sqlite_busy") ||
+      text.includes("sqlite_locked")
+    );
+  }
+
+  private warnBusyOncePerWindow(context: string, error: Error): void {
+    const now = Date.now();
+    if (now - this.lastBusyWarnAtMs < 5_000) return;
+    this.lastBusyWarnAtMs = now;
+    console.warn(`[state-sqlite] busy/locked (${context}); dropping state write/read this cycle`, {
+      dbPath: this.dbPath,
+      busyTimeoutMs: this.busyTimeoutMs,
+      busyRetryCount: this.busyRetryCount,
+      error: error.message,
+    });
+  }
+
+  private runWithBusyRetry<T>(context: string, fallback: T, op: () => T): T {
+    const attempts = this.busyRetryCount + 1;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        return op();
+      } catch (error) {
+        if (!this.isBusyOrLockedError(error)) throw error;
+        if (error instanceof Error) this.warnBusyOncePerWindow(`${context}#${attempt}`, error);
+        if (attempt >= attempts) return fallback;
+      }
+    }
+    return fallback;
+  }
+
   close(): void {
     if (!this.db) return;
     this.db.close();
@@ -166,12 +219,14 @@ export class StateSqliteStore {
     const at = typeof input.at === "string" && input.at.trim().length > 0
       ? input.at.trim()
       : nowIso();
-    this.upsertSnapshotStmt.run(
-      input.scope,
-      input.visibility,
-      at,
-      safeJsonStringify(input.data),
-    );
+    this.runWithBusyRetry<void>("upsertSnapshot", undefined, () => {
+      this.upsertSnapshotStmt?.run(
+        input.scope,
+        input.visibility,
+        at,
+        safeJsonStringify(input.data),
+      );
+    });
   }
 
   appendEvent(input: {
@@ -188,20 +243,26 @@ export class StateSqliteStore {
     const at = typeof input.at === "string" && input.at.trim().length > 0
       ? input.at.trim()
       : nowIso();
-    this.insertEventStmt.run(
-      input.source,
-      input.topic,
-      input.eventType,
-      input.visibility,
-      at,
-      safeJsonStringify(input.payload),
-    );
+    this.runWithBusyRetry<void>("appendEvent", undefined, () => {
+      this.insertEventStmt?.run(
+        input.source,
+        input.topic,
+        input.eventType,
+        input.visibility,
+        at,
+        safeJsonStringify(input.payload),
+      );
+    });
   }
 
   getSnapshot<T>(scope: string): T | null {
     if (!this.enabled) return null;
     this.init();
-    const rowUnknown = this.getSnapshotStmt?.get(scope) as unknown;
+    const rowUnknown = this.runWithBusyRetry<unknown>(
+      "getSnapshot",
+      null,
+      () => this.getSnapshotStmt?.get(scope) as unknown,
+    );
     if (!isRecord(rowUnknown)) return null;
     const row = rowUnknown as unknown as SnapshotRow;
     const parsed = safeJsonParse(row.json);
@@ -213,7 +274,11 @@ export class StateSqliteStore {
     this.init();
     if (!this.getRecentEventsStmt) return [];
     const bounded = Math.max(1, Math.min(500, Math.floor(limit)));
-    const rowsUnknown = this.getRecentEventsStmt.all(visibility, bounded) as unknown;
+    const rowsUnknown = this.runWithBusyRetry<unknown>(
+      "getRecentEvents",
+      [],
+      () => this.getRecentEventsStmt?.all(visibility, bounded) as unknown,
+    );
     if (!Array.isArray(rowsUnknown)) return [];
     const rows = rowsUnknown as unknown as EventRow[];
     const out: Array<Record<string, unknown>> = [];
@@ -236,8 +301,17 @@ export class StateSqliteStore {
 export const createStateSqliteStoreFromEnv = (stateDir: string): StateSqliteStore => {
   const enabled = parseBool(trimEnv("MG_AGENT_STATE_DB_ENABLED"), true);
   const pathFromEnv = trimEnv("MG_AGENT_STATE_DB_PATH");
+  const busyTimeoutRaw = trimEnv("MG_AGENT_STATE_DB_BUSY_TIMEOUT_MS");
+  const busyRetryRaw = trimEnv("MG_AGENT_STATE_DB_BUSY_RETRY_COUNT");
+  const busyTimeoutMs = Math.max(0, parseIntEnv(busyTimeoutRaw, 5000));
+  const busyRetryCount = Math.max(0, parseIntEnv(busyRetryRaw, 2));
   const dbPath = pathFromEnv
     ? path.resolve(pathFromEnv)
     : path.resolve(stateDir, "ipc", "state.sqlite");
-  return new StateSqliteStore({ enabled, dbPath });
+  return new StateSqliteStore({
+    enabled,
+    dbPath,
+    busyTimeoutMs,
+    busyRetryCount,
+  });
 };

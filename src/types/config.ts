@@ -177,6 +177,8 @@ export type RuntimeConfig = {
   chatRuntimeTextStreamStepChars: number;
   chatRuntimeTextStreamStepMs: number;
   chatRuntimeTextStreamUpdateMinMs: number;
+  chatRuntimeStaleReplyMaxAgeMs: number;
+  chatRuntimeStaleReplyMaxAgeImportantMs: number;
 
   // Execution / queue
   autoRetryPendingMs: number;

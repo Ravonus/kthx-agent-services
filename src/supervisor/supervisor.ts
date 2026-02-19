@@ -68,6 +68,8 @@ const resolveKthxConfigPath = (homeDir: string): string => {
   return path.resolve(homeDir, "config.json");
 };
 const debugPath = (stateDir: string, name: string): string => path.join(stateDir, "ipc", "debug", name);
+const persistedAgentKeyBoxPath = (stateDir: string): string =>
+  path.join(stateDir, "ipc", "auth", "agent-key-box.json");
 const writeJsonSync = (filePath: string, payload: unknown): boolean => { try { fs.mkdirSync(path.dirname(filePath), { recursive: true }); fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8"); return true; } catch { return false; } };
 
 const appendDebug = (stateDir: string, payload: Record<string, unknown>): void => {
@@ -93,6 +95,32 @@ const writeBotSessionFile = (filePath: string, payload: unknown): boolean => {
     return true;
   } catch {
     return false;
+  }
+};
+
+const readPersistedAgentKeyBoxOwnerPid = (stateDir: string): number | null => {
+  const filePath = persistedAgentKeyBoxPath(stateDir);
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) return null;
+    const pid = parsed.ownerSupervisorPid;
+    if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) return pid;
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+const clearPersistedAgentKeyBoxFile = (stateDir: string, reason: string): void => {
+  const filePath = persistedAgentKeyBoxPath(stateDir);
+  try {
+    if (!fs.existsSync(filePath)) return;
+    fs.rmSync(filePath, { force: true });
+    console.warn(`[supervisor] cleared persisted agent key-box (${reason})`);
+  } catch {
+    // best-effort
   }
 };
 
@@ -275,6 +303,16 @@ const main = async (): Promise<void> => {
     else console.error("[supervisor] unable to acquire lock");
     process.exitCode = 2;
     return;
+  }
+
+  const persistedOwnerPid = readPersistedAgentKeyBoxOwnerPid(stateDir);
+  if (persistedOwnerPid !== process.pid) {
+    clearPersistedAgentKeyBoxFile(
+      stateDir,
+      persistedOwnerPid
+        ? `owner_pid_mismatch owner=${persistedOwnerPid} current=${process.pid}`
+        : "owner_pid_missing_or_legacy",
+    );
   }
 
   // Build managed process entries
@@ -464,6 +502,7 @@ const main = async (): Promise<void> => {
   const buildChildEnv = (): NodeJS.ProcessEnv => {
     const env = { ...process.env };
     env.MG_REALTIME_CONNECTION_ID = runtimeConnId;
+    env.MG_AGENT_SUPERVISOR_PID = String(process.pid);
     if (!env.MG_AGENT_HOME_DIR?.trim()) env.MG_AGENT_HOME_DIR = path.resolve(process.cwd(), "kthx-agents");
     if (!env.MG_AGENT_STATE_DIR?.trim()) env.MG_AGENT_STATE_DIR = path.join(env.MG_AGENT_HOME_DIR!, "state");
     return env;
@@ -639,6 +678,7 @@ const main = async (): Promise<void> => {
       await sleep(POLL_MS);
     }
   } finally {
+    clearPersistedAgentKeyBoxFile(stateDir, "supervisor_exit");
     writeBotSessionFile(botTokenPath, { updatedAt: nowIso(), source: "agent-ws-supervisor", token: null, expiresAt: null, connectionId: runtimeConnId, state: "cleared", reason: "supervisor_exit" });
     try { const lock = readLock(lockPath); if (!lock || lock.pid === process.pid) fs.rmSync(lockPath, { force: true }); } catch { /* ignore */ }
     writeStatus("shutdown");

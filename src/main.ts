@@ -25,12 +25,14 @@ import { trimEnv } from "./lib/env-parse.js";
 import { isRecord } from "./lib/guards.js";
 import { nowIso } from "./lib/text.js";
 import {
+  clearBotTokenState,
   getBotToken,
   setBotTokenState,
   notifySupervisorFatal,
 } from "./auth/bot-token.js";
 import {
   registerBot,
+  clearPersistedAgentKeyBox,
   persistAgentKeyBox,
   persistAgentIdentity,
   readPersistedAgentKeyBox,
@@ -123,6 +125,13 @@ const parseRetryAfterMs = (input: {
   return Math.max(1000, input.fallbackMs);
 };
 
+const isBotTokenAuthFailureMessage = (message: string): boolean =>
+  /bot token is invalid/iu.test(message) ||
+  /bot token invalid/iu.test(message) ||
+  /bot token expired/iu.test(message) ||
+  /bot token missing/iu.test(message) ||
+  /x-bot-session-token/iu.test(message);
+
 const parseSocketDigestIntervalMs = (
   envKey: string,
   fallbackMs: number,
@@ -132,6 +141,14 @@ const parseSocketDigestIntervalMs = (
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed)) return fallbackMs;
   return Math.max(15_000, Math.min(30 * 60_000, Math.floor(parsed)));
+};
+
+const parseSupervisorPid = (value: string | null): number | null => {
+  if (!value) return null;
+  const parsed = Number.parseInt(value.trim(), 10);
+  if (!Number.isFinite(parsed)) return null;
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
 };
 
 // ---------------------------------------------------------------------------
@@ -235,6 +252,9 @@ const main = async (): Promise<void> => {
   // -- Config
   const config = createRuntimeConfig();
   const chatApiBaseUrl = resolveChatApiBaseUrl(config.realtimeWsUrl);
+  const supervisorPid = parseSupervisorPid(trimEnv("MG_AGENT_SUPERVISOR_PID"));
+  const supervisorConnectionId =
+    trimEnv("MG_REALTIME_CONNECTION_ID")?.trim() ?? null;
   let agentKeyBox = await readSecretFromEnvOrFile(
     "MG_AGENT_KEY_BOX",
     "MG_AGENT_KEY_BOX_FILE",
@@ -245,9 +265,21 @@ const main = async (): Promise<void> => {
   if (!agentKeyBox && !agentKey) {
     const persisted = await readPersistedAgentKeyBox(config.stateDir);
     if (persisted) {
-      agentKeyBox = persisted;
-      process.env.MG_AGENT_KEY_BOX = persisted;
-      console.log("[agent-runtime] Loaded agentKeyBox from persisted state.");
+      const ownedByCurrentSupervisor =
+        typeof supervisorPid === "number" &&
+        persisted.ownerSupervisorPid === supervisorPid;
+      if (ownedByCurrentSupervisor) {
+        agentKeyBox = persisted.agentKeyBox;
+        process.env.MG_AGENT_KEY_BOX = persisted.agentKeyBox;
+        console.log(
+          `[agent-runtime] Loaded agentKeyBox from persisted state (supervisor pid ${supervisorPid}).`,
+        );
+      } else {
+        await clearPersistedAgentKeyBox(config.stateDir);
+        console.log(
+          "[agent-runtime] Ignored stale persisted agentKeyBox; cleared because supervisor PID did not match.",
+        );
+      }
     }
   }
 
@@ -283,13 +315,21 @@ const main = async (): Promise<void> => {
     process.env.MG_AGENT_KEY_BOX = result.agentKeyBox;
 
     // Persist credentials for future boots
-    const savedPath = await persistAgentKeyBox({
-      agentKeyBox: result.agentKeyBox,
-      stateDir: config.stateDir,
-    });
-    console.log(
-      `[agent-runtime] Registration complete. agentKeyBox saved to ${savedPath}`,
-    );
+    if (typeof supervisorPid === "number") {
+      const savedPath = await persistAgentKeyBox({
+        agentKeyBox: result.agentKeyBox,
+        stateDir: config.stateDir,
+        ownerSupervisorPid: supervisorPid,
+        ownerConnectionId: supervisorConnectionId,
+      });
+      console.log(
+        `[agent-runtime] Registration complete. agentKeyBox saved to ${savedPath} (owned by supervisor pid ${supervisorPid}).`,
+      );
+    } else {
+      console.log(
+        "[agent-runtime] Registration complete. Skipped convenience key persistence because runtime is not owned by a supervisor PID.",
+      );
+    }
     console.log(
       `[agent-runtime] Registered as @${result.user.handle} (id: ${result.user.id})`,
     );
@@ -793,50 +833,63 @@ const main = async (): Promise<void> => {
         `agent chat bridge request rate-limited (${chatBridgeRateLimitedUntilMs - nowMs}ms remaining)`,
       );
     }
-    const botToken = await getBotToken();
-    const response = await fetch(`${chatApiBaseUrl}/api/agent/chat`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(agentKeyBox
-          ? { "x-agent-key-box": agentKeyBox }
-          : { "x-agent-key": agentKey ?? "" }),
-        ...(botToken ? { "x-bot-session-token": botToken } : {}),
-      },
-      body: JSON.stringify(payload),
-    });
-    const body = (await response.json().catch(() => null)) as unknown;
-    if (
-      response.ok &&
-      isRecord(body) &&
-      body.ok === true
-    ) {
-      chatBridgeRateLimitedUntilMs = 0;
-      return body.data;
-    }
-    if (response.status === 429) {
-      const retryAfterMs = parseRetryAfterMs({
-        response,
-        body,
-        fallbackMs: chatBridgeRateLimitRetryFallbackMs,
+    let attemptedTokenRecovery = false;
+    while (true) {
+      const botToken = await getBotToken();
+      const response = await fetch(`${chatApiBaseUrl}/api/agent/chat`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(agentKeyBox
+            ? { "x-agent-key-box": agentKeyBox }
+            : { "x-agent-key": agentKey ?? "" }),
+          ...(botToken ? { "x-bot-session-token": botToken } : {}),
+        },
+        body: JSON.stringify(payload),
       });
-      chatBridgeRateLimitedUntilMs = Math.max(
-        chatBridgeRateLimitedUntilMs,
-        Date.now() + retryAfterMs,
-      );
+      const body = (await response.json().catch(() => null)) as unknown;
+      if (
+        response.ok &&
+        isRecord(body) &&
+        body.ok === true
+      ) {
+        chatBridgeRateLimitedUntilMs = 0;
+        return body.data;
+      }
+      if (response.status === 429) {
+        const retryAfterMs = parseRetryAfterMs({
+          response,
+          body,
+          fallbackMs: chatBridgeRateLimitRetryFallbackMs,
+        });
+        chatBridgeRateLimitedUntilMs = Math.max(
+          chatBridgeRateLimitedUntilMs,
+          Date.now() + retryAfterMs,
+        );
+        const errorMessage =
+          isRecord(body) && typeof body.error === "string"
+            ? body.error
+            : "Too many requests";
+        throw new Error(
+          `agent chat bridge request rate-limited: ${errorMessage} (retryAfterMs=${retryAfterMs})`,
+        );
+      }
       const errorMessage =
         isRecord(body) && typeof body.error === "string"
           ? body.error
-          : "Too many requests";
-      throw new Error(
-        `agent chat bridge request rate-limited: ${errorMessage} (retryAfterMs=${retryAfterMs})`,
-      );
+          : `HTTP ${response.status}`;
+      const isTokenAuthFailure =
+        response.status === 401 && isBotTokenAuthFailureMessage(errorMessage);
+      if (isTokenAuthFailure && !attemptedTokenRecovery) {
+        attemptedTokenRecovery = true;
+        clearBotTokenState("chat_bridge_token_auth_failure");
+        await ctx.mintManager?.attemptMint("chat_bridge_token_auth_failure").catch(
+          () => undefined,
+        );
+        continue;
+      }
+      throw new Error(`agent chat bridge request failed: ${errorMessage}`);
     }
-    const errorMessage =
-      isRecord(body) && typeof body.error === "string"
-        ? body.error
-        : `HTTP ${response.status}`;
-    throw new Error(`agent chat bridge request failed: ${errorMessage}`);
   };
 
   const callAgentUploadChunk = async (payload: unknown): Promise<unknown> => {
@@ -846,46 +899,59 @@ const main = async (): Promise<void> => {
         `agent chunk upload request rate-limited (${chunkUploadRateLimitedUntilMs - nowMs}ms remaining)`,
       );
     }
-    const botToken = await getBotToken();
-    const response = await fetch(`${chatApiBaseUrl}/api/agent/upload/chunk`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...(agentKeyBox
-          ? { "x-agent-key-box": agentKeyBox }
-          : { "x-agent-key": agentKey ?? "" }),
-        ...(botToken ? { "x-bot-session-token": botToken } : {}),
-      },
-      body: JSON.stringify(payload),
-    });
-    const body = (await response.json().catch(() => null)) as unknown;
-    if (response.ok) {
-      chunkUploadRateLimitedUntilMs = 0;
-      return body;
-    }
-    if (response.status === 429) {
-      const retryAfterMs = parseRetryAfterMs({
-        response,
-        body,
-        fallbackMs: chatBridgeRateLimitRetryFallbackMs,
+    let attemptedTokenRecovery = false;
+    while (true) {
+      const botToken = await getBotToken();
+      const response = await fetch(`${chatApiBaseUrl}/api/agent/upload/chunk`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(agentKeyBox
+            ? { "x-agent-key-box": agentKeyBox }
+            : { "x-agent-key": agentKey ?? "" }),
+          ...(botToken ? { "x-bot-session-token": botToken } : {}),
+        },
+        body: JSON.stringify(payload),
       });
-      chunkUploadRateLimitedUntilMs = Math.max(
-        chunkUploadRateLimitedUntilMs,
-        Date.now() + retryAfterMs,
-      );
+      const body = (await response.json().catch(() => null)) as unknown;
+      if (response.ok) {
+        chunkUploadRateLimitedUntilMs = 0;
+        return body;
+      }
+      if (response.status === 429) {
+        const retryAfterMs = parseRetryAfterMs({
+          response,
+          body,
+          fallbackMs: chatBridgeRateLimitRetryFallbackMs,
+        });
+        chunkUploadRateLimitedUntilMs = Math.max(
+          chunkUploadRateLimitedUntilMs,
+          Date.now() + retryAfterMs,
+        );
+        const errorMessage =
+          isRecord(body) && typeof body.error === "string"
+            ? body.error
+            : "Too many requests";
+        throw new Error(
+          `agent chunk upload request rate-limited: ${errorMessage} (retryAfterMs=${retryAfterMs})`,
+        );
+      }
       const errorMessage =
         isRecord(body) && typeof body.error === "string"
           ? body.error
-          : "Too many requests";
-      throw new Error(
-        `agent chunk upload request rate-limited: ${errorMessage} (retryAfterMs=${retryAfterMs})`,
-      );
+          : `HTTP ${response.status}`;
+      const isTokenAuthFailure =
+        response.status === 401 && isBotTokenAuthFailureMessage(errorMessage);
+      if (isTokenAuthFailure && !attemptedTokenRecovery) {
+        attemptedTokenRecovery = true;
+        clearBotTokenState("chunk_upload_token_auth_failure");
+        await ctx.mintManager?.attemptMint("chunk_upload_token_auth_failure").catch(
+          () => undefined,
+        );
+        continue;
+      }
+      throw new Error(`agent chunk upload request failed: ${errorMessage}`);
     }
-    const errorMessage =
-      isRecord(body) && typeof body.error === "string"
-        ? body.error
-        : `HTTP ${response.status}`;
-    throw new Error(`agent chunk upload request failed: ${errorMessage}`);
   };
 
   const commandExecutor = new CommandExecutor({
@@ -990,6 +1056,9 @@ const main = async (): Promise<void> => {
       chatRuntimeTextStreamStepChars: config.chatRuntimeTextStreamStepChars,
       chatRuntimeTextStreamStepMs: config.chatRuntimeTextStreamStepMs,
       chatRuntimeTextStreamUpdateMinMs: config.chatRuntimeTextStreamUpdateMinMs,
+      chatRuntimeStaleReplyMaxAgeMs: config.chatRuntimeStaleReplyMaxAgeMs,
+      chatRuntimeStaleReplyMaxAgeImportantMs:
+        config.chatRuntimeStaleReplyMaxAgeImportantMs,
     },
     ipcPaths: {
       chatInboxPath: ipcPaths.chatInboxPath,

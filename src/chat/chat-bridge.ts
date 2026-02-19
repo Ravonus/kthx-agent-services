@@ -127,23 +127,23 @@ const isMissingBotTokenError = (message: string): boolean =>
 const payloadRequiresBotToken = (payload: Record<string, unknown>): boolean => {
   const action = typeof payload.action === "string" ? payload.action.trim() : "";
   return (
-    action === "gateway_session" ||
-    action === "gateway_ticket" ||
-    action === "shell" ||
-    action === "list_messages" ||
-    action === "find_user" ||
-    action === "find_post" ||
-    action === "find_comment" ||
     action === "send_message" ||
     action === "edit_message" ||
     action === "open_dm" ||
     action === "typing" ||
-    action === "delivery_confirmed"
+    action === "delivery_confirmed" ||
+    action === "report_system_probe"
   );
 };
 
 const isBridgeCallError = (value: unknown): value is BridgeCallError =>
   value instanceof BridgeCallError;
+
+const isBotTokenInvalidMessage = (message: string): boolean =>
+  /bot token is invalid/iu.test(message) ||
+  /bot token invalid/iu.test(message) ||
+  /bot token expired/iu.test(message) ||
+  /x-bot-session-token/iu.test(message);
 
 const parseRetryAfterMs = (input: {
   response: Response;
@@ -206,12 +206,35 @@ const readSecretFromEnvOrFile = async (envKey: string, fileKey: string): Promise
   return raw?.trim().length ? raw.trim() : null;
 };
 
-const readBotTokenFromFile = async (filePath: string): Promise<string | null> => {
+const readBotTokenFromFile = async (
+  filePath: string,
+  tokenExpirySkewMs: number,
+): Promise<string | null> => {
   const raw = await fs.readFile(filePath, "utf8").catch(() => null);
   if (!raw?.trim().length) return null;
   try {
     const parsed = JSON.parse(raw.trim()) as unknown;
     if (isRecord(parsed)) {
+      const state =
+        typeof parsed.state === "string"
+          ? parsed.state.trim().toLowerCase()
+          : "";
+      if (state === "cleared") {
+        return null;
+      }
+      const expiresAt =
+        typeof parsed.expiresAt === "string"
+          ? parsed.expiresAt.trim()
+          : "";
+      if (expiresAt.length > 0) {
+        const expiresAtMs = Date.parse(expiresAt);
+        if (
+          Number.isFinite(expiresAtMs) &&
+          Date.now() + tokenExpirySkewMs >= expiresAtMs
+        ) {
+          return null;
+        }
+      }
       const token = typeof parsed.token === "string" ? parsed.token.trim() : typeof parsed.sessionToken === "string" ? (parsed.sessionToken as string).trim() : "";
       return token.length ? token : null;
     }
@@ -364,7 +387,49 @@ const main = async (): Promise<void> => {
   const statusPath = path.join(stateDir, "ipc", "chat", "status.json");
   const wakePath = path.join(stateDir, "ipc", "wake-chat");
   const stateDb = createStateSqliteStoreFromEnv(stateDir);
-  stateDb.init();
+  let stateDbReady = false;
+  try {
+    stateDb.init();
+    stateDbReady = true;
+  } catch (error) {
+    console.warn("[chat-bridge] state sqlite init failed; continuing without sqlite state store.", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const safeStateAppendEvent = (input: {
+    source: string;
+    topic: string;
+    eventType: string;
+    visibility: "public" | "private";
+    at: string;
+    payload: unknown;
+  }) => {
+    if (!stateDbReady) return;
+    try {
+      stateDb.appendEvent(input);
+    } catch (error) {
+      console.warn("[chat-bridge] failed to append sqlite state event; continuing.", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
+  const safeStateUpsertSnapshot = (input: {
+    scope: string;
+    visibility: "public" | "private";
+    at: string;
+    data: unknown;
+  }) => {
+    if (!stateDbReady) return;
+    try {
+      stateDb.upsertSnapshot(input);
+    } catch (error) {
+      console.warn("[chat-bridge] failed to upsert sqlite state snapshot; continuing.", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
 
   const maxTrackedIds = Math.max(100, parseIntEnv("MG_CHAT_AGENT_TRACKED_MESSAGE_IDS", 1200));
   const maxTopics = Math.max(5, parseIntEnv("MG_CHAT_AGENT_MAX_TOPICS", 180));
@@ -372,6 +437,13 @@ const main = async (): Promise<void> => {
   const tokenPollMs = Math.max(
     250,
     Math.min(10_000, parseIntEnv("MG_CHAT_AGENT_TOKEN_POLL_MS", 1000)),
+  );
+  const botTokenExpirySkewMs = Math.max(
+    0,
+    Math.min(
+      300_000,
+      parseIntEnv("MG_AGENT_BOT_TOKEN_EXPIRY_SKEW_MS", 15_000),
+    ),
   );
   const tokenFastRetryMs = Math.max(
     100,
@@ -409,6 +481,7 @@ const main = async (): Promise<void> => {
 
   let preferredTokenSource: string | null = null;
   let preferredTokenValue: string | null = null;
+  const rejectedBotTokenValues = new Set<string>();
   let bridgeRateLimitedUntilMs = 0;
   let bridgeRateLimitedReason: string | null = null;
 
@@ -416,14 +489,24 @@ const main = async (): Promise<void> => {
     const candidates: Array<{ source: string; token: string }> = [];
     const push = (source: string, token: string | null): void => {
       const t = typeof token === "string" ? token.trim() : "";
-      if (t.length && !candidates.some((c) => c.token === t)) candidates.push({ source, token: t });
+      if (!t.length) return;
+      if (rejectedBotTokenValues.has(t)) return;
+      if (!candidates.some((c) => c.token === t)) {
+        candidates.push({ source, token: t });
+      }
     };
     push("env:MG_BOT_SESSION_TOKEN", trimEnv("MG_BOT_SESSION_TOKEN"));
     push("env:MG_BOT_TOKEN", trimEnv("MG_BOT_TOKEN"));
-    push(`file:${tokenFile}`, await readBotTokenFromFile(tokenFile));
+    push(
+      `file:${tokenFile}`,
+      await readBotTokenFromFile(tokenFile, botTokenExpirySkewMs),
+    );
     if (botTokenFile) {
       const resolvedBotTokenFile = path.resolve(botTokenFile);
-      push(`file:${resolvedBotTokenFile}`, await readBotTokenFromFile(resolvedBotTokenFile));
+      push(
+        `file:${resolvedBotTokenFile}`,
+        await readBotTokenFromFile(resolvedBotTokenFile, botTokenExpirySkewMs),
+      );
     }
     if (preferredTokenValue && preferredTokenSource) {
       const idx = candidates.findIndex((c) => c.token === preferredTokenValue);
@@ -452,13 +535,19 @@ const main = async (): Promise<void> => {
     }
 
     const candidates = await resolveBotTokenCandidates();
-    if (payloadRequiresBotToken(payload) && candidates.length === 0) {
+    const requiresBotToken = payloadRequiresBotToken(payload);
+    if (requiresBotToken && candidates.length === 0) {
       throw new BridgeCallError(
         "Bot token missing. Provide x-bot-session-token. (tokenSource=none)",
         { status: 401, tokenSource: "none" },
       );
     }
-    const attempts = candidates.length > 0 ? candidates : [{ source: "none", token: null }];
+    const attempts: Array<{ source: string; token: string | null }> = [
+      ...candidates,
+    ];
+    if (!requiresBotToken || attempts.length === 0) {
+      attempts.push({ source: "none", token: null });
+    }
     let lastError: BridgeCallError | null = null;
 
     for (let i = 0; i < attempts.length; i++) {
@@ -498,7 +587,18 @@ const main = async (): Promise<void> => {
         status: res.status,
         tokenSource: candidate.source,
       });
-      const isTokenMismatch = /bot token is invalid/iu.test(errMsg) || /bot token invalid/iu.test(errMsg);
+      const isTokenMismatch = isBotTokenInvalidMessage(errMsg);
+      if (
+        isTokenMismatch &&
+        typeof candidate.token === "string" &&
+        candidate.token.trim().length > 0
+      ) {
+        rejectedBotTokenValues.add(candidate.token);
+        if (preferredTokenValue === candidate.token) {
+          preferredTokenValue = null;
+          preferredTokenSource = null;
+        }
+      }
       if (isTokenMismatch && i < attempts.length - 1) continue;
       throw lastError;
     }
@@ -520,7 +620,7 @@ const main = async (): Promise<void> => {
       typeof payload.at === "string" && payload.at.trim().length > 0
         ? payload.at.trim()
         : nowIso();
-    stateDb.appendEvent({
+    safeStateAppendEvent({
       source: "chat-bridge",
       topic: "chat.bridge",
       eventType,
@@ -536,7 +636,7 @@ const main = async (): Promise<void> => {
       typeof payload.at === "string" && payload.at.trim().length > 0
         ? payload.at.trim()
         : nowIso();
-    stateDb.appendEvent({
+    safeStateAppendEvent({
       source: "chat-bridge",
       topic: "chat.inbox",
       eventType: "message.created",
@@ -587,7 +687,7 @@ const main = async (): Promise<void> => {
   const updateStatus = async (patch: Partial<BridgeStatus>): Promise<void> => {
     status = { ...status, ...patch, updatedAt: nowIso() };
     await writeJsonFile(statusPath, status).catch(() => undefined);
-    stateDb.upsertSnapshot({
+    safeStateUpsertSnapshot({
       scope: "chat.bridge.status",
       visibility: "public",
       at: status.updatedAt,
@@ -1327,6 +1427,9 @@ const main = async (): Promise<void> => {
       const latest = candidates.length > 0 ? candidates[0]!.token : null;
       if (latest === lastObservedTokenValue) return;
       lastObservedTokenValue = latest;
+      if (latest) {
+        rejectedBotTokenValues.delete(latest);
+      }
       if (!latest) return;
       const socket = activeSocket;
       if (socket && socket.readyState === WebSocket.OPEN) return;

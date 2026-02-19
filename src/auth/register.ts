@@ -62,6 +62,14 @@ export interface RegisterBotResult {
   identity: AgentIdentity | null;
 }
 
+export interface PersistedAgentKeyBoxRecord {
+  agentKeyBox: string;
+  ownerSupervisorPid: number | null;
+  ownerConnectionId: string | null;
+  registeredAt: string | null;
+  source: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Temporary WS client
 // ---------------------------------------------------------------------------
@@ -221,15 +229,30 @@ export const registerBot = async (
 export const persistAgentKeyBox = async (options: {
   agentKeyBox: string;
   stateDir: string;
+  ownerSupervisorPid?: number | null;
+  ownerConnectionId?: string | null;
 }): Promise<string> => {
   const authDir = path.join(options.stateDir, "ipc", "auth");
   await fs.mkdir(authDir, { recursive: true });
+  const ownerSupervisorPid =
+    typeof options.ownerSupervisorPid === "number" &&
+    Number.isInteger(options.ownerSupervisorPid) &&
+    options.ownerSupervisorPid > 0
+      ? options.ownerSupervisorPid
+      : null;
+  const ownerConnectionId =
+    typeof options.ownerConnectionId === "string" &&
+    options.ownerConnectionId.trim().length > 0
+      ? options.ownerConnectionId.trim()
+      : null;
   const filePath = path.join(authDir, "agent-key-box.json");
   const payload = JSON.stringify(
     {
       agentKeyBox: options.agentKeyBox,
       registeredAt: new Date().toISOString(),
       source: "auto-register",
+      ownerSupervisorPid,
+      ownerConnectionId,
     },
     null,
     2,
@@ -266,17 +289,59 @@ export const persistAgentIdentity = async (options: {
  */
 export const readPersistedAgentKeyBox = async (
   stateDir: string,
-): Promise<string | null> => {
+): Promise<PersistedAgentKeyBoxRecord | null> => {
   const filePath = path.join(stateDir, "ipc", "auth", "agent-key-box.json");
   try {
     const raw = await fs.readFile(filePath, "utf8");
-    const parsed = JSON.parse(raw) as { agentKeyBox?: string };
-    const value =
+    const parsed = JSON.parse(raw) as {
+      agentKeyBox?: string;
+      ownerSupervisorPid?: number | null;
+      ownerConnectionId?: string | null;
+      registeredAt?: string | null;
+      source?: string | null;
+    };
+    const agentKeyBox =
       typeof parsed?.agentKeyBox === "string"
         ? parsed.agentKeyBox.trim()
         : "";
-    return value.length > 0 ? value : null;
+    if (!agentKeyBox.length) return null;
+    const ownerSupervisorPid =
+      typeof parsed.ownerSupervisorPid === "number" &&
+      Number.isInteger(parsed.ownerSupervisorPid) &&
+      parsed.ownerSupervisorPid > 0
+        ? parsed.ownerSupervisorPid
+        : null;
+    const ownerConnectionId =
+      typeof parsed.ownerConnectionId === "string" &&
+      parsed.ownerConnectionId.trim().length > 0
+        ? parsed.ownerConnectionId.trim()
+        : null;
+    const registeredAt =
+      typeof parsed.registeredAt === "string" &&
+      parsed.registeredAt.trim().length > 0
+        ? parsed.registeredAt.trim()
+        : null;
+    const source =
+      typeof parsed.source === "string" && parsed.source.trim().length > 0
+        ? parsed.source.trim()
+        : null;
+    return {
+      agentKeyBox,
+      ownerSupervisorPid,
+      ownerConnectionId,
+      registeredAt,
+      source,
+    };
   } catch {
     return null;
   }
+};
+
+/**
+ * Removes the persisted convenience key from state.
+ * Best-effort; does not throw.
+ */
+export const clearPersistedAgentKeyBox = async (stateDir: string): Promise<void> => {
+  const filePath = path.join(stateDir, "ipc", "auth", "agent-key-box.json");
+  await fs.rm(filePath, { force: true }).catch(() => {});
 };

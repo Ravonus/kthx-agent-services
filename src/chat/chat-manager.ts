@@ -44,6 +44,8 @@ export interface ChatManagerContext {
     chatRuntimeTextStreamStepChars: number;
     chatRuntimeTextStreamStepMs: number;
     chatRuntimeTextStreamUpdateMinMs: number;
+    chatRuntimeStaleReplyMaxAgeMs: number;
+    chatRuntimeStaleReplyMaxAgeImportantMs: number;
   };
   ipcPaths: {
     chatInboxPath: string;
@@ -94,6 +96,13 @@ interface StreamState {
   nativeDeltaChars: number;
 }
 
+interface StaleReplyDecision {
+  skipReply: boolean;
+  ageMs: number | null;
+  important: boolean;
+  reason: "fresh" | "stale_not_important" | "stale_important_expired" | "stale_important_allowed" | "invalid_timestamp";
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 const extractSentMessageId = (response: unknown): string | null => {
@@ -129,6 +138,9 @@ const parsePostAndCommentHints = (text: string): {
 
 const MEMORY_INTERNAL_BULLET_PATTERN =
   /\b(openclaw|bot token|session token|agent key|directive|queue|runtime|bridge|heartbeat|mint|challenge|permission(?:s)?(?:\s+state)?|no_grant|api\/agent\/chat|port\s*\d{3,5}|websocket|socket|postgres|database|sql|migration|column\s+\w+)\b/iu;
+
+const STALE_IMPORTANT_PATTERN =
+  /\?|(\b(can you|could you|would you|please|help|urgent|asap|stuck|error|failed|fix|why|where|when|what|how|follow up|follow-up)\b)/iu;
 
 const isSafeMemoryBullet = (value: string): boolean =>
   !MEMORY_INTERNAL_BULLET_PATTERN.test(value.trim().toLowerCase());
@@ -201,6 +213,7 @@ export class ChatManager implements ChatManagerLike {
     try {
       await this.initializeCursor();
       const lines = await this.readDeltaLines();
+      let staleReplySkippedCount = 0;
       for (const line of lines) {
         let parsed: unknown;
         try { parsed = JSON.parse(line); } catch { continue; }
@@ -216,6 +229,38 @@ export class ChatManager implements ChatManagerLike {
         }).catch(() => undefined);
         const mentionTokens = await this.resolveMentionTokens();
         if (!shouldReplyToChatInboxEntry(entry, { channelRequireMention: this.ctx.config.chatRuntimeChannelRequireMention, mentionTokens })) continue;
+        const staleDecision = this.evaluateStaleReplyDecision(entry);
+        if (staleDecision.skipReply) {
+          staleReplySkippedCount += 1;
+          await this.ctx.memory
+            .recordWrite({
+              type: "chat_runtime_stale_reply_skipped",
+              at: nowIso(),
+              messageId: entry.messageId,
+              conversationId: entry.conversationId,
+              channelId: entry.channelId,
+              eventType: entry.eventType,
+              reason: staleDecision.reason,
+              ageMs: staleDecision.ageMs,
+              important: staleDecision.important,
+              bodyPreview: toAnswerPreview(entry.body, 180),
+            })
+            .catch(() => undefined);
+          continue;
+        }
+        if (staleDecision.reason === "stale_important_allowed") {
+          await this.ctx.memory
+            .recordWrite({
+              type: "chat_runtime_stale_reply_allowed",
+              at: nowIso(),
+              messageId: entry.messageId,
+              conversationId: entry.conversationId,
+              channelId: entry.channelId,
+              ageMs: staleDecision.ageMs,
+              important: true,
+            })
+            .catch(() => undefined);
+        }
         await this.ctx
           .runMemoryCheckpoint({
             force: true,
@@ -307,6 +352,15 @@ export class ChatManager implements ChatManagerLike {
         } finally {
           if (typingSent) await this.setTyping(entry, false).catch(() => undefined);
         }
+      }
+      if (staleReplySkippedCount > 0) {
+        await this.ctx
+          .runMemoryCheckpoint({
+            force: false,
+            source: "chat_runtime_stale_ingest",
+            allowAgentCompression: true,
+          })
+          .catch(() => undefined);
       }
       await this.persistState("poll");
     } catch (error: unknown) {
@@ -407,6 +461,78 @@ export class ChatManager implements ChatManagerLike {
       if (removed) this.ctx.chat.chatSeenMessageIds.delete(removed);
     }
     this.ctx.chat.chatRuntimeStateDirty = true;
+  }
+
+  // -----------------------------------------------------------------------
+  // Private: stale reply policy
+  // -----------------------------------------------------------------------
+
+  private evaluateStaleReplyDecision(entry: ChatInboxEntry): StaleReplyDecision {
+    const receivedAtMs = this.parseEntryTimestampMs(entry.receivedAt);
+    if (receivedAtMs === null) {
+      return {
+        skipReply: false,
+        ageMs: null,
+        important: false,
+        reason: "invalid_timestamp",
+      };
+    }
+    const ageMs = Date.now() - receivedAtMs;
+    if (ageMs <= this.ctx.config.chatRuntimeStaleReplyMaxAgeMs) {
+      return {
+        skipReply: false,
+        ageMs,
+        important: false,
+        reason: "fresh",
+      };
+    }
+    const important = this.isImportantMissedMessage(entry);
+    if (!important) {
+      return {
+        skipReply: true,
+        ageMs,
+        important: false,
+        reason: "stale_not_important",
+      };
+    }
+    if (ageMs > this.ctx.config.chatRuntimeStaleReplyMaxAgeImportantMs) {
+      return {
+        skipReply: true,
+        ageMs,
+        important: true,
+        reason: "stale_important_expired",
+      };
+    }
+    return {
+      skipReply: false,
+      ageMs,
+      important: true,
+      reason: "stale_important_allowed",
+    };
+  }
+
+  private parseEntryTimestampMs(value: string): number | null {
+    const raw = value.trim();
+    if (!raw.length) return null;
+    const ms = Date.parse(raw);
+    if (!Number.isFinite(ms)) return null;
+    return ms;
+  }
+
+  private isImportantMissedMessage(entry: ChatInboxEntry): boolean {
+    const body = entry.body.trim();
+    if (!body.length) return false;
+    const bodyLower = body.toLowerCase();
+    if (STALE_IMPORTANT_PATTERN.test(bodyLower)) return true;
+    if (entry.channelId && bodyLower.includes("@")) return true;
+    if (
+      entry.serverIntentActionFamily === "conversation" &&
+      typeof entry.serverIntentConfidence === "string" &&
+      entry.serverIntentConfidence === "high"
+    ) {
+      return true;
+    }
+    return false;
   }
 
   // -----------------------------------------------------------------------

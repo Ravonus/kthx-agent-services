@@ -83,6 +83,8 @@ See `src/config/runtime.ts` for all env vars. Key ones:
 - `MG_AGENT_BOT_SESSION_FILE_WRITER` (optional, `auto|supervisor|runtime`, default `auto`) - select writer for `state/ipc/auth/bot-session.json`
 - `MG_AGENT_STATE_DB_ENABLED` (optional, default `1`) - enable SQLite state ledger
 - `MG_AGENT_STATE_DB_PATH` (optional, default `state/ipc/state.sqlite`) - SQLite file path
+- `MG_AGENT_STATE_DB_BUSY_TIMEOUT_MS` (optional, default `5000`) - SQLite busy timeout to wait on lock contention
+- `MG_AGENT_STATE_DB_BUSY_RETRY_COUNT` (optional, default `2`) - retry count after busy/locked responses
 - `MG_AGENT_HEALTH_PRIVATE_KEY` (optional) - enables `/api/health/private` auth via `?key=` or `x-agent-health-key`
 
 Notes:
