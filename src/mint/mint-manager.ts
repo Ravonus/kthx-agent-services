@@ -68,8 +68,8 @@ const errCode = (e: unknown): string | null => {
 const errMsg = (e: unknown): string =>
   e instanceof Error ? e.message : typeof e === "string" ? e : "unknown error";
 
-const MINT_CHALLENGE_SOLVER_MAX_ATTEMPTS = 3;
-const MINT_CHALLENGE_SOLVER_RETRY_DELAY_MS = 800;
+const MINT_CHALLENGE_SOLVER_MAX_ATTEMPTS = 2;
+const MINT_CHALLENGE_SOLVER_RETRY_DELAY_MS = 500;
 const MINT_MAX_CHALLENGE_STEPS_PER_FLOW = 12;
 const MINT_MAX_SOLVER_FLOW_FAILS_PER_CHALLENGE = 3;
 const MINT_PENDING_CHALLENGE_EXPIRY_SKEW_MS = 1_000;

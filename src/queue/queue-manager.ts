@@ -305,11 +305,18 @@ export class QueueManager implements QueueManagerLike {
                 qi.lastError.trim().length > 0
                   ? qi.lastError.trim()
                   : "not_ready";
+              const retryDelaySeconds = Math.max(
+                2,
+                Math.min(60, (typeof qi.attempts === "number" ? qi.attempts : 1) * 2),
+              );
+              const nextDueAt = new Date(
+                Date.now() + retryDelaySeconds * 1000,
+              ).toISOString();
               return {
                 ...qi,
-                status: (qi.dueAt
-                  ? "scheduled"
-                  : "queued") as QueueItem["status"],
+                status: "scheduled" as QueueItem["status"],
+                dueAt: nextDueAt,
+                scheduledBy: "queue_not_ready_backoff",
                 lastError: preservedError,
               };
             });
@@ -379,6 +386,10 @@ export class QueueManager implements QueueManagerLike {
       .then(async () => {
         const current = await this.readQueueState();
         const nextCandidate = await mutate(current);
+        if (!nextCandidate || nextCandidate === current) {
+          resolvedState = current;
+          return;
+        }
         const next = normalizeQueueState(nextCandidate ?? current);
         resolvedState = await this.writeQueueState(next);
       })
@@ -432,6 +443,7 @@ export class QueueManager implements QueueManagerLike {
       queueConfig.maxSpacingSeconds,
     );
 
+    let planChanged = false;
     const state = await this.mutateQueueState((current) => {
       const pending = current.items
         .filter(
@@ -457,25 +469,46 @@ export class QueueManager implements QueueManagerLike {
       const next = { ...current };
       next.items = current.items.map((qi) => ({ ...qi }));
       for (const item of pending) {
-        const delaySeconds = delays.get(item.inboxFile) ?? 0;
-        const dueAt = new Date(nowMs + delaySeconds * 1000).toISOString();
         const target = next.items.find((qi) => qi.id === item.id);
         if (!target) continue;
+        const shouldKeepExistingSchedule =
+          target.status === "scheduled" &&
+          typeof target.dueAt === "string" &&
+          target.dueAt.trim().length > 0 &&
+          target.scheduledBy === reason;
+        if (shouldKeepExistingSchedule) {
+          continue;
+        }
+        const delaySeconds = delays.get(item.inboxFile) ?? 0;
+        const dueAt = new Date(nowMs + delaySeconds * 1000).toISOString();
+        if (
+          target.status === "scheduled" &&
+          target.dueAt === dueAt &&
+          target.scheduledBy === reason
+        ) {
+          continue;
+        }
         target.status = "scheduled";
         target.dueAt = dueAt;
         target.scheduledBy = reason;
+        planChanged = true;
+      }
+      if (!planChanged) {
+        return current;
       }
       next.lastPlanAt = nowIso();
       next.lastPlanSource = reason;
       return next;
     });
 
-    await this.ctx.memory.recordWrite({
-      type: "directive_queue_planned",
-      at: nowIso(),
-      reason,
-      itemCount: state.items.length,
-    });
+    if (planChanged) {
+      await this.ctx.memory.recordWrite({
+        type: "directive_queue_planned",
+        at: nowIso(),
+        reason,
+        itemCount: state.items.length,
+      });
+    }
 
     return state;
   }

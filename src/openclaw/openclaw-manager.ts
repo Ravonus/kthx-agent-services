@@ -100,17 +100,26 @@ export interface OpenClawPromptResult {
 // ---------------------------------------------------------------------------
 
 const OPENCLAW_ANSI_PATTERN = /\u001b\[[0-9;]*[A-Za-z]/gu;
-const DEFAULT_MINT_CHALLENGE_TIMEOUT_MS = 45_000;
+const DEFAULT_MINT_CHALLENGE_TIMEOUT_MS = 20_000;
+const DEFAULT_MINT_CHALLENGE_THINKING_LEVEL = "off";
 
 const parseMintChallengeTimeoutMs = (): number => {
   const raw = trimEnv("MG_AGENT_MINT_CHALLENGE_OPENCLAW_TIMEOUT_MS");
   if (!raw) return DEFAULT_MINT_CHALLENGE_TIMEOUT_MS;
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed)) return DEFAULT_MINT_CHALLENGE_TIMEOUT_MS;
-  return Math.max(10_000, Math.min(90_000, parsed));
+  return Math.max(5_000, Math.min(30_000, parsed));
 };
 
 const MINT_CHALLENGE_TIMEOUT_MS = parseMintChallengeTimeoutMs();
+const MINT_CHALLENGE_THINKING_LEVEL = (() => {
+  const raw = trimEnv("MG_AGENT_MINT_CHALLENGE_OPENCLAW_THINKING");
+  if (!raw) return DEFAULT_MINT_CHALLENGE_THINKING_LEVEL;
+  const normalized = raw.trim().toLowerCase();
+  return normalized.length > 0
+    ? normalized
+    : DEFAULT_MINT_CHALLENGE_THINKING_LEVEL;
+})();
 
 const stripEmptyAgentFlag = (command: string): string =>
   command
@@ -188,6 +197,23 @@ const applyOpenClawBinOverride = (command: string): string => {
   // Replace leading "openclaw " with the override path.
   // Handles: `openclaw agent ...` but not `/usr/bin/openclaw ...` or `myopenclaw ...`
   return command.replace(/^openclaw(?=\s)/u, bin);
+};
+
+const enforceMintChallengeFastThinking = (command: string): string => {
+  const normalized = command.trim();
+  if (!normalized.length) return command;
+  const isOpenClawCommand =
+    /(^|\s|[/\\])openclaw(?:\.cmd|\.exe)?(?=\s|$)/iu.test(normalized);
+  if (!isOpenClawCommand) return command;
+  const desiredThinking = MINT_CHALLENGE_THINKING_LEVEL.trim();
+  if (!desiredThinking.length) return command;
+  if (/\s--thinking\s+\S+/iu.test(command)) {
+    return command.replace(/\s--thinking\s+\S+/iu, ` --thinking ${desiredThinking}`);
+  }
+  if (/\s-m\s/iu.test(command)) {
+    return command.replace(/\s-m\s/iu, ` --thinking ${desiredThinking} -m `);
+  }
+  return `${command} --thinking ${desiredThinking}`;
 };
 
 /** Build a resolved shell command from a template with placeholder substitution. */
@@ -277,6 +303,9 @@ export class OpenClawManager implements OpenClawManagerLike {
       template.replaceAll("{prompt}", promptForCommand),
       agentName, this.ctx.config,
     );
+    const effectiveCommand = isMintChallenge
+      ? enforceMintChallengeFastThinking(command)
+      : command;
     const configuredTimeoutMs =
       typeof ocConfig.timeoutMs === "number" && Number.isFinite(ocConfig.timeoutMs)
         ? Math.max(15_000, Math.floor(ocConfig.timeoutMs))
@@ -292,14 +321,14 @@ export class OpenClawManager implements OpenClawManagerLike {
       ? this.runShellCommand.bind(this)
       : this.runLockedShellCommand.bind(this);
     const result = await runCommand({
-      command, timeoutMs,
+      command: effectiveCommand, timeoutMs,
       ...(allowNativeTextStreaming ? { onStdoutData: (chunk: string) => { const delta = parseOpenClawStdoutDelta(chunk); if (delta.length) onTextDelta(delta); } } : {}),
     });
     await this.ctx.memory.recordWrite({
       type: "openclaw_prompt_result", at: nowIso(), purpose, ok: result.ok,
       code: result.code, agentName: agentName ?? null,
       executionMode: isMintChallenge ? "direct_subprocess" : "locked_subprocess",
-      commandPreview: toAnswerPreview(command, 180), stderrPreview: toAnswerPreview(result.stderr, 180),
+      commandPreview: toAnswerPreview(effectiveCommand, 180), stderrPreview: toAnswerPreview(result.stderr, 180),
     });
     if (!result.ok) return null;
     const parsedRaw = parseJsonFromMixedText(result.stdout);
