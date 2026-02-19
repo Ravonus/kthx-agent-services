@@ -6,8 +6,7 @@
  * Connects to the chat gateway via HTTP bridge endpoints, establishes a
  * WebSocket session, subscribes to topics (DMs, channels, servers), and
  * writes incoming messages to the chat inbox JSONL. Bot-session tokens are
- * resolved from the environment or a token file, with automatic fallback
- * retry on mismatch.
+ * resolved from explicit env/file sources.
  *
  * Required env:
  *   MG_AGENT_KEY_BOX (or MG_AGENT_KEY_BOX_FILE, or MG_AGENT_KEY)
@@ -358,7 +357,6 @@ const main = async (): Promise<void> => {
   const agentHomeDir = path.resolve(trimEnv("MG_AGENT_HOME_DIR") ?? "kthx-agents");
   const stateDir = path.resolve(trimEnv("MG_AGENT_STATE_DIR") ?? path.join(agentHomeDir, "state"));
   const defaultTokenFile = path.join(stateDir, "ipc", "auth", "bot-session.json");
-  const legacyWsTokenFile = path.join(stateDir, "secrets", "MG_BOT_SESSION_TOKEN.ws.txt");
   const tokenFile = path.resolve(trimEnv("MG_BOT_SESSION_TOKEN_FILE") ?? defaultTokenFile);
   const botTokenFile = trimEnv("MG_BOT_TOKEN_FILE");
   const eventsPath = path.join(stateDir, "ipc", "chat", "events.jsonl");
@@ -427,8 +425,6 @@ const main = async (): Promise<void> => {
       const resolvedBotTokenFile = path.resolve(botTokenFile);
       push(`file:${resolvedBotTokenFile}`, await readBotTokenFromFile(resolvedBotTokenFile));
     }
-    if (defaultTokenFile !== tokenFile) push(`file:${defaultTokenFile}`, await readBotTokenFromFile(defaultTokenFile));
-    push(`file:${legacyWsTokenFile}`, await readBotTokenFromFile(legacyWsTokenFile));
     if (preferredTokenValue && preferredTokenSource) {
       const idx = candidates.findIndex((c) => c.token === preferredTokenValue);
       if (idx > 0) { const [item] = candidates.splice(idx, 1); candidates.unshift(item!); }
@@ -736,22 +732,6 @@ const main = async (): Promise<void> => {
     return items.length > maxTopics ? items.slice(0, maxTopics) : items;
   };
 
-  const fallbackTopics = (mode: SubscriptionMode): TopicRequest[] => {
-    const map = new Map<string, TopicRequest>();
-    const add = (r: TopicRequest): void => {
-      const key = r.topicType === "user" ? "user" : `${r.topicType}:${r.topicId ?? ""}`;
-      if (!map.has(key)) map.set(key, r);
-    };
-    add({ topicType: "user" });
-    if (mode === "idle_user_only") {
-      if (idleKeepManualTopics) manualTopics.forEach((r) => add(r));
-    } else {
-      manualTopics.forEach((r) => add(r));
-    }
-    const items = Array.from(map.values());
-    return items.length > maxTopics ? items.slice(0, maxTopics) : items;
-  };
-
   // Inbox enrichment
   const enrichInbox = async (topic: string, event: Record<string, unknown>): Promise<void> => {
     const eventType = typeof event.type === "string" ? event.type.trim() : "";
@@ -1002,23 +982,24 @@ const main = async (): Promise<void> => {
     await updateStatus({ gatewayWsUrl: wsUrl });
 
     let topicRequests: TopicRequest[];
-    let topicCollectionError: string | null = null;
-    try { topicRequests = await collectTopics(connectMode); } catch (e) {
-      topicCollectionError = e instanceof Error ? e.message : String(e);
-      topicRequests = fallbackTopics(connectMode);
+    try {
+      topicRequests = await collectTopics(connectMode);
+    } catch (e) {
+      const topicCollectionError = e instanceof Error ? e.message : String(e);
       lastShellSummary = null;
       await appendBridgeEvent({
         at: nowIso(),
         type: "topic_collection_failed",
         mode: connectMode,
         message: topicCollectionError,
-        fallbackTopicCount: topicRequests.length,
       });
       await updateStatus({
-        state: "connecting_degraded",
+        state: "reconnecting",
         connected: false,
         lastError: `topic_collection_failed: ${topicCollectionError}`,
       });
+      await scheduleReconnect(`topic_collection_failed: ${topicCollectionError}`);
+      return;
     }
     const requestedTopicCounts = countTopicRequests(topicRequests);
 
@@ -1222,7 +1203,7 @@ const main = async (): Promise<void> => {
         gatewayWsUrl: wsUrl,
         botTokenSource: preferredTokenSource,
         reconnectAttempt,
-        lastError: topicCollectionError ? `topic_collection_failed: ${topicCollectionError}` : null,
+        lastError: null,
         viewerMainUserId,
         subscribedTopics: Array.from(ticketMap.keys()),
         subscriptionMode: connectMode,

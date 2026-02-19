@@ -92,6 +92,101 @@ const truncateText = (value: string, maxChars: number): string => {
   return `${text.slice(0, Math.max(8, maxChars - 1))}…`;
 };
 
+type CropRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type ProfileCropSpec = {
+  target: "avatar" | "banner";
+  outputAspect: number;
+  focalPoint: { x: number; y: number };
+  safeZone: CropRect;
+  avoidEdges: { top: number; right: number; bottom: number; left: number };
+  textSafeZone?: CropRect;
+  guidance: string;
+};
+
+const roundNorm = (value: number): number =>
+  Math.round(Math.min(1, Math.max(0, value)) * 1000) / 1000;
+const roundValue = (value: number): number =>
+  Math.round(value * 1000) / 1000;
+
+const buildProfileCropSpec = (target: "avatar" | "banner"): ProfileCropSpec => {
+  if (target === "avatar") {
+    return {
+      target,
+      outputAspect: 1,
+      focalPoint: { x: 0.5, y: 0.42 },
+      safeZone: { x: 0.18, y: 0.16, width: 0.64, height: 0.64 },
+      avoidEdges: { top: 0.08, right: 0.08, bottom: 0.08, left: 0.08 },
+      guidance:
+        "Keep the face/primary subject in the center 64% square and avoid placing key details near the outer 8% edge (circular crop loss).",
+    };
+  }
+  return {
+    target,
+    outputAspect: 3,
+    focalPoint: { x: 0.5, y: 0.38 },
+    safeZone: { x: 0.08, y: 0.18, width: 0.84, height: 0.64 },
+    textSafeZone: { x: 0.12, y: 0.24, width: 0.76, height: 0.48 },
+    avoidEdges: { top: 0.1, right: 0.08, bottom: 0.1, left: 0.08 },
+    guidance:
+      "Keep core visuals inside the center safe zone (84% x 64%) and reserve top/bottom edges; put text/logo inside the text-safe band.",
+  };
+};
+
+const normalizeProfileCropSpec = (spec: ProfileCropSpec): ProfileCropSpec => ({
+  ...spec,
+  outputAspect: roundValue(spec.outputAspect),
+  focalPoint: {
+    x: roundNorm(spec.focalPoint.x),
+    y: roundNorm(spec.focalPoint.y),
+  },
+  safeZone: {
+    x: roundNorm(spec.safeZone.x),
+    y: roundNorm(spec.safeZone.y),
+    width: roundNorm(spec.safeZone.width),
+    height: roundNorm(spec.safeZone.height),
+  },
+  avoidEdges: {
+    top: roundNorm(spec.avoidEdges.top),
+    right: roundNorm(spec.avoidEdges.right),
+    bottom: roundNorm(spec.avoidEdges.bottom),
+    left: roundNorm(spec.avoidEdges.left),
+  },
+  ...(spec.textSafeZone
+    ? {
+        textSafeZone: {
+          x: roundNorm(spec.textSafeZone.x),
+          y: roundNorm(spec.textSafeZone.y),
+          width: roundNorm(spec.textSafeZone.width),
+          height: roundNorm(spec.textSafeZone.height),
+        },
+      }
+    : {}),
+});
+
+const buildProfileCropPromptHint = (spec: ProfileCropSpec): string => {
+  if (spec.target === "avatar") {
+    return [
+      "Crop-safe avatar composition requirements:",
+      "- Single clear subject, forward-facing, upper-center focus.",
+      "- Keep the subject inside the center 64% safe square.",
+      "- Leave the outer 8% edge clean to survive circular crop masking.",
+    ].join("\n");
+  }
+  return [
+    "Crop-safe banner composition requirements:",
+    "- Compose for a 3:1 banner frame with focal point slightly above center.",
+    "- Keep essential visuals inside the center safe zone (84% x 64%).",
+    "- Keep top/bottom 10% and side 8% relatively clean for variable viewport crops.",
+    "- Keep text/logo inside the inner text-safe zone.",
+  ].join("\n");
+};
+
 const parseDataUriPayload = (
   value: string,
 ): { mime: string; data: string } | null => {
@@ -599,7 +694,7 @@ export class CommandExecutor {
         asNonEmptyString(payload.prompt),
       ],
     });
-    const result = await this.updateAvatarWithFallback({
+    const result = await this.updateAvatar({
       target,
       imageUrl: media.mediaUrl,
       ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
@@ -642,7 +737,7 @@ export class CommandExecutor {
         asNonEmptyString(payload.prompt),
       ],
     });
-    const result = await this.updateBannerWithFallback({
+    const result = await this.updateBanner({
       target,
       bannerUrl: media.mediaUrl,
       ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
@@ -947,7 +1042,12 @@ export class CommandExecutor {
       avatarTarget === "agent" &&
       (recentGeneratedAssetType === "persona" ||
         recentGeneratedAssetType === "avatar");
-    const prompt = shouldReusePersonaReference
+    const profileCropSpec = avatarRequest
+      ? normalizeProfileCropSpec(buildProfileCropSpec("avatar"))
+      : bannerRequest
+        ? normalizeProfileCropSpec(buildProfileCropSpec("banner"))
+        : null;
+    const promptBase = shouldReusePersonaReference
       ? [
           basePrompt,
           "Maintain visual persona continuity with the previous avatar.",
@@ -961,6 +1061,11 @@ export class CommandExecutor {
           .filter((entry): entry is string => Boolean(entry))
           .join("\n")
       : basePrompt;
+    const prompt = profileCropSpec
+      ? [promptBase, buildProfileCropPromptHint(profileCropSpec)]
+          .filter((entry) => entry.trim().length > 0)
+          .join("\n\n")
+      : promptBase;
     const provenance = asNonEmptyString(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
@@ -1000,7 +1105,11 @@ export class CommandExecutor {
           : 1;
       const summary = truncateText(basePrompt, 220);
       if (avatarRequest) {
-        const avatarResult = await this.updateAvatarWithFallback({
+        const avatarCropSpec =
+          profileCropSpec?.target === "avatar"
+            ? profileCropSpec
+            : normalizeProfileCropSpec(buildProfileCropSpec("avatar"));
+        const avatarResult = await this.updateAvatar({
           target: avatarTarget,
           imageUrl: media.mediaUrl,
           ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
@@ -1023,8 +1132,8 @@ export class CommandExecutor {
           : null;
         const completionText =
           avatarTarget === "owner"
-            ? "Done. Here is your new avatar. If framing looks off, tap Crop avatar and center the face in the circle."
-            : "Done. Here is my new avatar. If framing looks off, tap Crop avatar and center the face in the circle.";
+            ? "Done. Here is your new avatar. If framing looks off, tap Crop avatar and keep your face in the center safe zone."
+            : "Done. Here is my new avatar. If framing looks off, tap Crop avatar and keep the face in the center safe zone.";
         await this.ctx.callAgentChatBridge({
           action: "send_message",
           clientMessageId: `runtime_avatar_result_${Date.now().toString(36)}_${crypto
@@ -1045,6 +1154,7 @@ export class CommandExecutor {
                 source: "runtime.avatar",
                 generatedAssetType: "persona",
                 personaType: "persona",
+                cropZones: avatarCropSpec,
               },
             },
           ],
@@ -1058,7 +1168,8 @@ export class CommandExecutor {
               summary,
               href: media.mediaUrl,
               hrefLabel: "Open avatar image",
-              cropHint: "Crop tip: center the face/subject and keep edges clear for circular framing.",
+              cropHint: avatarCropSpec.guidance,
+              cropZones: avatarCropSpec,
               ...(avatarProfileHref
                 ? {
                     secondaryHref: avatarProfileHref,
@@ -1079,6 +1190,7 @@ export class CommandExecutor {
             mediaUrl: media.mediaUrl,
             prompt: summary,
             personaType: "persona",
+            cropZones: avatarCropSpec,
             userId: avatarUserId,
             handle: avatarHandle,
             targetConversationId: chatTarget.conversationId ?? null,
@@ -1093,7 +1205,11 @@ export class CommandExecutor {
         });
       }
       if (bannerRequest) {
-        const bannerResult = await this.updateBannerWithFallback({
+        const bannerCropSpec =
+          profileCropSpec?.target === "banner"
+            ? profileCropSpec
+            : normalizeProfileCropSpec(buildProfileCropSpec("banner"));
+        const bannerResult = await this.updateBanner({
           target: bannerTarget,
           bannerUrl: media.mediaUrl,
           ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
@@ -1111,10 +1227,13 @@ export class CommandExecutor {
         const bannerUser = isRecord(bannerData?.user) ? bannerData.user : null;
         const bannerHandle = asNonEmptyString(bannerUser?.handle);
         const bannerUserId = asNonEmptyString(bannerUser?.id);
+        const bannerProfileHref = bannerTarget === "owner" && bannerHandle
+          ? `/u/${bannerHandle.replace(/^@+/u, "")}?edit=banner&crop=1`
+          : null;
         const completionText =
           bannerTarget === "owner"
-            ? "Done. Here is your new banner."
-            : "Done. Here is my new banner.";
+            ? "Done. Here is your new banner. If framing looks off, tap Crop banner and keep key details in the center safe zone."
+            : "Done. Here is my new banner. If framing looks off, keep key details in the center safe zone.";
         await this.ctx.callAgentChatBridge({
           action: "send_message",
           clientMessageId: `runtime_banner_result_${Date.now().toString(36)}_${crypto
@@ -1134,6 +1253,7 @@ export class CommandExecutor {
               metadata: {
                 source: "runtime.banner",
                 generatedAssetType: "banner",
+                cropZones: bannerCropSpec,
               },
             },
           ],
@@ -1147,6 +1267,14 @@ export class CommandExecutor {
               summary,
               href: media.mediaUrl,
               hrefLabel: "Open banner image",
+              cropHint: bannerCropSpec.guidance,
+              cropZones: bannerCropSpec,
+              ...(bannerProfileHref
+                ? {
+                    secondaryHref: bannerProfileHref,
+                    secondaryHrefLabel: "Crop banner",
+                  }
+                : {}),
               bannerTarget,
               ...(bannerHandle ? { handle: bannerHandle } : {}),
               ...(bannerUserId ? { userId: bannerUserId } : {}),
@@ -1160,6 +1288,7 @@ export class CommandExecutor {
           bannerTarget,
           mediaUrl: media.mediaUrl,
           prompt: summary,
+          cropZones: bannerCropSpec,
           userId: bannerUserId,
           handle: bannerHandle,
           targetConversationId: chatTarget.conversationId ?? null,
@@ -2266,111 +2395,16 @@ export class CommandExecutor {
     });
   }
 
-  private isMissingMutationPathError(error: unknown, path: string): boolean {
-    const message =
-      error instanceof Error
-        ? error.message
-        : typeof error === "string"
-          ? error
-          : "";
-    if (!message.trim().length) return false;
-    return (
-      message.includes(`No "mutation"-procedure on path "${path}"`) ||
-      message.includes(`No "mutation"-procedure on path '${path}'`) ||
-      message.includes(`No mutation-procedure on path ${path}`)
-    );
-  }
-
-  private async updateAvatarWithFallback(
+  private async updateAvatar(
     input: Record<string, unknown> & { target: string; imageUrl: string },
   ): Promise<unknown> {
-    try {
-      return await this.agent().updateAvatar.mutate(input);
-    } catch (error) {
-      if (!this.isMissingMutationPathError(error, "agent.updateAvatar")) {
-        throw error;
-      }
-      const target = asNonEmptyString(input.target)?.toLowerCase() ?? "agent";
-      if (target !== "agent") {
-        throw new Error(
-          'Owner avatar update requires backend support for "agent.updateAvatar". Update server and retry.',
-        );
-      }
-
-      const fallbackMutator = this.ctx.trpc?.realtime?.updateBotProfile;
-      if (!fallbackMutator || typeof fallbackMutator.mutate !== "function") {
-        throw new Error(
-          'Avatar update fallback unavailable. Missing "realtime.updateBotProfile".',
-        );
-      }
-
-      const imageUrl = asNonEmptyString(input.imageUrl);
-      if (!imageUrl) {
-        throw new Error("Avatar update fallback failed: missing image URL.");
-      }
-
-      const updated = await fallbackMutator.mutate({ image: imageUrl });
-      const fallbackUser = isRecord(updated) ? updated : null;
-      return {
-        ok: true,
-        source: "realtime.updateBotProfile",
-        user: fallbackUser
-          ? {
-              id: asNonEmptyString(fallbackUser.id),
-              handle: asNonEmptyString(fallbackUser.handle),
-              name: asNonEmptyString(fallbackUser.name),
-              image: asNonEmptyString(fallbackUser.image),
-              banner: asNonEmptyString(fallbackUser.banner),
-            }
-          : null,
-      };
-    }
+    return await this.agent().updateAvatar.mutate(input);
   }
 
-  private async updateBannerWithFallback(
+  private async updateBanner(
     input: Record<string, unknown> & { target: string; bannerUrl: string },
   ): Promise<unknown> {
-    try {
-      return await this.agent().updateBanner.mutate(input);
-    } catch (error) {
-      if (!this.isMissingMutationPathError(error, "agent.updateBanner")) {
-        throw error;
-      }
-      const target = asNonEmptyString(input.target)?.toLowerCase() ?? "agent";
-      if (target !== "agent") {
-        throw new Error(
-          'Owner banner update requires backend support for "agent.updateBanner". Update server and retry.',
-        );
-      }
-
-      const fallbackMutator = this.ctx.trpc?.realtime?.updateBotProfile;
-      if (!fallbackMutator || typeof fallbackMutator.mutate !== "function") {
-        throw new Error(
-          'Banner update fallback unavailable. Missing "realtime.updateBotProfile".',
-        );
-      }
-
-      const bannerUrl = asNonEmptyString(input.bannerUrl);
-      if (!bannerUrl) {
-        throw new Error("Banner update fallback failed: missing banner URL.");
-      }
-
-      const updated = await fallbackMutator.mutate({ banner: bannerUrl });
-      const fallbackUser = isRecord(updated) ? updated : null;
-      return {
-        ok: true,
-        source: "realtime.updateBotProfile",
-        user: fallbackUser
-          ? {
-              id: asNonEmptyString(fallbackUser.id),
-              handle: asNonEmptyString(fallbackUser.handle),
-              name: asNonEmptyString(fallbackUser.name),
-              image: asNonEmptyString(fallbackUser.image),
-              banner: asNonEmptyString(fallbackUser.banner),
-            }
-          : null,
-      };
-    }
+    return await this.agent().updateBanner.mutate(input);
   }
 
   private successOutcome(command: Command, data: unknown): CommandOutcome {
