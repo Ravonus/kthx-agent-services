@@ -323,19 +323,19 @@ export const startRuntime = async (deps: RuntimeDeps): Promise<void> => {
 
   intervals.push(
     setInterval(() => {
-      if (
-        !ctx.queueManager?.isRunnerEnabled() ||
-        ctx.queue.queueRunnerTickInFlight
-      ) {
+      if (!ctx.queueManager?.isRunnerEnabled()) {
         return;
       }
-      ctx.queue.queueRunnerTickInFlight = true;
-      void ctx.queueManager
-        .runnerTick()
-        .catch(() => {})
-        .finally(() => {
-          ctx.queue.queueRunnerTickInFlight = false;
+      void ctx.queueManager.runnerTick().catch((error: unknown) => {
+        const message =
+          error instanceof Error ? error.message : String(error);
+        console.warn("[agent-runtime] queue runner tick failed", message);
+        void ctx.memory.recordWrite({
+          type: "queue_runner_tick_failed",
+          at: nowIso(),
+          error: message,
         });
+      });
     }, queueTickMs),
   );
 
