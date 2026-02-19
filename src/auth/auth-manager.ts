@@ -210,8 +210,15 @@ export class AuthManager implements AuthManagerLike {
     options: { invalidateToken: boolean },
   ): Promise<void> {
     const nowMs = Date.now();
-    if (this.ctx.auth.authRefreshInFlight) return;
-    if (nowMs - this.ctx.auth.lastAuthRefreshAtMs < AUTH_REFRESH_MIN_GAP_MS) return;
+    if (this.ctx.auth.authRefreshInFlight) {
+      if (options.invalidateToken) {
+        clearBotTokenState("auth_refresh_invalidate_inflight");
+      }
+      return;
+    }
+    const debounceHit =
+      nowMs - this.ctx.auth.lastAuthRefreshAtMs < AUTH_REFRESH_MIN_GAP_MS;
+    if (debounceHit && !options.invalidateToken) return;
 
     this.ctx.auth.authRefreshInFlight = true;
     this.ctx.auth.lastAuthRefreshAtMs = nowMs;
