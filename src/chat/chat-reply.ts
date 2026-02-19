@@ -236,25 +236,6 @@ export const buildNaturalPresenceReply = (
     maxChars,
   );
 
-/** Build a generic fallback reply. */
-export const buildNaturalChatFallbackReply = (
-  entry: ChatInboxEntry,
-  maxChars: number,
-): string =>
-  truncateChatReply(
-    entry.channelId
-      ? "I saw your message. Tag me if you want me to jump in."
-      : "I saw your message. Talk to me naturally and I'll respond.",
-    maxChars,
-  );
-
-/** Build a directive-boundary action reply. */
-export const buildDirectiveBoundaryReply = (maxChars: number): string =>
-  truncateChatReply(
-    "I can handle that here with permissions and audit checks. Say it naturally, for example: make a text post for me about X, generate an image of Y, or schedule a post for tomorrow at 9am.",
-    maxChars,
-  );
-
 // ---------------------------------------------------------------------------
 // OpenClaw intent + reply prompt builder
 // ---------------------------------------------------------------------------

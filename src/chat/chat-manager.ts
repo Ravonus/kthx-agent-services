@@ -19,7 +19,6 @@ import {
   truncateChatReply,
   shouldReplyToChatInboxEntry,
   buildMentionTokens,
-  buildNaturalChatFallbackReply,
 } from "./chat-reply.js";
 import { normalizeInboxEntry, buildAutoReply } from "./chat-intent.js";
 
@@ -242,12 +241,8 @@ export class ChatManager implements ChatManagerLike {
               this.reportSystemProbe(flaggedEntry, reason),
           });
           if (!replyBody.length) {
-            const fallbackReply = buildNaturalChatFallbackReply(
-              entry,
-              this.ctx.config.chatRuntimeReplyMaxChars,
-            );
-            if (!fallbackReply.length) {
-              await this.ctx.memory.recordWrite({
+            await this.ctx.memory
+              .recordWrite({
                 type: "chat_runtime_auto_reply_suppressed",
                 at: nowIso(),
                 messageId: entry.messageId,
@@ -255,20 +250,8 @@ export class ChatManager implements ChatManagerLike {
                 channelId: entry.channelId,
                 reason: "empty_llm_reply",
                 bodyPreview: toAnswerPreview(entry.body, 140),
-              }).catch(() => undefined);
-              continue;
-            }
-            await this.sendReply(entry, fallbackReply).catch(() => undefined);
-            this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
-            await this.ctx.memory.recordWrite({
-              type: "chat_runtime_auto_reply_fallback_sent",
-              at: nowIso(),
-              messageId: entry.messageId,
-              conversationId: entry.conversationId,
-              channelId: entry.channelId,
-              reason: "empty_llm_reply",
-              replyPreview: toAnswerPreview(fallbackReply, 220),
-            }).catch(() => undefined);
+              })
+              .catch(() => undefined);
             continue;
           }
           const nowMs = Date.now();

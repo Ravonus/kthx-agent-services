@@ -327,6 +327,39 @@ const classifyIntentAndDraftReplyWithDrilldown = async (input: {
   return parseIntentAndReplyFromPromptResult(result);
 };
 
+const classifyFinalFallbackReply = async (input: {
+  entry: ChatInboxEntry;
+  runOpenClawPrompt: (opts: { prompt: string; purpose: string }) => Promise<OpenClawPromptResponse | null>;
+}): Promise<string> => {
+  const messageBody = input.entry.body.trim();
+  if (!messageBody.length) return "";
+  const authorName =
+    input.entry.authorDisplay.length > 0
+      ? input.entry.authorDisplay
+      : input.entry.authorHandle.length > 0
+        ? input.entry.authorHandle
+        : "user";
+  const contextType = input.entry.conversationId ? "dm" : "channel";
+  const prompt = [
+    "Draft one direct natural chat reply for this message.",
+    "Do not ask the user to restate their request.",
+    "If the ask is unclear, ask one concise clarifying question.",
+    "No commands, no JSON, no system/runtime details.",
+    `Context: ${contextType}`,
+    `User: ${authorName}`,
+    `Message: \"${messageBody.slice(0, 360)}\"`,
+    "",
+    "Return ONLY the reply text.",
+  ].join("\n");
+  const result = await input.runOpenClawPrompt({
+    prompt,
+    purpose: "chat_reply_final_fallback",
+  });
+  if (!result) return "";
+  const parsed = parseChatOpenClawReply(result);
+  return sanitizeChatOpenClawDraftReply(parsed);
+};
+
 // ---------------------------------------------------------------------------
 // Build auto-reply orchestrator
 // ---------------------------------------------------------------------------
@@ -510,6 +543,26 @@ export const buildAutoReply = async (
       replyPreview: toAnswerPreview(firstPassReply, 160),
     }).catch(() => undefined);
     return firstPassReply;
+  }
+
+  const finalFallbackReply = await classifyFinalFallbackReply({
+    entry,
+    runOpenClawPrompt: opts.runOpenClawPrompt,
+  });
+  if (finalFallbackReply.length > 0) {
+    const normalized = truncateChatReply(finalFallbackReply, maxChars);
+    if (normalized.length > 0 && !isSystemDisclosureReply(normalized)) {
+      await opts
+        .recordWrite({
+          type: "chat_runtime_reply_final_fallback_sent",
+          at: nowIso(),
+          messageId: entry.messageId,
+          bodyPreview: toAnswerPreview(messageBody, 140),
+          replyPreview: toAnswerPreview(normalized, 160),
+        })
+        .catch(() => undefined);
+      return normalized;
+    }
   }
 
   await opts.recordWrite({

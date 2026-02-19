@@ -438,6 +438,7 @@ export class CommandExecutor {
     if (
       kind === "brain.generateandqueue" ||
       kind === "brain.plan" ||
+      kind === "brain.retrypending" ||
       kind === "agent.task" ||
       kind === "agent_task"
     ) {
