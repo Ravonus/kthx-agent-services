@@ -333,6 +333,27 @@ export class ConsoleManager implements ConsoleManagerLike {
     consoleWriteLine(
       `openclaw=${ctx.openclaw.resolvedOpenClawAgentName ?? "auto"}`,
     );
+    consoleWriteLine(
+      `openclawBin=${ctx.openclaw.resolvedOpenClawBin ?? "openclaw"} ` +
+        `source=${ctx.openclaw.openClawBinSource ?? "unknown"} ` +
+        `available=${
+          ctx.openclaw.openClawBinAvailable === null
+            ? "unknown"
+            : ctx.openclaw.openClawBinAvailable
+              ? "yes"
+              : "no"
+        }`,
+    );
+    if (ctx.openclaw.openClawBinResolutionWarning) {
+      consoleWriteLine(
+        `openclawBinWarning=${ctx.openclaw.openClawBinResolutionWarning}`,
+      );
+    }
+    if (ctx.openclaw.openClawBinLastError) {
+      consoleWriteLine(
+        `openclawBinError=${ctx.openclaw.openClawBinLastError}`,
+      );
+    }
   }
 
   // -------------------------------------------------------------------------

@@ -8,6 +8,7 @@
 
 import { nowIso, sanitizeChallengeAnswerText, toAnswerPreview } from "../lib/text.js";
 import { isRecord } from "../lib/guards.js";
+import { parseJsonFromMixedText } from "../lib/parsing.js";
 
 // ---------------------------------------------------------------------------
 // Narrow context
@@ -128,6 +129,27 @@ export const answerChallengeWithOpenClaw = async (
   ];
 
   let lastRaw = "";
+
+  const extractAnswerFromLooseText = (text: string): string => {
+    const trimmed = text.trim();
+    if (!trimmed.length) return "";
+    const parsed = parseJsonFromMixedText(trimmed);
+    if (isRecord(parsed)) {
+      const parsedAnswer = parsed.answer;
+      if (typeof parsedAnswer === "string" && parsedAnswer.trim().length > 0) {
+        return parsedAnswer.trim();
+      }
+      if (typeof parsedAnswer === "number" && Number.isFinite(parsedAnswer)) {
+        return String(parsedAnswer);
+      }
+    }
+    const answerStringMatch = /"answer"\s*:\s*"([^"]+)"/iu.exec(trimmed);
+    if (answerStringMatch?.[1]) return answerStringMatch[1].trim();
+    const answerNumericMatch = /"answer"\s*:\s*(-?\d+(?:\.\d+)?)/iu.exec(trimmed);
+    if (answerNumericMatch?.[1]) return answerNumericMatch[1].trim();
+    return "";
+  };
+
   for (let i = 0; i < prompts.length; i += 1) {
     const prompt = prompts[i]!;
     const res = await ctx.runOpenClawPrompt({ prompt, purpose: "mint_challenge" });
@@ -155,15 +177,38 @@ export const answerChallengeWithOpenClaw = async (
         ? res.raw.trim()
         : "";
     const callbackText = ctx.parseChatOpenClawReply ? ctx.parseChatOpenClawReply(res) : "";
-    const raw =
+    const rawPrimary =
       parsedAnswer ||
       callbackText ||
       parsedReply ||
       parsedText ||
       payloadText ||
       rawText;
+    const looseAnswer = rawPrimary.length > 0 ? extractAnswerFromLooseText(rawPrimary) : "";
+    const raw = looseAnswer.length > 0 ? looseAnswer : rawPrimary;
     lastRaw = raw;
     const norm = normalizeChallengeAnswerForSubmit(raw, ctx.config.challengeAnswerMaxChars);
+    const rejectReason = !norm.length
+      ? "empty_after_normalize"
+      : isConsoleCommandLikeAnswer(norm)
+        ? "command_like_output"
+        : null;
+    await ctx.appendMintTrace({
+      type: "mint_answer_openclaw_attempt",
+      challengeId: params.challengeId,
+      promptToken: params.promptToken ?? null,
+      solverAttempt: i + 1,
+      parsedAnswerPreview: toAnswerPreview(parsedAnswer),
+      parsedReplyPreview: toAnswerPreview(parsedReply),
+      parsedTextPreview: toAnswerPreview(parsedText),
+      payloadTextPreview: toAnswerPreview(payloadText),
+      rawTextPreview: toAnswerPreview(rawText),
+      selectedRawPreview: toAnswerPreview(raw),
+      looseAnswerPreview: toAnswerPreview(looseAnswer),
+      normalizedPreview: toAnswerPreview(norm),
+      rejected: rejectReason !== null,
+      rejectReason,
+    });
     if (norm.length > 0 && !isConsoleCommandLikeAnswer(norm)) {
       await ctx.appendMintTrace({
         type: "mint_answer_openclaw_generated",

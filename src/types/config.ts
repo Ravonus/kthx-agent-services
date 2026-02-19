@@ -13,6 +13,7 @@ import type { PersonaDefinition } from "../lib/persona.js";
 
 export type KthxOpenClawConfig = {
   enabled: boolean;
+  binPath: string;
   agentName: string;
   listAgentsCommand: string;
   promptCommand: string;

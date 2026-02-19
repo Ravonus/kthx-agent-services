@@ -7,8 +7,12 @@
  */
 
 import { spawn } from "node:child_process";
-import { trimEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
+import {
+  probeOpenClawBinary,
+  resolveOpenClawBinary,
+  withOpenClawPathInEnv,
+} from "../openclaw/openclaw-binary.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,18 +40,14 @@ const runOpenClawPrompt = async (
   opts?: { timeoutMs?: number | undefined },
 ): Promise<string | null> => {
   const timeoutMs = opts?.timeoutMs ?? DEFAULT_OPENCLAW_TIMEOUT_MS;
-
-  // Resolve the openclaw command. Check env overrides first.
-  const openclawBin =
-    trimEnv("MG_OPENCLAW_BIN") ??
-    trimEnv("OPENCLAW_BIN") ??
-    "openclaw";
+  const resolution = resolveOpenClawBinary();
+  const env = withOpenClawPathInEnv({ ...process.env }, resolution);
 
   return new Promise<string | null>((resolve) => {
-    const child = spawn(openclawBin, ["agent", "--json", "-m", prompt], {
+    const child = spawn(resolution.command, ["agent", "--json", "-m", prompt], {
       stdio: ["ignore", "pipe", "pipe"],
       timeout: timeoutMs,
-      env: { ...process.env },
+      env,
     });
 
     let stdout = "";
@@ -322,14 +322,33 @@ export const generateAgentIdentity = async (
 /**
  * Check if the openclaw CLI is available by running `openclaw --version`.
  */
-export const isOpenClawAvailable = async (): Promise<boolean> => {
-  const bin = trimEnv("MG_OPENCLAW_BIN") ?? trimEnv("OPENCLAW_BIN") ?? "openclaw";
-  return new Promise<boolean>((resolve) => {
-    const child = spawn(bin, ["--version"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 10_000,
-    });
-    child.on("error", () => resolve(false));
-    child.on("close", (code) => resolve(code === 0));
-  });
+export interface OpenClawAvailability {
+  available: boolean;
+  command: string;
+  source: string;
+  resolvedPath: string | null;
+  warning: string | null;
+  version: string | null;
+  error: string | null;
+}
+
+export const getOpenClawAvailability = async (): Promise<OpenClawAvailability> => {
+  const resolution = resolveOpenClawBinary();
+  const probe = await probeOpenClawBinary(resolution, 10_000);
+  return {
+    available: probe.ok,
+    command: resolution.command,
+    source: resolution.source,
+    resolvedPath: resolution.resolvedPath,
+    warning: resolution.warning,
+    version: probe.version,
+    error:
+      probe.ok
+        ? null
+        : probe.error ??
+          (typeof probe.code === "number" ? `exit_code_${probe.code}` : null),
+  };
 };
+
+export const isOpenClawAvailable = async (): Promise<boolean> =>
+  (await getOpenClawAvailability()).available;

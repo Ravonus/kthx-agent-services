@@ -47,6 +47,7 @@ export const buildDefaultKthxConfig = (homeDir: string): KthxConfig => ({
   },
   openclaw: {
     enabled: true,
+    binPath: "",
     agentName: "",
     listAgentsCommand: "openclaw agents",
     promptCommand: DEFAULT_OPENCLAW_PROMPT_TEMPLATE,
@@ -325,6 +326,7 @@ export const normalizeKthxConfig = (
     paths,
     openclaw: {
       enabled: sourceOpenClaw.enabled !== false,
+      binPath: safeString(sourceOpenClaw.binPath, ""),
       agentName: safeString(sourceOpenClaw.agentName, ""),
       listAgentsCommand: safeString(
         sourceOpenClaw.listAgentsCommand,

@@ -194,6 +194,14 @@ export interface OpenClawTrackingState {
   openClawWakeUrl: string | null;
   openClawWakeKey: string | null;
   openClawWakeReasonSet: Set<string> | null;
+  resolvedOpenClawBin: string | null;
+  openClawBinSource: string | null;
+  openClawBinResolvedPath: string | null;
+  openClawBinResolutionWarning: string | null;
+  openClawBinAvailable: boolean | null;
+  openClawBinVersion: string | null;
+  openClawBinCheckedAtMs: number;
+  openClawBinLastError: string | null;
   resolvedOpenClawAgentName: string | null;
   openClawAgentResolvedAtMs: number;
   openClawDraftCache: Map<string, unknown>;
@@ -353,6 +361,14 @@ export class RuntimeContext {
       openClawWakeUrl: null,
       openClawWakeKey: null,
       openClawWakeReasonSet: null,
+      resolvedOpenClawBin: null,
+      openClawBinSource: null,
+      openClawBinResolvedPath: null,
+      openClawBinResolutionWarning: null,
+      openClawBinAvailable: null,
+      openClawBinVersion: null,
+      openClawBinCheckedAtMs: 0,
+      openClawBinLastError: null,
       resolvedOpenClawAgentName: null,
       openClawAgentResolvedAtMs: 0,
       openClawDraftCache: new Map(),

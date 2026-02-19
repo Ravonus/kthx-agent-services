@@ -46,6 +46,10 @@ import { DirectiveManager } from "./directives/directive-manager.js";
 import { QueueManager } from "./queue/queue-manager.js";
 import { CommandExecutor } from "./commands/command-executor.js";
 import { OpenClawManager } from "./openclaw/openclaw-manager.js";
+import {
+  probeOpenClawBinary,
+  resolveOpenClawBinary,
+} from "./openclaw/openclaw-binary.js";
 import { ChatManager } from "./chat/chat-manager.js";
 import {
   markWsActivity as markWsActivityFn,
@@ -368,6 +372,16 @@ const main = async (): Promise<void> => {
   const kthxConfig: KthxConfig = isRecord(kthxConfigInfo?.config)
     ? (kthxConfigInfo!.config as KthxConfig)
     : normalizeKthxConfig({}, config.agentHomeDir);
+  const openClawBinaryResolution = resolveOpenClawBinary({
+    configuredBinPath: kthxConfig.openclaw.binPath,
+  });
+  const openClawProbeCheckedAtMs = Date.now();
+  const openClawProbeResult = kthxConfig.openclaw.enabled
+    ? await probeOpenClawBinary(
+        openClawBinaryResolution,
+        Math.min(15_000, Math.max(5_000, kthxConfig.openclaw.timeoutMs)),
+      )
+    : null;
 
   // -- MemoryStore
   const stateDb = createStateSqliteStoreFromEnv(config.stateDir);
@@ -386,6 +400,53 @@ const main = async (): Promise<void> => {
     stateDir: config.stateDir,
     kthxConfigPath: config.kthxConfigPath,
   });
+  await memory.recordWrite({
+    type: "openclaw_binary_probe",
+    at: nowIso(),
+    enabled: kthxConfig.openclaw.enabled,
+    command: openClawBinaryResolution.command,
+    resolvedPath: openClawBinaryResolution.resolvedPath,
+    source: openClawBinaryResolution.source,
+    warning: openClawBinaryResolution.warning,
+    probeOk: openClawProbeResult?.ok ?? null,
+    probeCode: openClawProbeResult?.code ?? null,
+    probeVersion: openClawProbeResult?.version ?? null,
+    probeError: openClawProbeResult?.error ?? null,
+    probeStdoutPreview:
+      typeof openClawProbeResult?.stdout === "string"
+        ? openClawProbeResult.stdout.slice(0, 180)
+        : null,
+    probeStderrPreview:
+      typeof openClawProbeResult?.stderr === "string"
+        ? openClawProbeResult.stderr.slice(0, 180)
+        : null,
+  });
+  if (kthxConfig.openclaw.enabled) {
+    if (openClawProbeResult?.ok) {
+      const versionText =
+        typeof openClawProbeResult.version === "string" &&
+          openClawProbeResult.version.trim().length > 0
+          ? ` (${openClawProbeResult.version.trim()})`
+          : "";
+      console.log(
+        `[agent-runtime] OpenClaw binary ready: ${openClawBinaryResolution.command} [${openClawBinaryResolution.source}]${versionText}`,
+      );
+    } else {
+      const probeError =
+        openClawProbeResult?.error ??
+        (typeof openClawProbeResult?.code === "number"
+          ? `exit_code_${openClawProbeResult.code}`
+          : "unknown_error");
+      console.warn(
+        `[agent-runtime] OpenClaw binary check failed: ${openClawBinaryResolution.command} [${openClawBinaryResolution.source}] (${probeError})`,
+      );
+      if (openClawBinaryResolution.warning) {
+        console.warn(
+          `[agent-runtime] OpenClaw binary resolution warning: ${openClawBinaryResolution.warning}`,
+        );
+      }
+    }
+  }
 
   // -- IPC
   const ipcPaths = createIpcPaths(config.stateDir);
@@ -437,6 +498,21 @@ const main = async (): Promise<void> => {
   ctx.wsClient = wsClient;
   ctx.trpc = trpc;
   ctx.collectRuntimeHashes = collectRuntimeHashes;
+  ctx.openclaw.resolvedOpenClawBin = openClawBinaryResolution.command;
+  ctx.openclaw.openClawBinSource = openClawBinaryResolution.source;
+  ctx.openclaw.openClawBinResolvedPath = openClawBinaryResolution.resolvedPath;
+  ctx.openclaw.openClawBinResolutionWarning = openClawBinaryResolution.warning;
+  ctx.openclaw.openClawBinAvailable = openClawProbeResult?.ok ?? null;
+  ctx.openclaw.openClawBinVersion = openClawProbeResult?.version ?? null;
+  ctx.openclaw.openClawBinCheckedAtMs = openClawProbeCheckedAtMs;
+  ctx.openclaw.openClawBinLastError = openClawProbeResult
+    ? openClawProbeResult.ok
+      ? null
+      : openClawProbeResult.error ??
+        (typeof openClawProbeResult.code === "number"
+          ? `exit_code_${openClawProbeResult.code}`
+          : "unknown_error")
+    : null;
 
   // -- OpenClaw wake config
   // v2 runtime is local-only for wake signaling (hook files + queue runner tick).
@@ -520,6 +596,7 @@ const main = async (): Promise<void> => {
       if (!oc || !oc.enabled) return null;
       return {
         enabled: oc.enabled,
+        binPath: oc.binPath,
         agentName: oc.agentName,
         listAgentsCommand: oc.listAgentsCommand,
         promptCommand: oc.promptCommand,

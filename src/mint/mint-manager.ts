@@ -554,7 +554,8 @@ export class MintManager implements MintManagerLike {
     return /\bRun `mint retry`\b/iu.test(m) || /Mint challenge expired before answer entry/iu.test(m)
       || /Socket mint challenge required\./iu.test(m) || /Mint challenge missing challengeId/iu.test(m)
       || /Mint challenge solver failed repeatedly/iu.test(m)
-      || /Mint challenge flow exceeded guard limit/iu.test(m);
+      || /Mint challenge flow exceeded guard limit/iu.test(m)
+      || /Mint challenge answer unavailable from OpenClaw/iu.test(m);
   }
 
   private chalCtx(): ChallengeContext {

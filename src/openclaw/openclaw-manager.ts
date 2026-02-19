@@ -9,6 +9,7 @@
  */
 
 import { spawn } from "node:child_process";
+import path from "node:path";
 
 import { trimEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
@@ -28,6 +29,12 @@ import {
   deliverWakeBody,
   type WakeInput,
 } from "./openclaw-wake.js";
+import {
+  applyOpenClawBinaryToShellCommand,
+  resolveOpenClawBinary,
+  withOpenClawPathInEnv,
+  type OpenClawBinaryResolution,
+} from "./openclaw-binary.js";
 
 // ---------------------------------------------------------------------------
 // Narrow context interface
@@ -58,6 +65,7 @@ export interface OpenClawManagerContext {
 
 export interface OpenClawConfigSnapshot {
   enabled: boolean;
+  binPath: string;
   agentName: string;
   listAgentsCommand: string;
   promptCommand: string;
@@ -74,6 +82,14 @@ export interface OpenClawTrackingState {
   openClawWakeUrl: string | null;
   openClawWakeKey: string | null;
   openClawWakeReasonSet: Set<string> | null;
+  resolvedOpenClawBin: string | null;
+  openClawBinSource: string | null;
+  openClawBinResolvedPath: string | null;
+  openClawBinResolutionWarning: string | null;
+  openClawBinAvailable: boolean | null;
+  openClawBinVersion: string | null;
+  openClawBinCheckedAtMs: number;
+  openClawBinLastError: string | null;
   resolvedOpenClawAgentName: string | null;
   openClawAgentResolvedAtMs: number;
   openClawDraftCache: Map<string, unknown>;
@@ -177,33 +193,71 @@ export const parseOpenClawStdoutDelta = (chunk: unknown): string => {
 const resolveAgentFromListOutput = (output: unknown): string | null => {
   const text = typeof output === "string" ? output : "";
   if (!text.trim().length) return null;
-  const defaultMatch = /-\s*([a-zA-Z0-9._-]+)\s*\(default\)/iu.exec(text);
-  if (defaultMatch?.[1]?.trim().length) return defaultMatch[1].trim();
-  const agentsInlineMatch = /Agents:\s*-\s*([a-zA-Z0-9._-]+)/iu.exec(text);
+  const tokenPattern = /[a-zA-Z0-9._-]+/u;
+  const defaultInlinePatterns = [
+    /-\s*(?:name\s*:\s*)?([a-zA-Z0-9._-]+)\s*\(default\)/iu,
+    /\bname\s*:\s*([a-zA-Z0-9._-]+)\s*\(default\)/iu,
+  ];
+  for (const pattern of defaultInlinePatterns) {
+    const match = pattern.exec(text);
+    if (match?.[1]?.trim().length) return match[1].trim();
+  }
+
+  // YAML-ish format support:
+  // Agents:
+  // - name: foo
+  //   default: true
+  const blockDefaultMatch =
+    /-\s*name\s*:\s*([a-zA-Z0-9._-]+)[\s\S]{0,200}?\bdefault\s*:\s*(?:true|yes|1)\b/iu.exec(
+      text,
+    );
+  if (blockDefaultMatch?.[1]?.trim().length) return blockDefaultMatch[1].trim();
+
+  let currentName: string | null = null;
+  for (const rawLine of text.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (!line.length) continue;
+    const listNameMatch = /^-\s*(?:name\s*:\s*)?([a-zA-Z0-9._-]+)\b/iu.exec(line);
+    if (listNameMatch?.[1]) {
+      currentName = listNameMatch[1];
+      if (/\(default\)/iu.test(line)) return currentName;
+      continue;
+    }
+    const nameMatch = /^name\s*:\s*([a-zA-Z0-9._-]+)\b/iu.exec(line);
+    if (nameMatch?.[1]) {
+      currentName = nameMatch[1];
+      if (/\(default\)/iu.test(line)) return currentName;
+      continue;
+    }
+    if (
+      currentName &&
+      /^default\s*:\s*(?:true|yes|1)\b/iu.test(line)
+    ) {
+      return currentName;
+    }
+    if (currentName && /^-\s*/u.test(line) && !tokenPattern.test(line)) {
+      currentName = null;
+    }
+  }
+
+  const agentsInlineMatch = /Agents:\s*-\s*(?:name\s*:\s*)?([a-zA-Z0-9._-]+)/iu.exec(text);
   if (agentsInlineMatch?.[1]?.trim().length) return agentsInlineMatch[1].trim();
+  const firstNameFieldMatch = /-\s*name\s*:\s*([a-zA-Z0-9._-]+)/iu.exec(text);
+  if (firstNameFieldMatch?.[1]?.trim().length) return firstNameFieldMatch[1].trim();
   const firstMatch = /-\s*([a-zA-Z0-9._-]+)/u.exec(text);
   if (firstMatch?.[1]?.trim().length) return firstMatch[1].trim();
   return null;
 };
 
-/**
- * If MG_OPENCLAW_BIN (or OPENCLAW_BIN) is set, replace a bare `openclaw`
- * at the start of a command string with the full path so the runtime
- * respects the same override used by identity.ts / self-discovery.
- */
-const applyOpenClawBinOverride = (command: string): string => {
-  const bin = trimEnv("MG_OPENCLAW_BIN") ?? trimEnv("OPENCLAW_BIN");
-  if (!bin) return command;
-  // Replace leading "openclaw " with the override path.
-  // Handles: `openclaw agent ...` but not `/usr/bin/openclaw ...` or `myopenclaw ...`
-  return command.replace(/^openclaw(?=\s)/u, bin);
-};
-
 const enforceMintChallengeFastThinking = (command: string): string => {
   const normalized = command.trim();
   if (!normalized.length) return command;
+  const tokenMatch =
+    /^\s*(?:"([^"]+)"|'([^']+)'|(\S+))/u.exec(normalized);
+  const commandToken = (tokenMatch?.[1] ?? tokenMatch?.[2] ?? tokenMatch?.[3] ?? "").trim();
+  const commandBase = commandToken ? path.basename(commandToken).toLowerCase() : "";
   const isOpenClawCommand =
-    /(^|\s|[/\\])openclaw(?:\.cmd|\.exe)?(?=\s|$)/iu.test(normalized);
+    /^openclaw(?:\.(?:cmd|exe|bat|ps1))?$/iu.test(commandBase);
   if (!isOpenClawCommand) return command;
   const desiredThinking = MINT_CHALLENGE_THINKING_LEVEL.trim();
   if (!desiredThinking.length) return command;
@@ -220,6 +274,7 @@ const enforceMintChallengeFastThinking = (command: string): string => {
 const resolveTemplateCommand = (
   template: string, agentName: string | null,
   config: { agentHomeDir: string; stateDir: string; kthxConfigPath: string },
+  binary: OpenClawBinaryResolution,
   extraReplacements?: Record<string, string>,
 ): string => {
   let raw = template;
@@ -233,7 +288,7 @@ const resolveTemplateCommand = (
     .replaceAll("{home}", config.agentHomeDir.replaceAll('"', '\\"'))
     .replaceAll("{state}", config.stateDir.replaceAll('"', '\\"'))
     .replaceAll("{config}", config.kthxConfigPath.replaceAll('"', '\\"'));
-  raw = applyOpenClawBinOverride(raw);
+  raw = applyOpenClawBinaryToShellCommand(raw, binary);
   return stripEmptyAgentFlag(raw);
 };
 
@@ -248,8 +303,32 @@ export class OpenClawManager implements OpenClawManagerLike {
   private wakeBatchTimer: ReturnType<typeof setTimeout> | null = null;
   private wakeBatchItems: WakeInput[] = [];
   private lastSocketWakeConnectivity: boolean | null = null;
+  private openClawBinaryCache: {
+    cacheKey: string;
+    value: OpenClawBinaryResolution;
+  } | null = null;
 
   constructor(ctx: OpenClawManagerContext) { this.ctx = ctx; }
+
+  private getOpenClawBinaryResolution(): OpenClawBinaryResolution {
+    const ocConfig = this.ctx.openclawConfig();
+    const configuredBinPath =
+      typeof ocConfig?.binPath === "string" ? ocConfig.binPath.trim() : "";
+    const envOverride = trimEnv("MG_OPENCLAW_BIN") ?? trimEnv("OPENCLAW_BIN") ?? "";
+    const cacheKey = `${configuredBinPath}::${envOverride}`;
+    if (this.openClawBinaryCache?.cacheKey === cacheKey) {
+      return this.openClawBinaryCache.value;
+    }
+    const resolution = resolveOpenClawBinary({
+      configuredBinPath: configuredBinPath.length > 0 ? configuredBinPath : null,
+    });
+    this.openClawBinaryCache = { cacheKey, value: resolution };
+    this.ctx.openclaw.resolvedOpenClawBin = resolution.command;
+    this.ctx.openclaw.openClawBinSource = resolution.source;
+    this.ctx.openclaw.openClawBinResolvedPath = resolution.resolvedPath;
+    this.ctx.openclaw.openClawBinResolutionWarning = resolution.warning;
+    return resolution;
+  }
 
   async resolveAgentName(): Promise<string | null> {
     const ocConfig = this.ctx.openclawConfig();
@@ -258,9 +337,14 @@ export class OpenClawManager implements OpenClawManagerLike {
     if (this.ctx.openclaw.resolvedOpenClawAgentName && Date.now() - this.ctx.openclaw.openClawAgentResolvedAtMs < 120_000) {
       return this.ctx.openclaw.resolvedOpenClawAgentName;
     }
-    const listCommand = applyOpenClawBinOverride(
+    const openClawBinary = this.getOpenClawBinaryResolution();
+    const listTemplate =
       typeof ocConfig.listAgentsCommand === "string" && ocConfig.listAgentsCommand.trim().length > 0
-        ? ocConfig.listAgentsCommand.trim() : "openclaw agents",
+        ? ocConfig.listAgentsCommand.trim()
+        : "openclaw agents";
+    const listCommand = applyOpenClawBinaryToShellCommand(
+      listTemplate,
+      openClawBinary,
     );
     const timeoutMs = typeof ocConfig.timeoutMs === "number" && Number.isFinite(ocConfig.timeoutMs)
       ? Math.max(5_000, Math.floor(ocConfig.timeoutMs / 2)) : 60_000;
@@ -290,18 +374,19 @@ export class OpenClawManager implements OpenClawManagerLike {
       await this.ctx.memory.recordWrite({ type: "openclaw_prompt_skipped", at: nowIso(), purpose, reason: "missing_template" });
       return null;
     }
-    // Mint challenge solving is latency-sensitive and should not wait on
-    // shared agent resolution. Use a direct subprocess with no --agent pin.
-    const agentName = isMintChallenge ? null : await this.resolveAgentName();
+    const agentName = await this.resolveAgentName();
     const resolvedPrompt = typeof input === "string" ? input.trim() : "";
     if (!resolvedPrompt.length) {
       await this.ctx.memory.recordWrite({ type: "openclaw_prompt_skipped", at: nowIso(), purpose, reason: "empty_prompt" });
       return null;
     }
     const promptForCommand = resolvedPrompt.replace(/\r?\n/gu, " ").replaceAll('"', '\\"');
+    const openClawBinary = this.getOpenClawBinaryResolution();
     const command = resolveTemplateCommand(
       template.replaceAll("{prompt}", promptForCommand),
-      agentName, this.ctx.config,
+      agentName,
+      this.ctx.config,
+      openClawBinary,
     );
     const effectiveCommand = isMintChallenge
       ? enforceMintChallengeFastThinking(command)
@@ -324,14 +409,34 @@ export class OpenClawManager implements OpenClawManagerLike {
       command: effectiveCommand, timeoutMs,
       ...(allowNativeTextStreaming ? { onStdoutData: (chunk: string) => { const delta = parseOpenClawStdoutDelta(chunk); if (delta.length) onTextDelta(delta); } } : {}),
     });
+    const stdoutText = typeof result.stdout === "string" ? result.stdout.trim() : "";
+    const stderrText = typeof result.stderr === "string" ? result.stderr.trim() : "";
+    const parseSourceRaw = stdoutText.length > 0 ? result.stdout : stderrText.length > 0 ? result.stderr : result.stdout;
+    const parseSource = stdoutText.length > 0 ? "stdout" : stderrText.length > 0 ? "stderr" : "none";
     await this.ctx.memory.recordWrite({
       type: "openclaw_prompt_result", at: nowIso(), purpose, ok: result.ok,
       code: result.code, agentName: agentName ?? null,
       executionMode: isMintChallenge ? "direct_subprocess" : "locked_subprocess",
-      commandPreview: toAnswerPreview(effectiveCommand, 180), stderrPreview: toAnswerPreview(result.stderr, 180),
+      commandPreview: toAnswerPreview(effectiveCommand, 180),
+      stdoutPreview: toAnswerPreview(result.stdout, 240),
+      stderrPreview: toAnswerPreview(result.stderr, 240),
+      parseSource,
     });
-    if (!result.ok) return null;
-    const parsedRaw = parseJsonFromMixedText(result.stdout);
+    const canParseFailedMintResult =
+      isMintChallenge && parseSourceRaw.trim().length > 0;
+    if (!result.ok && !canParseFailedMintResult) return null;
+    if (!result.ok && canParseFailedMintResult) {
+      await this.ctx.memory.recordWrite({
+        type: "openclaw_prompt_nonzero_with_output",
+        at: nowIso(),
+        purpose,
+        code: result.code,
+        parseSource,
+        stdoutPreview: toAnswerPreview(result.stdout, 240),
+        stderrPreview: toAnswerPreview(result.stderr, 240),
+      });
+    }
+    const parsedRaw = parseJsonFromMixedText(parseSourceRaw);
     let parsed = parsedRaw;
     let payloadText: string | null = null;
     let envelope: Record<string, unknown> | null = null;
@@ -339,10 +444,10 @@ export class OpenClawManager implements OpenClawManagerLike {
       const unwrapped = unwrapOpenClawEnvelopePayload(parsedRaw);
       parsed = unwrapped.parsed; payloadText = unwrapped.payloadText; envelope = unwrapped.envelope;
     } else {
-      const stdoutText = typeof result.stdout === "string" ? result.stdout.trim() : "";
-      if (stdoutText.length > 0) { parsed = { text: stdoutText }; payloadText = stdoutText; }
+      const fallbackText = parseSourceRaw.trim();
+      if (fallbackText.length > 0) { parsed = { text: fallbackText }; payloadText = fallbackText; }
     }
-    return { parsed, raw: result.stdout, agentName, payloadText, envelope };
+    return { parsed, raw: parseSourceRaw, agentName, payloadText, envelope };
   }
 
   scheduleWake(reasons: string[]): void {
@@ -374,7 +479,14 @@ export class OpenClawManager implements OpenClawManagerLike {
     const template = typeof ocConfig.createAgentCommand === "string" ? ocConfig.createAgentCommand.trim() : "";
     if (!template.length) return { ok: false, error: "openclaw.createAgentCommand is empty." };
     const currentAgent = await this.resolveAgentName();
-    const command = resolveTemplateCommand(template, currentAgent, this.ctx.config, { "{new_agent}": parsedName });
+    const openClawBinary = this.getOpenClawBinaryResolution();
+    const command = resolveTemplateCommand(
+      template,
+      currentAgent,
+      this.ctx.config,
+      openClawBinary,
+      { "{new_agent}": parsedName },
+    );
     const timeoutMs = typeof ocConfig.timeoutMs === "number" && Number.isFinite(ocConfig.timeoutMs)
       ? Math.max(15_000, Math.floor(ocConfig.timeoutMs)) : 120_000;
     const result = await this.runLockedShellCommand({ command, timeoutMs });
@@ -418,7 +530,16 @@ export class OpenClawManager implements OpenClawManagerLike {
     onStdoutData?: ((chunk: string) => void) | null;
   }): Promise<ShellResult> {
     return new Promise((resolve) => {
-      const child = spawn(opts.command, { shell: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...(opts.extraEnv ?? {}) } });
+      const openClawBinary = this.getOpenClawBinaryResolution();
+      const mergedEnv = withOpenClawPathInEnv(
+        { ...process.env, ...(opts.extraEnv ?? {}) },
+        openClawBinary,
+      );
+      const child = spawn(opts.command, {
+        shell: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: mergedEnv,
+      });
       const stdoutChunks: string[] = [];
       const stderrChunks: string[] = [];
       const timer = setTimeout(() => { child.kill("SIGTERM"); }, opts.timeoutMs);
@@ -429,10 +550,18 @@ export class OpenClawManager implements OpenClawManagerLike {
       child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(String(chunk)));
       child.on("error", (error: Error) => {
         clearTimeout(timer);
+        this.ctx.openclaw.openClawBinCheckedAtMs = Date.now();
+        this.ctx.openclaw.openClawBinAvailable = false;
+        this.ctx.openclaw.openClawBinLastError = error.message;
         resolve({ ok: false, code: null, stdout: stdoutChunks.join(""), stderr: stderrChunks.join(""), error: error.message });
       });
       child.on("close", (code: number | null) => {
         clearTimeout(timer);
+        this.ctx.openclaw.openClawBinCheckedAtMs = Date.now();
+        if (code === 0) {
+          this.ctx.openclaw.openClawBinAvailable = true;
+          this.ctx.openclaw.openClawBinLastError = null;
+        }
         resolve({ ok: code === 0, code: typeof code === "number" ? code : null, stdout: stdoutChunks.join(""), stderr: stderrChunks.join(""), error: null });
       });
     });

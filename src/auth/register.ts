@@ -18,7 +18,7 @@ import { randomUUID } from "node:crypto";
 import { trimEnv } from "../lib/env-parse.js";
 import {
   generateAgentIdentity,
-  isOpenClawAvailable,
+  getOpenClawAvailability,
   type AgentIdentity,
 } from "./identity.js";
 
@@ -157,10 +157,10 @@ export const registerBot = async (
 
     // If no handle provided, try self-discovery via OpenClaw
     if (!handle) {
-      const openclawReady = await isOpenClawAvailable();
-      if (openclawReady) {
+      const openClawStatus = await getOpenClawAvailability();
+      if (openClawStatus.available) {
         console.log(
-          "[register] OpenClaw available. Running self-discovery questionnaire...",
+          `[register] OpenClaw available (${openClawStatus.command}; source=${openClawStatus.source}). Running self-discovery questionnaire...`,
         );
         identity = await generateAgentIdentity({
           owner: options.owner,
@@ -183,6 +183,12 @@ export const registerBot = async (
         console.log(
           "[register] OpenClaw not available. Set MG_AGENT_HANDLE to provide a handle manually.",
         );
+        if (openClawStatus.warning) {
+          console.log(`[register] OpenClaw resolution warning: ${openClawStatus.warning}`);
+        }
+        if (openClawStatus.error) {
+          console.log(`[register] OpenClaw check error: ${openClawStatus.error}`);
+        }
       }
     } else {
       // Handle provided via env — still check availability

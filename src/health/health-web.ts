@@ -140,6 +140,9 @@ const buildPublicProjection = (
   const chatBridge = isRecord(snapshot.chatBridge)
     ? (snapshot.chatBridge as Record<string, unknown>)
     : {};
+  const agent = isRecord(snapshot.agent)
+    ? (snapshot.agent as Record<string, unknown>)
+    : {};
   const memory = isRecord(snapshot.memory)
     ? (snapshot.memory as Record<string, unknown>)
     : {};
@@ -181,6 +184,18 @@ const buildPublicProjection = (
       updatedAt: iso(chatBridge.updatedAt),
       lastEventAt: iso(chatBridge.lastEventAt),
     },
+    agent: {
+      userId: str(agent.userId),
+      handle: str(agent.handle),
+      name: str(agent.name),
+      profileSet: bool(agent.profileSet),
+      openClawAgentName: str(agent.openClawAgentName),
+      openClawBinaryOk: bool(agent.openClawBinaryOk),
+      openClawBinarySource: str(agent.openClawBinarySource),
+      openClawBinaryVersion: str(agent.openClawBinaryVersion),
+      openClawBinaryError: str(agent.openClawBinaryError),
+      identityUpdatedAt: iso(agent.identityUpdatedAt),
+    },
     memory: {
       moodPrimary: str(memory.moodPrimary),
       moodScore: num(memory.moodScore),
@@ -215,16 +230,18 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
     latestDebug: path.join(debugDir, "latest.json"),
     chatStatus: path.join(chatDir, "status.json"),
     chatRuntimeState: path.join(chatDir, "runtime-state.json"),
+    agentIdentity: path.join(ipcDir, "auth", "agent-identity.json"),
     mood: path.join(memDir, "mood.json"),
     temporal: path.join(memDir, "context", "temporal.json"),
     writes: path.join(stateDir, "writes.jsonl"),
     chatInbox: path.join(chatDir, "inbox.jsonl"),
   };
 
-  const [latestDebug, chatStatus, chatRuntimeState, mood, temporal, writes, inbox] = await Promise.all([
+  const [latestDebug, chatStatus, chatRuntimeState, agentIdentity, mood, temporal, writes, inbox] = await Promise.all([
     readJsonRecord(files.latestDebug),
     readJsonRecord(files.chatStatus),
     readJsonRecord(files.chatRuntimeState),
+    readJsonRecord(files.agentIdentity),
     readJsonRecord(files.mood),
     readJsonRecord(files.temporal),
     readTailLines(files.writes, TAIL_MAX_BYTES, TAIL_MAX_LINES),
@@ -238,6 +255,8 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
   let chatAutoReplies = 0, memoryRefreshes = 0, notificationsFlushed = 0;
   let lastDirectiveAt: string | null = null, lastPublishAt: string | null = null;
   let lastInboundAt: string | null = null, lastAutoReplyAt: string | null = null;
+  let lastOpenClawAgentName: string | null = null;
+  let lastOpenClawProbe: Record<string, unknown> | null = null;
   const recentEvents: Array<{ at: string | null; type: string; detail: string | null }> = [];
 
   for (const envelope of writeRecords) {
@@ -254,6 +273,13 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
     if (type === CHAT_AUTO_REPLY) { chatAutoReplies++; lastAutoReplyAt = at ?? lastAutoReplyAt; }
     if (type === MEMORY_REFRESH) memoryRefreshes++;
     if (type === NOTIFICATIONS_FLUSHED) notificationsFlushed++;
+    if (type === "openclaw_prompt_result") {
+      const agentName = str(payload.agentName);
+      if (agentName) lastOpenClawAgentName = agentName;
+    }
+    if (type === "openclaw_binary_probe") {
+      lastOpenClawProbe = payload;
+    }
 
     const detail = type === PUBLISH_RESULT
       ? (bool(payload.ok) === true ? "publish ok" : str(payload.error) ?? "publish failed")
@@ -271,6 +297,7 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
 
   const ws = latestDebug && isRecord(latestDebug.ws) ? latestDebug.ws as Record<string, unknown> : null;
   const auth = latestDebug && isRecord(latestDebug.auth) ? latestDebug.auth as Record<string, unknown> : null;
+  const authUser = auth && isRecord(auth.user) ? auth.user as Record<string, unknown> : null;
   const perm = latestDebug && isRecord(latestDebug.permission) ? latestDebug.permission as Record<string, unknown> : null;
   const pub = latestDebug && isRecord(latestDebug.publish) ? latestDebug.publish as Record<string, unknown> : null;
 
@@ -315,6 +342,35 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
       runtimeReadOffset: num(chatRuntimeState?.readOffset),
       runtimeLastProcessedMessageId: str(chatRuntimeState?.lastProcessedMessageId),
       runtimeLastProcessedAt: iso(chatRuntimeState?.lastProcessedAt),
+    },
+    agent: {
+      userId:
+        str(chatStatus?.viewerMainUserId) ??
+        str(auth?.userId) ??
+        str(auth?.mainUserId) ??
+        str(authUser?.id),
+      handle:
+        str(agentIdentity?.handle) ??
+        str(auth?.handle) ??
+        str(authUser?.handle),
+      name:
+        str(agentIdentity?.name) ??
+        str(auth?.name) ??
+        str(authUser?.name),
+      profileSet: Boolean(
+        str(agentIdentity?.handle) ??
+          str(agentIdentity?.name) ??
+          str(agentIdentity?.bio),
+      ),
+      bio: str(agentIdentity?.bio),
+      personality: str(agentIdentity?.personality),
+      identityUpdatedAt: iso(agentIdentity?.updatedAt),
+      openClawAgentName: lastOpenClawAgentName,
+      openClawBinaryCommand: str(lastOpenClawProbe?.command),
+      openClawBinarySource: str(lastOpenClawProbe?.source),
+      openClawBinaryOk: bool(lastOpenClawProbe?.probeOk),
+      openClawBinaryVersion: str(lastOpenClawProbe?.probeVersion),
+      openClawBinaryError: str(lastOpenClawProbe?.probeError),
     },
     memory: {
       moodPrimary: str(mood?.primary), moodScore: num(mood?.score), moodUpdatedAt: iso(mood?.updatedAt),
@@ -381,6 +437,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 <div class="grid">
 <div class="card"><div class="muted">Runtime</div><div id="rt"></div></div>
 <div class="card"><div class="muted">Chat Bridge</div><div id="cb"></div></div>
+<div class="card"><div class="muted">Agent</div><div id="ag"></div></div>
 <div class="card"><div class="muted">Memory</div><div id="mm"></div></div>
 <div class="card"><div class="muted">Activity</div><div id="ac"></div></div>
 </div>
@@ -398,6 +455,7 @@ const qs=new URLSearchParams(window.location.search);const k=(qs.get('key')??'')
 const render=snap=>{if(!snap)return;document.getElementById('ts').textContent='updated '+fmt(snap.generatedAt)+(snap.available===false&&snap.reason?' · '+snap.reason:'');
 const[rC,rT]=badge(snap.runtime?.wsState);document.getElementById('rt').innerHTML='<div class="badge '+esc(rC)+'">'+esc(rT)+'</div><div class="kv" style="margin-top:8px">'+kv({auth:snap.runtime?.authEffective,permission:snap.runtime?.permissionState,wsTransport:snap.runtime?.wsTransportState,lastEnvelope:fmt(snap.runtime?.lastEnvelopeAt),lastPublish:fmt(snap.runtime?.lastPublishAt),publishError:snap.runtime?.lastPublishError??'none'})+'</div>';
 const[cC,cT]=badge(snap.chatBridge?.connected===true?'ready':(snap.chatBridge?.state??'unknown'));document.getElementById('cb').innerHTML='<div class="badge '+esc(cC)+'">'+esc(cT)+'</div><div class="kv" style="margin-top:8px">'+kv({connected:String(snap.chatBridge?.connected),mode:snap.chatBridge?.subscriptionMode,topics:snap.chatBridge?.subscribedTopics,requested:fmtTopicCounts(snap.chatBridge?.requestedTopicCounts),subscribed:fmtTopicCounts(snap.chatBridge?.subscribedTopicCounts),shell:shellCounts(snap.chatBridge?.lastShellSummary),ticketFailures:snap.chatBridge?.lastTicketFailureCount,lastError:snap.chatBridge?.lastError??'none'})+'</div>';
+document.getElementById('ag').innerHTML='<div class="kv">'+kv({userId:snap.agent?.userId,handle:snap.agent?.handle,name:snap.agent?.name,openclawAgent:snap.agent?.openClawAgentName,openclawBinOk:String(snap.agent?.openClawBinaryOk),openclawBinSource:snap.agent?.openClawBinarySource,openclawBinVersion:snap.agent?.openClawBinaryVersion??'n/a',openclawBinError:snap.agent?.openClawBinaryError??'none',identityUpdated:fmt(snap.agent?.identityUpdatedAt)})+'</div>';
 document.getElementById('mm').innerHTML='<div class="kv">'+kv({mood:snap.memory?.moodPrimary,moodScore:snap.memory?.moodScore,tier24h:snap.memory?.tier24hEvents,tier7d:snap.memory?.tier7dEvents})+'</div>';
 document.getElementById('ac').innerHTML='<div class="kv">'+kv({publishOk:snap.activity?.publishSuccess,publishFail:snap.activity?.publishFailed,directives:snap.activity?.directivesExecuted,messages:snap.activity?.chatMessagesReceived,autoReplies:snap.activity?.chatAutoRepliesSent})+'</div>';
 const evts=Array.isArray(snap.activity?.recentEvents)?snap.activity.recentEvents:[];document.getElementById('events').innerHTML=evts.length?evts.map(e=>'<div class="evt"><strong>'+esc(e?.type)+'</strong><br/><span class="muted">'+esc(e?.detail??'-')+' · '+esc(fmt(e?.at))+'</span></div>').join(''):'<div class="muted">No recent events.</div>';
