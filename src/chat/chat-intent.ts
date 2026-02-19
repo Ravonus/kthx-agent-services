@@ -48,6 +48,24 @@ export const normalizeInboxEntry = (value: unknown): ChatInboxEntry | null => {
   const channelId = channelIdRaw.trim();
   if (!conversationId.length && !channelId.length) return null;
   const author = messageEnvelope && isRecord(messageEnvelope.author) ? messageEnvelope.author : null;
+  const metadata =
+    (isRecord(message.metadata) ? message.metadata : null) ??
+    (isRecord(messageEnvelope?.metadata) ? messageEnvelope.metadata : null);
+  const serverIntentHint = isRecord(metadata?.agentIntentHint) ? metadata.agentIntentHint : null;
+  const serverIntentCommand =
+    typeof serverIntentHint?.command === "string" && serverIntentHint.command.trim().length > 0
+      ? serverIntentHint.command.trim().toLowerCase()
+      : null;
+  const serverIntentActionFamily =
+    typeof serverIntentHint?.actionFamily === "string" &&
+      serverIntentHint.actionFamily.trim().length > 0
+      ? serverIntentHint.actionFamily.trim().toLowerCase()
+      : null;
+  const serverIntentConfidence =
+    typeof serverIntentHint?.confidence === "string" &&
+      serverIntentHint.confidence.trim().length > 0
+      ? serverIntentHint.confidence.trim().toLowerCase()
+      : null;
   const authorMainUserId =
     typeof author?.mainUserId === "string" && author.mainUserId.trim().length > 0
       ? author.mainUserId.trim()
@@ -64,6 +82,9 @@ export const normalizeInboxEntry = (value: unknown): ChatInboxEntry | null => {
     authorDisplay: typeof author?.displayCache === "string" ? author.displayCache : "",
     authorHandle: typeof author?.handleCache === "string" ? author.handleCache : "",
     receivedAt: typeof value.at === "string" && value.at.trim().length > 0 ? value.at.trim() : nowIso(),
+    serverIntentCommand,
+    serverIntentActionFamily,
+    serverIntentConfidence,
   };
 };
 

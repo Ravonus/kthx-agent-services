@@ -942,6 +942,7 @@ export class CommandExecutor {
     const recentGeneratedAssetHref = asNonEmptyString(recentGeneratedAsset?.href);
     const shouldReusePersonaReference =
       avatarRequest &&
+      avatarTarget === "agent" &&
       (recentGeneratedAssetType === "persona" ||
         recentGeneratedAssetType === "avatar");
     const prompt = shouldReusePersonaReference
@@ -1015,10 +1016,13 @@ export class CommandExecutor {
         const avatarUser = isRecord(avatarData?.user) ? avatarData.user : null;
         const avatarHandle = asNonEmptyString(avatarUser?.handle);
         const avatarUserId = asNonEmptyString(avatarUser?.id);
+        const avatarProfileHref = avatarTarget === "owner" && avatarHandle
+          ? `/u/${avatarHandle.replace(/^@+/u, "")}?edit=avatar&crop=1`
+          : null;
         const completionText =
           avatarTarget === "owner"
-            ? "Done. Here is your new avatar."
-            : "Done. Here is my new avatar.";
+            ? "Done. Here is your new avatar. If framing looks off, tap Crop avatar and center the face in the circle."
+            : "Done. Here is my new avatar. If framing looks off, tap Crop avatar and center the face in the circle.";
         await this.ctx.callAgentChatBridge({
           action: "send_message",
           clientMessageId: `runtime_avatar_result_${Date.now().toString(36)}_${crypto
@@ -1052,6 +1056,13 @@ export class CommandExecutor {
               summary,
               href: media.mediaUrl,
               hrefLabel: "Open avatar image",
+              cropHint: "Crop tip: center the face/subject and keep edges clear for circular framing.",
+              ...(avatarProfileHref
+                ? {
+                    secondaryHref: avatarProfileHref,
+                    secondaryHrefLabel: "Crop avatar",
+                  }
+                : {}),
               avatarTarget,
               ...(avatarHandle ? { handle: avatarHandle } : {}),
               ...(avatarUserId ? { userId: avatarUserId } : {}),

@@ -270,6 +270,10 @@ export const buildChatResultMessageFromOutcome = ({
         ? user.handle.trim()
         : null;
     const image = isRecord(data?.image) ? (data.image as Record<string, unknown>) : null;
+    const target =
+      typeof data?.target === "string" && data.target.trim().length > 0
+        ? data.target.trim().toLowerCase()
+        : "agent";
     const imageUrl =
       (typeof image?.url === "string" && image.url.trim().length > 0
         ? image.url.trim()
@@ -277,11 +281,14 @@ export const buildChatResultMessageFromOutcome = ({
       (typeof user?.image === "string" && user.image.trim().length > 0
         ? user.image.trim()
         : null);
+    const cropHref = target === "owner" && handle
+      ? `/u/${handle.replace(/^@+/u, "")}?edit=avatar&crop=1`
+      : null;
     if (ok && imageUrl) {
       return {
         body: handle
-          ? `Done. Updated avatar for @${handle}.`
-          : "Done. Updated avatar.",
+          ? `Done. Updated avatar for @${handle}. If framing looks off, tap Crop avatar and center the face in the circle.`
+          : "Done. Updated avatar. If framing looks off, tap Crop avatar and center the face in the circle.",
         metadata: {
           automated: true,
           sourceContext: "CHAT",
@@ -292,6 +299,13 @@ export const buildChatResultMessageFromOutcome = ({
             summary: handle ? `Updated @${handle}` : null,
             href: imageUrl,
             hrefLabel: "Open avatar image",
+            cropHint: "Crop tip: center the face/subject and keep edges clear for circular framing.",
+            ...(cropHref
+              ? {
+                  secondaryHref: cropHref,
+                  secondaryHrefLabel: "Crop avatar",
+                }
+              : {}),
           },
         },
       };

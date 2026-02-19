@@ -219,6 +219,9 @@ export interface ChatInboxEntry {
   authorDisplay: string;
   authorHandle: string;
   receivedAt: string;
+  serverIntentCommand: string | null;
+  serverIntentActionFamily: string | null;
+  serverIntentConfidence: string | null;
 }
 
 /** Build a natural presence reply ("Yep, I'm here..."). */
@@ -435,6 +438,14 @@ export const shouldReplyToChatInboxEntry = (
 ): boolean => {
   if (entry.authorIsAgent) return false;
   if (entry.commandKind !== "none") return false;
+  if (
+    entry.serverIntentActionFamily &&
+    entry.serverIntentActionFamily !== "conversation"
+  ) {
+    // Server-side command parsing already delegated this message to the
+    // runtime command pipeline. Avoid sending a second conversational reply.
+    return false;
+  }
   if (!entry.body.trim().length) return false;
   if (!entry.messageId.trim().length) return false;
   if (entry.channelId) {
