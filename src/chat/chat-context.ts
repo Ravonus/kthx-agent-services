@@ -262,6 +262,55 @@ export const buildChatResultMessageFromOutcome = ({
     };
   }
 
+  if (kind === "write.updateAvatar") {
+    const data = isRecord(outcome?.data) ? (outcome!.data as Record<string, unknown>) : null;
+    const user = isRecord(data?.user) ? (data.user as Record<string, unknown>) : null;
+    const handle =
+      typeof user?.handle === "string" && user.handle.trim().length > 0
+        ? user.handle.trim()
+        : null;
+    const image = isRecord(data?.image) ? (data.image as Record<string, unknown>) : null;
+    const imageUrl =
+      (typeof image?.url === "string" && image.url.trim().length > 0
+        ? image.url.trim()
+        : null) ??
+      (typeof user?.image === "string" && user.image.trim().length > 0
+        ? user.image.trim()
+        : null);
+    if (ok && imageUrl) {
+      return {
+        body: handle
+          ? `Done. Updated avatar for @${handle}.`
+          : "Done. Updated avatar.",
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: "avatar",
+            status: "success",
+            title: "Avatar updated",
+            summary: handle ? `Updated @${handle}` : null,
+            href: imageUrl,
+            hrefLabel: "Open avatar image",
+          },
+        },
+      };
+    }
+    return {
+      body: `I couldn't complete that avatar update${errorMessage ? `: ${errorMessage}` : "."}`,
+      metadata: {
+        automated: true,
+        sourceContext: "CHAT",
+        actionPreview: {
+          type: "avatar",
+          status: "failed",
+          title: "Avatar update failed",
+          error: errorMessage || null,
+        },
+      },
+    };
+  }
+
   return null;
 };
 

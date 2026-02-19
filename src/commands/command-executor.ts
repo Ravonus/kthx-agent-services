@@ -16,6 +16,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import {
+  clampPublishText,
   inheritChatContextIntoPayload,
   resolveChatTargetFromPayload,
   sendChatResultMessageFromOutcome,
@@ -126,6 +127,7 @@ type AgentRouterLike = {
   createPost: AgentMutator;
   createStory: AgentMutator;
   commentPost: AgentMutator;
+  updateAvatar: AgentMutator;
   votePost: AgentMutator;
   repostPost: AgentMutator;
   generate: AgentMutator;
@@ -198,6 +200,14 @@ type GeneratedDraft = {
 };
 
 type GeneratedAssetType = "image" | "gif" | "pdf" | "csv" | "code" | "file" | "txt" | "md";
+type DraftPreviewPayload = {
+  body: string;
+  summary: string;
+  draftPreviewText: string;
+  draftPostKind: "post" | "thread";
+  draftMode: "thread" | "carousel";
+  draftSlideCount: number;
+};
 
 export class CommandExecutor {
   private readonly ctx: CommandExecutorContext;
@@ -236,6 +246,7 @@ export class CommandExecutor {
       createPost: requireMutator("createPost"),
       createStory: requireMutator("createStory"),
       commentPost: requireMutator("commentPost"),
+      updateAvatar: requireMutator("updateAvatar"),
       votePost: requireMutator("votePost"),
       repostPost: requireMutator("repostPost"),
       generate: requireMutator("generate"),
@@ -391,6 +402,10 @@ export class CommandExecutor {
       const outcome = await this.executeWriteCreateStory(command);
       return { processed: true, outcome };
     }
+    if (kind === "write.updateavatar") {
+      const outcome = await this.executeWriteUpdateAvatar(command);
+      return { processed: true, outcome };
+    }
     if (kind === "write.commentpost" || kind === "write.comment") {
       const outcome = await this.executeWriteComment(command);
       return { processed: true, outcome };
@@ -538,6 +553,49 @@ export class CommandExecutor {
     return this.successOutcome(command, result);
   }
 
+  private async executeWriteUpdateAvatar(command: Command): Promise<CommandOutcome> {
+    const payload = isRecord(command.payload) ? command.payload : null;
+    if (!payload) {
+      return this.failedOutcome(command, "Invalid payload for write.updateAvatar.");
+    }
+    const targetRaw = asNonEmptyString(payload.target)?.toLowerCase();
+    const target =
+      targetRaw === "owner" || targetRaw === "for-me" || targetRaw === "for_owner" || targetRaw === "me"
+        ? "owner"
+        : "agent";
+    const provenance = asNonEmptyString(payload.provenance);
+    const sourceDirectiveId =
+      asNonEmptyString(payload.sourceDirectiveId) ??
+      command.sourceDirectiveId ??
+      null;
+    const sourceDirectiveActionNonce =
+      asNonEmptyString(payload.sourceDirectiveActionNonce) ??
+      command.actionNonce ??
+      null;
+
+    const media = await this.resolveMediaUpload({
+      payload,
+      promptFallbacks: [
+        asNonEmptyString(payload.mediaPrompt),
+        asNonEmptyString(payload.imagePrompt),
+        asNonEmptyString(payload.prompt),
+      ],
+    });
+    const result = await this.agent().updateAvatar.mutate({
+      target,
+      imageUrl: media.mediaUrl,
+      ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
+      ...(media.mediaOptimizedUrl ? { optimizedUrl: media.mediaOptimizedUrl } : {}),
+      ...(media.mediaContentHash ? { contentHash: media.mediaContentHash } : {}),
+      ...(media.mediaIpfsCid ? { ipfsCid: media.mediaIpfsCid } : {}),
+      ...(typeof media.mediaSizeBytes === "number" ? { sizeBytes: media.mediaSizeBytes } : {}),
+      ...(provenance ? { provenance } : {}),
+      ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
+      ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
+    });
+    return this.successOutcome(command, result);
+  }
+
   private async executeWriteComment(command: Command): Promise<CommandOutcome> {
     const payload = isRecord(command.payload) ? command.payload : null;
     if (!payload) {
@@ -623,7 +681,44 @@ export class CommandExecutor {
         ? inlineDrafts
         : this.extractGeneratedDrafts(generatedResult);
     if (drafts.length === 0) {
+      if (payload.requireDraftOnly === true) {
+        await this.sendDraftFailureMessage({
+          payload,
+          message: "I couldn't generate a draft right now. Please try again.",
+        }).catch(() => undefined);
+      }
       return this.failedOutcome(command, "generate returned no executable drafts.", "no_drafts");
+    }
+
+    const requireDraftOnly = payload.requireDraftOnly === true;
+    if (requireDraftOnly) {
+      const draftPreview = this.buildDraftPreviewPayload(drafts);
+      if (!draftPreview) {
+        await this.sendDraftFailureMessage({
+          payload,
+          message: "I generated output, but couldn't shape a readable draft preview.",
+        }).catch(() => undefined);
+        return this.failedOutcome(
+          command,
+          "generate returned drafts without previewable text.",
+          "draft_preview_missing",
+        );
+      }
+      await this.sendDraftPreviewMessage({
+        payload,
+        preview: draftPreview,
+      }).catch(() => undefined);
+      return this.successOutcome(command, {
+        generated: generatedResult,
+        draftOnly: true,
+        draftCount: drafts.length,
+        preview: {
+          summary: draftPreview.summary,
+          postKind: draftPreview.draftPostKind,
+          mode: draftPreview.draftMode,
+          slideCount: draftPreview.draftSlideCount,
+        },
+      });
     }
 
     const requireExplicitPublishVerb = payload.requireExplicitPublishVerb === true;
@@ -741,13 +836,22 @@ export class CommandExecutor {
       );
     }
 
+    const avatarRequest =
+      payload.avatarRequest === true ||
+      asNonEmptyString(payload.requestedAction)?.toLowerCase() === "avatar";
+    const avatarTargetRaw = asNonEmptyString(payload.avatarTarget)?.toLowerCase();
+    const avatarTarget = avatarTargetRaw === "owner" ? "owner" : "agent";
+    const defaultAvatarPrompt =
+      avatarTarget === "owner"
+        ? "Create a profile avatar for my account on this social app."
+        : "Create a profile avatar for your account on this social app.";
     const prompt =
       asNonEmptyString(payload.mediaPrompt) ??
       asNonEmptyString(payload.imagePrompt) ??
       asNonEmptyString(payload.prompt) ??
       asNonEmptyString(payload.topic) ??
       asNonEmptyString(payload.requestText) ??
-      null;
+      (avatarRequest ? defaultAvatarPrompt : null);
     if (!prompt) {
       return this.failedOutcome(
         command,
@@ -755,6 +859,15 @@ export class CommandExecutor {
         "missing_prompt",
       );
     }
+    const provenance = asNonEmptyString(payload.provenance);
+    const sourceDirectiveId =
+      asNonEmptyString(payload.sourceDirectiveId) ??
+      command.sourceDirectiveId ??
+      command.id;
+    const sourceDirectiveActionNonce =
+      asNonEmptyString(payload.sourceDirectiveActionNonce) ??
+      command.actionNonce ??
+      null;
 
     const generatedAssetType = this.resolveGeneratedAssetType(payload.generatedAssetType);
     const generatedLabel = generatedAssetType === "gif" ? "GIF" : "image";
@@ -763,7 +876,7 @@ export class CommandExecutor {
       const mimeType = this.resolveGeneratedAttachmentMimeType({
         generatedAssetType,
         mediaUrl: media.mediaUrl,
-        mediaType: media.mediaType,
+        ...(media.mediaType ? { mediaType: media.mediaType } : {}),
       });
       const sizeBytes =
         typeof media.mediaSizeBytes === "number" &&
@@ -772,6 +885,88 @@ export class CommandExecutor {
           ? Math.max(1, Math.floor(media.mediaSizeBytes))
           : 1;
       const summary = truncateText(prompt, 220);
+      if (avatarRequest) {
+        const avatarResult = await this.agent().updateAvatar.mutate({
+          target: avatarTarget,
+          imageUrl: media.mediaUrl,
+          ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
+          ...(media.mediaOptimizedUrl ? { optimizedUrl: media.mediaOptimizedUrl } : {}),
+          ...(media.mediaContentHash ? { contentHash: media.mediaContentHash } : {}),
+          ...(media.mediaIpfsCid ? { ipfsCid: media.mediaIpfsCid } : {}),
+          ...(typeof media.mediaSizeBytes === "number"
+            ? { sizeBytes: media.mediaSizeBytes }
+            : {}),
+          ...(provenance ? { provenance } : {}),
+          ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
+          ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
+        });
+        const avatarData = isRecord(avatarResult) ? avatarResult : null;
+        const avatarUser = isRecord(avatarData?.user) ? avatarData.user : null;
+        const avatarHandle = asNonEmptyString(avatarUser?.handle);
+        const avatarUserId = asNonEmptyString(avatarUser?.id);
+        const completionText =
+          avatarTarget === "owner"
+            ? "Done. Here is your new avatar."
+            : "Done. Here is my new avatar.";
+        await this.ctx.callAgentChatBridge({
+          action: "send_message",
+          clientMessageId: `runtime_avatar_result_${Date.now().toString(36)}_${crypto
+            .randomUUID()
+            .replaceAll("-", "")
+            .slice(0, 10)}`,
+          ...(chatTarget.conversationId
+            ? { conversationId: chatTarget.conversationId }
+            : { channelId: chatTarget.channelId }),
+          body: completionText,
+          format: "markdown",
+          attachments: [
+            {
+              url: media.mediaUrl,
+              mimeType,
+              sizeBytes,
+              metadata: {
+                source: "runtime.avatar",
+                generatedAssetType: "image",
+              },
+            },
+          ],
+          metadata: {
+            automated: true,
+            sourceContext: "CHAT",
+            actionPreview: {
+              type: "avatar",
+              status: "success",
+              title: "Avatar updated",
+              summary,
+              href: media.mediaUrl,
+              hrefLabel: "Open avatar image",
+              avatarTarget,
+              ...(avatarHandle ? { handle: avatarHandle } : {}),
+              ...(avatarUserId ? { userId: avatarUserId } : {}),
+            },
+          },
+        });
+        await this.ctx.memory.recordWrite({
+          type: "chat_avatar_updated",
+          at: nowIso(),
+          commandId: command.id,
+          avatarTarget,
+          mediaUrl: media.mediaUrl,
+          prompt: summary,
+          userId: avatarUserId,
+          handle: avatarHandle,
+          targetConversationId: chatTarget.conversationId ?? null,
+          targetChannelId: chatTarget.channelId ?? null,
+        });
+        return this.successOutcome(command, {
+          mode: "chat_avatar_update",
+          avatarTarget,
+          mediaUrl: media.mediaUrl,
+          prompt: summary,
+          updateResult: avatarResult,
+        });
+      }
+
       await this.ctx.callAgentChatBridge({
         action: "send_message",
         clientMessageId: `runtime_generate_result_${Date.now().toString(36)}_${crypto
@@ -834,15 +1029,19 @@ export class CommandExecutor {
         ...(chatTarget.conversationId
           ? { conversationId: chatTarget.conversationId }
           : { channelId: chatTarget.channelId }),
-        body: `I could not generate that ${generatedLabel} right now. Please retry in a moment.`,
+        body: avatarRequest
+          ? "I could not update that avatar right now. Please retry in a moment."
+          : `I could not generate that ${generatedLabel} right now. Please retry in a moment.`,
         format: "markdown",
         metadata: {
           automated: true,
           sourceContext: "CHAT",
           actionPreview: {
-            type: generatedAssetType,
+            type: avatarRequest ? "avatar" : generatedAssetType,
             status: "failed",
-            title: `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
+            title: avatarRequest
+              ? "Avatar update failed"
+              : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
             error: truncateText(message, 240),
           },
         },
@@ -852,12 +1051,15 @@ export class CommandExecutor {
         at: nowIso(),
         commandId: command.id,
         generatedAssetType,
+        avatarRequest,
         error: message,
       });
       return this.failedOutcome(
         command,
-        `Literal generate failed: ${message}`,
-        "literal_generate_failed",
+        avatarRequest
+          ? `Avatar update failed: ${message}`
+          : `Literal generate failed: ${message}`,
+        avatarRequest ? "avatar_update_failed" : "literal_generate_failed",
       );
     }
   }
@@ -866,6 +1068,7 @@ export class CommandExecutor {
     const kind = command.kind.trim().toLowerCase();
     if (kind === "write.createpost") return this.executeWriteCreatePost(command);
     if (kind === "write.createstory") return this.executeWriteCreateStory(command);
+    if (kind === "write.updateavatar") return this.executeWriteUpdateAvatar(command);
     if (kind === "write.commentpost" || kind === "write.comment") {
       return this.executeWriteComment(command);
     }
@@ -925,6 +1128,7 @@ export class CommandExecutor {
   }
 
   private mapGoalToGenerateKind(goal: string): string {
+    if (goal === "avatar") return "media";
     if (goal === "story") return "story";
     if (goal === "thread") return "thread";
     if (goal === "comment" || goal === "reply") return "comment";
@@ -1000,6 +1204,8 @@ export class CommandExecutor {
         ? "write.createStory"
         : action === "comment"
           ? "write.commentPost"
+          : action === "avatar"
+            ? "write.updateAvatar"
           : action === "like"
             ? "write.votePost"
             : action === "post"
@@ -1472,6 +1678,204 @@ export class CommandExecutor {
       deps: {
         callAgentChatBridge: this.ctx.callAgentChatBridge,
         memory: this.ctx.memory,
+      },
+    });
+  }
+
+  private buildDraftPreviewPayload(drafts: GeneratedDraft[]): DraftPreviewPayload | null {
+    const previewParts: string[] = [];
+    let firstPostKind: "post" | "thread" = "post";
+    let mode: "thread" | "carousel" = "thread";
+    let slideCount = 1;
+
+    const resolveMediaUrlFromDraft = (draftPayload: Record<string, unknown>): string | null => {
+      const direct = asNonEmptyString(draftPayload.mediaUrl);
+      if (direct) return direct;
+      const mediaItems = Array.isArray(draftPayload.mediaItems) ? draftPayload.mediaItems : [];
+      for (const item of mediaItems) {
+        if (!isRecord(item)) continue;
+        const itemUrl = asNonEmptyString(item.mediaUrl) ?? asNonEmptyString(item.url);
+        if (itemUrl) return itemUrl;
+      }
+      return null;
+    };
+
+    const resolveMediaItemCount = (draftPayload: Record<string, unknown>): number => {
+      const mediaItems = Array.isArray(draftPayload.mediaItems) ? draftPayload.mediaItems : [];
+      return mediaItems.filter((entry) => isRecord(entry)).length;
+    };
+
+    const addPreviewPart = (value: string | null): void => {
+      if (!value) return;
+      const normalized = value.trim();
+      if (!normalized.length) return;
+      previewParts.push(normalized);
+    };
+
+    for (const draft of drafts.slice(0, 5)) {
+      const action = draft.action.trim().toLowerCase();
+      if (action === "post") {
+        const postType = asNonEmptyString(draft.payload.postType)?.toLowerCase();
+        const textBody =
+          asNonEmptyString(draft.payload.textBody) ??
+          asNonEmptyString(draft.payload.body) ??
+          asNonEmptyString(draft.payload.text);
+        const caption =
+          asNonEmptyString(draft.payload.caption) ??
+          asNonEmptyString(draft.payload.title);
+        const imagePrompt =
+          asNonEmptyString(draft.payload.imagePrompt) ??
+          asNonEmptyString(draft.payload.mediaPrompt) ??
+          asNonEmptyString(draft.payload.prompt);
+        const mediaUrl = resolveMediaUrlFromDraft(draft.payload);
+        const mediaItemCount = resolveMediaItemCount(draft.payload);
+        if (postType === "text" && textBody) {
+          addPreviewPart(textBody);
+          firstPostKind = "post";
+          continue;
+        }
+
+        if (textBody || caption || imagePrompt || mediaUrl) {
+          const composed = [textBody, caption, imagePrompt ? `Image prompt: ${imagePrompt}` : null]
+            .filter((entry): entry is string => Boolean(entry))
+            .join("\n");
+          addPreviewPart(
+            composed.length > 0
+              ? composed
+              : mediaUrl
+                ? "Post draft with attached media is ready for review."
+                : "Post draft is ready for review.",
+          );
+          firstPostKind = "post";
+          if (postType === "media" || imagePrompt || mediaUrl || mediaItemCount > 0) {
+            mode = "carousel";
+            slideCount = Math.max(slideCount, mediaItemCount > 1 ? mediaItemCount : 2);
+          }
+          continue;
+        }
+      }
+      if (action === "story") {
+        const caption = asNonEmptyString(draft.payload.caption);
+        const imagePrompt =
+          asNonEmptyString(draft.payload.imagePrompt) ??
+          asNonEmptyString(draft.payload.mediaPrompt) ??
+          asNonEmptyString(draft.payload.prompt);
+        const mediaUrl = resolveMediaUrlFromDraft(draft.payload);
+        const composed = [caption, imagePrompt ? `Image prompt: ${imagePrompt}` : null]
+          .filter((entry): entry is string => Boolean(entry))
+          .join("\n");
+        addPreviewPart(
+          composed.length > 0
+            ? composed
+            : mediaUrl
+              ? "Story draft with media is ready for review."
+              : "Story draft is ready for review.",
+        );
+        firstPostKind = "post";
+        if (imagePrompt || mediaUrl) {
+          mode = "carousel";
+          slideCount = Math.max(slideCount, 2);
+        }
+        continue;
+      }
+      if (action === "comment") {
+        const body =
+          asNonEmptyString(draft.payload.body) ??
+          asNonEmptyString(draft.payload.text) ??
+          asNonEmptyString(draft.payload.caption);
+        addPreviewPart(body ?? "Comment draft is ready for review.");
+        firstPostKind = "thread";
+        continue;
+      }
+      if (action === "like") {
+        const reason = asNonEmptyString(draft.payload.reason);
+        addPreviewPart(reason ? `Like draft: ${reason}` : "Like action draft is ready.");
+      }
+    }
+
+    if (previewParts.length === 0) {
+      const actionSummary = drafts
+        .slice(0, 3)
+        .map((entry) => entry.action.trim().toLowerCase())
+        .filter((entry) => entry.length > 0)
+        .join(", ");
+      if (!actionSummary.length) return null;
+      previewParts.push(`Draft ready for review (${actionSummary}).`);
+    }
+    const draftPreviewText = previewParts.join("\n\n").slice(0, 2500);
+    const summary = clampPublishText(draftPreviewText, 220);
+    return {
+      body: `Draft ready for review:\n\n${draftPreviewText}`,
+      summary,
+      draftPreviewText,
+      draftPostKind: firstPostKind,
+      draftMode: mode,
+      draftSlideCount: slideCount,
+    };
+  }
+
+  private async sendDraftPreviewMessage(input: {
+    payload: Record<string, unknown>;
+    preview: DraftPreviewPayload;
+  }): Promise<void> {
+    if (!this.ctx.callAgentChatBridge) return;
+    const chatTarget = resolveChatTargetFromPayload(input.payload);
+    if (!chatTarget) return;
+    await this.ctx.callAgentChatBridge({
+      action: "send_message",
+      clientMessageId: `runtime_draft_result_${Date.now().toString(36)}_${crypto
+        .randomUUID()
+        .replaceAll("-", "")
+        .slice(0, 10)}`,
+      ...(chatTarget.conversationId
+        ? { conversationId: chatTarget.conversationId }
+        : { channelId: chatTarget.channelId }),
+      body: input.preview.body,
+      format: "markdown",
+      metadata: {
+        automated: true,
+        sourceContext: "CHAT",
+        draftPreviewText: input.preview.draftPreviewText,
+        draftPostKind: input.preview.draftPostKind,
+        draftMode: input.preview.draftMode,
+        draftSlideCount: input.preview.draftSlideCount,
+        actionPreview: {
+          type: "draft",
+          status: "success",
+          title: "Draft ready",
+          summary: input.preview.summary,
+        },
+      },
+    });
+  }
+
+  private async sendDraftFailureMessage(input: {
+    payload: Record<string, unknown>;
+    message: string;
+  }): Promise<void> {
+    if (!this.ctx.callAgentChatBridge) return;
+    const chatTarget = resolveChatTargetFromPayload(input.payload);
+    if (!chatTarget) return;
+    await this.ctx.callAgentChatBridge({
+      action: "send_message",
+      clientMessageId: `runtime_draft_error_${Date.now().toString(36)}_${crypto
+        .randomUUID()
+        .replaceAll("-", "")
+        .slice(0, 10)}`,
+      ...(chatTarget.conversationId
+        ? { conversationId: chatTarget.conversationId }
+        : { channelId: chatTarget.channelId }),
+      body: input.message,
+      format: "markdown",
+      metadata: {
+        automated: true,
+        sourceContext: "CHAT",
+        actionPreview: {
+          type: "draft",
+          status: "failed",
+          title: "Draft failed",
+          error: input.message,
+        },
       },
     });
   }
