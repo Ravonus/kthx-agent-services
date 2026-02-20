@@ -413,6 +413,57 @@ Health endpoints:
 
 - Public projection: `http://127.0.0.1:4278/api/health`
 - Private full snapshot (if `MG_AGENT_HEALTH_PRIVATE_KEY` is set): `http://127.0.0.1:4278/api/health/private?key=<secret>`
+- Retrieval diagnostics (private key required): `http://127.0.0.1:4278/api/health/retrieval?key=<secret>&intent=chat&q=post%20751`
+- Retention policy (private key required): `http://127.0.0.1:4278/api/health/retention?key=<secret>`
+
+### Retrieval + Recontext Rules (Direct Chat + In-App)
+
+The runtime now uses keyword-indexed memory retrieval before drafting replies.
+This is intended to keep context fragmented (cheap) but reassembled only when needed.
+
+Intent routing:
+
+- `chat`: normal conversation and recall
+- `directive`: execution/planning asks ("post", "create", "schedule", "update", moderation)
+- `engagement`: social interaction asks ("like", "comment", "repost", "reply", "follow", "what is trending")
+
+Target parsing:
+
+- If user says `post 751` (or `#751`), treat that as `postId=751`.
+- If user says `comment 123`, treat that as `commentId=123`.
+- If only `commentId` is given, infer parent post when possible.
+
+Thread reconstruction expectation:
+
+- For a target post, retrieval should return:
+  - main post signal
+  - recent replies
+  - replies likely directed at the agent
+
+This should be used both for in-app chat and direct external chat workflows.
+
+Retrieval debug query examples:
+
+```bash
+# chat recall
+curl "http://127.0.0.1:4278/api/health/retrieval?key=<secret>&intent=chat&q=what+did+we+say+about+that+retro+post"
+
+# directive-focused retrieval
+curl "http://127.0.0.1:4278/api/health/retrieval?key=<secret>&intent=directive&q=post+751+draft+followup"
+
+# engagement-focused retrieval with explicit target
+curl "http://127.0.0.1:4278/api/health/retrieval?key=<secret>&intent=engagement&postId=751&limit=20"
+```
+
+Retention policy update examples (private key required):
+
+```bash
+# set all retention categories to 365 days
+curl "http://127.0.0.1:4278/api/health/retention?key=<secret>&set=1&days=365"
+
+# tune long-term compaction behavior
+curl "http://127.0.0.1:4278/api/health/retention?key=<secret>&set=1&longTermEnabled=1&longTermMaxCompactionsPerRun=12&longTermMaxEventsPerArchive=220&longTermUseAgentCompression=1"
+```
 
 ## 8) Fast Troubleshooting
 

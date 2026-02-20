@@ -12,7 +12,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type {
-  MemoryEnvelope,
+  ArchiveIndex,
   StreamName,
   StreamPathMap,
   MoodState,
@@ -25,6 +25,11 @@ import { isRecord } from "~/lib/guards.js";
 import { readLastJsonLines, writeJsonLines } from "~/lib/fs-helpers.js";
 import { parseMemoryEnvelope, classifyRetentionCategory } from "./extract.js";
 import { listArchiveIndexes } from "./archive.js";
+
+export type ArchiveDeleteGuard = (input: {
+  stream: StreamName;
+  index: ArchiveIndex;
+}) => Promise<boolean> | boolean;
 
 // ---------------------------------------------------------------------------
 // pruneStreamByRetention
@@ -104,10 +109,12 @@ export const pruneArchivesByRetention = async ({
   stream,
   maxAgeDays,
   stateDir,
+  shouldRemove,
 }: {
   stream: StreamName;
   maxAgeDays: number;
   stateDir: string;
+  shouldRemove?: ArchiveDeleteGuard;
 }): Promise<ArchivePruneResult> => {
   if (maxAgeDays <= 0) return { removed: 0, stream };
   const indexes = await listArchiveIndexes({ stateDir, stream });
@@ -123,6 +130,10 @@ export const pruneArchivesByRetention = async ({
       : NaN;
     if (!Number.isFinite(maxAtMs)) continue;
     if (nowMs - maxAtMs <= cutoffMs) continue;
+    if (shouldRemove) {
+      const allowed = await shouldRemove({ stream, index });
+      if (allowed !== true) continue;
+    }
 
     const streamDir = path.join(stateDir, "archive", stream);
     const gzPath = path.join(
@@ -150,12 +161,18 @@ export const runRetentionCleanup = async ({
   tailMaxBytes,
   stateDir,
   moodState,
+  streamRetentionMap,
+  archiveDeleteGuard,
+  longTermCompactions = 0,
 }: {
   retentionConfig: KthxRetentionConfig;
   streamPaths: StreamPathMap;
   tailMaxBytes: number;
   stateDir: string;
   moodState: MoodState;
+  streamRetentionMap?: Partial<Record<StreamName, number>>;
+  archiveDeleteGuard?: ArchiveDeleteGuard;
+  longTermCompactions?: number;
 }): Promise<{
   result: RetentionCleanupResult | null;
   moodDirty: boolean;
@@ -164,38 +181,51 @@ export const runRetentionCleanup = async ({
   if (!isRecord(retentionConfig) || retentionConfig.enabled !== true)
     return { result: null, moodDirty: false, updatedMoodState: moodState };
 
-  const streamRetentionMap: Record<string, number> = {
-    notifications: retentionConfig.notifications?.days ?? 3,
-    feed: retentionConfig.posts?.days ?? 90,
-    activity: retentionConfig.interactions?.days ?? 14,
-    likes: retentionConfig.interactions?.days ?? 14,
-    reposts: retentionConfig.interactions?.days ?? 14,
-    comments: retentionConfig.interactions?.days ?? 14,
-    views: retentionConfig.interactions?.days ?? 14,
+  const effectiveStreamRetentionMap: Record<StreamName, number> = {
+    notifications: retentionConfig.notifications?.days ?? 365,
+    feed: retentionConfig.posts?.days ?? 365,
+    activity: retentionConfig.interactions?.days ?? 365,
+    likes: retentionConfig.interactions?.days ?? 365,
+    reposts: retentionConfig.interactions?.days ?? 365,
+    comments: retentionConfig.interactions?.days ?? 365,
+    views: retentionConfig.interactions?.days ?? 365,
     writes: Math.max(
-      retentionConfig.commands?.days ?? 7,
-      retentionConfig.system?.days ?? 7,
+      retentionConfig.commands?.days ?? 365,
+      retentionConfig.system?.days ?? 365,
     ),
-    errors: retentionConfig.system?.days ?? 7,
+    errors: retentionConfig.system?.days ?? 365,
+    director: retentionConfig.system?.days ?? 365,
+    memory_activity: retentionConfig.system?.days ?? 365,
+    tags: retentionConfig.posts?.days ?? 365,
+    story_replies: retentionConfig.interactions?.days ?? 365,
   };
+  if (streamRetentionMap) {
+    for (const [stream, days] of Object.entries(streamRetentionMap)) {
+      if (!Number.isFinite(days) || days <= 0) continue;
+      if (!(stream in effectiveStreamRetentionMap)) continue;
+      effectiveStreamRetentionMap[stream as StreamName] = Math.floor(days);
+    }
+  }
 
   const activeResults: PruneResult[] = [];
   const archiveResults: ArchivePruneResult[] = [];
 
-  for (const stream of Object.keys(streamRetentionMap)) {
+  for (const stream of Object.keys(effectiveStreamRetentionMap)) {
+    const streamName = stream as StreamName;
     const result = await pruneStreamByRetention({
-      stream: stream as StreamName,
+      stream: streamName,
       retentionConfig,
       streamPaths,
       tailMaxBytes,
     });
     activeResults.push(result);
 
-    const maxDays = streamRetentionMap[stream] ?? 7;
+    const maxDays = effectiveStreamRetentionMap[streamName] ?? 365;
     const archiveResult = await pruneArchivesByRetention({
-      stream: stream as StreamName,
+      stream: streamName,
       maxAgeDays: maxDays,
       stateDir,
+      ...(archiveDeleteGuard ? { shouldRemove: archiveDeleteGuard } : {}),
     });
     archiveResults.push(archiveResult);
   }
@@ -224,6 +254,7 @@ export const runRetentionCleanup = async ({
       active: activeResults,
       archives: archiveResults,
       moodSignalsPruned: moodPruned,
+      longTermCompactions,
     },
     moodDirty,
     updatedMoodState,

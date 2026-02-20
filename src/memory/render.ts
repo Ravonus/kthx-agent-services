@@ -34,8 +34,8 @@ export const renderContextPrompt = (bundle: ContextBundle): string => {
   if (isRecord(bundle.mood)) {
     const moodPrimary =
       typeof bundle.mood.primary === "string" &&
-      (bundle.mood.primary as string).trim().length > 0
-        ? (bundle.mood.primary as string).trim()
+      bundle.mood.primary.trim().length > 0
+        ? bundle.mood.primary.trim()
         : "steady";
     const moodScore =
       typeof bundle.mood.score === "number" &&
@@ -80,6 +80,50 @@ export const renderContextPrompt = (bundle: ContextBundle): string => {
     bundle.notes.forEach((note) => {
       parts.push(`- ${note.title}: ${note.content}`);
     });
+  }
+
+  // -- view context ---------------------------------------------------------
+  if (
+    isRecord(bundle.view) &&
+    bundle.view.enabled === true &&
+    bundle.view.relevant === true &&
+    Array.isArray(bundle.view.lines) &&
+    bundle.view.lines.length > 0
+  ) {
+    parts.push("\n## View Context");
+    bundle.view.lines
+      .filter(
+        (line): line is string =>
+          typeof line === "string" && line.trim().length > 0,
+      )
+      .slice(0, 16)
+      .forEach((line) => parts.push(`- ${line.trim()}`));
+  }
+
+  // -- retrieval context ----------------------------------------------------
+  if (
+    isRecord(bundle.retrieval) &&
+    bundle.retrieval.enabled === true &&
+    Array.isArray(bundle.retrieval.lines) &&
+    bundle.retrieval.lines.length > 0
+  ) {
+    parts.push("\n## Retrieval Context");
+    if (typeof bundle.retrieval.intent === "string" && bundle.retrieval.intent.trim().length > 0) {
+      parts.push(`intent=${bundle.retrieval.intent.trim()}`);
+    }
+    if (typeof bundle.retrieval.query === "string" && bundle.retrieval.query.trim().length > 0) {
+      parts.push(`query=${bundle.retrieval.query.trim()}`);
+    }
+    if (Array.isArray(bundle.retrieval.keywords) && bundle.retrieval.keywords.length > 0) {
+      parts.push(`keywords=${bundle.retrieval.keywords.join(",")}`);
+    }
+    bundle.retrieval.lines
+      .filter(
+        (line): line is string =>
+          typeof line === "string" && line.trim().length > 0,
+      )
+      .slice(0, 16)
+      .forEach((line) => parts.push(`- ${line.trim()}`));
   }
 
   // -- target ---------------------------------------------------------------

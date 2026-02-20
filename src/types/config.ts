@@ -50,6 +50,14 @@ export type KthxRetentionConfig = {
   interactions: RetentionCategoryConfig;
   notifications: RetentionCategoryConfig;
   system: RetentionCategoryConfig;
+  longTerm: {
+    enabled: boolean;
+    maxCapsules: number;
+    maxCompactionsPerRun: number;
+    maxEventsPerArchive: number;
+    maxSnippetsPerArchive: number;
+    useAgentCompression: boolean;
+  };
 };
 
 export type KthxMemoryConfig = {

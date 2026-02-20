@@ -135,8 +135,15 @@ export type TemporalContext = {
 // ---------------------------------------------------------------------------
 
 export type ViewStateItem = {
-  status: string;
+  status: "unviewed" | "viewed";
   receivedAt: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  seenCount: number;
+  postId: number | null;
+  commentId: number | null;
+  sourceType: string | null;
+  lastTopic: string | null;
 };
 
 export type ViewState = {
@@ -144,6 +151,22 @@ export type ViewState = {
   updatedAt: string;
   items: Record<string, ViewStateItem>;
 };
+
+export type ViewContextSummary = {
+  enabled: boolean;
+  relevant: boolean;
+  lines: string[];
+};
+
+export type RetrievalContextSummary = {
+  enabled: boolean;
+  intent: RetrievalIntent;
+  query: string | null;
+  keywords: string[];
+  lines: string[];
+};
+
+export type RetrievalIntent = "chat" | "directive" | "engagement";
 
 // ---------------------------------------------------------------------------
 // Memory notes
@@ -172,6 +195,12 @@ export type ContextRequest = {
   audience?: string;
   maxRecentEvents?: number;
   maxArchiveEvents?: number;
+  includeViewState?: boolean;
+  viewStateMaxItems?: number;
+  includeKeywordRetrieval?: boolean;
+  retrievalQuery?: string;
+  retrievalMaxItems?: number;
+  retrievalIntent?: RetrievalIntent;
 };
 
 export type TargetFocus = {
@@ -184,6 +213,8 @@ export type ContextBundle = {
   identity: string | null;
   mode: string | null;
   audience: string | null;
+  view: ViewContextSummary;
+  retrieval: RetrievalContextSummary;
   mood: MoodState;
   temporal: TemporalContext;
   target: {
@@ -249,7 +280,52 @@ export type RetentionCleanupResult = {
   active: PruneResult[];
   archives: ArchivePruneResult[];
   moodSignalsPruned: number;
+  longTermCompactions: number;
 };
+
+export type LongTermArchiveTypeCount = {
+  type: string;
+  count: number;
+};
+
+export type LongTermArchiveCapsule = {
+  id: string;
+  stream: string;
+  archiveBasename: string;
+  compactedAt: string;
+  receivedAtMin: string | null;
+  receivedAtMax: string | null;
+  eventCount: number;
+  postIds: number[];
+  commentIds: number[];
+  topTypes: LongTermArchiveTypeCount[];
+  summary: string;
+  snippets: string[];
+  keywords: string[];
+  compressedBy: "algorithm" | "agent";
+};
+
+export type LongTermArchiveIndex = {
+  version: 1;
+  updatedAt: string;
+  items: LongTermArchiveCapsule[];
+};
+
+export type ArchiveCompressionRequest = {
+  stream: string;
+  archiveBasename: string;
+  receivedAtMin: string | null;
+  receivedAtMax: string | null;
+  eventCount: number;
+  topTypes: LongTermArchiveTypeCount[];
+  postIds: number[];
+  commentIds: number[];
+  sampleLines: string[];
+};
+
+export type ArchiveCompressFn = (
+  request: ArchiveCompressionRequest,
+) => Promise<unknown>;
 
 // ---------------------------------------------------------------------------
 // Agent compression

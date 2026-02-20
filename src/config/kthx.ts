@@ -84,14 +84,22 @@ export const buildDefaultKthxConfig = (homeDir: string): KthxConfig => ({
     agentCompressionCooldownMinutes: 30,
     notificationBufferMax: 4000,
     retention: {
-      enabled: false,
-      intervalMinutes: 60,
-      commands: { days: 7 },
-      moods: { days: 30 },
-      posts: { days: 90 },
-      interactions: { days: 14 },
-      notifications: { days: 3 },
-      system: { days: 7 },
+      enabled: true,
+      intervalMinutes: 180,
+      commands: { days: 365 },
+      moods: { days: 365 },
+      posts: { days: 365 },
+      interactions: { days: 365 },
+      notifications: { days: 365 },
+      system: { days: 365 },
+      longTerm: {
+        enabled: true,
+        maxCapsules: 200_000,
+        maxCompactionsPerRun: 10,
+        maxEventsPerArchive: 180,
+        maxSnippetsPerArchive: 8,
+        useAgentCompression: true,
+      },
     },
   },
   image: {
@@ -323,6 +331,68 @@ export const normalizeKthxConfig = (
       sourceRetention.system,
       defaults.memory.retention.system.days,
     ),
+    longTerm: {
+      enabled:
+        typeof sourceRetention.longTerm === "object" &&
+        sourceRetention.longTerm !== null &&
+        typeof (sourceRetention.longTerm as Record<string, unknown>).enabled ===
+          "boolean"
+          ? (sourceRetention.longTerm as Record<string, unknown>).enabled === true
+          : defaults.memory.retention.longTerm.enabled,
+      maxCapsules: Math.max(
+        1000,
+        Math.min(
+          2_000_000,
+          safeFiniteInt(
+            isRecord(sourceRetention.longTerm)
+              ? sourceRetention.longTerm.maxCapsules
+              : undefined,
+            defaults.memory.retention.longTerm.maxCapsules,
+          ),
+        ),
+      ),
+      maxCompactionsPerRun: Math.max(
+        1,
+        Math.min(
+          100,
+          safeFiniteInt(
+            isRecord(sourceRetention.longTerm)
+              ? sourceRetention.longTerm.maxCompactionsPerRun
+              : undefined,
+            defaults.memory.retention.longTerm.maxCompactionsPerRun,
+          ),
+        ),
+      ),
+      maxEventsPerArchive: Math.max(
+        20,
+        Math.min(
+          2000,
+          safeFiniteInt(
+            isRecord(sourceRetention.longTerm)
+              ? sourceRetention.longTerm.maxEventsPerArchive
+              : undefined,
+            defaults.memory.retention.longTerm.maxEventsPerArchive,
+          ),
+        ),
+      ),
+      maxSnippetsPerArchive: Math.max(
+        1,
+        Math.min(
+          24,
+          safeFiniteInt(
+            isRecord(sourceRetention.longTerm)
+              ? sourceRetention.longTerm.maxSnippetsPerArchive
+              : undefined,
+            defaults.memory.retention.longTerm.maxSnippetsPerArchive,
+          ),
+        ),
+      ),
+      useAgentCompression:
+        isRecord(sourceRetention.longTerm) &&
+        typeof sourceRetention.longTerm.useAgentCompression === "boolean"
+          ? sourceRetention.longTerm.useAgentCompression
+          : defaults.memory.retention.longTerm.useAgentCompression,
+    },
   };
 
   return {

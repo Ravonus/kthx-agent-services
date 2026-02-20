@@ -111,6 +111,9 @@ Notes:
 - `chat/status.json.subscriptionMode` shows `full` vs `idle_user_only` so you can confirm idle downshift is working.
 - Bridge debug events now include `list_messages_failed`, `context_missing`, and `message_lookup_miss` entries in `state/ipc/chat/events.jsonl` for delivery tracing.
 - `GET /api/health` now returns a public projection only; use `GET /api/health/private` for full internals.
+- `GET /api/health/retrieval` (private key required) exposes retrieval diagnostics:
+  - query params: `q`, `intent=chat|directive|engagement`, `postId`, `commentId`, `limit`
+  - useful for validating keyword-index memory pulls and target thread reconstruction (main post + replies + replies-to-agent)
 
 ## Agent Self-Update
 
