@@ -136,6 +136,18 @@ const quoteForShell = (token: string): string => {
 const getCommandTokenBaseName = (token: string): string =>
   path.basename(token).trim().toLowerCase();
 
+const isOpenClawToken = (token: string): boolean =>
+  OPENCLAW_TOKEN_PATTERN.test(getCommandTokenBaseName(token));
+
+const isOpenClawExecutable = (
+  token: string,
+  resolvedPath: string | null,
+): boolean => {
+  if (isOpenClawToken(token)) return true;
+  if (resolvedPath && isOpenClawToken(path.basename(resolvedPath))) return true;
+  return false;
+};
+
 export type OpenClawBinarySource =
   | "config.openclaw.binPath"
   | "env:MG_OPENCLAW_BIN"
@@ -179,6 +191,7 @@ export const resolveOpenClawBinary = (
 ): OpenClawBinaryResolution => {
   const env = options?.env ?? process.env;
   const platform = options?.platform ?? process.platform;
+  let fallbackWarning: string | null = null;
 
   const configuredBin = normalizeCandidate(options?.configuredBinPath ?? null, env);
   if (configuredBin) {
@@ -187,20 +200,26 @@ export const resolveOpenClawBinary = (
         ? configuredBin
         : path.resolve(configuredBin);
       if (isExecutableFile(abs, platform)) {
+        if (!isOpenClawExecutable(configuredBin, abs)) {
+          fallbackWarning =
+            `configured openclaw.binPath ignored because it is not an openclaw executable: ${abs}`;
+        } else {
+          return buildResolution({
+            command: abs,
+            resolvedPath: abs,
+            source: "config.openclaw.binPath",
+            fromOverride: true,
+          });
+        }
+      } else {
         return buildResolution({
           command: abs,
-          resolvedPath: abs,
+          resolvedPath: null,
           source: "config.openclaw.binPath",
           fromOverride: true,
+          warning: `configured openclaw.binPath does not exist or is not executable: ${abs}`,
         });
       }
-      return buildResolution({
-        command: abs,
-        resolvedPath: null,
-        source: "config.openclaw.binPath",
-        fromOverride: true,
-        warning: `configured openclaw.binPath does not exist or is not executable: ${abs}`,
-      });
     }
     const fromPath = resolveFromPath({
       command: configuredBin,
@@ -208,15 +227,20 @@ export const resolveOpenClawBinary = (
       env,
       pathValue: options?.pathValue,
     });
-    return buildResolution({
-      command: configuredBin,
-      resolvedPath: fromPath,
-      source: "config.openclaw.binPath",
-      fromOverride: true,
-      warning: fromPath
-        ? null
-        : `configured openclaw.binPath command was not found in PATH: ${configuredBin}`,
-    });
+    if (fromPath && !isOpenClawExecutable(configuredBin, fromPath)) {
+      fallbackWarning =
+        `configured openclaw.binPath ignored because it resolves to non-openclaw command: ${configuredBin}`;
+    } else {
+      return buildResolution({
+        command: configuredBin,
+        resolvedPath: fromPath,
+        source: "config.openclaw.binPath",
+        fromOverride: true,
+        warning: fromPath
+          ? null
+          : `configured openclaw.binPath command was not found in PATH: ${configuredBin}`,
+      });
+    }
   }
 
   const envOverrides: Array<{ key: "MG_OPENCLAW_BIN" | "OPENCLAW_BIN"; source: OpenClawBinarySource }> = [
@@ -229,6 +253,11 @@ export const resolveOpenClawBinary = (
     if (looksPathLike(rawValue)) {
       const abs = path.isAbsolute(rawValue) ? rawValue : path.resolve(rawValue);
       if (isExecutableFile(abs, platform)) {
+        if (!isOpenClawExecutable(rawValue, abs)) {
+          fallbackWarning =
+            `${override.key} ignored because it is not an openclaw executable: ${abs}`;
+          continue;
+        }
         return buildResolution({
           command: abs,
           resolvedPath: abs,
@@ -250,6 +279,11 @@ export const resolveOpenClawBinary = (
       env,
       pathValue: options?.pathValue,
     });
+    if (fromPath && !isOpenClawExecutable(rawValue, fromPath)) {
+      fallbackWarning =
+        `${override.key} ignored because it resolves to non-openclaw command: ${rawValue}`;
+      continue;
+    }
     return buildResolution({
       command: rawValue,
       resolvedPath: fromPath,
@@ -273,6 +307,7 @@ export const resolveOpenClawBinary = (
       resolvedPath: defaultFromPath,
       source: "path_lookup",
       fromOverride: false,
+      warning: fallbackWarning,
     });
   }
   return buildResolution({
@@ -280,7 +315,10 @@ export const resolveOpenClawBinary = (
     resolvedPath: null,
     source: "default",
     fromOverride: false,
-    warning: "openclaw command not found in PATH",
+    warning:
+      fallbackWarning !== null
+        ? `${fallbackWarning}; openclaw command not found in PATH`
+        : "openclaw command not found in PATH",
   });
 };
 

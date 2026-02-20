@@ -3,7 +3,7 @@
  *
  * Handles: request grant -> receive challenge -> solve -> confirm.
  * Includes retry with exponential backoff, failure streak tracking,
- * manual retry gating, and OpenClaw integration.
+ * manual retry gating, and util-agent challenge solving.
  *
  * Ported from agent-runtime.mjs lines 8393-9425.
  */
@@ -48,8 +48,10 @@ export interface MintManagerContext {
   runBackendCall<T>(label: string, fn: () => Promise<T>): Promise<T>;
   markWsActivity(source: string): void;
   getRuntimeAttestation(connectionId: string): unknown;
-  runOpenClawPrompt?(input: { prompt: string; purpose: string }): Promise<{ parsed: unknown } | null>;
-  parseChatOpenClawReply?(response: unknown): string;
+  runUtilAgentPrompt?: (input: {
+    prompt: string;
+    purpose: string;
+  }) => Promise<{ parsed: unknown; payloadText?: string | null; raw?: string | null } | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -560,11 +562,15 @@ export class MintManager implements MintManagerLike {
 
   private chalCtx(): ChallengeContext {
     return {
-      config: this.ctx.config,
+      config: {
+        challengeAnswerMaxChars: this.ctx.config.challengeAnswerMaxChars,
+        mintChallengeUseOpenClaw: this.ctx.config.mintChallengeUseOpenClaw,
+      },
       memory: this.ctx.memory,
       appendMintTrace: (e: unknown) => this.trace(e),
-      ...(this.ctx.runOpenClawPrompt ? { runOpenClawPrompt: this.ctx.runOpenClawPrompt } : {}),
-      ...(this.ctx.parseChatOpenClawReply ? { parseChatOpenClawReply: this.ctx.parseChatOpenClawReply } : {}),
+      ...(this.ctx.runUtilAgentPrompt
+        ? { runUtilAgentPrompt: this.ctx.runUtilAgentPrompt }
+        : {}),
     };
   }
 

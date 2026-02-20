@@ -78,11 +78,20 @@ export interface OpenClawManagerLike {
       onTextDelta?: ((delta: string) => void) | null;
     },
   ): Promise<OpenClawPromptResultLike | null>;
+  promptAgent(
+    agentName: string,
+    input: string,
+    opts?: {
+      purpose?: string;
+      onTextDelta?: ((delta: string) => void) | null;
+    },
+  ): Promise<OpenClawPromptResultLike | null>;
   scheduleWake(reasons: string[]): void;
   wakeFromEnvelope(envelope: unknown): Promise<void>;
   createAgent(opts: {
     agentName: string;
     source?: string;
+    responseAgentModelOverride?: string;
   }): Promise<{ ok: boolean; error?: string; agentName?: string; stdout?: string }>;
   dispose(): void;
 }

@@ -621,15 +621,7 @@ const main = async (): Promise<void> => {
     touchWake,
   });
   ctx.openClawManager = openClawManager;
-  openClawManager.ensureUtilAgent().catch((err: unknown) => {
-    memory
-      .recordWrite({
-        type: "openclaw_util_agent_ensure_error",
-        at: new Date().toISOString(),
-        error: String(err),
-      })
-      .catch(() => {});
-  });
+  openClawManager.ensureUtilAgent().catch(() => {});
 
   // -- MintManager
   const mintManager = new MintManager({
@@ -658,8 +650,12 @@ const main = async (): Promise<void> => {
       markWsActivityFn(ctx.wsStateContext, source),
     getRuntimeAttestation: (connectionId: string) =>
       getRuntimeAttestation(connectionId),
-    runOpenClawPrompt: async (input: { prompt: string; purpose: string }) => {
-      const result = await openClawManager.prompt(input.prompt, { purpose: input.purpose });
+    runUtilAgentPrompt: async (input: { prompt: string; purpose: string }) => {
+      const result = await openClawManager.promptAgent(
+        kthxConfig.openclaw.responseAgentName,
+        input.prompt,
+        { purpose: input.purpose },
+      );
       return result;
     },
   });

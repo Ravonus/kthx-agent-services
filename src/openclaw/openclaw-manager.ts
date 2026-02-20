@@ -223,6 +223,115 @@ const parseOpenClawAgentName = (value: unknown): string | null => {
   return trimmed;
 };
 
+const DEFAULT_RESPONSE_AGENT_MODEL = "anthropic/claude-haiku-4-5";
+
+const escapeRegex = (value: string): string =>
+  value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+
+const listOutputIncludesAgent = (
+  output: string | null | undefined,
+  agentName: string,
+): boolean => {
+  const text = typeof output === "string" ? output : "";
+  if (!text.trim().length) return false;
+  const escapedName = escapeRegex(agentName);
+  const patterns = [
+    new RegExp(`\\b${escapedName}\\b`, "iu"),
+    new RegExp(`name\\s*:\\s*${escapedName}\\b`, "iu"),
+    new RegExp(`-\\s*(?:name\\s*:\\s*)?${escapedName}(?:\\s|$|\\()`, "iu"),
+  ];
+  return patterns.some((pattern) => pattern.test(text));
+};
+
+const normalizeModelToken = (value: string): string | null => {
+  const trimmed = value.trim().replace(/,$/u, "");
+  if (!trimmed.length) return null;
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    const inner = trimmed.slice(1, -1).trim();
+    return inner.length > 0 ? inner : null;
+  }
+  const first = trimmed.split(/\s+/u)[0] ?? "";
+  return first.length > 0 ? first : null;
+};
+
+const resolveResponseAgentModelFromListOutput = (
+  output: unknown,
+  utilAgentName: string,
+): string | null => {
+  const text = typeof output === "string" ? output : "";
+  if (!text.trim().length) return null;
+  const lines = text.split(/\r?\n/u);
+  type Entry = { name: string | null; isDefault: boolean; model: string | null };
+  const entries: Entry[] = [];
+  let current: Entry | null = null;
+  const commitCurrent = () => {
+    if (current) entries.push(current);
+    current = null;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line.length) continue;
+    const itemMatch =
+      /^-\s*(?:name\s*:\s*)?([a-zA-Z0-9._-]+)\b(.*)$/iu.exec(line);
+    if (itemMatch?.[1]) {
+      commitCurrent();
+      current = {
+        name: itemMatch[1].trim(),
+        isDefault: /\(default\)/iu.test(line),
+        model: null,
+      };
+      const inlineModelMatch = /\bmodel\s*:\s*(.+)$/iu.exec(itemMatch[2] ?? "");
+      if (inlineModelMatch?.[1]) {
+        current.model = normalizeModelToken(inlineModelMatch[1]);
+      }
+      continue;
+    }
+
+    if (!current) continue;
+    const nameMatch = /^name\s*:\s*([a-zA-Z0-9._-]+)\b/iu.exec(line);
+    if (nameMatch?.[1]) {
+      current.name = nameMatch[1].trim();
+      if (/\(default\)/iu.test(line)) current.isDefault = true;
+    }
+    if (/^default\s*:\s*(?:true|yes|1)\b/iu.test(line)) {
+      current.isDefault = true;
+    }
+    const modelMatch = /^model\s*:\s*(.+)$/iu.exec(line);
+    if (modelMatch?.[1]) {
+      current.model = normalizeModelToken(modelMatch[1]);
+    }
+  }
+  commitCurrent();
+
+  const nonUtilDefault = entries.find(
+    (entry) =>
+      entry.model !== null &&
+      entry.isDefault &&
+      entry.name !== null &&
+      entry.name !== utilAgentName,
+  );
+  if (nonUtilDefault?.model) return nonUtilDefault.model;
+
+  const nonUtilAny = entries.find(
+    (entry) =>
+      entry.model !== null &&
+      entry.name !== null &&
+      entry.name !== utilAgentName,
+  );
+  if (nonUtilAny?.model) return nonUtilAny.model;
+
+  const anyModel = entries.find((entry) => entry.model !== null);
+  if (anyModel?.model) return anyModel.model;
+
+  const inlineModel = /\bmodel\s*:\s*([^\s,]+)/iu.exec(text);
+  if (inlineModel?.[1]) return normalizeModelToken(inlineModel[1]);
+  return null;
+};
+
 const extractTextFromUnknownChunk = (value: unknown): string => {
   if (typeof value === "string") {
     const normalized = value.replace(OPENCLAW_ANSI_PATTERN, "").replaceAll("\r", "");
@@ -466,13 +575,18 @@ export class OpenClawManager implements OpenClawManagerLike {
     }
     const selected = resolveAgentFromListOutput(result.stdout);
     if (!selected) {
+      const modelOverride = resolveResponseAgentModelFromListOutput(
+        result.stdout,
+        parseOpenClawAgentName(ocConfig.responseAgentName) ?? "util-agent",
+      );
       await this.ctx.memory.recordWrite({
         type: "openclaw_agent_resolution_failed",
         at: nowIso(),
         reason: "no_default_agent_in_list",
         stdoutPreview: toAnswerPreview(result.stdout, 180),
+        responseAgentModelOverride: modelOverride,
       });
-      return await this.tryAutoCreateUtilAgent(ocConfig);
+      return await this.tryAutoCreateUtilAgent(ocConfig, modelOverride);
     }
     this.ctx.openclaw.resolvedOpenClawAgentName = selected;
     this.ctx.openclaw.openClawAgentResolvedAtMs = Date.now();
@@ -481,15 +595,10 @@ export class OpenClawManager implements OpenClawManagerLike {
 
   async ensureUtilAgent(): Promise<void> {
     const ocConfig = this.ctx.openclawConfig();
-    if (
-      !ocConfig?.enabled ||
-      !ocConfig.autoCreateResponseAgent ||
-      !ocConfig.allowCreateAgent
-    ) {
-      return;
-    }
+    if (!ocConfig?.enabled) return;
     const targetName =
       parseOpenClawAgentName(ocConfig.responseAgentName) ?? "util-agent";
+    const configuredModel = normalizeModelToken(ocConfig.responseAgentModel);
     const binary = this.getOpenClawBinaryResolution();
     const listCmd = applyOpenClawBinaryToShellCommand(
       ocConfig.listAgentsCommand || "openclaw agents",
@@ -499,22 +608,48 @@ export class OpenClawManager implements OpenClawManagerLike {
       command: listCmd,
       timeoutMs: 30_000,
     });
-    if (!result.ok || new RegExp(`\\b${targetName}\\b`, "u").test(result.stdout ?? "")) {
+    const detectedModel = result.ok
+      ? resolveResponseAgentModelFromListOutput(result.stdout, targetName)
+      : null;
+    const responseAgentModel =
+      detectedModel ?? configuredModel ?? DEFAULT_RESPONSE_AGENT_MODEL;
+    if (result.ok && listOutputIncludesAgent(result.stdout, targetName)) {
+      await writeUtilAgentWorkspace(this.ctx.config.agentHomeDir, targetName).catch(
+        () => {},
+      );
+      await this.ctx.memory.recordWrite({
+        type: "openclaw_util_agent_already_present",
+        at: nowIso(),
+        agentName: targetName,
+        responseAgentModel,
+      });
       return;
+    }
+    if (!result.ok) {
+      await this.ctx.memory.recordWrite({
+        type: "openclaw_util_agent_list_failed",
+        at: nowIso(),
+        agentName: targetName,
+        code: result.code,
+        stderrPreview: toAnswerPreview(result.stderr, 180),
+      });
     }
     await this.ctx.memory.recordWrite({
       type: "openclaw_util_agent_auto_create_start",
       at: nowIso(),
       agentName: targetName,
+      responseAgentModel,
     });
     const created = await this.createAgent({
       agentName: targetName,
       source: "startup_ensure_util_agent",
+      responseAgentModelOverride: responseAgentModel,
     });
     await this.ctx.memory.recordWrite({
       type: "openclaw_util_agent_auto_create_result",
       at: nowIso(),
       agentName: targetName,
+      responseAgentModel,
       ok: created.ok,
       error: created.error ?? null,
     });
@@ -522,19 +657,26 @@ export class OpenClawManager implements OpenClawManagerLike {
 
   private async tryAutoCreateUtilAgent(
     ocConfig: OpenClawConfigSnapshot,
+    modelOverride: string | null = null,
   ): Promise<string | null> {
-    if (!ocConfig.autoCreateResponseAgent) return null;
     const targetName =
       parseOpenClawAgentName(ocConfig.responseAgentName) ?? "util-agent";
+    const configuredModel = normalizeModelToken(ocConfig.responseAgentModel);
+    const responseAgentModel =
+      normalizeModelToken(modelOverride ?? "") ??
+      configuredModel ??
+      DEFAULT_RESPONSE_AGENT_MODEL;
     const created = await this.createAgent({
       agentName: targetName,
       source: "auto_util_agent_bootstrap",
+      responseAgentModelOverride: responseAgentModel,
     });
     if (!created.ok) {
       await this.ctx.memory.recordWrite({
         type: "openclaw_util_agent_auto_create_failed",
         at: nowIso(),
         agentName: targetName,
+        responseAgentModel,
         error: created.error ?? "unknown_error",
       });
       return null;
@@ -545,6 +687,7 @@ export class OpenClawManager implements OpenClawManagerLike {
       type: "openclaw_util_agent_auto_created",
       at: nowIso(),
       agentName: targetName,
+      responseAgentModel,
     });
     return targetName;
   }
@@ -552,6 +695,32 @@ export class OpenClawManager implements OpenClawManagerLike {
   async prompt(
     input: string,
     opts?: { purpose?: string; onTextDelta?: ((delta: string) => void) | null },
+  ): Promise<OpenClawPromptResult | null> {
+    return this.promptWithAgent(input, opts, null);
+  }
+
+  async promptAgent(
+    agentName: string,
+    input: string,
+    opts?: { purpose?: string; onTextDelta?: ((delta: string) => void) | null },
+  ): Promise<OpenClawPromptResult | null> {
+    const parsedAgentName = parseOpenClawAgentName(agentName);
+    if (!parsedAgentName) {
+      await this.ctx.memory.recordWrite({
+        type: "openclaw_prompt_skipped",
+        at: nowIso(),
+        purpose: opts?.purpose ?? "general",
+        reason: "invalid_agent_name",
+      });
+      return null;
+    }
+    return this.promptWithAgent(input, opts, parsedAgentName);
+  }
+
+  private async promptWithAgent(
+    input: string,
+    opts: { purpose?: string; onTextDelta?: ((delta: string) => void) | null } | undefined,
+    explicitAgentName: string | null,
   ): Promise<OpenClawPromptResult | null> {
     const purpose = opts?.purpose ?? "general";
     const isMintChallenge = purpose === "mint_challenge";
@@ -566,7 +735,7 @@ export class OpenClawManager implements OpenClawManagerLike {
       await this.ctx.memory.recordWrite({ type: "openclaw_prompt_skipped", at: nowIso(), purpose, reason: "missing_template" });
       return null;
     }
-    const agentName = await this.resolveAgentName();
+    const agentName = explicitAgentName ?? (await this.resolveAgentName());
     const resolvedPrompt = typeof input === "string" ? input.trim() : "";
     if (!resolvedPrompt.length) {
       await this.ctx.memory.recordWrite({ type: "openclaw_prompt_skipped", at: nowIso(), purpose, reason: "empty_prompt" });
@@ -675,22 +844,31 @@ export class OpenClawManager implements OpenClawManagerLike {
   }
 
   async createAgent(opts: {
-    agentName: string; source?: string;
+    agentName: string;
+    source?: string;
+    responseAgentModelOverride?: string;
   }): Promise<{ ok: boolean; error?: string; agentName?: string; stdout?: string }> {
     const parsedName = parseOpenClawAgentName(opts.agentName);
     if (!parsedName) return { ok: false, error: "Invalid agent name. Use only letters, numbers, dot, underscore, or dash (max 64 chars)." };
     const ocConfig = this.ctx.openclawConfig();
     if (!ocConfig || !ocConfig.enabled) return { ok: false, error: "OpenClaw integration is disabled in config." };
-    if (ocConfig.allowCreateAgent !== true) {
+    const source = opts.source ?? "runtime";
+    const bypassAllowCreateGate =
+      source === "startup_ensure_util_agent" ||
+      source === "auto_util_agent_bootstrap";
+    if (ocConfig.allowCreateAgent !== true && !bypassAllowCreateGate) {
       return {
         ok: false,
         error:
           "Agent creation is disabled. Set openclaw.allowCreateAgent=true in kthx config.",
       };
     }
-    const source = opts.source ?? "runtime";
     const template = typeof ocConfig.createAgentCommand === "string" ? ocConfig.createAgentCommand.trim() : "";
     if (!template.length) return { ok: false, error: "openclaw.createAgentCommand is empty." };
+    const resolvedResponseAgentModel =
+      normalizeModelToken(opts.responseAgentModelOverride ?? "") ??
+      normalizeModelToken(ocConfig.responseAgentModel) ??
+      DEFAULT_RESPONSE_AGENT_MODEL;
     const currentAgent =
       this.ctx.openclaw.resolvedOpenClawAgentName ??
       (typeof ocConfig.agentName === "string" && ocConfig.agentName.trim().length > 0
@@ -704,9 +882,10 @@ export class OpenClawManager implements OpenClawManagerLike {
       openClawBinary,
       {
         "{new_agent}": parsedName,
-        "{response_agent_model}": (
-          ocConfig.responseAgentModel || "anthropic/claude-haiku-4-5"
-        ).replaceAll('"', '\\"'),
+        "{response_agent_model}": resolvedResponseAgentModel.replaceAll(
+          '"',
+          '\\"',
+        ),
       },
     );
     const timeoutMs = typeof ocConfig.timeoutMs === "number" && Number.isFinite(ocConfig.timeoutMs)
@@ -715,6 +894,7 @@ export class OpenClawManager implements OpenClawManagerLike {
     await this.ctx.memory.recordWrite({
       type: "openclaw_create_agent_result", at: nowIso(), source, requestedAgentName: parsedName,
       ok: result.ok, code: result.code, commandPreview: toAnswerPreview(command, 180),
+      responseAgentModel: resolvedResponseAgentModel,
       stdoutPreview: toAnswerPreview(result.stdout, 180), stderrPreview: toAnswerPreview(result.stderr, 180),
     });
     if (!result.ok) {
