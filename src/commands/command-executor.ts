@@ -31,10 +31,39 @@ import { nowIso } from "../lib/text.js";
 import { normalizeQueueState } from "../queue/queue-state.js";
 import type { QueueState } from "../types/ipc.js";
 import type { Command } from "../types/ipc.js";
+import type { ContextBundle, ContextRequest } from "../types/memory.js";
 
 const MEDIA_FILE_RE = /\.(png|jpe?g|webp|gif|svg|mp4|mov|webm)$/iu;
 const MAX_MEDIA_REFERENCE_INPUTS = 8;
 const MAX_COLLECTED_REFERENCE_INPUTS = 12;
+const COMMENT_ECHO_PREFIX_PATTERN = /^frame\s*\d+\s*[:.-]/iu;
+const COMMENT_PROMPT_WRAPPER_PATTERN =
+  /^(?:generate|create|make|draw|render)\s+(?:an?\s+)?(?:image|gif|avatar|banner|file)\b/iu;
+const COMMENT_TOKEN_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "for",
+  "frame",
+  "from",
+  "in",
+  "is",
+  "it",
+  "of",
+  "on",
+  "or",
+  "style",
+  "that",
+  "the",
+  "this",
+  "to",
+  "with",
+]);
 
 const isHttpUrl = (value: string): boolean => /^https?:\/\//iu.test(value.trim());
 const isDataUri = (value: string): boolean => /^data:/iu.test(value.trim());
@@ -107,6 +136,42 @@ const truncateText = (value: string, maxChars: number): string => {
   const text = value.trim();
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(8, maxChars - 1))}…`;
+};
+
+const normalizeCommentText = (value: string): string =>
+  value.trim().replace(/\s+/gu, " ").toLowerCase();
+
+const tokenizeCommentText = (value: string): string[] =>
+  normalizeCommentText(value)
+    .replace(/[^a-z0-9\s]/gu, " ")
+    .split(/\s+/u)
+    .map((token) => token.trim())
+    .filter(
+      (token) =>
+        token.length >= 2 &&
+        token.length <= 24 &&
+        !COMMENT_TOKEN_STOP_WORDS.has(token) &&
+        !/^\d+$/u.test(token),
+    );
+
+const computeTokenOverlapRatio = (candidate: string, reference: string): number => {
+  const candidateTokens = Array.from(new Set(tokenizeCommentText(candidate)));
+  if (candidateTokens.length === 0) return 0;
+  const referenceTokens = new Set(tokenizeCommentText(reference));
+  if (referenceTokens.size === 0) return 0;
+  let overlap = 0;
+  for (const token of candidateTokens) {
+    if (referenceTokens.has(token)) {
+      overlap += 1;
+    }
+  }
+  return overlap / candidateTokens.length;
+};
+
+const extractCommentAnchorPhrase = (value: string): string => {
+  const tokens = tokenizeCommentText(value);
+  if (tokens.length === 0) return "direction";
+  return tokens.slice(0, 3).join(" ");
 };
 
 type CropRect = {
@@ -284,6 +349,7 @@ type CommandExecutorContext = {
   };
   memory: {
     recordWrite(payload: unknown): Promise<void>;
+    buildContext?: (request: ContextRequest) => Promise<ContextBundle>;
   };
   trpc: TrpcLike | null;
   commandSeal: CommandSealState;
@@ -331,6 +397,35 @@ type DraftPreviewPayload = {
   draftPostKind: "post" | "thread";
   draftMode: "thread" | "carousel";
   draftSlideCount: number;
+};
+
+type CommentCurationContext = {
+  postAuthorHandle: string | null;
+  postText: string | null;
+  mediaSummary: string | null;
+  threadSummary: string | null;
+  payloadHint: string | null;
+  memorySummary: string | null;
+};
+
+type CuratedCommentBody = {
+  body: string;
+  source: "openclaw" | "deterministic_fallback";
+  reason: string;
+};
+
+type EngagementDecisionContext = {
+  postAuthorHandle: string | null;
+  postText: string | null;
+  mediaSummary: string | null;
+  payloadHint: string | null;
+  memorySummary: string | null;
+};
+
+type EngagementDecision = {
+  shouldExecute: boolean;
+  reason: string;
+  source: "openclaw" | "default_allow";
 };
 
 export class CommandExecutor {
@@ -793,16 +888,582 @@ export class CommandExecutor {
       command.actionNonce ??
       null;
     const parentId = asPositiveInt(payload.parentId);
+    const curatedBody = await this.curateCommentBodyWithOpenClaw({
+      command,
+      payload,
+      postId,
+      parentId,
+      body,
+    });
+    const finalBody = curatedBody?.body ?? body;
     const result = await this.agent().commentPost.mutate({
       postId,
-      body,
+      body: finalBody,
       ...(parentId ? { parentId } : {}),
       ...(provenance ? { provenance } : {}),
       ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
       ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       ...(command.grantId ? { grantId: command.grantId } : {}),
     });
+    if (curatedBody) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "comment_body_curated",
+          at: nowIso(),
+          commandId: command.id,
+          postId,
+          parentId,
+          source: curatedBody.source,
+          reason: curatedBody.reason,
+          draftBody: truncateText(body, 200),
+          finalBody: truncateText(finalBody, 200),
+        })
+        .catch(() => undefined);
+    }
     return this.successOutcome(command, result);
+  }
+
+  private async curateCommentBodyWithOpenClaw(input: {
+    command: Command;
+    payload: Record<string, unknown>;
+    postId: number;
+    parentId: number | null;
+    body: string;
+  }): Promise<CuratedCommentBody | null> {
+    const context = await this.loadCommentCurationContext({
+      postId: input.postId,
+      parentId: input.parentId,
+      payload: input.payload,
+    });
+    const draftBody = input.body.trim();
+    if (!draftBody.length) return null;
+
+    const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
+    if (runOpenClawPrompt) {
+      try {
+        const curationPrompt = this.buildCommentCurationPrompt({
+          postId: input.postId,
+          draftBody,
+          context,
+        });
+        const result = await runOpenClawPrompt({
+          prompt: curationPrompt,
+          purpose: "comment_body_curation",
+        });
+        const candidate =
+          (result
+            ? this.extractCuratedCommentBodyFromUnknown(result.parsed) ??
+              this.extractCuratedCommentBodyFromUnknown(result.payloadText) ??
+              this.extractCuratedCommentBodyFromUnknown(result.raw)
+            : null) ?? null;
+        if (candidate) {
+          const validation = this.validateCuratedCommentCandidate({
+            candidate,
+            draftBody,
+            context,
+          });
+          if (validation.ok) {
+            return {
+              body: candidate,
+              source: "openclaw",
+              reason: "openclaw_curated",
+            };
+          }
+          await this.ctx.memory
+            .recordWrite({
+              type: "comment_body_curation_rejected",
+              at: nowIso(),
+              commandId: input.command.id,
+              postId: input.postId,
+              reason: validation.reason,
+              draftBody: truncateText(draftBody, 200),
+              candidate: truncateText(candidate, 200),
+            })
+            .catch(() => undefined);
+        } else {
+          await this.ctx.memory
+            .recordWrite({
+              type: "comment_body_curation_missing_candidate",
+              at: nowIso(),
+              commandId: input.command.id,
+              postId: input.postId,
+            })
+            .catch(() => undefined);
+        }
+      } catch (error: unknown) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "comment_body_curation_failed",
+            at: nowIso(),
+            commandId: input.command.id,
+            postId: input.postId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          .catch(() => undefined);
+      }
+    }
+
+    if (!this.isDraftCommentEchoLike(draftBody, context)) {
+      return null;
+    }
+    const fallback = this.buildDeterministicCommentFallback({
+      draftBody,
+      context,
+      postId: input.postId,
+    });
+    if (!fallback) return null;
+    const fallbackValidation = this.validateCuratedCommentCandidate({
+      candidate: fallback,
+      draftBody,
+      context,
+    });
+    if (!fallbackValidation.ok) return null;
+    return {
+      body: fallback,
+      source: "deterministic_fallback",
+      reason: "echo_guard_fallback",
+    };
+  }
+
+  private async loadCommentCurationContext(input: {
+    postId: number;
+    parentId: number | null;
+    payload: Record<string, unknown>;
+  }): Promise<CommentCurationContext> {
+    const context: CommentCurationContext = {
+      postAuthorHandle: null,
+      postText: null,
+      mediaSummary: null,
+      threadSummary: null,
+      payloadHint: this.extractCommentPayloadHint(input.payload),
+      memorySummary: await this.loadEngagementMemorySummary({
+        action: "comment",
+        postId: input.postId,
+        commentId: input.parentId,
+        payload: input.payload,
+      }),
+    };
+
+    const callAgentChatBridge = this.ctx.callAgentChatBridge;
+    if (!callAgentChatBridge) {
+      return context;
+    }
+
+    try {
+      const postResponse = await callAgentChatBridge({
+        action: "find_post",
+        postId: input.postId,
+      });
+      const postRecord = this.extractPostRecordForCommentCuration(postResponse);
+      if (postRecord) {
+        const author = isRecord(postRecord.author) ? postRecord.author : null;
+        context.postAuthorHandle =
+          asNonEmptyString(author?.handle) ??
+          asNonEmptyString(postRecord.authorHandle);
+        context.postText =
+          asNonEmptyString(postRecord.textBody) ??
+          asNonEmptyString(postRecord.caption) ??
+          asNonEmptyString(postRecord.body);
+        context.mediaSummary = this.summarizePostMediaForComment(postRecord);
+      }
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "comment_curation_post_lookup_failed",
+          at: nowIso(),
+          postId: input.postId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+    }
+
+    if (input.parentId) {
+      try {
+        const commentResponse = await callAgentChatBridge({
+          action: "find_comment",
+          postId: input.postId,
+          commentId: input.parentId,
+        });
+        const commentRecord = this.extractCommentRecordForCommentCuration(commentResponse);
+        if (commentRecord) {
+          const commentAuthor = isRecord(commentRecord.author)
+            ? commentRecord.author
+            : null;
+          const commentAuthorHandle =
+            asNonEmptyString(commentAuthor?.handle) ??
+            asNonEmptyString(commentRecord.authorHandle) ??
+            "user";
+          const commentBody =
+            asNonEmptyString(commentRecord.body) ??
+            asNonEmptyString(commentRecord.textBody);
+          if (commentBody) {
+            context.threadSummary = truncateText(
+              `Reply target @${commentAuthorHandle}: ${commentBody}`,
+              220,
+            );
+          }
+        }
+      } catch (error: unknown) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "comment_curation_parent_lookup_failed",
+            at: nowIso(),
+            postId: input.postId,
+            parentId: input.parentId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          .catch(() => undefined);
+      }
+    }
+
+    return context;
+  }
+
+  private extractCommentPayloadHint(payload: Record<string, unknown>): string | null {
+    const hint = [
+      asNonEmptyString(payload.requestText),
+      asNonEmptyString(payload.topic),
+      asNonEmptyString(payload.prompt),
+      asNonEmptyString(payload.caption),
+      asNonEmptyString(payload.textBody),
+    ].find((value): value is string => typeof value === "string" && value.trim().length > 0);
+    return hint ? truncateText(hint, 180) : null;
+  }
+
+  private async loadEngagementMemorySummary(input: {
+    action: "comment" | "like" | "repost";
+    postId: number;
+    commentId: number | null;
+    payload: Record<string, unknown>;
+  }): Promise<string | null> {
+    if (typeof this.ctx.memory.buildContext !== "function") {
+      return null;
+    }
+    try {
+      const request: ContextRequest = {
+        mode: "engagement",
+        audience: "runtime_write",
+        postId: input.postId,
+        ...(typeof input.commentId === "number" ? { commentId: input.commentId } : {}),
+        maxRecentEvents: 120,
+        maxArchiveEvents: 40,
+        includeViewState: true,
+        viewStateMaxItems: 10,
+        includeKeywordRetrieval: true,
+        retrievalIntent: "engagement",
+        retrievalMaxItems: 10,
+        retrievalQuery: this.buildEngagementRetrievalQuery(input),
+      };
+      const bundle = await this.ctx.memory.buildContext(request);
+      return this.buildCompactEngagementMemorySummary(bundle);
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "engagement_memory_context_failed",
+          at: nowIso(),
+          action: input.action,
+          postId: input.postId,
+          commentId: input.commentId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return null;
+    }
+  }
+
+  private buildEngagementRetrievalQuery(input: {
+    action: "comment" | "like" | "repost";
+    postId: number;
+    commentId: number | null;
+    payload: Record<string, unknown>;
+  }): string {
+    const payloadHint = this.extractCommentPayloadHint(input.payload);
+    const actionPhrase =
+      input.action === "comment"
+        ? "comment engagement context"
+        : input.action === "like"
+          ? "like engagement context"
+          : "repost engagement context";
+    const commentToken =
+      typeof input.commentId === "number" ? `comment ${input.commentId}` : "";
+    const hintToken = payloadHint ? `hint ${payloadHint}` : "";
+    return [
+      actionPhrase,
+      `post ${input.postId}`,
+      commentToken,
+      "most engaged comments last comments, likes and views this week",
+      hintToken,
+    ]
+      .filter((value) => value.length > 0)
+      .join(" · ");
+  }
+
+  private buildCompactEngagementMemorySummary(bundle: ContextBundle): string | null {
+    const lines: string[] = [];
+    if (
+      isRecord(bundle.retrieval) &&
+      bundle.retrieval.enabled === true &&
+      Array.isArray(bundle.retrieval.lines)
+    ) {
+      lines.push(
+        ...bundle.retrieval.lines
+          .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+          .slice(0, 8)
+          .map((entry) => `retrieval: ${entry.trim()}`),
+      );
+    }
+    if (
+      isRecord(bundle.view) &&
+      bundle.view.enabled === true &&
+      Array.isArray(bundle.view.lines)
+    ) {
+      lines.push(
+        ...bundle.view.lines
+          .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+          .slice(0, 6)
+          .map((entry) => `view: ${entry.trim()}`),
+      );
+    }
+    if (
+      isRecord(bundle.target) &&
+      isRecord(bundle.target.focus) &&
+      Array.isArray(bundle.target.focus.bullets)
+    ) {
+      lines.push(
+        ...bundle.target.focus.bullets
+          .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+          .slice(0, 6)
+          .map((entry) => `focus: ${entry.trim()}`),
+      );
+    }
+    if (
+      isRecord(bundle.temporal) &&
+      isRecord(bundle.temporal.tiers) &&
+      isRecord(bundle.temporal.tiers["24h"]) &&
+      Array.isArray(bundle.temporal.tiers["24h"].bullets)
+    ) {
+      lines.push(
+        ...bundle.temporal.tiers["24h"].bullets
+          .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+          .slice(0, 2)
+          .map((entry) => `tier24h: ${entry.trim()}`),
+      );
+    }
+    if (lines.length === 0) return null;
+    return truncateText(lines.join("\n"), 2200);
+  }
+
+  private extractPostRecordForCommentCuration(value: unknown): Record<string, unknown> | null {
+    if (!isRecord(value)) return null;
+    if (isRecord(value.data)) return this.extractPostRecordForCommentCuration(value.data);
+    if (isRecord(value.post)) return value.post;
+    if (Array.isArray(value.items)) {
+      const first = value.items.find((entry) => isRecord(entry));
+      if (isRecord(first)) return first;
+    }
+    return value;
+  }
+
+  private extractCommentRecordForCommentCuration(
+    value: unknown,
+  ): Record<string, unknown> | null {
+    if (!isRecord(value)) return null;
+    if (isRecord(value.data)) return this.extractCommentRecordForCommentCuration(value.data);
+    if (isRecord(value.comment)) return value.comment;
+    if (Array.isArray(value.comments)) {
+      const first = value.comments.find((entry) => isRecord(entry));
+      if (isRecord(first)) return first;
+      return null;
+    }
+    return value;
+  }
+
+  private summarizePostMediaForComment(post: Record<string, unknown>): string | null {
+    const mediaItems = Array.isArray(post.mediaItems)
+      ? post.mediaItems.filter((entry): entry is Record<string, unknown> => isRecord(entry))
+      : [];
+    if (mediaItems.length === 0) return null;
+    let imageCount = 0;
+    let videoCount = 0;
+    const captionHints: string[] = [];
+    for (const item of mediaItems) {
+      const mediaType = asNonEmptyString(item.mediaType)?.toLowerCase();
+      if (mediaType === "video") {
+        videoCount += 1;
+      } else {
+        imageCount += 1;
+      }
+      const caption = asNonEmptyString(item.caption);
+      if (caption && captionHints.length < 3) {
+        captionHints.push(truncateText(caption, 80));
+      }
+    }
+    const bits = [
+      imageCount > 0 ? `${imageCount} image${imageCount === 1 ? "" : "s"}` : null,
+      videoCount > 0 ? `${videoCount} video${videoCount === 1 ? "" : "s"}` : null,
+      captionHints.length > 0 ? `cues: ${captionHints.join(" | ")}` : null,
+    ].filter((entry): entry is string => Boolean(entry));
+    if (bits.length === 0) return null;
+    return truncateText(bits.join(". "), 220);
+  }
+
+  private buildCommentCurationPrompt(input: {
+    postId: number;
+    draftBody: string;
+    context: CommentCurationContext;
+  }): string {
+    const contextLines = [
+      `postId: ${input.postId}`,
+      input.context.postAuthorHandle
+        ? `postAuthor: @${input.context.postAuthorHandle.replace(/^@+/u, "")}`
+        : null,
+      input.context.postText ? `postText: ${input.context.postText}` : null,
+      input.context.mediaSummary ? `mediaContext: ${input.context.mediaSummary}` : null,
+      input.context.threadSummary ? `threadContext: ${input.context.threadSummary}` : null,
+      input.context.payloadHint ? `requestHint: ${input.context.payloadHint}` : null,
+      input.context.memorySummary ? `memoryContext: ${input.context.memorySummary}` : null,
+    ].filter((entry): entry is string => Boolean(entry));
+
+    return [
+      "You are rewriting a social-media comment for quality and relevance.",
+      "Return strict JSON only with exactly this shape: {\"body\":\"...\"}.",
+      "Rules:",
+      "- body must be 14-180 characters.",
+      "- 1-2 concise sentences in a natural voice.",
+      "- Reference real context from the post/media/thread details.",
+      "- Do not copy wording from the draft or post text.",
+      "- Never start with 'Frame N:' and never output image-prompt wrappers.",
+      "- No hashtags, no emojis, no system/tool mentions.",
+      `Draft comment: ${input.draftBody}`,
+      "Context:",
+      ...contextLines.map((line) => `- ${line}`),
+    ].join("\n");
+  }
+
+  private normalizeCuratedCommentBody(value: string): string {
+    const unfenced = value
+      .replace(/^```(?:json|text|markdown)?\s*/iu, "")
+      .replace(/```$/u, "")
+      .trim();
+    const unquoted = unfenced.replace(/^["'`]|["'`]$/gu, "").trim();
+    const stripped = unquoted.replace(/^(?:body|comment|reply)\s*:\s*/iu, "").trim();
+    return stripped.replace(/\s+/gu, " ").trim();
+  }
+
+  private extractCuratedCommentBodyFromUnknown(value: unknown): string | null {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed.length) return null;
+      const parsed = parseJsonFromMixedText(trimmed);
+      if (parsed !== null && parsed !== value) {
+        const fromParsed = this.extractCuratedCommentBodyFromUnknown(parsed);
+        if (fromParsed) return fromParsed;
+      }
+      const normalized = this.normalizeCuratedCommentBody(trimmed);
+      return normalized.length > 0 ? normalized : null;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        const extracted = this.extractCuratedCommentBodyFromUnknown(entry);
+        if (extracted) return extracted;
+      }
+      return null;
+    }
+    if (!isRecord(value)) return null;
+    const keys = ["body", "comment", "reply", "text", "output", "result", "content"] as const;
+    for (const key of keys) {
+      const extracted = this.extractCuratedCommentBodyFromUnknown(value[key]);
+      if (extracted) return extracted;
+    }
+    return null;
+  }
+
+  private validateCuratedCommentCandidate(input: {
+    candidate: string;
+    draftBody: string;
+    context: CommentCurationContext;
+  }): { ok: true } | { ok: false; reason: string } {
+    const candidate = input.candidate.trim();
+    if (candidate.length < 10) {
+      return { ok: false, reason: "too_short" };
+    }
+    if (candidate.length > 280) {
+      return { ok: false, reason: "too_long" };
+    }
+    if (COMMENT_ECHO_PREFIX_PATTERN.test(candidate)) {
+      return { ok: false, reason: "frame_prefix" };
+    }
+    if (COMMENT_PROMPT_WRAPPER_PATTERN.test(candidate)) {
+      return { ok: false, reason: "prompt_wrapper" };
+    }
+    const normalizedCandidate = normalizeCommentText(candidate);
+    const normalizedDraft = normalizeCommentText(input.draftBody);
+    if (normalizedCandidate === normalizedDraft) {
+      return { ok: false, reason: "same_as_draft" };
+    }
+    const draftOverlap = computeTokenOverlapRatio(candidate, input.draftBody);
+    if (draftOverlap >= 0.86) {
+      return { ok: false, reason: "too_similar_to_draft" };
+    }
+    if (input.context.postText) {
+      const normalizedPostText = normalizeCommentText(input.context.postText);
+      if (normalizedCandidate === normalizedPostText) {
+        return { ok: false, reason: "same_as_post_text" };
+      }
+      const overlap = computeTokenOverlapRatio(candidate, input.context.postText);
+      if (overlap >= 0.92) {
+        return { ok: false, reason: "too_similar_to_post_text" };
+      }
+    }
+    if (input.context.mediaSummary) {
+      const overlap = computeTokenOverlapRatio(candidate, input.context.mediaSummary);
+      if (overlap >= 0.95) {
+        return { ok: false, reason: "too_similar_to_media_summary" };
+      }
+    }
+    return { ok: true };
+  }
+
+  private isDraftCommentEchoLike(body: string, context: CommentCurationContext): boolean {
+    const trimmed = body.trim();
+    if (!trimmed.length) return true;
+    if (COMMENT_ECHO_PREFIX_PATTERN.test(trimmed)) return true;
+    if (COMMENT_PROMPT_WRAPPER_PATTERN.test(trimmed)) return true;
+    if (
+      context.postText &&
+      normalizeCommentText(trimmed) === normalizeCommentText(context.postText)
+    ) {
+      return true;
+    }
+    if (context.postText && computeTokenOverlapRatio(trimmed, context.postText) >= 0.9) {
+      return true;
+    }
+    if (context.mediaSummary && computeTokenOverlapRatio(trimmed, context.mediaSummary) >= 0.9) {
+      return true;
+    }
+    return false;
+  }
+
+  private buildDeterministicCommentFallback(input: {
+    draftBody: string;
+    context: CommentCurationContext;
+    postId: number;
+  }): string | null {
+    const anchorSource =
+      input.context.threadSummary ??
+      input.context.postText ??
+      input.context.mediaSummary ??
+      input.context.payloadHint ??
+      input.draftBody;
+    const anchor = extractCommentAnchorPhrase(anchorSource);
+    const templates = [
+      `That ${anchor} angle lands hard. The execution feels intentional and alive.`,
+      `Strong direction on ${anchor}. This one has real momentum to build on.`,
+      `The ${anchor} concept works well here. Curious where you take it next.`,
+    ];
+    const selected = templates[input.postId % templates.length] ?? templates[0];
+    if (!selected) return null;
+    return truncateText(selected, 200);
   }
 
   private async executeWriteVote(command: Command): Promise<CommandOutcome> {
