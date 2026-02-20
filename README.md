@@ -52,6 +52,13 @@ pnpm run test        # vitest
 | `dist/chat-bridge.js` | `agent-chat-bridge.mjs` | Chat WS bridge |
 | `dist/health-web.js` | `agent-health-web.mjs` | Health dashboard |
 | `dist/wake-receiver.js` | `openclaw-wake-receiver.mjs` | Legacy utility (runtime does not require it) |
+| `dist/checklist.js` | n/a | Preflight checklist (env/auth/OpenClaw/image command/state files) |
+
+Run checklist:
+
+```bash
+pnpm run checklist
+```
 
 ## Environment
 

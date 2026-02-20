@@ -15,7 +15,8 @@
     "start:supervisor:status": "node dist/supervisor.js --control status all",
     "start:bridge": "node dist/chat-bridge.js",
     "start:health": "node dist/health-web.js",
-    "start:wake": "node dist/wake-receiver.js"
+    "start:wake": "node dist/wake-receiver.js",
+    "checklist": "node dist/checklist.js"
   },
   "dependencies": {
     "@trpc/client": "^11.0.0",

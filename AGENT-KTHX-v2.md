@@ -508,6 +508,7 @@ Then restart runtime + bridge:
 ## 9) One-Command Daily Check
 
 ```bash
+node kthx-agent-services/dist/checklist.js
 node kthx-agent-services/dist/supervisor.js --control status all
 ```
 

@@ -7,6 +7,7 @@ export default defineConfig({
     "chat-bridge": "src/chat/chat-bridge.ts",
     "health-web": "src/health/health-web.ts",
     "wake-receiver": "src/openclaw/wake-receiver.ts",
+    checklist: "src/checklist.ts",
   },
   format: ["esm"],
   platform: "node",

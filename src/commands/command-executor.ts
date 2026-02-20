@@ -33,9 +33,26 @@ import type { QueueState } from "../types/ipc.js";
 import type { Command } from "../types/ipc.js";
 
 const MEDIA_FILE_RE = /\.(png|jpe?g|webp|gif|svg|mp4|mov|webm)$/iu;
+const MAX_MEDIA_REFERENCE_INPUTS = 8;
+const MAX_COLLECTED_REFERENCE_INPUTS = 12;
 
 const isHttpUrl = (value: string): boolean => /^https?:\/\//iu.test(value.trim());
 const isDataUri = (value: string): boolean => /^data:/iu.test(value.trim());
+const isFileUrl = (value: string): boolean => /^file:\/\//iu.test(value.trim());
+const escapeRegex = (value: string): string =>
+  value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+const stripEmptyFilesFlag = (command: string, token: string): string => {
+  const escaped = escapeRegex(token);
+  return command
+    .replace(new RegExp(`\\s--files\\s+"${escaped}"`, "giu"), " ")
+    .replace(new RegExp(`\\s--files\\s+'${escaped}'`, "giu"), " ")
+    .replace(new RegExp(`\\s--files\\s+${escaped}`, "giu"), " ")
+    .replace(new RegExp(`\\s-f\\s+"${escaped}"`, "giu"), " ")
+    .replace(new RegExp(`\\s-f\\s+'${escaped}'`, "giu"), " ")
+    .replace(new RegExp(`\\s-f\\s+${escaped}`, "giu"), " ")
+    .replace(/\s{2,}/gu, " ")
+    .trim();
+};
 
 const asNonEmptyString = (value: unknown): string | null => {
   if (typeof value !== "string") return null;
@@ -604,6 +621,7 @@ export class CommandExecutor {
 
     const media = await this.resolveMediaUpload({
       payload,
+      keepOriginal: true,
       promptFallbacks: [
         asNonEmptyString(payload.mediaPrompt),
         asNonEmptyString(payload.imagePrompt),
@@ -639,6 +657,7 @@ export class CommandExecutor {
 
     const media = await this.resolveMediaUpload({
       payload,
+      keepOriginal: false,
       promptFallbacks: [
         asNonEmptyString(payload.mediaPrompt),
         asNonEmptyString(payload.imagePrompt),
@@ -688,6 +707,7 @@ export class CommandExecutor {
 
     const media = await this.resolveMediaUpload({
       payload,
+      keepOriginal: false,
       promptFallbacks: [
         asNonEmptyString(payload.mediaPrompt),
         asNonEmptyString(payload.imagePrompt),
@@ -731,6 +751,7 @@ export class CommandExecutor {
 
     const media = await this.resolveMediaUpload({
       payload,
+      keepOriginal: false,
       promptFallbacks: [
         asNonEmptyString(payload.mediaPrompt),
         asNonEmptyString(payload.imagePrompt),
@@ -1077,6 +1098,14 @@ export class CommandExecutor {
       null;
 
     const generatedAssetType = this.resolveGeneratedAssetType(payload.generatedAssetType);
+    const referenceInputs = this.collectMediaReferenceInputs(payload);
+    if (
+      shouldReusePersonaReference &&
+      recentGeneratedAssetHref &&
+      !referenceInputs.includes(recentGeneratedAssetHref)
+    ) {
+      referenceInputs.unshift(recentGeneratedAssetHref);
+    }
     const generatedLabel =
       bannerRequest
         ? "banner"
@@ -1091,6 +1120,7 @@ export class CommandExecutor {
           : bannerRequest
             ? "chat_banner_update"
             : "chat_literal_generate",
+        referenceInputs,
       });
       const mimeType = this.resolveGeneratedAttachmentMimeType({
         generatedAssetType,
@@ -1607,14 +1637,188 @@ export class CommandExecutor {
     return command;
   }
 
+  private collectMediaReferenceInputs(payload: Record<string, unknown>): string[] {
+    const context = isRecord(payload.context) ? payload.context : null;
+    const collected: string[] = [];
+    const pushMaybe = (value: unknown): void => {
+      if (typeof value !== "string") return;
+      const trimmed = value.trim();
+      if (!trimmed.length) return;
+      collected.push(trimmed);
+    };
+    const pushMaybeArray = (value: unknown): void => {
+      if (!Array.isArray(value)) return;
+      for (const entry of value) {
+        if (typeof entry === "string") {
+          pushMaybe(entry);
+          continue;
+        }
+        if (!isRecord(entry)) continue;
+        pushMaybe(entry.mediaRef);
+        pushMaybe(entry.uploadedUrl);
+        pushMaybe(entry.originalUrl);
+        pushMaybe(entry.url);
+        pushMaybe(entry.image);
+        pushMaybe(entry.imageUrl);
+        pushMaybe(entry.mediaUrl);
+        pushMaybe(entry.file);
+        pushMaybe(entry.path);
+        pushMaybe(entry.href);
+      }
+    };
+
+    [
+      payload.mediaReferenceUrls,
+      payload.mediaReferenceFiles,
+      payload.mediaReferenceMedia,
+      payload.referenceMedia,
+      payload.referenceImages,
+      payload.taggedUsers,
+      payload.mediaItems,
+      context?.mediaReferenceUrls,
+      context?.mediaReferenceFiles,
+      context?.mediaReferenceMedia,
+      context?.referenceMedia,
+      context?.referenceImages,
+      context?.taggedUsers,
+      context?.mediaItems,
+    ].forEach((value) => pushMaybeArray(value));
+    [
+      payload.mediaReferenceUrl,
+      payload.mediaReferenceFile,
+      payload.referenceImage,
+      payload.referenceMediaUrl,
+      context?.mediaReferenceUrl,
+      context?.mediaReferenceFile,
+      context?.referenceImage,
+      context?.referenceMediaUrl,
+    ].forEach((value) => pushMaybe(value));
+
+    const recentGeneratedAsset = isRecord(payload.recentGeneratedAsset)
+      ? payload.recentGeneratedAsset
+      : null;
+    pushMaybe(recentGeneratedAsset?.href);
+    pushMaybe(recentGeneratedAsset?.url);
+    pushMaybe(recentGeneratedAsset?.imageUrl);
+    pushMaybe(recentGeneratedAsset?.mediaUrl);
+
+    return Array.from(new Set(collected)).slice(0, MAX_COLLECTED_REFERENCE_INPUTS);
+  }
+
+  private async resolveLocalReferencePath(reference: string): Promise<string | null> {
+    const trimmed = reference.trim();
+    if (!trimmed.length) return null;
+
+    if (isFileUrl(trimmed)) {
+      try {
+        const parsed = new URL(trimmed);
+        let candidatePath = decodeURIComponent(parsed.pathname);
+        if (process.platform === "win32" && /^\/[a-zA-Z]:/u.test(candidatePath)) {
+          candidatePath = candidatePath.slice(1);
+        }
+        const absolutePath = path.resolve(candidatePath);
+        await fs.access(absolutePath);
+        return absolutePath;
+      } catch {
+        return null;
+      }
+    }
+
+    if (isHttpUrl(trimmed) || isDataUri(trimmed)) return null;
+    const absolutePath = path.resolve(trimmed);
+    const fileStat = await fs.stat(absolutePath).catch(() => null);
+    if (!fileStat?.isFile()) return null;
+    return absolutePath;
+  }
+
+  private async materializeMediaReferenceFiles(input: {
+    requestDir: string;
+    referenceInputs: string[];
+    maxReferenceInputs?: number;
+  }): Promise<string[]> {
+    const maxReferenceInputsRaw =
+      typeof input.maxReferenceInputs === "number" &&
+      Number.isFinite(input.maxReferenceInputs)
+        ? Math.floor(input.maxReferenceInputs)
+        : MAX_MEDIA_REFERENCE_INPUTS;
+    const maxReferenceInputs = Math.max(
+      0,
+      Math.min(MAX_MEDIA_REFERENCE_INPUTS, maxReferenceInputsRaw),
+    );
+    if (maxReferenceInputs === 0 || input.referenceInputs.length === 0) return [];
+    const refsDir = path.join(input.requestDir, "refs");
+    await ensureDir(refsDir);
+    const resolved: string[] = [];
+    const seen = new Set<string>();
+
+    const pushResolved = (value: string): void => {
+      if (resolved.length >= maxReferenceInputs) return;
+      const normalized = path.resolve(value);
+      if (seen.has(normalized)) return;
+      seen.add(normalized);
+      resolved.push(normalized);
+    };
+
+    for (const rawReference of input.referenceInputs) {
+      if (resolved.length >= maxReferenceInputs) break;
+      const reference = rawReference.trim();
+      if (!reference.length) continue;
+
+      const localPath = await this.resolveLocalReferencePath(reference);
+      if (localPath) {
+        pushResolved(localPath);
+        continue;
+      }
+
+      if (isDataUri(reference)) {
+        const parsed = parseDataUriPayload(reference);
+        if (!parsed) continue;
+        const targetPath = path.join(
+          refsDir,
+          `data-${resolved.length + 1}.${mimeToExt(parsed.mime)}`,
+        );
+        await fs
+          .writeFile(targetPath, Buffer.from(parsed.data, "base64"))
+          .then(() => pushResolved(targetPath))
+          .catch(() => undefined);
+        continue;
+      }
+
+      if (isHttpUrl(reference)) {
+        try {
+          const response = await fetch(reference);
+          if (!response.ok) continue;
+          const bytes = Buffer.from(await response.arrayBuffer());
+          if (!bytes.byteLength) continue;
+          const contentType =
+            response.headers.get("content-type") ??
+            inferMimeTypeFromUrl(reference) ??
+            "application/octet-stream";
+          const targetPath = path.join(
+            refsDir,
+            `remote-${resolved.length + 1}.${mimeToExt(contentType)}`,
+          );
+          await fs.writeFile(targetPath, bytes);
+          pushResolved(targetPath);
+        } catch {
+          // best effort only for reference enrichment
+        }
+      }
+    }
+
+    return resolved;
+  }
+
   private async resolveMediaUpload(input: {
     payload: Record<string, unknown>;
+    keepOriginal?: boolean;
     promptFallbacks: Array<string | null>;
   }): Promise<ResolvedMediaUpload> {
     const payload = input.payload;
+    const keepOriginal = input.keepOriginal === true;
     const existingMediaUrl = asNonEmptyString(payload.mediaUrl);
     if (existingMediaUrl) {
-      return this.uploadResolvedMediaSource(existingMediaUrl);
+      return this.uploadResolvedMediaSource(existingMediaUrl, { keepOriginal });
     }
 
     const mediaItems = Array.isArray(payload.mediaItems) ? payload.mediaItems : [];
@@ -1622,7 +1826,7 @@ export class CommandExecutor {
       if (!isRecord(mediaItem)) continue;
       const mediaUrl = asNonEmptyString(mediaItem.mediaUrl);
       if (mediaUrl) {
-        return this.uploadResolvedMediaSource(mediaUrl);
+        return this.uploadResolvedMediaSource(mediaUrl, { keepOriginal });
       }
     }
 
@@ -1635,10 +1839,16 @@ export class CommandExecutor {
     return this.generateAndUploadMediaFromPrompt(prompt, {
       generatedAssetType: this.resolveGeneratedAssetType(payload.generatedAssetType),
       mode: "write_media_generate",
+      referenceInputs: this.collectMediaReferenceInputs(payload),
+      keepOriginal,
     });
   }
 
-  private async uploadResolvedMediaSource(source: string): Promise<ResolvedMediaUpload> {
+  private async uploadResolvedMediaSource(
+    source: string,
+    options?: { keepOriginal?: boolean },
+  ): Promise<ResolvedMediaUpload> {
+    const keepOriginal = options?.keepOriginal === true;
     const trimmed = source.trim();
     if (isDataUri(trimmed)) {
       const parsed = parseDataUriPayload(trimmed);
@@ -1649,15 +1859,22 @@ export class CommandExecutor {
             bytes,
             mimeType: parsed.mime,
             filename: `upload-${Date.now()}.${mimeToExt(parsed.mime)}`,
+            keepOriginal,
           });
           if (uploadedByChunk) return uploadedByChunk;
         }
       }
-      const uploaded = await this.agent().uploadDataUri.mutate({ dataUri: trimmed });
+      const uploaded = await this.agent().uploadDataUri.mutate({
+        dataUri: trimmed,
+        keepOriginal,
+      });
       return this.mapUploadResult(uploaded);
     }
     if (isHttpUrl(trimmed)) {
-      const uploaded = await this.agent().uploadRemote.mutate({ url: trimmed });
+      const uploaded = await this.agent().uploadRemote.mutate({
+        url: trimmed,
+        keepOriginal,
+      });
       return this.mapUploadResult(uploaded);
     }
     const localPath = path.resolve(trimmed);
@@ -1670,10 +1887,14 @@ export class CommandExecutor {
       bytes,
       mimeType: mime,
       filename: path.basename(localPath) || `upload-${Date.now()}.${mimeToExt(mime)}`,
+      keepOriginal,
     });
     if (uploadedByChunk) return uploadedByChunk;
     const dataUri = `data:${mime};base64,${bytes.toString("base64")}`;
-    const uploaded = await this.agent().uploadDataUri.mutate({ dataUri });
+    const uploaded = await this.agent().uploadDataUri.mutate({
+      dataUri,
+      keepOriginal,
+    });
     return this.mapUploadResult(uploaded);
   }
 
@@ -1681,6 +1902,7 @@ export class CommandExecutor {
     bytes: Buffer;
     mimeType: string;
     filename: string;
+    keepOriginal?: boolean;
   }): Promise<ResolvedMediaUpload | null> {
     const callAgentUploadChunk = this.ctx.callAgentUploadChunk;
     if (!callAgentUploadChunk) return null;
@@ -1693,6 +1915,7 @@ export class CommandExecutor {
         filename: input.filename,
         mimeType: input.mimeType,
         totalBytes,
+        keepOriginal: input.keepOriginal === true,
       });
       if (!isRecord(started) || typeof started.uploadId !== "string") {
         throw new Error("chunk_upload_start_invalid");
@@ -1760,13 +1983,15 @@ export class CommandExecutor {
         : mediaTypeRaw === "image"
           ? ("image" as const)
           : undefined;
-    const result: ResolvedMediaUpload = { mediaUrl };
-    const originalUrl = asNonEmptyString(data?.originalUrl);
-    const optimizedUrl = asNonEmptyString(data?.optimizedUrl);
+    const originalUrl = asNonEmptyString(data?.originalUrl) ?? mediaUrl;
+    const optimizedUrl = asNonEmptyString(data?.optimizedUrl) ?? mediaUrl;
+    const result: ResolvedMediaUpload = {
+      mediaUrl,
+      mediaOriginalUrl: originalUrl,
+      mediaOptimizedUrl: optimizedUrl,
+    };
     const contentHash = asNonEmptyString(data?.contentHash);
     const ipfsCid = asNonEmptyString(data?.ipfsCid);
-    if (originalUrl) result.mediaOriginalUrl = originalUrl;
-    if (optimizedUrl) result.mediaOptimizedUrl = optimizedUrl;
     if (contentHash) result.mediaContentHash = contentHash;
     if (ipfsCid) result.mediaIpfsCid = ipfsCid;
     if (typeof data?.sizeBytes === "number" && Number.isFinite(data.sizeBytes)) {
@@ -1915,7 +2140,13 @@ export class CommandExecutor {
 
   private async generateAndUploadMediaFromPrompt(
     prompt: string,
-    opts?: { generatedAssetType?: GeneratedAssetType; mode?: string },
+    opts?: {
+      generatedAssetType?: GeneratedAssetType;
+      mode?: string;
+      referenceInputs?: string[];
+      maxReferenceInputs?: number;
+      keepOriginal?: boolean;
+    },
   ): Promise<ResolvedMediaUpload> {
     const sourcePrompt = prompt.trim();
     if (!sourcePrompt.length) {
@@ -1941,6 +2172,19 @@ export class CommandExecutor {
     const promptFilePath = path.join(requestDir, "prompt.txt");
     const outputPath = path.join(requestDir, "output.png");
     await fs.writeFile(promptFilePath, `${curatedPrompt}\n`, "utf8").catch(() => undefined);
+    const referenceInputs = Array.isArray(opts?.referenceInputs)
+      ? opts.referenceInputs.filter(
+          (entry): entry is string =>
+            typeof entry === "string" && entry.trim().length > 0,
+        )
+      : [];
+    const referenceFiles = await this.materializeMediaReferenceFiles({
+      requestDir,
+      referenceInputs,
+      ...(typeof opts?.maxReferenceInputs === "number"
+        ? { maxReferenceInputs: opts.maxReferenceInputs }
+        : {}),
+    });
 
     const refs =
       process.platform === "win32"
@@ -1965,6 +2209,9 @@ export class CommandExecutor {
       .replaceAll("{prompt_file}", refs.promptFile)
       .replaceAll("{files}", refs.files)
       .trim();
+    if (referenceFiles.length === 0) {
+      command = stripEmptyFilesFlag(command, refs.files);
+    }
     if (!command.includes(refs.prompt)) {
       command = `${command} "${refs.prompt}"`.trim();
     }
@@ -1977,6 +2224,8 @@ export class CommandExecutor {
       generatedAssetType,
       sourcePromptChars: sourcePrompt.length,
       promptChars: curatedPrompt.length,
+      referenceInputCount: referenceInputs.length,
+      referenceFileCount: referenceFiles.length,
       commandPreview: command.slice(0, 240),
     }).catch(() => undefined);
 
@@ -1985,7 +2234,7 @@ export class CommandExecutor {
       MG_IMAGE_PROMPT_DIR: requestDir,
       MG_IMAGE_OUTPUT: outputPath,
       MG_IMAGE_PROMPT_FILE: promptFilePath,
-      MG_IMAGE_FILES: "",
+      MG_IMAGE_FILES: referenceFiles.join(","),
     });
     if (!execResult.ok) {
       const reason = execResult.timedOut
@@ -2008,7 +2257,9 @@ export class CommandExecutor {
     if (!resolvedSource) {
       throw new Error("no_media_url");
     }
-    return this.uploadResolvedMediaSource(resolvedSource);
+    return this.uploadResolvedMediaSource(resolvedSource, {
+      keepOriginal: opts?.keepOriginal === true,
+    });
   }
 
   private async resolveGeneratedMediaSource(input: {
