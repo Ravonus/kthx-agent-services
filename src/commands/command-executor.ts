@@ -908,7 +908,8 @@ export class CommandExecutor {
           action === "post" ||
           action === "comment" ||
           action === "story" ||
-          action === "like"
+          action === "like" ||
+          action === "repost"
         );
       }).length;
       if (blockedDraftCount > 0) {
@@ -922,7 +923,7 @@ export class CommandExecutor {
         }).catch(() => undefined);
         return this.failedOutcome(
           command,
-          "Publish action blocked: explicit post/publish/share/comment/story request required.",
+          "Publish action blocked: explicit post/publish/share/comment/story/repost request required.",
           "publish_verb_required",
         );
       }
@@ -1519,6 +1520,7 @@ export class CommandExecutor {
     if (goal === "thread") return "thread";
     if (goal === "comment" || goal === "reply") return "comment";
     if (goal === "like" || goal === "engagement") return "like";
+    if (goal === "repost" || goal === "boost") return "repost";
     if (goal === "multi_media" || goal === "carousel") return "multi_media";
     if (goal === "media" || goal === "image" || goal === "post") return "media";
     return "story";
@@ -1590,6 +1592,8 @@ export class CommandExecutor {
         ? "write.createStory"
         : action === "comment"
           ? "write.commentPost"
+          : action === "repost"
+            ? "write.repostPost"
           : action === "avatar"
             ? "write.updateAvatar"
             : action === "banner"
