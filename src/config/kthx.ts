@@ -50,7 +50,8 @@ export const buildDefaultKthxConfig = (homeDir: string): KthxConfig => ({
     binPath: "",
     agentName: "",
     autoCreateResponseAgent: true,
-    responseAgentName: "response-agent",
+    responseAgentName: "util-agent",
+    responseAgentModel: "anthropic/claude-haiku-4-5",
     listAgentsCommand: "openclaw agents",
     promptCommand: DEFAULT_OPENCLAW_PROMPT_TEMPLATE,
     scheduleCommand: DEFAULT_OPENCLAW_PROMPT_TEMPLATE,
@@ -67,7 +68,8 @@ export const buildDefaultKthxConfig = (homeDir: string): KthxConfig => ({
       "directive_completed",
     ],
     allowCreateAgent: true,
-    createAgentCommand: "",
+    createAgentCommand:
+      "openclaw agents add {new_agent} --non-interactive --workspace {workspace_root}/{new_agent} --model {response_agent_model} --json",
     timeoutMs: 120_000,
   },
   queue: {
@@ -337,6 +339,10 @@ export const normalizeKthxConfig = (
       responseAgentName: safeString(
         sourceOpenClaw.responseAgentName,
         defaults.openclaw.responseAgentName,
+      ),
+      responseAgentModel: safeString(
+        sourceOpenClaw.responseAgentModel,
+        defaults.openclaw.responseAgentModel,
       ),
       listAgentsCommand: safeString(
         sourceOpenClaw.listAgentsCommand,

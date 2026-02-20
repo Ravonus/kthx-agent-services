@@ -600,6 +600,7 @@ const main = async (): Promise<void> => {
         agentName: oc.agentName,
         autoCreateResponseAgent: oc.autoCreateResponseAgent,
         responseAgentName: oc.responseAgentName,
+        responseAgentModel: oc.responseAgentModel,
         listAgentsCommand: oc.listAgentsCommand,
         promptCommand: oc.promptCommand,
         scheduleCommand: oc.scheduleCommand,
@@ -620,6 +621,15 @@ const main = async (): Promise<void> => {
     touchWake,
   });
   ctx.openClawManager = openClawManager;
+  openClawManager.ensureUtilAgent().catch((err: unknown) => {
+    memory
+      .recordWrite({
+        type: "openclaw_util_agent_ensure_error",
+        at: new Date().toISOString(),
+        error: String(err),
+      })
+      .catch(() => {});
+  });
 
   // -- MintManager
   const mintManager = new MintManager({

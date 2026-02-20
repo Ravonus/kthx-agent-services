@@ -71,6 +71,7 @@ export interface OpenClawConfigSnapshot {
   agentName: string;
   autoCreateResponseAgent: boolean;
   responseAgentName: string;
+  responseAgentModel: string;
   listAgentsCommand: string;
   promptCommand: string;
   scheduleCommand: string;
@@ -357,11 +358,43 @@ const resolveTemplateCommand = (
   raw = raw
     .replaceAll("{agent}", (agentName ?? "__MG_AGENT_AUTO__").replaceAll('"', '\\"'))
     .replaceAll("{home}", config.agentHomeDir.replaceAll('"', '\\"'))
+    .replaceAll(
+      "{workspace_root}",
+      path.dirname(config.agentHomeDir).replaceAll('"', '\\"'),
+    )
     .replaceAll("{state}", config.stateDir.replaceAll('"', '\\"'))
     .replaceAll("{config}", config.kthxConfigPath.replaceAll('"', '\\"'));
   raw = applyOpenClawBinaryToShellCommand(raw, binary);
   return stripEmptyAgentFlag(raw);
 };
+
+async function writeUtilAgentWorkspace(
+  agentHomeDir: string,
+  agentName: string,
+): Promise<void> {
+  const dir = path.join(path.dirname(agentHomeDir), agentName);
+  await fs.mkdir(dir, { recursive: true });
+  await Promise.all([
+    fs.writeFile(
+      path.join(dir, "SOUL.md"),
+      "You are a stateless utility agent. No persona. Answer prompts directly. Never write to memory. No web search unless prompt requires it.",
+      "utf8",
+    ),
+    fs.writeFile(
+      path.join(dir, "AGENTS.md"),
+      "Stateless utility agent. Respond to the prompt. Do not write memory files or heartbeats.",
+      "utf8",
+    ),
+    fs.writeFile(path.join(dir, "HEARTBEAT.md"), "HEARTBEAT_OK\n", "utf8"),
+    fs.writeFile(
+      path.join(dir, "IDENTITY.md"),
+      `- **Name:** ${agentName}\n- **Role:** Utility agent\n- **Emoji:** 🔧`,
+      "utf8",
+    ),
+    fs.rm(path.join(dir, "BOOTSTRAP.md"), { force: true }),
+    fs.rm(path.join(dir, "USER.md"), { force: true }),
+  ]);
+}
 
 // ---------------------------------------------------------------------------
 // OpenClawManager class
@@ -429,7 +462,7 @@ export class OpenClawManager implements OpenClawManagerLike {
         code: result.code,
         stderrPreview: toAnswerPreview(result.stderr, 180),
       });
-      return await this.tryAutoCreateResponseAgent(ocConfig);
+      return await this.tryAutoCreateUtilAgent(ocConfig);
     }
     const selected = resolveAgentFromListOutput(result.stdout);
     if (!selected) {
@@ -439,26 +472,67 @@ export class OpenClawManager implements OpenClawManagerLike {
         reason: "no_default_agent_in_list",
         stdoutPreview: toAnswerPreview(result.stdout, 180),
       });
-      return await this.tryAutoCreateResponseAgent(ocConfig);
+      return await this.tryAutoCreateUtilAgent(ocConfig);
     }
     this.ctx.openclaw.resolvedOpenClawAgentName = selected;
     this.ctx.openclaw.openClawAgentResolvedAtMs = Date.now();
     return selected;
   }
 
-  private async tryAutoCreateResponseAgent(
+  async ensureUtilAgent(): Promise<void> {
+    const ocConfig = this.ctx.openclawConfig();
+    if (
+      !ocConfig?.enabled ||
+      !ocConfig.autoCreateResponseAgent ||
+      !ocConfig.allowCreateAgent
+    ) {
+      return;
+    }
+    const targetName =
+      parseOpenClawAgentName(ocConfig.responseAgentName) ?? "util-agent";
+    const binary = this.getOpenClawBinaryResolution();
+    const listCmd = applyOpenClawBinaryToShellCommand(
+      ocConfig.listAgentsCommand || "openclaw agents",
+      binary,
+    );
+    const result = await this.runLockedShellCommand({
+      command: listCmd,
+      timeoutMs: 30_000,
+    });
+    if (!result.ok || new RegExp(`\\b${targetName}\\b`, "u").test(result.stdout ?? "")) {
+      return;
+    }
+    await this.ctx.memory.recordWrite({
+      type: "openclaw_util_agent_auto_create_start",
+      at: nowIso(),
+      agentName: targetName,
+    });
+    const created = await this.createAgent({
+      agentName: targetName,
+      source: "startup_ensure_util_agent",
+    });
+    await this.ctx.memory.recordWrite({
+      type: "openclaw_util_agent_auto_create_result",
+      at: nowIso(),
+      agentName: targetName,
+      ok: created.ok,
+      error: created.error ?? null,
+    });
+  }
+
+  private async tryAutoCreateUtilAgent(
     ocConfig: OpenClawConfigSnapshot,
   ): Promise<string | null> {
     if (!ocConfig.autoCreateResponseAgent) return null;
     const targetName =
-      parseOpenClawAgentName(ocConfig.responseAgentName) ?? "response-agent";
+      parseOpenClawAgentName(ocConfig.responseAgentName) ?? "util-agent";
     const created = await this.createAgent({
       agentName: targetName,
-      source: "auto_response_agent_bootstrap",
+      source: "auto_util_agent_bootstrap",
     });
     if (!created.ok) {
       await this.ctx.memory.recordWrite({
-        type: "openclaw_response_agent_auto_create_failed",
+        type: "openclaw_util_agent_auto_create_failed",
         at: nowIso(),
         agentName: targetName,
         error: created.error ?? "unknown_error",
@@ -468,7 +542,7 @@ export class OpenClawManager implements OpenClawManagerLike {
     this.ctx.openclaw.resolvedOpenClawAgentName = targetName;
     this.ctx.openclaw.openClawAgentResolvedAtMs = Date.now();
     await this.ctx.memory.recordWrite({
-      type: "openclaw_response_agent_auto_created",
+      type: "openclaw_util_agent_auto_created",
       at: nowIso(),
       agentName: targetName,
     });
@@ -607,7 +681,14 @@ export class OpenClawManager implements OpenClawManagerLike {
     if (!parsedName) return { ok: false, error: "Invalid agent name. Use only letters, numbers, dot, underscore, or dash (max 64 chars)." };
     const ocConfig = this.ctx.openclawConfig();
     if (!ocConfig || !ocConfig.enabled) return { ok: false, error: "OpenClaw integration is disabled in config." };
-    if (ocConfig.allowCreateAgent !== true) return { ok: false, error: "Agent creation is disabled. Set openclaw.allowCreateAgent=true in kthx config." };
+    if (ocConfig.allowCreateAgent !== true) {
+      return {
+        ok: false,
+        error:
+          "Agent creation is disabled. Set openclaw.allowCreateAgent=true in kthx config.",
+      };
+    }
+    const source = opts.source ?? "runtime";
     const template = typeof ocConfig.createAgentCommand === "string" ? ocConfig.createAgentCommand.trim() : "";
     if (!template.length) return { ok: false, error: "openclaw.createAgentCommand is empty." };
     const currentAgent =
@@ -621,12 +702,16 @@ export class OpenClawManager implements OpenClawManagerLike {
       currentAgent,
       this.ctx.config,
       openClawBinary,
-      { "{new_agent}": parsedName },
+      {
+        "{new_agent}": parsedName,
+        "{response_agent_model}": (
+          ocConfig.responseAgentModel || "anthropic/claude-haiku-4-5"
+        ).replaceAll('"', '\\"'),
+      },
     );
     const timeoutMs = typeof ocConfig.timeoutMs === "number" && Number.isFinite(ocConfig.timeoutMs)
       ? Math.max(15_000, Math.floor(ocConfig.timeoutMs)) : 120_000;
     const result = await this.runLockedShellCommand({ command, timeoutMs });
-    const source = opts.source ?? "runtime";
     await this.ctx.memory.recordWrite({
       type: "openclaw_create_agent_result", at: nowIso(), source, requestedAgentName: parsedName,
       ok: result.ok, code: result.code, commandPreview: toAnswerPreview(command, 180),
@@ -636,6 +721,14 @@ export class OpenClawManager implements OpenClawManagerLike {
       const errorMessage = typeof result.stderr === "string" && result.stderr.trim().length > 0 ? result.stderr.trim()
         : typeof result.error === "string" && result.error.trim().length > 0 ? result.error.trim() : "create agent command failed";
       return { ok: false, error: errorMessage };
+    }
+    if (
+      parsedName ===
+      (parseOpenClawAgentName(ocConfig.responseAgentName) ?? "util-agent")
+    ) {
+      await writeUtilAgentWorkspace(this.ctx.config.agentHomeDir, parsedName).catch(
+        () => {},
+      );
     }
     return { ok: true, agentName: parsedName, stdout: result.stdout };
   }

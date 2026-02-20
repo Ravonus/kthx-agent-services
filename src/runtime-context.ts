@@ -70,6 +70,7 @@ export interface QueueManagerLike {
 
 export interface OpenClawManagerLike {
   resolveAgentName(): Promise<string | null>;
+  ensureUtilAgent(): Promise<void>;
   prompt(
     input: string,
     opts?: {

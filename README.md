@@ -95,6 +95,7 @@ Notes:
   - `openclaw.autoCreateResponseAgent` (default `true`)
   - `openclaw.responseAgentName` (default `response-agent`)
   - `openclaw.allowCreateAgent` must be `true` (default `true`)
+  - bootstrap runs on runtime start (no manual `openclaw create agent ...` needed)
 - Runtime mint now persists tokens to `state/ipc/auth/bot-session.json` so `chat-bridge` can reuse them.
 - When runtime is launched by supervisor, supervisor is now the default bot-session file writer to prevent write races.
 - If `chat-bridge` reports `tokenSource=none`, verify runtime/supervisor wrote `state/ipc/auth/bot-session.json` and that it contains a non-empty `token`.
