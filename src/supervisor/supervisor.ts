@@ -678,7 +678,6 @@ const main = async (): Promise<void> => {
       await sleep(POLL_MS);
     }
   } finally {
-    clearPersistedAgentKeyBoxFile(stateDir, "supervisor_exit");
     writeBotSessionFile(botTokenPath, { updatedAt: nowIso(), source: "agent-ws-supervisor", token: null, expiresAt: null, connectionId: runtimeConnId, state: "cleared", reason: "supervisor_exit" });
     try { const lock = readLock(lockPath); if (!lock || lock.pid === process.pid) fs.rmSync(lockPath, { force: true }); } catch { /* ignore */ }
     writeStatus("shutdown");
