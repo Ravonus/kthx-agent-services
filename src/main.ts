@@ -136,17 +136,6 @@ const isBotTokenAuthFailureMessage = (message: string): boolean =>
   /bot token missing/iu.test(message) ||
   /x-bot-session-token/iu.test(message);
 
-const parseSocketDigestIntervalMs = (
-  envKey: string,
-  fallbackMs: number,
-): number => {
-  const raw = trimEnv(envKey);
-  if (!raw) return fallbackMs;
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed)) return fallbackMs;
-  return Math.max(15_000, Math.min(30 * 60_000, Math.floor(parsed)));
-};
-
 const parseSupervisorPid = (value: string | null): number | null => {
   if (!value) return null;
   const parsed = Number.parseInt(value.trim(), 10);
@@ -663,60 +652,120 @@ const main = async (): Promise<void> => {
   ctx.mintManager = mintManager;
 
   // -- Envelope handler (dispatches subscription events to managers)
-  const socketNotificationDigestMinMs = parseSocketDigestIntervalMs(
-    "MG_AGENT_SOCKET_NOTIFICATION_DIGEST_MS",
-    120_000,
-  );
-  const socketFeedDigestMinMs = parseSocketDigestIntervalMs(
-    "MG_AGENT_SOCKET_FEED_DIGEST_MS",
-    180_000,
-  );
-  let lastNotificationDigestAtMs = 0;
-  let lastFeedDigestAtMs = 0;
-  let socketDigestInFlight = false;
-  const maybeRunSocketDigest = (
+  type SocketBatchState = {
+    pendingCount: number;
+    notificationCount: number;
+    feedCount: number;
+    firstQueuedAt: string | null;
+    lastQueuedAt: string | null;
+    lastEventType: string | null;
+    lastTopic: string | null;
+  };
+  const socketBatchState: SocketBatchState = {
+    pendingCount: 0,
+    notificationCount: 0,
+    feedCount: 0,
+    firstQueuedAt: null,
+    lastQueuedAt: null,
+    lastEventType: null,
+    lastTopic: null,
+  };
+  let socketBatchFlushInFlight: Promise<void> | null = null;
+  const mergeSocketBatch = (
+    target: SocketBatchState,
+    delta: SocketBatchState,
+  ): void => {
+    target.pendingCount += delta.pendingCount;
+    target.notificationCount += delta.notificationCount;
+    target.feedCount += delta.feedCount;
+    if (!target.firstQueuedAt) {
+      target.firstQueuedAt = delta.firstQueuedAt;
+    }
+    target.lastQueuedAt = delta.lastQueuedAt ?? target.lastQueuedAt;
+    target.lastEventType = delta.lastEventType ?? target.lastEventType;
+    target.lastTopic = delta.lastTopic ?? target.lastTopic;
+  };
+  const markSocketBatchPending = (
     kind: "notifications" | "feed",
     envelope: {
-      source: "user" | "public";
+      receivedAt: string;
       topic: string;
     },
     eventType: string,
   ): void => {
-    const nowMs = Date.now();
+    socketBatchState.pendingCount += 1;
     if (kind === "notifications") {
-      if (
-        socketDigestInFlight ||
-        nowMs - lastNotificationDigestAtMs < socketNotificationDigestMinMs
-      ) {
-        return;
-      }
-      lastNotificationDigestAtMs = nowMs;
+      socketBatchState.notificationCount += 1;
     } else {
-      if (socketDigestInFlight || nowMs - lastFeedDigestAtMs < socketFeedDigestMinMs) {
-        return;
-      }
-      lastFeedDigestAtMs = nowMs;
+      socketBatchState.feedCount += 1;
     }
-    socketDigestInFlight = true;
-    void memory
-      .refreshTemporalContext({
-        force: false,
-        allowAgentCompression: false,
-      })
-      .then(async () => {
+    socketBatchState.firstQueuedAt ??= envelope.receivedAt;
+    socketBatchState.lastQueuedAt = envelope.receivedAt;
+    socketBatchState.lastEventType = eventType || null;
+    socketBatchState.lastTopic = envelope.topic;
+  };
+  const flushSocketBatchForDirective = async (
+    trigger: string,
+  ): Promise<void> => {
+    if (socketBatchFlushInFlight) {
+      await socketBatchFlushInFlight;
+    }
+    if (socketBatchState.pendingCount <= 0) {
+      return;
+    }
+
+    const snapshot: SocketBatchState = {
+      pendingCount: socketBatchState.pendingCount,
+      notificationCount: socketBatchState.notificationCount,
+      feedCount: socketBatchState.feedCount,
+      firstQueuedAt: socketBatchState.firstQueuedAt,
+      lastQueuedAt: socketBatchState.lastQueuedAt,
+      lastEventType: socketBatchState.lastEventType,
+      lastTopic: socketBatchState.lastTopic,
+    };
+    socketBatchState.pendingCount = 0;
+    socketBatchState.notificationCount = 0;
+    socketBatchState.feedCount = 0;
+    socketBatchState.firstQueuedAt = null;
+    socketBatchState.lastQueuedAt = null;
+    socketBatchState.lastEventType = null;
+    socketBatchState.lastTopic = null;
+
+    socketBatchFlushInFlight = (async () => {
+      try {
+        await memory
+          .refreshTemporalContext({
+            force: true,
+            allowAgentCompression: false,
+          })
+          .catch(() => {});
         await memory.recordWrite({
-          type: "socket_memory_digest_refreshed",
+          type: "notifications_buffer_flushed",
           at: nowIso(),
-          digestKind: kind,
-          source: envelope.source,
-          topic: envelope.topic,
-          eventType,
+          trigger,
+          pendingCount: snapshot.pendingCount,
+          notificationEvents: snapshot.notificationCount,
+          feedEvents: snapshot.feedCount,
+          firstQueuedAt: snapshot.firstQueuedAt,
+          lastQueuedAt: snapshot.lastQueuedAt,
+          lastEventType: snapshot.lastEventType,
+          lastTopic: snapshot.lastTopic,
         });
-      })
-      .catch(() => {})
-      .finally(() => {
-        socketDigestInFlight = false;
-      });
+      } catch (error: unknown) {
+        mergeSocketBatch(socketBatchState, snapshot);
+        await memory
+          .recordWrite({
+            type: "notifications_buffer_flush_failed",
+            at: nowIso(),
+            trigger,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          .catch(() => {});
+      } finally {
+        socketBatchFlushInFlight = null;
+      }
+    })();
+    await socketBatchFlushInFlight;
   };
 
   const handleEnvelope = async (envelope: {
@@ -767,10 +816,10 @@ const main = async (): Promise<void> => {
     }
 
     if (isNotificationEnvelope) {
-      maybeRunSocketDigest("notifications", envelope, eventType);
+      markSocketBatchPending("notifications", envelope, eventType);
     }
     if (isFeedEnvelope) {
-      maybeRunSocketDigest("feed", envelope, eventType);
+      markSocketBatchPending("feed", envelope, eventType);
     }
 
     // Auth state updates
@@ -820,6 +869,7 @@ const main = async (): Promise<void> => {
         ? payload.directive
         : payload;
       try {
+        await flushSocketBatchForDirective("directive_intake");
         await ctx.directiveManager?.intake(directivePayload);
       } catch (error: unknown) {
         const directiveId =

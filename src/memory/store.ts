@@ -316,12 +316,7 @@ export class MemoryStore {
       at === "read" ||
       at === "comment" ||
       at === "publish_result" ||
-      at === "directive_executed" ||
-      type === "notification_created" ||
-      type === "post_created" ||
-      (envelope.source === "public" &&
-        typeof envelope.topic === "string" &&
-        envelope.topic.startsWith("feed:"));
+      at === "directive_executed";
     if (shouldRefreshTemporalContext) {
       void this.refreshTemporalContext({ force: false, allowAgentCompression: false }).catch(() => {});
     }
