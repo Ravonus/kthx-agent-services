@@ -49,6 +49,8 @@ export const buildDefaultKthxConfig = (homeDir: string): KthxConfig => ({
     enabled: true,
     binPath: "",
     agentName: "",
+    autoCreateResponseAgent: true,
+    responseAgentName: "response-agent",
     listAgentsCommand: "openclaw agents",
     promptCommand: DEFAULT_OPENCLAW_PROMPT_TEMPLATE,
     scheduleCommand: DEFAULT_OPENCLAW_PROMPT_TEMPLATE,
@@ -64,7 +66,7 @@ export const buildDefaultKthxConfig = (homeDir: string): KthxConfig => ({
       "terminal_run_required",
       "directive_completed",
     ],
-    allowCreateAgent: false,
+    allowCreateAgent: true,
     createAgentCommand: "",
     timeoutMs: 120_000,
   },
@@ -328,6 +330,14 @@ export const normalizeKthxConfig = (
       enabled: sourceOpenClaw.enabled !== false,
       binPath: safeString(sourceOpenClaw.binPath, ""),
       agentName: safeString(sourceOpenClaw.agentName, ""),
+      autoCreateResponseAgent:
+        typeof sourceOpenClaw.autoCreateResponseAgent === "boolean"
+          ? sourceOpenClaw.autoCreateResponseAgent
+          : defaults.openclaw.autoCreateResponseAgent,
+      responseAgentName: safeString(
+        sourceOpenClaw.responseAgentName,
+        defaults.openclaw.responseAgentName,
+      ),
       listAgentsCommand: safeString(
         sourceOpenClaw.listAgentsCommand,
         defaults.openclaw.listAgentsCommand,
@@ -342,7 +352,10 @@ export const normalizeKthxConfig = (
             .map((value) => value.trim())
             .filter((value) => value.length > 0)
         : defaults.openclaw.wakeReasons,
-      allowCreateAgent: sourceOpenClaw.allowCreateAgent === true,
+      allowCreateAgent:
+        typeof sourceOpenClaw.allowCreateAgent === "boolean"
+          ? sourceOpenClaw.allowCreateAgent
+          : defaults.openclaw.allowCreateAgent,
       createAgentCommand: safeString(
         sourceOpenClaw.createAgentCommand,
         defaults.openclaw.createAgentCommand,

@@ -91,6 +91,10 @@ See `src/config/runtime.ts` for all env vars. Key ones:
 Notes:
 - OpenClaw binary resolution order: `kthx-config openclaw.binPath` -> `MG_OPENCLAW_BIN` -> `OPENCLAW_BIN` -> PATH lookup.
 - Runtime writes an `openclaw_binary_probe` event to `writes.jsonl` on boot; use it to verify the exact command/path used.
+- OpenClaw response-agent bootstrap: when no default/listed agent is found, runtime can auto-create one via:
+  - `openclaw.autoCreateResponseAgent` (default `true`)
+  - `openclaw.responseAgentName` (default `response-agent`)
+  - `openclaw.allowCreateAgent` must be `true` (default `true`)
 - Runtime mint now persists tokens to `state/ipc/auth/bot-session.json` so `chat-bridge` can reuse them.
 - When runtime is launched by supervisor, supervisor is now the default bot-session file writer to prevent write races.
 - If `chat-bridge` reports `tokenSource=none`, verify runtime/supervisor wrote `state/ipc/auth/bot-session.json` and that it contains a non-empty `token`.

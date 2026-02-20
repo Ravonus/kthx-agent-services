@@ -598,6 +598,8 @@ const main = async (): Promise<void> => {
         enabled: oc.enabled,
         binPath: oc.binPath,
         agentName: oc.agentName,
+        autoCreateResponseAgent: oc.autoCreateResponseAgent,
+        responseAgentName: oc.responseAgentName,
         listAgentsCommand: oc.listAgentsCommand,
         promptCommand: oc.promptCommand,
         scheduleCommand: oc.scheduleCommand,

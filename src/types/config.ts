@@ -15,6 +15,8 @@ export type KthxOpenClawConfig = {
   enabled: boolean;
   binPath: string;
   agentName: string;
+  autoCreateResponseAgent: boolean;
+  responseAgentName: string;
   listAgentsCommand: string;
   promptCommand: string;
   scheduleCommand: string;
