@@ -168,10 +168,21 @@ const computeTokenOverlapRatio = (candidate: string, reference: string): number 
   return overlap / candidateTokens.length;
 };
 
-const extractCommentAnchorPhrase = (value: string): string => {
-  const tokens = tokenizeCommentText(value);
-  if (tokens.length === 0) return "direction";
-  return tokens.slice(0, 3).join(" ");
+const hasLongNormalizedPhraseOverlap = (
+  candidate: string,
+  reference: string,
+): boolean => {
+  const normalizedCandidate = normalizeCommentText(candidate);
+  const normalizedReference = normalizeCommentText(reference);
+  if (normalizedCandidate.length < 18 || normalizedReference.length < 18) {
+    return false;
+  }
+  const [shorter, longer] =
+    normalizedCandidate.length <= normalizedReference.length
+      ? [normalizedCandidate, normalizedReference]
+      : [normalizedReference, normalizedCandidate];
+  if (shorter.length < 18) return false;
+  return longer.includes(shorter);
 };
 
 type CropRect = {
@@ -399,6 +410,13 @@ type DraftPreviewPayload = {
   draftSlideCount: number;
 };
 
+class RequeueCommandError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RequeueCommandError";
+  }
+}
+
 type CommentCurationContext = {
   postAuthorHandle: string | null;
   postText: string | null;
@@ -410,7 +428,7 @@ type CommentCurationContext = {
 
 type CuratedCommentBody = {
   body: string;
-  source: "openclaw" | "deterministic_fallback";
+  source: "openclaw";
   reason: string;
 };
 
@@ -425,7 +443,7 @@ type EngagementDecisionContext = {
 type EngagementDecision = {
   shouldExecute: boolean;
   reason: string;
-  source: "openclaw" | "default_allow";
+  source: "openclaw";
 };
 
 export class CommandExecutor {
@@ -569,6 +587,22 @@ export class CommandExecutor {
     }
 
     const result = await this.executeCommand(command).catch((error: unknown) => {
+      if (error instanceof RequeueCommandError) {
+        void this.ctx.memory
+          .recordWrite({
+            type: "inbox_command_requeued",
+            at: nowIso(),
+            inboxFile,
+            commandId: command.id,
+            kind: command.kind,
+            reason: error.message,
+          })
+          .catch(() => undefined);
+        return {
+          processed: false,
+          outcome: null,
+        } satisfies ExecuteResult;
+      }
       const message = error instanceof Error ? error.message : String(error);
       const outcome: CommandOutcome = {
         at: nowIso(),
@@ -939,7 +973,10 @@ export class CommandExecutor {
     if (!draftBody.length) return null;
 
     const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
+    let attemptedOpenClawCuration = false;
+    let openClawCurationErrored = false;
     if (runOpenClawPrompt) {
+      attemptedOpenClawCuration = true;
       try {
         const curationPrompt = this.buildCommentCurationPrompt({
           postId: input.postId,
@@ -991,6 +1028,7 @@ export class CommandExecutor {
             .catch(() => undefined);
         }
       } catch (error: unknown) {
+        openClawCurationErrored = true;
         await this.ctx.memory
           .recordWrite({
             type: "comment_body_curation_failed",
@@ -1006,23 +1044,32 @@ export class CommandExecutor {
     if (!this.isDraftCommentEchoLike(draftBody, context)) {
       return null;
     }
-    const fallback = this.buildDeterministicCommentFallback({
-      draftBody,
-      context,
-      postId: input.postId,
-    });
-    if (!fallback) return null;
-    const fallbackValidation = this.validateCuratedCommentCandidate({
-      candidate: fallback,
-      draftBody,
-      context,
-    });
-    if (!fallbackValidation.ok) return null;
-    return {
-      body: fallback,
-      source: "deterministic_fallback",
-      reason: "echo_guard_fallback",
-    };
+    if (!runOpenClawPrompt) {
+      throw new RequeueCommandError(
+        "comment_curation_waiting_for_openclaw:openclaw_required_unavailable",
+      );
+    }
+    if (openClawCurationErrored) {
+      throw new RequeueCommandError(
+        "comment_curation_waiting_for_openclaw:openclaw_curation_failed",
+      );
+    }
+    await this.ctx.memory
+      .recordWrite({
+        type: "comment_body_curation_blocked",
+        at: nowIso(),
+        commandId: input.command.id,
+        postId: input.postId,
+        parentId: input.parentId,
+        reason: attemptedOpenClawCuration
+          ? "echo_like_without_valid_llm_curation"
+          : "echo_like_without_llm_curation",
+        draftBody: truncateText(draftBody, 200),
+      })
+      .catch(() => undefined);
+    throw new Error(
+      "Comment blocked: near-duplicate/echo content requires valid LLM curation.",
+    );
   }
 
   private async loadCommentCurationContext(input: {
@@ -1405,20 +1452,47 @@ export class CommandExecutor {
     if (draftOverlap >= 0.86) {
       return { ok: false, reason: "too_similar_to_draft" };
     }
+    if (hasLongNormalizedPhraseOverlap(candidate, input.draftBody)) {
+      return { ok: false, reason: "contains_draft_phrase" };
+    }
     if (input.context.postText) {
       const normalizedPostText = normalizeCommentText(input.context.postText);
       if (normalizedCandidate === normalizedPostText) {
         return { ok: false, reason: "same_as_post_text" };
       }
       const overlap = computeTokenOverlapRatio(candidate, input.context.postText);
-      if (overlap >= 0.92) {
+      if (overlap >= 0.86) {
         return { ok: false, reason: "too_similar_to_post_text" };
+      }
+      if (hasLongNormalizedPhraseOverlap(candidate, input.context.postText)) {
+        return { ok: false, reason: "contains_post_phrase" };
       }
     }
     if (input.context.mediaSummary) {
       const overlap = computeTokenOverlapRatio(candidate, input.context.mediaSummary);
-      if (overlap >= 0.95) {
+      if (overlap >= 0.9) {
         return { ok: false, reason: "too_similar_to_media_summary" };
+      }
+      if (hasLongNormalizedPhraseOverlap(candidate, input.context.mediaSummary)) {
+        return { ok: false, reason: "contains_media_summary_phrase" };
+      }
+    }
+    if (input.context.threadSummary) {
+      const overlap = computeTokenOverlapRatio(candidate, input.context.threadSummary);
+      if (overlap >= 0.82) {
+        return { ok: false, reason: "too_similar_to_thread_summary" };
+      }
+      if (hasLongNormalizedPhraseOverlap(candidate, input.context.threadSummary)) {
+        return { ok: false, reason: "contains_thread_phrase" };
+      }
+    }
+    if (input.context.payloadHint) {
+      const overlap = computeTokenOverlapRatio(candidate, input.context.payloadHint);
+      if (overlap >= 0.84) {
+        return { ok: false, reason: "too_similar_to_payload_hint" };
+      }
+      if (hasLongNormalizedPhraseOverlap(candidate, input.context.payloadHint)) {
+        return { ok: false, reason: "contains_payload_hint_phrase" };
       }
     }
     return { ok: true };
@@ -1438,32 +1512,224 @@ export class CommandExecutor {
     if (context.postText && computeTokenOverlapRatio(trimmed, context.postText) >= 0.9) {
       return true;
     }
+    if (
+      context.postText &&
+      hasLongNormalizedPhraseOverlap(trimmed, context.postText)
+    ) {
+      return true;
+    }
     if (context.mediaSummary && computeTokenOverlapRatio(trimmed, context.mediaSummary) >= 0.9) {
+      return true;
+    }
+    if (
+      context.mediaSummary &&
+      hasLongNormalizedPhraseOverlap(trimmed, context.mediaSummary)
+    ) {
+      return true;
+    }
+    if (context.threadSummary && computeTokenOverlapRatio(trimmed, context.threadSummary) >= 0.82) {
+      return true;
+    }
+    if (
+      context.threadSummary &&
+      hasLongNormalizedPhraseOverlap(trimmed, context.threadSummary)
+    ) {
+      return true;
+    }
+    if (context.payloadHint && computeTokenOverlapRatio(trimmed, context.payloadHint) >= 0.84) {
+      return true;
+    }
+    if (
+      context.payloadHint &&
+      hasLongNormalizedPhraseOverlap(trimmed, context.payloadHint)
+    ) {
       return true;
     }
     return false;
   }
 
-  private buildDeterministicCommentFallback(input: {
-    draftBody: string;
-    context: CommentCurationContext;
+  private async loadEngagementDecisionContext(input: {
+    action: "like" | "repost";
     postId: number;
-  }): string | null {
-    const anchorSource =
-      input.context.threadSummary ??
-      input.context.postText ??
-      input.context.mediaSummary ??
-      input.context.payloadHint ??
-      input.draftBody;
-    const anchor = extractCommentAnchorPhrase(anchorSource);
-    const templates = [
-      `That ${anchor} angle lands hard. The execution feels intentional and alive.`,
-      `Strong direction on ${anchor}. This one has real momentum to build on.`,
-      `The ${anchor} concept works well here. Curious where you take it next.`,
-    ];
-    const selected = templates[input.postId % templates.length] ?? templates[0];
-    if (!selected) return null;
-    return truncateText(selected, 200);
+    payload: Record<string, unknown>;
+  }): Promise<EngagementDecisionContext> {
+    const context: EngagementDecisionContext = {
+      postAuthorHandle: null,
+      postText: null,
+      mediaSummary: null,
+      payloadHint: this.extractCommentPayloadHint(input.payload),
+      memorySummary: await this.loadEngagementMemorySummary({
+        action: input.action,
+        postId: input.postId,
+        commentId: null,
+        payload: input.payload,
+      }),
+    };
+    const callAgentChatBridge = this.ctx.callAgentChatBridge;
+    if (!callAgentChatBridge) return context;
+    try {
+      const postResponse = await callAgentChatBridge({
+        action: "find_post",
+        postId: input.postId,
+      });
+      const postRecord = this.extractPostRecordForCommentCuration(postResponse);
+      if (!postRecord) return context;
+      const author = isRecord(postRecord.author) ? postRecord.author : null;
+      context.postAuthorHandle =
+        asNonEmptyString(author?.handle) ??
+        asNonEmptyString(postRecord.authorHandle);
+      context.postText =
+        asNonEmptyString(postRecord.textBody) ??
+        asNonEmptyString(postRecord.caption) ??
+        asNonEmptyString(postRecord.body);
+      context.mediaSummary = this.summarizePostMediaForComment(postRecord);
+      return context;
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "engagement_post_lookup_failed",
+          at: nowIso(),
+          action: input.action,
+          postId: input.postId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return context;
+    }
+  }
+
+  private buildEngagementDecisionPrompt(input: {
+    action: "like" | "repost";
+    postId: number;
+    context: EngagementDecisionContext;
+  }): string {
+    const actionLabel = input.action === "like" ? "like" : "repost";
+    const contextLines = [
+      `postId: ${input.postId}`,
+      input.context.postAuthorHandle
+        ? `postAuthor: @${input.context.postAuthorHandle.replace(/^@+/u, "")}`
+        : null,
+      input.context.postText ? `postText: ${input.context.postText}` : null,
+      input.context.mediaSummary ? `mediaContext: ${input.context.mediaSummary}` : null,
+      input.context.payloadHint ? `requestHint: ${input.context.payloadHint}` : null,
+      input.context.memorySummary ? `memoryContext: ${input.context.memorySummary}` : null,
+    ].filter((entry): entry is string => Boolean(entry));
+    return [
+      "Decide whether the runtime should execute this social engagement action now.",
+      "Return strict JSON only with exactly this shape:",
+      '{"shouldExecute":true|false,"reason":"..."}',
+      "Rules:",
+      "- shouldExecute=true when context suggests this action is relevant and non-spammy.",
+      "- Prefer own-post engagement when it is active and high-signal; avoid repetitive low-value actions.",
+      "- reason must be short (6-120 chars) and action-specific.",
+      `Action: ${actionLabel}`,
+      "Context:",
+      ...contextLines.map((line) => `- ${line}`),
+    ].join("\n");
+  }
+
+  private extractEngagementDecisionFromUnknown(
+    value: unknown,
+  ): { shouldExecute: boolean; reason: string } | null {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed.length) return null;
+      const parsed = parseJsonFromMixedText(trimmed);
+      if (parsed !== null && parsed !== value) {
+        return this.extractEngagementDecisionFromUnknown(parsed);
+      }
+      const lowered = trimmed.toLowerCase();
+      if (lowered === "yes" || lowered === "true") {
+        return { shouldExecute: true, reason: "approved" };
+      }
+      if (lowered === "no" || lowered === "false") {
+        return { shouldExecute: false, reason: "declined" };
+      }
+      return null;
+    }
+    if (!isRecord(value)) return null;
+    const shouldExecuteValue = value.shouldExecute;
+    if (typeof shouldExecuteValue !== "boolean") return null;
+    const reason = asNonEmptyString(value.reason) ?? "no_reason";
+    return {
+      shouldExecute: shouldExecuteValue,
+      reason: truncateText(reason, 120),
+    };
+  }
+
+  private async evaluateEngagementActionWithOpenClaw(input: {
+    command: Command;
+    action: "like" | "repost";
+    postId: number;
+    payload: Record<string, unknown>;
+  }): Promise<EngagementDecision> {
+    const context = await this.loadEngagementDecisionContext({
+      action: input.action,
+      postId: input.postId,
+      payload: input.payload,
+    });
+    const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
+    if (!runOpenClawPrompt) {
+      return {
+        shouldExecute: false,
+        reason: "openclaw_required_unavailable",
+        source: "openclaw",
+      };
+    }
+    try {
+      const prompt = this.buildEngagementDecisionPrompt({
+        action: input.action,
+        postId: input.postId,
+        context,
+      });
+      const result = await runOpenClawPrompt({
+        prompt,
+        purpose: "engagement_action_decision",
+      });
+      const decision =
+        (result
+          ? this.extractEngagementDecisionFromUnknown(result.parsed) ??
+            this.extractEngagementDecisionFromUnknown(result.payloadText) ??
+            this.extractEngagementDecisionFromUnknown(result.raw)
+          : null) ?? null;
+      if (!decision) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "engagement_action_decision_missing",
+            at: nowIso(),
+            commandId: input.command.id,
+            action: input.action,
+            postId: input.postId,
+          })
+          .catch(() => undefined);
+        return {
+          shouldExecute: false,
+          reason: "openclaw_decision_invalid",
+          source: "openclaw",
+        };
+      }
+      return {
+        shouldExecute: decision.shouldExecute,
+        reason: decision.reason,
+        source: "openclaw",
+      };
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "engagement_action_decision_failed",
+          at: nowIso(),
+          commandId: input.command.id,
+          action: input.action,
+          postId: input.postId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return {
+        shouldExecute: false,
+        reason: "openclaw_decision_failed",
+        source: "openclaw",
+      };
+    }
   }
 
   private async executeWriteVote(command: Command): Promise<CommandOutcome> {
@@ -1476,6 +1742,42 @@ export class CommandExecutor {
         ? Math.trunc(payload.vote)
         : 1;
     const vote = voteRaw > 0 ? 1 : voteRaw < 0 ? -1 : 0;
+    if (vote === 1) {
+      const decision = await this.evaluateEngagementActionWithOpenClaw({
+        command,
+        action: "like",
+        postId,
+        payload,
+      });
+      const needsRequeue =
+        !decision.shouldExecute &&
+        decision.reason.trim().toLowerCase().startsWith("openclaw_");
+      if (needsRequeue) {
+        throw new RequeueCommandError(
+          `engagement_like_waiting_for_openclaw:${decision.reason}`,
+        );
+      }
+      await this.ctx.memory
+        .recordWrite({
+          type: "engagement_action_decision",
+          at: nowIso(),
+          commandId: command.id,
+          action: "like",
+          postId,
+          shouldExecute: decision.shouldExecute,
+          reason: decision.reason,
+          source: decision.source,
+        })
+        .catch(() => undefined);
+      if (!decision.shouldExecute) {
+        return this.successOutcome(command, {
+          skipped: true,
+          action: "like",
+          postId,
+          decision: decision.reason,
+        });
+      }
+    }
     const result = await this.agent().votePost.mutate({ postId, vote });
     return this.successOutcome(command, result);
   }
@@ -1486,6 +1788,42 @@ export class CommandExecutor {
     const postId = asPositiveInt(payload.postId);
     if (!postId) return this.failedOutcome(command, "postId is required for write.repostPost.");
     const repost = payload.repost === 0 ? 0 : 1;
+    if (repost === 1) {
+      const decision = await this.evaluateEngagementActionWithOpenClaw({
+        command,
+        action: "repost",
+        postId,
+        payload,
+      });
+      const needsRequeue =
+        !decision.shouldExecute &&
+        decision.reason.trim().toLowerCase().startsWith("openclaw_");
+      if (needsRequeue) {
+        throw new RequeueCommandError(
+          `engagement_repost_waiting_for_openclaw:${decision.reason}`,
+        );
+      }
+      await this.ctx.memory
+        .recordWrite({
+          type: "engagement_action_decision",
+          at: nowIso(),
+          commandId: command.id,
+          action: "repost",
+          postId,
+          shouldExecute: decision.shouldExecute,
+          reason: decision.reason,
+          source: decision.source,
+        })
+        .catch(() => undefined);
+      if (!decision.shouldExecute) {
+        return this.successOutcome(command, {
+          skipped: true,
+          action: "repost",
+          postId,
+          decision: decision.reason,
+        });
+      }
+    }
     const result = await this.agent().repostPost.mutate({ postId, repost });
     return this.successOutcome(command, result);
   }

@@ -1103,6 +1103,7 @@ const main = async (): Promise<void> => {
     },
     memory: {
       recordWrite: (p: unknown) => memory.recordWrite(p),
+      buildContext: (request) => memory.buildContext(request),
     },
     trpc: trpc as unknown as {
       agent: Record<string, { mutate: (input: Record<string, unknown>) => Promise<unknown> }>;

@@ -196,7 +196,7 @@ const ENGAGEMENT_RETRIEVAL_PATTERN =
   /\b(like|likes|comment|comments|reply|replies|repost|reposts|quote|follow|follows|engage|engagement|interact|interaction|views?|impressions?|timeline|feed|trending|viral)\b/iu;
 
 const SITE_LOOKUP_TRIGGER_PATTERN =
-  /\b(post|posts|comment|comments|likes?|views?|reposts?|engagement|followers?|following|draft|directive|timeline|feed|recent|latest|newest|last|who viewed|who liked)\b/iu;
+  /\b(post|posts|comment|comments|likes?|views?|reposts?|engagement|followers?|following|draft|directive|timeline|feed|recent|latest|newest|last|who viewed|who liked|gif|gifs|meme|reaction)\b/iu;
 
 const LOOKUP_FORCE_PATTERN =
   /\b(not found|never found|can't find|cant find|where (?:is|did)|show me|what happened to|pull it|fetch it)\b/iu;
@@ -206,6 +206,7 @@ const LATEST_POST_LOOKUP_PATTERN =
 
 const COMMENT_LOOKUP_PATTERN = /\bcomments?\b/iu;
 const FOLLOW_LOOKUP_PATTERN = /\bfollow(?:er|ers|ing)?\b/iu;
+const GIF_LOOKUP_PATTERN = /\b(gif|gifs|meme|reaction)\b/iu;
 
 const toFinitePositiveInt = (value: unknown): number | null => {
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
@@ -223,6 +224,28 @@ const parseHandleMentions = (value: string): string[] => {
     .map((match) => (match[1] ?? "").trim().toLowerCase())
     .filter((entry) => entry.length > 0);
   return [...new Set(handles)];
+};
+
+const extractGifSearchQuery = (value: string): string | null => {
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  if (!normalized.length) return null;
+  const slashMatch = /^\/(?:gif|gifs)\s+(.+)$/iu.exec(normalized);
+  if (slashMatch?.[1]) {
+    return toAnswerPreview(slashMatch[1], 120);
+  }
+  const afterGifMatch =
+    /\b(?:gif|gifs|meme|reaction)\b(?:\s+(?:of|for|about))?\s+(.+)/iu.exec(normalized);
+  if (afterGifMatch?.[1]) {
+    return toAnswerPreview(afterGifMatch[1], 120);
+  }
+  const softened = normalized.replace(
+    /\b(?:show|find|search|look|lookup|pull|fetch|get|give|send|share|checkout|check out)\b/giu,
+    " ",
+  );
+  const compact = softened.replace(/\s+/gu, " ").trim();
+  if (!compact.length) return null;
+  if (/^(?:gif|gifs|meme|reaction)$/iu.test(compact)) return null;
+  return toAnswerPreview(compact, 120);
 };
 
 const parseRetrievalHitCount = (bundle: ContextBundle): number => {
@@ -348,6 +371,47 @@ const summarizeCommentRecord = (
     .filter((part) => part.length > 0)
     .join(" · ");
   return { line, postId, commentId, bodyPreview };
+};
+
+const pickGifRecordsFromLookup = (
+  value: unknown,
+): Array<Record<string, unknown>> => {
+  if (Array.isArray(value)) {
+    return value.filter((entry): entry is Record<string, unknown> => isRecord(entry));
+  }
+  if (!isRecord(value)) return [];
+  if (Array.isArray(value.items)) {
+    return value.items.filter((entry): entry is Record<string, unknown> => isRecord(entry));
+  }
+  return [value];
+};
+
+const summarizeGifRecord = (
+  value: Record<string, unknown>,
+): { line: string; id: string | null; url: string | null; title: string | null } => {
+  const id = typeof value.id === "string" && value.id.trim().length > 0 ? value.id.trim() : null;
+  const url = typeof value.url === "string" && value.url.trim().length > 0 ? value.url.trim() : null;
+  const previewUrl =
+    typeof value.previewUrl === "string" && value.previewUrl.trim().length > 0
+      ? value.previewUrl.trim()
+      : null;
+  const titleRaw =
+    typeof value.title === "string" && value.title.trim().length > 0
+      ? value.title.trim()
+      : "";
+  const width = toFinitePositiveInt(value.width);
+  const height = toFinitePositiveInt(value.height);
+  const title = titleRaw.length > 0 ? toAnswerPreview(titleRaw, 60) : null;
+  const line = [
+    `gif:${id ?? "n/a"}`,
+    title ? `title=${title}` : "",
+    width && height ? `size=${width}x${height}` : "",
+    url ? `url=${url}` : "",
+    !url && previewUrl ? `preview=${previewUrl}` : "",
+  ]
+    .filter((part) => part.length > 0)
+    .join(" · ");
+  return { line, id, url: url ?? previewUrl, title };
 };
 
 const resolveRetrievalIntentForEntry = ({
@@ -1594,6 +1658,7 @@ export class ChatManager implements ChatManagerLike {
         "- user is talking to their connected runtime agent on Molkgram",
         "- prefer natural conversation; do not force command syntax",
         "- when asked about drafts/directives/posts/comments/likes, infer from recent memory first",
+        "- when asked for gifs or reactions, use live gif lookup results when available",
         "- if memory misses, use live site lookup results below before asking for clarification",
         "- if exact target unclear, ask one concise clarifying question",
         "",
@@ -1630,6 +1695,7 @@ export class ChatManager implements ChatManagerLike {
     }
     const query = input.retrievalQuery.trim();
     if (!query.length) return false;
+    if (GIF_LOOKUP_PATTERN.test(query)) return true;
     if (!SITE_LOOKUP_TRIGGER_PATTERN.test(query)) return false;
     if (LOOKUP_FORCE_PATTERN.test(query)) return true;
     if (LATEST_POST_LOOKUP_PATTERN.test(query)) return true;
@@ -1862,6 +1928,56 @@ export class ChatManager implements ChatManagerLike {
             error: toAnswerPreview(message, 180),
           });
         }
+      }
+    }
+
+    if (GIF_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      const gifQuery = extractGifSearchQuery(input.retrievalQuery);
+      try {
+        const response = await lookupCall({
+          action: "find_gif",
+          ...(gifQuery ? { query: gifQuery } : {}),
+          limit: 6,
+        });
+        const gifs = pickGifRecordsFromLookup(response)
+          .slice(0, 3)
+          .map((entry) => summarizeGifRecord(entry));
+        if (gifs.length === 0) {
+          lines.push(
+            gifQuery
+              ? `lookup: gifs for "${gifQuery}" not found`
+              : "lookup: trending gifs unavailable",
+          );
+          await remember({
+            lookupKind: "gif_search",
+            found: false,
+            query: gifQuery,
+            summary: gifQuery
+              ? `gifs for "${gifQuery}" not found`
+              : "trending gifs unavailable",
+          });
+        } else {
+          for (const gif of gifs) {
+            lines.push(`lookup: ${gif.line}`);
+            await remember({
+              lookupKind: "gif_search",
+              found: true,
+              query: gifQuery,
+              gifId: gif.id,
+              gifUrl: gif.url,
+              summary: gif.title ?? gif.line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(`lookup: gif fetch failed (${toAnswerPreview(message, 120)})`);
+        await remember({
+          lookupKind: "gif_search",
+          found: false,
+          query: gifQuery,
+          error: toAnswerPreview(message, 180),
+        });
       }
     }
 
