@@ -1183,7 +1183,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 <select id="rintent"><option value="chat">chat</option><option value="directive">directive</option><option value="engagement">engagement</option></select>
 <button id="rrun" type="button">Run</button>
 </div>
-<div id="rdmeta" class="muted">Use private health key to run retrieval debug.</div>
+<div id="rdmeta" class="muted">Run retrieval debug queries locally.</div>
 <div id="rd" class="list" style="margin-top:8px"></div>
 </div>
 <div class="card"><div class="muted">Recent Events</div><div id="events" class="list"></div></div>
@@ -1196,7 +1196,7 @@ const fmt=iso=>{if(!iso)return'n/a';const ms=Date.parse(iso);return Number.isFin
 const kv=obj=>Object.entries(obj).map(([k,v])=>'<div class="k">'+esc(k)+'</div><div>'+esc(v??'n/a')+'</div>').join('');
 const fmtTopicCounts=v=>{if(!v||typeof v!=='object')return'n/a';const o=v;return ['user','conversation','channel','server'].map(k=>k+':'+String(o[k]??0)).join(' · ')};
 const shellCounts=v=>{if(!v||typeof v!=='object')return'n/a';const c=v.counts; if(!c||typeof c!=='object')return'n/a'; return ['dms','agentDms','groups','servers','channels'].map(k=>k+':'+String(c[k]??0)).join(' · ')};
-const qs=new URLSearchParams(window.location.search);const k=(qs.get('key')??'').trim();const healthUrl=k?('/api/health/private?key='+encodeURIComponent(k)):'/api/health';
+const healthUrl='/api/health/private';
 const render=snap=>{if(!snap)return;document.getElementById('ts').textContent='updated '+fmt(snap.generatedAt)+(snap.available===false&&snap.reason?' · '+snap.reason:'');
 const[rC,rT]=badge(snap.runtime?.wsState);document.getElementById('rt').innerHTML='<div class="badge '+esc(rC)+'">'+esc(rT)+'</div><div class="kv" style="margin-top:8px">'+kv({auth:snap.runtime?.authEffective,permission:snap.runtime?.permissionState,wsTransport:snap.runtime?.wsTransportState,lastEnvelope:fmt(snap.runtime?.lastEnvelopeAt),lastPublish:fmt(snap.runtime?.lastPublishAt),publishError:snap.runtime?.lastPublishError??'none'})+'</div>';
 const[cC,cT]=badge(snap.chatBridge?.connected===true?'ready':(snap.chatBridge?.state??'unknown'));document.getElementById('cb').innerHTML='<div class="badge '+esc(cC)+'">'+esc(cT)+'</div><div class="kv" style="margin-top:8px">'+kv({connected:String(snap.chatBridge?.connected),mode:snap.chatBridge?.subscriptionMode,topics:snap.chatBridge?.subscribedTopics,requested:fmtTopicCounts(snap.chatBridge?.requestedTopicCounts),subscribed:fmtTopicCounts(snap.chatBridge?.subscribedTopicCounts),shell:shellCounts(snap.chatBridge?.lastShellSummary),ticketFailures:snap.chatBridge?.lastTicketFailureCount,lastError:snap.chatBridge?.lastError??'none'})+'</div>';
@@ -1205,7 +1205,7 @@ document.getElementById('mm').innerHTML='<div class="kv">'+kv({mood:snap.memory?
 document.getElementById('rp').innerHTML='<div class="kv">'+kv({enabled:String(snap.retention?.enabled),intervalMin:snap.retention?.intervalMinutes,postsDays:snap.retention?.postsDays,interactionsDays:snap.retention?.interactionsDays,notificationsDays:snap.retention?.notificationsDays,longTermEnabled:String(snap.retention?.longTermEnabled),longTermMaxCapsules:snap.retention?.longTermMaxCapsules,longTermCompactionsPerRun:snap.retention?.longTermMaxCompactionsPerRun})+'</div>';
 document.getElementById('ac').innerHTML='<div class="kv">'+kv({publishOk:snap.activity?.publishSuccess,publishFail:snap.activity?.publishFailed,directives:snap.activity?.directivesExecuted,messages:snap.activity?.chatMessagesReceived,autoReplies:snap.activity?.chatAutoRepliesSent})+'</div>';
 const evts=Array.isArray(snap.activity?.recentEvents)?snap.activity.recentEvents:[];document.getElementById('events').innerHTML=evts.length?evts.map(e=>'<div class="evt"><strong>'+esc(e?.type)+'</strong><br/><span class="muted">'+esc(e?.detail??'-')+' · '+esc(fmt(e?.at))+'</span></div>').join(''):'<div class="muted">No recent events.</div>';
-const files=snap.files&&typeof snap.files==='object'?snap.files:{};const pathRows=Object.entries(files);document.getElementById('paths').innerHTML=pathRows.length?pathRows.map(([k,v])=>'<div class="k">'+esc(k)+'</div><div><code>'+esc(v)+'</code></div>').join(''):'<div class="muted">Public projection only. Add ?key=... for private view.</div>'};
+const files=snap.files&&typeof snap.files==='object'?snap.files:{};const pathRows=Object.entries(files);document.getElementById('paths').innerHTML=pathRows.length?pathRows.map(([k,v])=>'<div class="k">'+esc(k)+'</div><div><code>'+esc(v)+'</code></div>').join(''):'<div class="muted">No state paths available.</div>'};
 const renderRetrieval=(payload)=>{
 const meta=document.getElementById('rdmeta');
 const box=document.getElementById('rd');
@@ -1251,7 +1251,7 @@ rows.push('<div class="evt"><strong>'+esc(h.sourceType??'event')+'</strong> scor
 }
 box.innerHTML=rows.join('')||'<div class="muted">No retrieval hits.</div>';
 };
-const runRetrieval=async()=>{if(!k){document.getElementById('rdmeta').textContent='add ?key=... for private retrieval debug';return;}const q=(document.getElementById('rq').value??'').toString().trim();const post=(document.getElementById('rpost').value??'').toString().trim();const comment=(document.getElementById('rcomment').value??'').toString().trim();const intent=(document.getElementById('rintent').value??'chat').toString();const sp=new URLSearchParams();if(q)sp.set('q',q);if(post)sp.set('postId',post);if(comment)sp.set('commentId',comment);if(intent)sp.set('intent',intent);sp.set('limit','20');sp.set('key',k);document.getElementById('rdmeta').textContent='running retrieval...';try{const r=await fetch('/api/health/retrieval?'+sp.toString(),{cache:'no-store'});renderRetrieval(await r.json())}catch(e){document.getElementById('rdmeta').textContent='retrieval failed: '+e}};
+const runRetrieval=async()=>{const q=(document.getElementById('rq').value??'').toString().trim();const post=(document.getElementById('rpost').value??'').toString().trim();const comment=(document.getElementById('rcomment').value??'').toString().trim();const intent=(document.getElementById('rintent').value??'chat').toString();const sp=new URLSearchParams();if(q)sp.set('q',q);if(post)sp.set('postId',post);if(comment)sp.set('commentId',comment);if(intent)sp.set('intent',intent);sp.set('limit','20');document.getElementById('rdmeta').textContent='running retrieval...';try{const r=await fetch('/api/health/retrieval?'+sp.toString(),{cache:'no-store'});renderRetrieval(await r.json())}catch(e){document.getElementById('rdmeta').textContent='retrieval failed: '+e}};
 const tick=async()=>{try{const r=await fetch(healthUrl,{cache:'no-store'});render(await r.json())}catch(e){document.getElementById('ts').textContent='refresh failed: '+e}};
 void tick();setInterval(tick,3000);
 document.getElementById('rrun').addEventListener('click',()=>{void runRetrieval()});
@@ -1399,11 +1399,26 @@ const main = async (): Promise<void> => {
   const port = Math.max(1, Math.min(65_535, parseIntEnv("MG_AGENT_HEALTH_PORT", 4278)));
   const privateKey = trimEnv("MG_AGENT_HEALTH_PRIVATE_KEY");
 
-  const hasPrivateAccess = (req: http.IncomingMessage, url: URL): boolean => {
+  const isLocalRequest = (req: http.IncomingMessage): boolean => {
+    const remoteRaw = (req.socket?.remoteAddress ?? "").trim().toLowerCase();
+    if (!remoteRaw) return false;
+    if (remoteRaw === "127.0.0.1" || remoteRaw === "::1" || remoteRaw === "::ffff:127.0.0.1") {
+      return true;
+    }
+    return remoteRaw.startsWith("127.") || remoteRaw.startsWith("::ffff:127.");
+  };
+
+  const hasPrivateAccess = (req: http.IncomingMessage): boolean => {
+    if (isLocalRequest(req)) return true;
     if (!privateKey) return true;
-    const fromQuery = (url.searchParams.get("key") ?? "").trim();
-    const fromHeader = (req.headers["x-agent-health-key"] ?? "").toString().trim();
-    return fromQuery === privateKey || fromHeader === privateKey;
+    const fromHeader = (
+      req.headers["x-agent-health-key"] ??
+      req.headers["x-health-key"] ??
+      ""
+    )
+      .toString()
+      .trim();
+    return fromHeader === privateKey;
   };
 
   const handleRequest = async (
@@ -1428,7 +1443,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (url.pathname === "/api/health/private") {
-      if (!hasPrivateAccess(req, url)) {
+      if (!hasPrivateAccess(req)) {
         json(res, 403, {
           ok: false,
           error: "forbidden",
@@ -1450,7 +1465,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (url.pathname === "/api/health/retrieval") {
-      if (!hasPrivateAccess(req, url)) {
+      if (!hasPrivateAccess(req)) {
         json(res, 403, {
           ok: false,
           error: "forbidden",
@@ -1513,7 +1528,7 @@ const main = async (): Promise<void> => {
       }
     }
     if (url.pathname === "/api/health/retention") {
-      if (!hasPrivateAccess(req, url)) {
+      if (!hasPrivateAccess(req)) {
         json(res, 403, {
           ok: false,
           error: "forbidden",
