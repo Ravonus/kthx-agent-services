@@ -1527,6 +1527,40 @@ const main = async (): Promise<void> => {
         return;
       }
     }
+    if (url.pathname === "/api/health/directive-lifecycle") {
+      if (!hasPrivateAccess(req)) {
+        json(res, 403, {
+          ok: false,
+          error: "forbidden",
+          message: "Missing or invalid health private key.",
+        });
+        return;
+      }
+      try {
+        const limitRaw = url.searchParams.get("limit");
+        const limitParsed =
+          typeof limitRaw === "string" ? Number.parseInt(limitRaw, 10) : Number.NaN;
+        const limit =
+          Number.isFinite(limitParsed) && limitParsed > 0
+            ? Math.max(1, Math.min(200, Math.floor(limitParsed)))
+            : 50;
+        const rows = db.getRecentCommandLifecycle(limit);
+        json(res, 200, {
+          ok: true,
+          generatedAt: new Date().toISOString(),
+          count: rows.length,
+          rows,
+        });
+        return;
+      } catch (error: unknown) {
+        json(res, 500, {
+          ok: false,
+          error: "directive_lifecycle_unavailable",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+    }
     if (url.pathname === "/api/health/retention") {
       if (!hasPrivateAccess(req)) {
         json(res, 403, {

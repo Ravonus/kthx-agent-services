@@ -23,12 +23,19 @@ import {
 } from "../chat/chat-context.js";
 import { verifyRuntimeCommandSeal } from "../directives/command-seal.js";
 import type { CommandSealState } from "../directives/command-seal.js";
+import { parseGrantCandidatesFromPermissionState } from "../grants/grant-state.js";
 import { computeCommandSignature } from "../lib/crypto.js";
+import {
+  applyTargetLock,
+  buildTargetHash,
+  isTargetLockMatch,
+} from "../lib/command-target.js";
 import { appendJsonLine, ensureDir, readJsonMaybeIncomplete, readJsonFile, writeJsonFile } from "../lib/fs.js";
 import { isRecord } from "../lib/guards.js";
 import { parseCommand, parseJsonFromMixedText } from "../lib/parsing.js";
 import { nowIso } from "../lib/text.js";
 import { normalizeQueueState } from "../queue/queue-state.js";
+import type { StateSqliteStore, CommandLifecycleState } from "../state/sqlite-state.js";
 import type { QueueState } from "../types/ipc.js";
 import type { Command } from "../types/ipc.js";
 import type { ContextBundle, ContextRequest } from "../types/memory.js";
@@ -39,6 +46,9 @@ const MAX_COLLECTED_REFERENCE_INPUTS = 12;
 const COMMENT_ECHO_PREFIX_PATTERN = /^frame\s*\d+\s*[:.-]/iu;
 const COMMENT_PROMPT_WRAPPER_PATTERN =
   /^(?:generate|create|make|draw|render)\s+(?:an?\s+)?(?:image|gif|avatar|banner|file)\b/iu;
+const ACTION_IDEMPOTENCY_IN_FLIGHT_WINDOW_MS = 45_000;
+const ACTION_REQUEUE_BACKOFF_MS = 15_000;
+const OWNER_CAPABILITY_COOLDOWN_MS = 60_000;
 const COMMENT_TOKEN_STOP_WORDS = new Set([
   "a",
   "an",
@@ -362,6 +372,7 @@ type CommandExecutorContext = {
     recordWrite(payload: unknown): Promise<void>;
     buildContext?: (request: ContextRequest) => Promise<ContextBundle>;
   };
+  stateDb?: StateSqliteStore | null;
   trpc: TrpcLike | null;
   commandSeal: CommandSealState;
   controlKey: string | null;
@@ -444,11 +455,30 @@ type EngagementDecision = {
   shouldExecute: boolean;
   reason: string;
   source: "openclaw";
+  contract: ActionContract | null;
+};
+
+type ActionContract = {
+  action: "comment" | "like" | "repost";
+  target: {
+    postId: number;
+    commentId: number | null;
+    targetHash: string;
+  };
+  body: string | null;
+  reason: string;
+  shouldExecute: boolean;
+};
+
+type OwnerCapabilityCooldown = {
+  untilMs: number;
+  reason: string;
 };
 
 export class CommandExecutor {
   private readonly ctx: CommandExecutorContext;
   private readonly inFlight = new Set<string>();
+  private readonly ownerCapabilityDeniedByTarget = new Map<string, OwnerCapabilityCooldown>();
 
   constructor(ctx: CommandExecutorContext) {
     this.ctx = ctx;
@@ -707,6 +737,339 @@ export class CommandExecutor {
     return { processed: true, outcome };
   }
 
+  private grantActionKeysFor(action: "comment" | "like" | "repost"): string[] {
+    if (action === "comment") return ["comment", "write.commentPost"];
+    if (action === "like") return ["like", "write.votePost"];
+    return ["repost", "write.repostPost"];
+  }
+
+  private hasUsablePermissionWindowForAction(
+    permissionState: unknown,
+    action: "comment" | "like" | "repost",
+  ): boolean {
+    const candidates = parseGrantCandidatesFromPermissionState(permissionState);
+    if (!candidates.length) return false;
+    const nowMs = Date.now();
+    const actionKeys = this.grantActionKeysFor(action);
+    for (const candidate of candidates) {
+      if (candidate.expiresAtMs <= nowMs) continue;
+      for (const key of actionKeys) {
+        const actionState = candidate.actions.get(key);
+        if (!actionState || actionState.remainingCount <= 0) continue;
+        const notBeforeAtMs =
+          typeof actionState.notBeforeAtMs === "number" &&
+          Number.isFinite(actionState.notBeforeAtMs)
+            ? actionState.notBeforeAtMs
+            : candidate.issuedAtMs + actionState.notBeforeSeconds * 1000;
+        if (notBeforeAtMs > nowMs) continue;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private buildActionIdempotencyKey(input: {
+    command: Command;
+    action: "comment" | "like" | "repost";
+    postId: number;
+    commentId: number | null;
+  }): string {
+    const directiveId = input.command.sourceDirectiveId ?? input.command.id;
+    const targetHash = buildTargetHash({
+      postId: input.postId,
+      commentId: input.commentId,
+    });
+    return crypto
+      .createHash("sha256")
+      .update(
+        JSON.stringify({
+          directiveId,
+          actionNonce: input.command.actionNonce ?? "",
+          action: input.action,
+          targetHash,
+        }),
+      )
+      .digest("hex");
+  }
+
+  private beginActionLifecycle(input: {
+    command: Command;
+    action: "comment" | "like" | "repost";
+    idempotencyKey: string;
+    target: {
+      postId: number;
+      commentId: number | null;
+      targetHash: string;
+    };
+    state: CommandLifecycleState;
+  }): { allowed: boolean; reason: string; requeue: boolean } {
+    const stateDb = this.ctx.stateDb;
+    if (!stateDb || !stateDb.enabled) {
+      return { allowed: true, reason: "state_db_disabled", requeue: false };
+    }
+    const existing = stateDb.getCommandLifecycleByIdempotencyKey(
+      input.idempotencyKey,
+    );
+    if (existing) {
+      if (existing.state === "acked") {
+        return { allowed: false, reason: "already_acked", requeue: false };
+      }
+      const updatedAtMs = Date.parse(existing.updatedAt);
+      if (
+        existing.state === "requeue" &&
+        Number.isFinite(updatedAtMs) &&
+        Date.now() - updatedAtMs < ACTION_REQUEUE_BACKOFF_MS
+      ) {
+        return { allowed: false, reason: "requeue_backoff", requeue: true };
+      }
+      if (
+        existing.state === "queued" ||
+        existing.state === "context_ready" ||
+        existing.state === "llm_running" ||
+        existing.state === "action_running"
+      ) {
+        if (
+          Number.isFinite(updatedAtMs) &&
+          Date.now() - updatedAtMs <
+            ACTION_IDEMPOTENCY_IN_FLIGHT_WINDOW_MS
+        ) {
+          return { allowed: false, reason: "already_in_flight", requeue: false };
+        }
+      }
+    }
+    stateDb.upsertCommandLifecycle({
+      commandId: input.command.id,
+      directiveId: input.command.sourceDirectiveId ?? input.command.id,
+      action: input.action,
+      targetPostId: input.target.postId,
+      targetCommentId: input.target.commentId,
+      targetHash: input.target.targetHash,
+      idempotencyKey: input.idempotencyKey,
+      state: input.state,
+      attemptDelta: 1,
+      sourceKind: input.command.kind,
+      grantId: input.command.grantId,
+      payload: input.command.payload,
+    });
+    return { allowed: true, reason: existing ? "retry" : "new", requeue: false };
+  }
+
+  private updateActionLifecycle(input: {
+    command: Command;
+    action: "comment" | "like" | "repost";
+    idempotencyKey: string;
+    target: {
+      postId: number;
+      commentId: number | null;
+      targetHash: string;
+    };
+    state: CommandLifecycleState;
+    lastError?: string | null;
+  }): void {
+    const stateDb = this.ctx.stateDb;
+    if (!stateDb || !stateDb.enabled) return;
+    stateDb.upsertCommandLifecycle({
+      commandId: input.command.id,
+      directiveId: input.command.sourceDirectiveId ?? input.command.id,
+      action: input.action,
+      targetPostId: input.target.postId,
+      targetCommentId: input.target.commentId,
+      targetHash: input.target.targetHash,
+      idempotencyKey: input.idempotencyKey,
+      state: input.state,
+      lastError: input.lastError ?? null,
+      sourceKind: input.command.kind,
+      grantId: input.command.grantId,
+      payload: input.command.payload,
+    });
+  }
+
+  private ownerCapabilityCooldownKey(input: {
+    action: "comment" | "like" | "repost";
+    targetHash: string;
+  }): string {
+    return `${input.action}:${input.targetHash}`;
+  }
+
+  private registerOwnerCapabilityCooldown(input: {
+    action: "comment" | "like" | "repost";
+    targetHash: string;
+    reason: string;
+  }): void {
+    const key = this.ownerCapabilityCooldownKey(input);
+    this.ownerCapabilityDeniedByTarget.set(key, {
+      untilMs: Date.now() + OWNER_CAPABILITY_COOLDOWN_MS,
+      reason: input.reason,
+    });
+  }
+
+  private resolveOwnerCapabilityCooldown(input: {
+    action: "comment" | "like" | "repost";
+    targetHash: string;
+  }): OwnerCapabilityCooldown | null {
+    const key = this.ownerCapabilityCooldownKey(input);
+    const entry = this.ownerCapabilityDeniedByTarget.get(key);
+    if (!entry) return null;
+    if (!Number.isFinite(entry.untilMs) || entry.untilMs <= Date.now()) {
+      this.ownerCapabilityDeniedByTarget.delete(key);
+      return null;
+    }
+    return entry;
+  }
+
+  private isOwnerCapabilityDeniedError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    return /owner capability denied/iu.test(error.message);
+  }
+
+  private async preflightGrantForAction(input: {
+    command: Command;
+    payload: Record<string, unknown>;
+    action: "comment" | "like" | "repost";
+    lifecycle: {
+      idempotencyKey: string;
+      target: {
+        postId: number;
+        commentId: number | null;
+        targetHash: string;
+      };
+    };
+  }): Promise<string> {
+    const ownerCooldown = this.resolveOwnerCapabilityCooldown({
+      action: input.action,
+      targetHash: input.lifecycle.target.targetHash,
+    });
+    if (ownerCooldown) {
+      const retryInMs = Math.max(0, ownerCooldown.untilMs - Date.now());
+      const message = `Owner capability denied: ${ownerCooldown.reason}. retry_in_ms=${retryInMs}`;
+      this.updateActionLifecycle({
+        command: input.command,
+        action: input.action,
+        idempotencyKey: input.lifecycle.idempotencyKey,
+        target: input.lifecycle.target,
+        state: "failed",
+        lastError: message,
+      });
+      throw new Error(message);
+    }
+
+    const grantId =
+      asNonEmptyString(input.command.grantId) ??
+      asNonEmptyString(input.payload.grantId);
+    if (grantId) return grantId;
+
+    const hasUsableWindow = this.hasUsablePermissionWindowForAction(
+      input.payload.permissionState,
+      input.action,
+    );
+    const reason = hasUsableWindow
+      ? "missing_grant_id_with_active_window"
+      : "no_grant";
+    const errorMessage = `Owner capability denied: ${reason}.`;
+    this.updateActionLifecycle({
+      command: input.command,
+      action: input.action,
+      idempotencyKey: input.lifecycle.idempotencyKey,
+      target: input.lifecycle.target,
+      state: "failed",
+      lastError: errorMessage,
+    });
+    await this.ctx.memory
+      .recordWrite({
+        type: "directive_preflight_grant_failed",
+        at: nowIso(),
+        commandId: input.command.id,
+        directiveId: input.command.sourceDirectiveId ?? input.command.id,
+        action: input.action,
+        reason,
+        hasUsableWindow,
+      })
+      .catch(() => undefined);
+    throw new Error(errorMessage);
+  }
+
+  private extractActionContractFromUnknown(input: {
+    value: unknown;
+    action: "comment" | "like" | "repost";
+    expectedPostId: number;
+    expectedCommentId: number | null;
+    expectedTargetHash: string;
+  }): ActionContract | null {
+    const parseFromRecord = (record: Record<string, unknown>): ActionContract | null => {
+      const action = asNonEmptyString(record.action)?.toLowerCase();
+      if (action !== input.action) return null;
+      if (typeof record.shouldExecute !== "boolean") return null;
+      const target = isRecord(record.target) ? record.target : null;
+      if (!target) return null;
+      const postId = asPositiveInt(target.postId);
+      if (postId !== input.expectedPostId) return null;
+      const commentId =
+        target.commentId === null ? null : asPositiveInt(target.commentId);
+      if (commentId !== (input.expectedCommentId ?? null)) return null;
+      const targetHash = asNonEmptyString(target.targetHash);
+      if (!targetHash || targetHash !== input.expectedTargetHash) return null;
+      const targetLockMatch = isTargetLockMatch({
+        payload: {
+          targetPostId: postId,
+          targetCommentId: commentId,
+          targetHash,
+        },
+        expected: {
+          postId: input.expectedPostId,
+          commentId: input.expectedCommentId,
+          targetHash: input.expectedTargetHash,
+        },
+      });
+      if (!targetLockMatch.ok) return null;
+      const reason = truncateText(asNonEmptyString(record.reason) ?? "no_reason", 120);
+      const body = asNonEmptyString(record.body);
+      if (input.action === "comment" && !body) return null;
+      return {
+        action: input.action,
+        target: {
+          postId,
+          commentId,
+          targetHash,
+        },
+        body: body ?? null,
+        reason,
+        shouldExecute: record.shouldExecute,
+      };
+    };
+
+    if (typeof input.value === "string") {
+      const trimmed = input.value.trim();
+      if (!trimmed.length) return null;
+      const parsed = parseJsonFromMixedText(trimmed);
+      if (parsed === null || parsed === input.value) return null;
+      return this.extractActionContractFromUnknown({
+        ...input,
+        value: parsed,
+      });
+    }
+    if (Array.isArray(input.value)) {
+      for (const entry of input.value) {
+        const parsed = this.extractActionContractFromUnknown({
+          ...input,
+          value: entry,
+        });
+        if (parsed) return parsed;
+      }
+      return null;
+    }
+    if (!isRecord(input.value)) return null;
+    const direct = parseFromRecord(input.value);
+    if (direct) return direct;
+    for (const key of ["contract", "result", "output", "payload", "data", "content"] as const) {
+      const nested = this.extractActionContractFromUnknown({
+        ...input,
+        value: input.value[key],
+      });
+      if (nested) return nested;
+    }
+    return null;
+  }
+
   private async executeWriteCreatePost(command: Command): Promise<CommandOutcome> {
     const payload = isRecord(command.payload) ? command.payload : null;
     if (!payload) {
@@ -908,38 +1271,110 @@ export class CommandExecutor {
       return this.failedOutcome(command, "Invalid payload for write.commentPost.");
     }
     const postId = asPositiveInt(payload.postId);
-    const body = asNonEmptyString(payload.body);
-    if (!postId || !body) {
-      return this.failedOutcome(command, "postId and body are required for comments.");
+    const body =
+      asNonEmptyString(payload.body) ??
+      asNonEmptyString(payload.requestText) ??
+      asNonEmptyString(payload.prompt) ??
+      "Write a concise, relevant reply to the target post.";
+    if (!postId) {
+      return this.failedOutcome(command, "postId is required for comments.");
     }
-    const provenance = asNonEmptyString(payload.provenance);
-    const sourceDirectiveId =
-      asNonEmptyString(payload.sourceDirectiveId) ??
-      command.sourceDirectiveId ??
-      null;
-    const sourceDirectiveActionNonce =
-      asNonEmptyString(payload.sourceDirectiveActionNonce) ??
-      command.actionNonce ??
-      null;
     const parentId = asPositiveInt(payload.parentId);
-    const curatedBody = await this.curateCommentBodyWithOpenClaw({
-      command,
+    const expectedTarget = {
+      postId,
+      commentId: parentId ?? null,
+      targetHash: buildTargetHash({
+        postId,
+        commentId: parentId ?? null,
+      }),
+    };
+    const lockMatch = isTargetLockMatch({
       payload,
-      postId,
-      parentId,
-      body,
+      expected: expectedTarget,
     });
-    const finalBody = curatedBody?.body ?? body;
-    const result = await this.agent().commentPost.mutate({
+    if (!lockMatch.ok) {
+      return this.failedOutcome(
+        command,
+        `Target lock mismatch: ${lockMatch.reason}.`,
+        "target_lock_mismatch",
+      );
+    }
+    const target = applyTargetLock(payload, {
       postId,
-      body: finalBody,
-      ...(parentId ? { parentId } : {}),
-      ...(provenance ? { provenance } : {}),
-      ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
-      ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
-      ...(command.grantId ? { grantId: command.grantId } : {}),
+      commentId: parentId ?? null,
     });
-    if (curatedBody) {
+    const idempotencyKey = this.buildActionIdempotencyKey({
+      command,
+      action: "comment",
+      postId: target.postId,
+      commentId: target.commentId,
+    });
+    const dedupe = this.beginActionLifecycle({
+      command,
+      action: "comment",
+      idempotencyKey,
+      target,
+      state: "context_ready",
+    });
+    if (!dedupe.allowed) {
+      if (dedupe.requeue) {
+        throw new RequeueCommandError(
+          `comment_waiting_for_backoff:${dedupe.reason}`,
+        );
+      }
+      return this.successOutcome(command, {
+        skipped: true,
+        action: "comment",
+        postId: target.postId,
+        commentId: target.commentId,
+        decision: dedupe.reason,
+      });
+    }
+    try {
+      const grantId = await this.preflightGrantForAction({
+        command,
+        payload,
+        action: "comment",
+        lifecycle: {
+          idempotencyKey,
+          target,
+        },
+      });
+      const provenance = asNonEmptyString(payload.provenance);
+      const sourceDirectiveId =
+        asNonEmptyString(payload.sourceDirectiveId) ??
+        command.sourceDirectiveId ??
+        null;
+      const sourceDirectiveActionNonce =
+        asNonEmptyString(payload.sourceDirectiveActionNonce) ??
+        command.actionNonce ??
+        null;
+      const curatedBody = await this.curateCommentBodyWithOpenClaw({
+        command,
+        payload,
+        postId,
+        parentId,
+        body,
+        targetHash: target.targetHash,
+        lifecycleIdempotencyKey: idempotencyKey,
+      });
+      this.updateActionLifecycle({
+        command,
+        action: "comment",
+        idempotencyKey,
+        target,
+        state: "action_running",
+      });
+      const finalBody = curatedBody.body;
+      const result = await this.agent().commentPost.mutate({
+        postId,
+        body: finalBody,
+        ...(parentId ? { parentId } : {}),
+        ...(provenance ? { provenance } : {}),
+        ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
+        ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
+        grantId,
+      });
       await this.ctx.memory
         .recordWrite({
           type: "comment_body_curated",
@@ -953,8 +1388,45 @@ export class CommandExecutor {
           finalBody: truncateText(finalBody, 200),
         })
         .catch(() => undefined);
+      this.updateActionLifecycle({
+        command,
+        action: "comment",
+        idempotencyKey,
+        target,
+        state: "acked",
+        lastError: null,
+      });
+      return this.successOutcome(command, result);
+    } catch (error: unknown) {
+      if (error instanceof RequeueCommandError) {
+        this.updateActionLifecycle({
+          command,
+          action: "comment",
+          idempotencyKey,
+          target,
+          state: "requeue",
+          lastError: error.message,
+        });
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.isOwnerCapabilityDeniedError(error)) {
+        this.registerOwnerCapabilityCooldown({
+          action: "comment",
+          targetHash: target.targetHash,
+          reason: "not_granted",
+        });
+      }
+      this.updateActionLifecycle({
+        command,
+        action: "comment",
+        idempotencyKey,
+        target,
+        state: "failed",
+        lastError: message,
+      });
+      throw error;
     }
-    return this.successOutcome(command, result);
   }
 
   private async curateCommentBodyWithOpenClaw(input: {
@@ -963,92 +1435,152 @@ export class CommandExecutor {
     postId: number;
     parentId: number | null;
     body: string;
-  }): Promise<CuratedCommentBody | null> {
+    targetHash: string;
+    lifecycleIdempotencyKey: string;
+  }): Promise<CuratedCommentBody> {
     const context = await this.loadCommentCurationContext({
       postId: input.postId,
       parentId: input.parentId,
       payload: input.payload,
     });
     const draftBody = input.body.trim();
-    if (!draftBody.length) return null;
+    if (!draftBody.length) {
+      throw new Error("Comment blocked: empty draft body.");
+    }
 
     const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
+    if (!runOpenClawPrompt) {
+      throw new RequeueCommandError(
+        "comment_curation_waiting_for_openclaw:openclaw_required_unavailable",
+      );
+    }
+    if (!context.postText && !context.mediaSummary && !context.threadSummary) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "comment_body_curation_blocked",
+          at: nowIso(),
+          commandId: input.command.id,
+          postId: input.postId,
+          parentId: input.parentId,
+          reason: "missing_target_post_context",
+        })
+        .catch(() => undefined);
+      throw new RequeueCommandError(
+        "comment_curation_waiting_for_target_context:missing_target_post_context",
+      );
+    }
     let attemptedOpenClawCuration = false;
     let openClawCurationErrored = false;
-    if (runOpenClawPrompt) {
-      attemptedOpenClawCuration = true;
-      try {
-        const curationPrompt = this.buildCommentCurationPrompt({
+    attemptedOpenClawCuration = true;
+    try {
+      this.updateActionLifecycle({
+        command: input.command,
+        action: "comment",
+        idempotencyKey: input.lifecycleIdempotencyKey,
+        target: {
           postId: input.postId,
-          draftBody,
-          context,
-        });
-        const result = await runOpenClawPrompt({
-          prompt: curationPrompt,
-          purpose: "comment_body_curation",
-        });
-        const candidate =
-          (result
-            ? this.extractCuratedCommentBodyFromUnknown(result.parsed) ??
-              this.extractCuratedCommentBodyFromUnknown(result.payloadText) ??
-              this.extractCuratedCommentBodyFromUnknown(result.raw)
-            : null) ?? null;
-        if (candidate) {
-          const validation = this.validateCuratedCommentCandidate({
-            candidate,
-            draftBody,
-            context,
-          });
-          if (validation.ok) {
-            return {
-              body: candidate,
-              source: "openclaw",
-              reason: "openclaw_curated",
-            };
-          }
+          commentId: input.parentId,
+          targetHash: input.targetHash,
+        },
+        state: "llm_running",
+      });
+      const curationPrompt = this.buildCommentCurationPrompt({
+        postId: input.postId,
+        parentId: input.parentId,
+        targetHash: input.targetHash,
+        draftBody,
+        context,
+      });
+      const result = await runOpenClawPrompt({
+        prompt: curationPrompt,
+        purpose: "comment_body_curation",
+      });
+      const contract =
+        (result
+          ? this.extractActionContractFromUnknown({
+            value: result.parsed,
+            action: "comment",
+            expectedPostId: input.postId,
+            expectedCommentId: input.parentId,
+            expectedTargetHash: input.targetHash,
+          }) ??
+            this.extractActionContractFromUnknown({
+              value: result.payloadText,
+              action: "comment",
+              expectedPostId: input.postId,
+              expectedCommentId: input.parentId,
+              expectedTargetHash: input.targetHash,
+            }) ??
+            this.extractActionContractFromUnknown({
+              value: result.raw,
+              action: "comment",
+              expectedPostId: input.postId,
+              expectedCommentId: input.parentId,
+              expectedTargetHash: input.targetHash,
+            })
+          : null) ?? null;
+      if (contract) {
+        if (!contract.shouldExecute || !contract.body) {
           await this.ctx.memory
             .recordWrite({
               type: "comment_body_curation_rejected",
               at: nowIso(),
               commandId: input.command.id,
               postId: input.postId,
-              reason: validation.reason,
+              reason: contract.shouldExecute ? "missing_body" : "llm_declined_execute",
               draftBody: truncateText(draftBody, 200),
-              candidate: truncateText(candidate, 200),
             })
             .catch(() => undefined);
-        } else {
-          await this.ctx.memory
-            .recordWrite({
-              type: "comment_body_curation_missing_candidate",
-              at: nowIso(),
-              commandId: input.command.id,
-              postId: input.postId,
-            })
-            .catch(() => undefined);
+          throw new RequeueCommandError(
+            "comment_curation_waiting_for_openclaw:openclaw_declined_or_missing_body",
+          );
         }
-      } catch (error: unknown) {
-        openClawCurationErrored = true;
+        const validation = this.validateCuratedCommentCandidate({
+          candidate: contract.body,
+          draftBody,
+          context,
+        });
+        if (validation.ok) {
+          return {
+            body: contract.body,
+            source: "openclaw",
+            reason: "openclaw_curated",
+          };
+        }
         await this.ctx.memory
           .recordWrite({
-            type: "comment_body_curation_failed",
+            type: "comment_body_curation_rejected",
             at: nowIso(),
             commandId: input.command.id,
             postId: input.postId,
-            error: error instanceof Error ? error.message : String(error),
+            reason: validation.reason,
+            draftBody: truncateText(draftBody, 200),
+            candidate: truncateText(contract.body, 200),
+          })
+          .catch(() => undefined);
+      } else {
+        await this.ctx.memory
+          .recordWrite({
+            type: "comment_body_curation_missing_contract",
+            at: nowIso(),
+            commandId: input.command.id,
+            postId: input.postId,
           })
           .catch(() => undefined);
       }
+    } catch (error: unknown) {
+      openClawCurationErrored = true;
+      await this.ctx.memory
+        .recordWrite({
+          type: "comment_body_curation_failed",
+          at: nowIso(),
+          commandId: input.command.id,
+          postId: input.postId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
     }
 
-    if (!this.isDraftCommentEchoLike(draftBody, context)) {
-      return null;
-    }
-    if (!runOpenClawPrompt) {
-      throw new RequeueCommandError(
-        "comment_curation_waiting_for_openclaw:openclaw_required_unavailable",
-      );
-    }
     if (openClawCurationErrored) {
       throw new RequeueCommandError(
         "comment_curation_waiting_for_openclaw:openclaw_curation_failed",
@@ -1062,13 +1594,13 @@ export class CommandExecutor {
         postId: input.postId,
         parentId: input.parentId,
         reason: attemptedOpenClawCuration
-          ? "echo_like_without_valid_llm_curation"
-          : "echo_like_without_llm_curation",
+          ? "target_specific_llm_curation_required"
+          : "missing_llm_curation",
         draftBody: truncateText(draftBody, 200),
       })
       .catch(() => undefined);
-    throw new Error(
-      "Comment blocked: near-duplicate/echo content requires valid LLM curation.",
+    throw new RequeueCommandError(
+      "comment_curation_waiting_for_openclaw:openclaw_contract_invalid",
     );
   }
 
@@ -1101,7 +1633,10 @@ export class CommandExecutor {
         action: "find_post",
         postId: input.postId,
       });
-      const postRecord = this.extractPostRecordForCommentCuration(postResponse);
+      const postRecord = this.extractPostRecordForCommentCuration(
+        postResponse,
+        input.postId,
+      );
       if (postRecord) {
         const author = isRecord(postRecord.author) ? postRecord.author : null;
         context.postAuthorHandle =
@@ -1234,11 +1769,15 @@ export class CommandExecutor {
     const commentToken =
       typeof input.commentId === "number" ? `comment ${input.commentId}` : "";
     const hintToken = payloadHint ? `hint ${payloadHint}` : "";
+    const scopeToken =
+      input.action === "comment"
+        ? "target post and thread only"
+        : "most engaged comments last comments, likes and views this week";
     return [
       actionPhrase,
       `post ${input.postId}`,
       commentToken,
-      "most engaged comments last comments, likes and views this week",
+      scopeToken,
       hintToken,
     ]
       .filter((value) => value.length > 0)
@@ -1300,15 +1839,34 @@ export class CommandExecutor {
     return truncateText(lines.join("\n"), 2200);
   }
 
-  private extractPostRecordForCommentCuration(value: unknown): Record<string, unknown> | null {
+  private extractPostRecordForCommentCuration(
+    value: unknown,
+    expectedPostId: number,
+  ): Record<string, unknown> | null {
     if (!isRecord(value)) return null;
-    if (isRecord(value.data)) return this.extractPostRecordForCommentCuration(value.data);
-    if (isRecord(value.post)) return value.post;
-    if (Array.isArray(value.items)) {
-      const first = value.items.find((entry) => isRecord(entry));
-      if (isRecord(first)) return first;
+    if (isRecord(value.data)) {
+      return this.extractPostRecordForCommentCuration(value.data, expectedPostId);
     }
-    return value;
+    if (isRecord(value.post)) {
+      const postId = asPositiveInt(value.post.id);
+      if (postId === expectedPostId) return value.post;
+      return null;
+    }
+    if (Array.isArray(value.items)) {
+      const items = value.items as unknown[];
+      const match = items.find((entry): entry is Record<string, unknown> => {
+        if (!isRecord(entry)) return false;
+        const postId = asPositiveInt(entry.id);
+        return postId === expectedPostId;
+      });
+      if (match) return match;
+      return null;
+    }
+    const rootPostId = asPositiveInt(value.id);
+    if (rootPostId === expectedPostId) {
+      return value;
+    }
+    return null;
   }
 
   private extractCommentRecordForCommentCuration(
@@ -1356,6 +1914,8 @@ export class CommandExecutor {
 
   private buildCommentCurationPrompt(input: {
     postId: number;
+    parentId: number | null;
+    targetHash: string;
     draftBody: string;
     context: CommentCurationContext;
   }): string {
@@ -1377,10 +1937,13 @@ export class CommandExecutor {
       "Rules:",
       "- body must be 14-180 characters.",
       "- 1-2 concise sentences in a natural voice.",
-      "- Reference real context from the post/media/thread details.",
+      "- Must clearly reference THIS target post/thread context.",
+      "- Include at least one concrete detail from post/media/thread context.",
       "- Do not copy wording from the draft or post text.",
       "- Never start with 'Frame N:' and never output image-prompt wrappers.",
       "- No hashtags, no emojis, no system/tool mentions.",
+      "Return strict JSON ONLY with this exact shape:",
+      `{"action":"comment","target":{"postId":${input.postId},"commentId":${input.parentId ?? "null"},"targetHash":"${input.targetHash}"},"body":"<comment>","reason":"<short reason>","shouldExecute":true}`,
       `Draft comment: ${input.draftBody}`,
       "Context:",
       ...contextLines.map((line) => `- ${line}`),
@@ -1495,7 +2058,42 @@ export class CommandExecutor {
         return { ok: false, reason: "contains_payload_hint_phrase" };
       }
     }
+    if (!this.hasTargetContextAnchor(candidate, input.context)) {
+      return { ok: false, reason: "missing_target_context_anchor" };
+    }
     return { ok: true };
+  }
+
+  private hasTargetContextAnchor(
+    candidate: string,
+    context: CommentCurationContext,
+  ): boolean {
+    const anchorSource = [
+      context.postText ?? "",
+      context.mediaSummary ?? "",
+      context.threadSummary ?? "",
+    ]
+      .filter((part) => part.trim().length > 0)
+      .join(" \n ");
+    const anchorTokens = Array.from(new Set(tokenizeCommentText(anchorSource)));
+    if (anchorTokens.length < 3) {
+      return true;
+    }
+    const candidateTokens = new Set(tokenizeCommentText(candidate));
+    if (candidateTokens.size === 0) {
+      return false;
+    }
+    const minimumOverlap = anchorTokens.length >= 12 ? 2 : 1;
+    let overlap = 0;
+    for (const token of anchorTokens) {
+      if (candidateTokens.has(token)) {
+        overlap += 1;
+        if (overlap >= minimumOverlap) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   private isDraftCommentEchoLike(body: string, context: CommentCurationContext): boolean {
@@ -1572,7 +2170,10 @@ export class CommandExecutor {
         action: "find_post",
         postId: input.postId,
       });
-      const postRecord = this.extractPostRecordForCommentCuration(postResponse);
+      const postRecord = this.extractPostRecordForCommentCuration(
+        postResponse,
+        input.postId,
+      );
       if (!postRecord) return context;
       const author = isRecord(postRecord.author) ? postRecord.author : null;
       context.postAuthorHandle =
@@ -1601,6 +2202,7 @@ export class CommandExecutor {
   private buildEngagementDecisionPrompt(input: {
     action: "like" | "repost";
     postId: number;
+    targetHash: string;
     context: EngagementDecisionContext;
   }): string {
     const actionLabel = input.action === "like" ? "like" : "repost";
@@ -1616,45 +2218,19 @@ export class CommandExecutor {
     ].filter((entry): entry is string => Boolean(entry));
     return [
       "Decide whether the runtime should execute this social engagement action now.",
-      "Return strict JSON only with exactly this shape:",
-      '{"shouldExecute":true|false,"reason":"..."}',
+      "Return strict JSON only.",
       "Rules:",
       "- shouldExecute=true when context suggests this action is relevant and non-spammy.",
       "- Prefer own-post engagement when it is active and high-signal; avoid repetitive low-value actions.",
       "- reason must be short (6-120 chars) and action-specific.",
+      `- action must be exactly \"${actionLabel}\".`,
+      "- target fields must match exactly.",
+      "Return strict JSON ONLY with this exact shape:",
+      `{"action":"${actionLabel}","target":{"postId":${input.postId},"commentId":null,"targetHash":"${input.targetHash}"},"shouldExecute":true,"reason":"<short reason>"}`,
       `Action: ${actionLabel}`,
       "Context:",
       ...contextLines.map((line) => `- ${line}`),
     ].join("\n");
-  }
-
-  private extractEngagementDecisionFromUnknown(
-    value: unknown,
-  ): { shouldExecute: boolean; reason: string } | null {
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      if (!trimmed.length) return null;
-      const parsed = parseJsonFromMixedText(trimmed);
-      if (parsed !== null && parsed !== value) {
-        return this.extractEngagementDecisionFromUnknown(parsed);
-      }
-      const lowered = trimmed.toLowerCase();
-      if (lowered === "yes" || lowered === "true") {
-        return { shouldExecute: true, reason: "approved" };
-      }
-      if (lowered === "no" || lowered === "false") {
-        return { shouldExecute: false, reason: "declined" };
-      }
-      return null;
-    }
-    if (!isRecord(value)) return null;
-    const shouldExecuteValue = value.shouldExecute;
-    if (typeof shouldExecuteValue !== "boolean") return null;
-    const reason = asNonEmptyString(value.reason) ?? "no_reason";
-    return {
-      shouldExecute: shouldExecuteValue,
-      reason: truncateText(reason, 120),
-    };
   }
 
   private async evaluateEngagementActionWithOpenClaw(input: {
@@ -1662,6 +2238,8 @@ export class CommandExecutor {
     action: "like" | "repost";
     postId: number;
     payload: Record<string, unknown>;
+    targetHash: string;
+    lifecycleIdempotencyKey: string;
   }): Promise<EngagementDecision> {
     const context = await this.loadEngagementDecisionContext({
       action: input.action,
@@ -1674,25 +2252,56 @@ export class CommandExecutor {
         shouldExecute: false,
         reason: "openclaw_required_unavailable",
         source: "openclaw",
+        contract: null,
       };
     }
     try {
+      this.updateActionLifecycle({
+        command: input.command,
+        action: input.action,
+        idempotencyKey: input.lifecycleIdempotencyKey,
+        target: {
+          postId: input.postId,
+          commentId: null,
+          targetHash: input.targetHash,
+        },
+        state: "llm_running",
+      });
       const prompt = this.buildEngagementDecisionPrompt({
         action: input.action,
         postId: input.postId,
+        targetHash: input.targetHash,
         context,
       });
       const result = await runOpenClawPrompt({
         prompt,
         purpose: "engagement_action_decision",
       });
-      const decision =
+      const contract =
         (result
-          ? this.extractEngagementDecisionFromUnknown(result.parsed) ??
-            this.extractEngagementDecisionFromUnknown(result.payloadText) ??
-            this.extractEngagementDecisionFromUnknown(result.raw)
+          ? this.extractActionContractFromUnknown({
+            value: result.parsed,
+            action: input.action,
+            expectedPostId: input.postId,
+            expectedCommentId: null,
+            expectedTargetHash: input.targetHash,
+          }) ??
+            this.extractActionContractFromUnknown({
+              value: result.payloadText,
+              action: input.action,
+              expectedPostId: input.postId,
+              expectedCommentId: null,
+              expectedTargetHash: input.targetHash,
+            }) ??
+            this.extractActionContractFromUnknown({
+              value: result.raw,
+              action: input.action,
+              expectedPostId: input.postId,
+              expectedCommentId: null,
+              expectedTargetHash: input.targetHash,
+            })
           : null) ?? null;
-      if (!decision) {
+      if (!contract) {
         await this.ctx.memory
           .recordWrite({
             type: "engagement_action_decision_missing",
@@ -1704,14 +2313,16 @@ export class CommandExecutor {
           .catch(() => undefined);
         return {
           shouldExecute: false,
-          reason: "openclaw_decision_invalid",
+          reason: "openclaw_contract_invalid",
           source: "openclaw",
+          contract: null,
         };
       }
       return {
-        shouldExecute: decision.shouldExecute,
-        reason: decision.reason,
+        shouldExecute: contract.shouldExecute,
+        reason: contract.reason,
         source: "openclaw",
+        contract,
       };
     } catch (error: unknown) {
       await this.ctx.memory
@@ -1728,6 +2339,7 @@ export class CommandExecutor {
         shouldExecute: false,
         reason: "openclaw_decision_failed",
         source: "openclaw",
+        contract: null,
       };
     }
   }
@@ -1737,49 +2349,196 @@ export class CommandExecutor {
     if (!payload) return this.failedOutcome(command, "Invalid payload for write.votePost.");
     const postId = asPositiveInt(payload.postId);
     if (!postId) return this.failedOutcome(command, "postId is required for write.votePost.");
+    const expectedTarget = {
+      postId,
+      commentId: null,
+      targetHash: buildTargetHash({
+        postId,
+        commentId: null,
+      }),
+    };
+    const lockMatch = isTargetLockMatch({
+      payload,
+      expected: expectedTarget,
+    });
+    if (!lockMatch.ok) {
+      return this.failedOutcome(
+        command,
+        `Target lock mismatch: ${lockMatch.reason}.`,
+        "target_lock_mismatch",
+      );
+    }
+    const target = applyTargetLock(payload, {
+      postId,
+      commentId: null,
+    });
+    const idempotencyKey = this.buildActionIdempotencyKey({
+      command,
+      action: "like",
+      postId: target.postId,
+      commentId: target.commentId,
+    });
+    const dedupe = this.beginActionLifecycle({
+      command,
+      action: "like",
+      idempotencyKey,
+      target,
+      state: "context_ready",
+    });
+    if (!dedupe.allowed) {
+      if (dedupe.requeue) {
+        throw new RequeueCommandError(
+          `engagement_like_waiting_for_backoff:${dedupe.reason}`,
+        );
+      }
+      return this.successOutcome(command, {
+        skipped: true,
+        action: "like",
+        postId: target.postId,
+        decision: dedupe.reason,
+      });
+    }
+    const sourceDirectiveId =
+      asNonEmptyString(payload.sourceDirectiveId) ??
+      command.sourceDirectiveId ??
+      null;
+    const sourceDirectiveActionNonce =
+      asNonEmptyString(payload.sourceDirectiveActionNonce) ??
+      command.actionNonce ??
+      null;
     const voteRaw =
       typeof payload.vote === "number" && Number.isFinite(payload.vote)
         ? Math.trunc(payload.vote)
         : 1;
     const vote = voteRaw > 0 ? 1 : voteRaw < 0 ? -1 : 0;
-    if (vote === 1) {
-      const decision = await this.evaluateEngagementActionWithOpenClaw({
+    try {
+      const grantId = await this.preflightGrantForAction({
+        command,
+        payload,
+        action: "like",
+        lifecycle: {
+          idempotencyKey,
+          target,
+        },
+      });
+      if (vote === 1) {
+        const decision = await this.evaluateEngagementActionWithOpenClaw({
+          command,
+          action: "like",
+          postId,
+          payload,
+          targetHash: target.targetHash,
+          lifecycleIdempotencyKey: idempotencyKey,
+        });
+        const needsRequeue =
+          !decision.shouldExecute &&
+          decision.reason.trim().toLowerCase().startsWith("openclaw_");
+        if (needsRequeue) {
+          throw new RequeueCommandError(
+            `engagement_like_waiting_for_openclaw:${decision.reason}`,
+          );
+        }
+        await this.ctx.memory
+          .recordWrite({
+            type: "engagement_action_decision",
+            at: nowIso(),
+            commandId: command.id,
+            action: "like",
+            postId,
+            shouldExecute: decision.shouldExecute,
+            reason: decision.reason,
+            source: decision.source,
+          })
+          .catch(() => undefined);
+        if (!decision.shouldExecute) {
+          const explicitRequested =
+            payload.explicitPublishRequested === true ||
+            payload.forceNow === true ||
+            payload.userExplicitRequest === true;
+          if (explicitRequested) {
+            await this.ctx.memory
+              .recordWrite({
+                type: "engagement_action_decision_overridden",
+                at: nowIso(),
+                commandId: command.id,
+                action: "like",
+                postId,
+                reason: decision.reason,
+                source: decision.source,
+                override: "explicit_request",
+              })
+              .catch(() => undefined);
+          } else {
+            this.updateActionLifecycle({
+              command,
+              action: "like",
+              idempotencyKey,
+              target,
+              state: "acked",
+              lastError: null,
+            });
+            return this.successOutcome(command, {
+              skipped: true,
+              action: "like",
+              postId,
+              decision: decision.reason,
+            });
+          }
+        }
+      }
+      this.updateActionLifecycle({
         command,
         action: "like",
-        postId,
-        payload,
+        idempotencyKey,
+        target,
+        state: "action_running",
       });
-      const needsRequeue =
-        !decision.shouldExecute &&
-        decision.reason.trim().toLowerCase().startsWith("openclaw_");
-      if (needsRequeue) {
-        throw new RequeueCommandError(
-          `engagement_like_waiting_for_openclaw:${decision.reason}`,
-        );
+      const result = await this.agent().votePost.mutate({
+        postId,
+        vote,
+        grantId,
+        ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
+        ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
+      });
+      this.updateActionLifecycle({
+        command,
+        action: "like",
+        idempotencyKey,
+        target,
+        state: "acked",
+        lastError: null,
+      });
+      return this.successOutcome(command, result);
+    } catch (error: unknown) {
+      if (error instanceof RequeueCommandError) {
+        this.updateActionLifecycle({
+          command,
+          action: "like",
+          idempotencyKey,
+          target,
+          state: "requeue",
+          lastError: error.message,
+        });
+        throw error;
       }
-      await this.ctx.memory
-        .recordWrite({
-          type: "engagement_action_decision",
-          at: nowIso(),
-          commandId: command.id,
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.isOwnerCapabilityDeniedError(error)) {
+        this.registerOwnerCapabilityCooldown({
           action: "like",
-          postId,
-          shouldExecute: decision.shouldExecute,
-          reason: decision.reason,
-          source: decision.source,
-        })
-        .catch(() => undefined);
-      if (!decision.shouldExecute) {
-        return this.successOutcome(command, {
-          skipped: true,
-          action: "like",
-          postId,
-          decision: decision.reason,
+          targetHash: target.targetHash,
+          reason: "not_granted",
         });
       }
+      this.updateActionLifecycle({
+        command,
+        action: "like",
+        idempotencyKey,
+        target,
+        state: "failed",
+        lastError: message,
+      });
+      throw error;
     }
-    const result = await this.agent().votePost.mutate({ postId, vote });
-    return this.successOutcome(command, result);
   }
 
   private async executeWriteRepost(command: Command): Promise<CommandOutcome> {
@@ -1787,45 +2546,192 @@ export class CommandExecutor {
     if (!payload) return this.failedOutcome(command, "Invalid payload for write.repostPost.");
     const postId = asPositiveInt(payload.postId);
     if (!postId) return this.failedOutcome(command, "postId is required for write.repostPost.");
-    const repost = payload.repost === 0 ? 0 : 1;
-    if (repost === 1) {
-      const decision = await this.evaluateEngagementActionWithOpenClaw({
-        command,
-        action: "repost",
+    const expectedTarget = {
+      postId,
+      commentId: null,
+      targetHash: buildTargetHash({
         postId,
-        payload,
-      });
-      const needsRequeue =
-        !decision.shouldExecute &&
-        decision.reason.trim().toLowerCase().startsWith("openclaw_");
-      if (needsRequeue) {
+        commentId: null,
+      }),
+    };
+    const lockMatch = isTargetLockMatch({
+      payload,
+      expected: expectedTarget,
+    });
+    if (!lockMatch.ok) {
+      return this.failedOutcome(
+        command,
+        `Target lock mismatch: ${lockMatch.reason}.`,
+        "target_lock_mismatch",
+      );
+    }
+    const target = applyTargetLock(payload, {
+      postId,
+      commentId: null,
+    });
+    const idempotencyKey = this.buildActionIdempotencyKey({
+      command,
+      action: "repost",
+      postId: target.postId,
+      commentId: target.commentId,
+    });
+    const dedupe = this.beginActionLifecycle({
+      command,
+      action: "repost",
+      idempotencyKey,
+      target,
+      state: "context_ready",
+    });
+    if (!dedupe.allowed) {
+      if (dedupe.requeue) {
         throw new RequeueCommandError(
-          `engagement_repost_waiting_for_openclaw:${decision.reason}`,
+          `engagement_repost_waiting_for_backoff:${dedupe.reason}`,
         );
       }
-      await this.ctx.memory
-        .recordWrite({
-          type: "engagement_action_decision",
-          at: nowIso(),
-          commandId: command.id,
+      return this.successOutcome(command, {
+        skipped: true,
+        action: "repost",
+        postId: target.postId,
+        decision: dedupe.reason,
+      });
+    }
+    const sourceDirectiveId =
+      asNonEmptyString(payload.sourceDirectiveId) ??
+      command.sourceDirectiveId ??
+      null;
+    const sourceDirectiveActionNonce =
+      asNonEmptyString(payload.sourceDirectiveActionNonce) ??
+      command.actionNonce ??
+      null;
+    const repost = payload.repost === 0 ? 0 : 1;
+    try {
+      const grantId = await this.preflightGrantForAction({
+        command,
+        payload,
+        action: "repost",
+        lifecycle: {
+          idempotencyKey,
+          target,
+        },
+      });
+      if (repost === 1) {
+        const decision = await this.evaluateEngagementActionWithOpenClaw({
+          command,
           action: "repost",
           postId,
-          shouldExecute: decision.shouldExecute,
-          reason: decision.reason,
-          source: decision.source,
-        })
-        .catch(() => undefined);
-      if (!decision.shouldExecute) {
-        return this.successOutcome(command, {
-          skipped: true,
+          payload,
+          targetHash: target.targetHash,
+          lifecycleIdempotencyKey: idempotencyKey,
+        });
+        const needsRequeue =
+          !decision.shouldExecute &&
+          decision.reason.trim().toLowerCase().startsWith("openclaw_");
+        if (needsRequeue) {
+          throw new RequeueCommandError(
+            `engagement_repost_waiting_for_openclaw:${decision.reason}`,
+          );
+        }
+        await this.ctx.memory
+          .recordWrite({
+            type: "engagement_action_decision",
+            at: nowIso(),
+            commandId: command.id,
+            action: "repost",
+            postId,
+            shouldExecute: decision.shouldExecute,
+            reason: decision.reason,
+            source: decision.source,
+          })
+          .catch(() => undefined);
+        if (!decision.shouldExecute) {
+          const explicitRequested =
+            payload.explicitPublishRequested === true ||
+            payload.forceNow === true ||
+            payload.userExplicitRequest === true;
+          if (explicitRequested) {
+            await this.ctx.memory
+              .recordWrite({
+                type: "engagement_action_decision_overridden",
+                at: nowIso(),
+                commandId: command.id,
+                action: "repost",
+                postId,
+                reason: decision.reason,
+                source: decision.source,
+                override: "explicit_request",
+              })
+              .catch(() => undefined);
+          } else {
+            this.updateActionLifecycle({
+              command,
+              action: "repost",
+              idempotencyKey,
+              target,
+              state: "acked",
+              lastError: null,
+            });
+            return this.successOutcome(command, {
+              skipped: true,
+              action: "repost",
+              postId,
+              decision: decision.reason,
+            });
+          }
+        }
+      }
+      this.updateActionLifecycle({
+        command,
+        action: "repost",
+        idempotencyKey,
+        target,
+        state: "action_running",
+      });
+      const result = await this.agent().repostPost.mutate({
+        postId,
+        repost,
+        grantId,
+        ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
+        ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
+      });
+      this.updateActionLifecycle({
+        command,
+        action: "repost",
+        idempotencyKey,
+        target,
+        state: "acked",
+        lastError: null,
+      });
+      return this.successOutcome(command, result);
+    } catch (error: unknown) {
+      if (error instanceof RequeueCommandError) {
+        this.updateActionLifecycle({
+          command,
           action: "repost",
-          postId,
-          decision: decision.reason,
+          idempotencyKey,
+          target,
+          state: "requeue",
+          lastError: error.message,
+        });
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.isOwnerCapabilityDeniedError(error)) {
+        this.registerOwnerCapabilityCooldown({
+          action: "repost",
+          targetHash: target.targetHash,
+          reason: "not_granted",
         });
       }
+      this.updateActionLifecycle({
+        command,
+        action: "repost",
+        idempotencyKey,
+        target,
+        state: "failed",
+        lastError: message,
+      });
+      throw error;
     }
-    const result = await this.agent().repostPost.mutate({ postId, repost });
-    return this.successOutcome(command, result);
   }
 
   private async executeGenerateAndQueue(command: Command): Promise<CommandOutcome> {

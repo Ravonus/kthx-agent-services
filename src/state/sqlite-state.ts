@@ -32,6 +32,33 @@ type EventRow = {
   json: string;
 };
 
+export type CommandLifecycleState =
+  | "queued"
+  | "context_ready"
+  | "llm_running"
+  | "action_running"
+  | "acked"
+  | "failed"
+  | "requeue";
+
+type CommandLifecycleRow = {
+  commandId: string;
+  directiveId: string;
+  action: string;
+  targetPostId: number | null;
+  targetCommentId: number | null;
+  targetHash: string | null;
+  idempotencyKey: string;
+  state: CommandLifecycleState;
+  attempts: number;
+  lastError: string | null;
+  sourceKind: string | null;
+  grantId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  payloadJson: string | null;
+};
+
 type StateDbConfig = {
   enabled: boolean;
   dbPath: string;
@@ -84,6 +111,9 @@ export class StateSqliteStore {
   private insertEventStmt: StatementSync | null;
   private getSnapshotStmt: StatementSync | null;
   private getRecentEventsStmt: StatementSync | null;
+  private upsertCommandLifecycleStmt: StatementSync | null;
+  private getCommandLifecycleByKeyStmt: StatementSync | null;
+  private getRecentCommandLifecycleStmt: StatementSync | null;
 
   constructor(config: StateDbConfig) {
     this.enabled = config.enabled;
@@ -97,6 +127,9 @@ export class StateSqliteStore {
     this.insertEventStmt = null;
     this.getSnapshotStmt = null;
     this.getRecentEventsStmt = null;
+    this.upsertCommandLifecycleStmt = null;
+    this.getCommandLifecycleByKeyStmt = null;
+    this.getRecentCommandLifecycleStmt = null;
   }
 
   init(): void {
@@ -129,6 +162,38 @@ export class StateSqliteStore {
       );
       CREATE INDEX IF NOT EXISTS idx_state_events_at ON state_events(at DESC);
       CREATE INDEX IF NOT EXISTS idx_state_events_visibility_at ON state_events(visibility, at DESC);
+      CREATE TABLE IF NOT EXISTS runtime_command_lifecycle (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        command_id TEXT NOT NULL,
+        directive_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_post_id INTEGER,
+        target_comment_id INTEGER,
+        target_hash TEXT,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (
+          state IN (
+            'queued',
+            'context_ready',
+            'llm_running',
+            'action_running',
+            'acked',
+            'failed',
+            'requeue'
+          )
+        ),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        source_kind TEXT,
+        grant_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        payload_json TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_runtime_command_lifecycle_directive
+        ON runtime_command_lifecycle(directive_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_runtime_command_lifecycle_state
+        ON runtime_command_lifecycle(state, updated_at DESC);
     `);
     this.db = db;
     this.upsertSnapshotStmt = db.prepare(`
@@ -154,6 +219,84 @@ export class StateSqliteStore {
       FROM state_events
       WHERE visibility = ?
       ORDER BY id DESC
+      LIMIT ?
+    `);
+    this.upsertCommandLifecycleStmt = db.prepare(`
+      INSERT INTO runtime_command_lifecycle (
+        command_id,
+        directive_id,
+        action,
+        target_post_id,
+        target_comment_id,
+        target_hash,
+        idempotency_key,
+        state,
+        attempts,
+        last_error,
+        source_kind,
+        grant_id,
+        created_at,
+        updated_at,
+        payload_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(idempotency_key) DO UPDATE SET
+        command_id = excluded.command_id,
+        directive_id = excluded.directive_id,
+        action = excluded.action,
+        target_post_id = excluded.target_post_id,
+        target_comment_id = excluded.target_comment_id,
+        target_hash = excluded.target_hash,
+        state = excluded.state,
+        attempts = runtime_command_lifecycle.attempts + CASE
+          WHEN excluded.attempts > 0 THEN excluded.attempts
+          ELSE 0
+        END,
+        last_error = excluded.last_error,
+        source_kind = COALESCE(excluded.source_kind, runtime_command_lifecycle.source_kind),
+        grant_id = COALESCE(excluded.grant_id, runtime_command_lifecycle.grant_id),
+        updated_at = excluded.updated_at,
+        payload_json = COALESCE(excluded.payload_json, runtime_command_lifecycle.payload_json)
+    `);
+    this.getCommandLifecycleByKeyStmt = db.prepare(`
+      SELECT
+        command_id AS commandId,
+        directive_id AS directiveId,
+        action,
+        target_post_id AS targetPostId,
+        target_comment_id AS targetCommentId,
+        target_hash AS targetHash,
+        idempotency_key AS idempotencyKey,
+        state,
+        attempts,
+        last_error AS lastError,
+        source_kind AS sourceKind,
+        grant_id AS grantId,
+        created_at AS createdAt,
+        updated_at AS updatedAt,
+        payload_json AS payloadJson
+      FROM runtime_command_lifecycle
+      WHERE idempotency_key = ?
+      LIMIT 1
+    `);
+    this.getRecentCommandLifecycleStmt = db.prepare(`
+      SELECT
+        command_id AS commandId,
+        directive_id AS directiveId,
+        action,
+        target_post_id AS targetPostId,
+        target_comment_id AS targetCommentId,
+        target_hash AS targetHash,
+        idempotency_key AS idempotencyKey,
+        state,
+        attempts,
+        last_error AS lastError,
+        source_kind AS sourceKind,
+        grant_id AS grantId,
+        created_at AS createdAt,
+        updated_at AS updatedAt,
+        payload_json AS payloadJson
+      FROM runtime_command_lifecycle
+      ORDER BY updated_at DESC
       LIMIT ?
     `);
     this.initialized = true;
@@ -205,6 +348,9 @@ export class StateSqliteStore {
     this.insertEventStmt = null;
     this.getSnapshotStmt = null;
     this.getRecentEventsStmt = null;
+    this.upsertCommandLifecycleStmt = null;
+    this.getCommandLifecycleByKeyStmt = null;
+    this.getRecentCommandLifecycleStmt = null;
   }
 
   upsertSnapshot(input: {
@@ -295,6 +441,97 @@ export class StateSqliteStore {
       });
     }
     return out;
+  }
+
+  upsertCommandLifecycle(input: {
+    commandId: string;
+    directiveId: string;
+    action: string;
+    targetPostId?: number | null;
+    targetCommentId?: number | null;
+    targetHash?: string | null;
+    idempotencyKey: string;
+    state: CommandLifecycleState;
+    attemptDelta?: number;
+    lastError?: string | null;
+    sourceKind?: string | null;
+    grantId?: string | null;
+    at?: string | null;
+    payload?: unknown;
+  }): void {
+    if (!this.enabled) return;
+    this.init();
+    if (!this.upsertCommandLifecycleStmt) return;
+    const at = typeof input.at === "string" && input.at.trim().length > 0
+      ? input.at.trim()
+      : nowIso();
+    const attemptDeltaRaw =
+      typeof input.attemptDelta === "number" && Number.isFinite(input.attemptDelta)
+        ? Math.floor(input.attemptDelta)
+        : 0;
+    const attemptDelta = Math.max(0, attemptDeltaRaw);
+    this.runWithBusyRetry<void>("upsertCommandLifecycle", undefined, () => {
+      this.upsertCommandLifecycleStmt?.run(
+        input.commandId,
+        input.directiveId,
+        input.action,
+        typeof input.targetPostId === "number" ? input.targetPostId : null,
+        typeof input.targetCommentId === "number" ? input.targetCommentId : null,
+        typeof input.targetHash === "string" ? input.targetHash : null,
+        input.idempotencyKey,
+        input.state,
+        attemptDelta,
+        typeof input.lastError === "string" ? input.lastError : null,
+        typeof input.sourceKind === "string" ? input.sourceKind : null,
+        typeof input.grantId === "string" ? input.grantId : null,
+        at,
+        at,
+        input.payload === undefined ? null : safeJsonStringify(input.payload),
+      );
+    });
+  }
+
+  getCommandLifecycleByIdempotencyKey(
+    idempotencyKey: string,
+  ): CommandLifecycleRow | null {
+    if (!this.enabled) return null;
+    this.init();
+    if (!this.getCommandLifecycleByKeyStmt) return null;
+    const rowUnknown = this.runWithBusyRetry<unknown>(
+      "getCommandLifecycleByIdempotencyKey",
+      null,
+      () => this.getCommandLifecycleByKeyStmt?.get(idempotencyKey) as unknown,
+    );
+    if (!isRecord(rowUnknown)) return null;
+    const row = rowUnknown as unknown as CommandLifecycleRow;
+    return {
+      ...row,
+      payloadJson:
+        typeof row.payloadJson === "string" && row.payloadJson.trim().length > 0
+          ? row.payloadJson
+          : null,
+    };
+  }
+
+  getRecentCommandLifecycle(limit: number): CommandLifecycleRow[] {
+    if (!this.enabled) return [];
+    this.init();
+    if (!this.getRecentCommandLifecycleStmt) return [];
+    const bounded = Math.max(1, Math.min(500, Math.floor(limit)));
+    const rowsUnknown = this.runWithBusyRetry<unknown>(
+      "getRecentCommandLifecycle",
+      [],
+      () => this.getRecentCommandLifecycleStmt?.all(bounded) as unknown,
+    );
+    if (!Array.isArray(rowsUnknown)) return [];
+    const rows = rowsUnknown as unknown as CommandLifecycleRow[];
+    return rows.map((row) => ({
+      ...row,
+      payloadJson:
+        typeof row.payloadJson === "string" && row.payloadJson.trim().length > 0
+          ? row.payloadJson
+          : null,
+    }));
   }
 }
 

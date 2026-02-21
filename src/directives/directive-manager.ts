@@ -15,6 +15,7 @@ import { isRecord } from "../lib/guards.js";
 import { nowIso } from "../lib/text.js";
 import { writeJsonFile, readJsonFile, readJsonMaybeIncomplete } from "../lib/fs.js";
 import { computeCommandSignature } from "../lib/crypto.js";
+import { applyTargetLock } from "../lib/command-target.js";
 import type { Command } from "../types/ipc.js";
 import type { DirectiveManagerLike } from "../runtime-context.js";
 import {
@@ -109,6 +110,59 @@ const resolveForceNowFromDirective = (directive: unknown): boolean => {
   if (hasForceFlagToken(directive.note) || hasForceFlagToken(directive.instruction)) return true;
   if (isMentionDirectivePayload(directive.payload)) return true;
   return resolveForceNowFromPayload(directive.payload);
+};
+
+const asPositiveInt = (value: unknown): number | null => {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return null;
+};
+
+const resolveDirectiveTarget = (input: {
+  kind: string;
+  payload: Record<string, unknown> | null;
+}): { postId: number; commentId: number | null } | null => {
+  const payload = input.payload;
+  if (!payload) return null;
+  const normalizedKind = input.kind.trim().toLowerCase();
+  const postId = asPositiveInt(payload.postId);
+  const commentId =
+    asPositiveInt(payload.commentId) ?? asPositiveInt(payload.parentId);
+  if (
+    normalizedKind === "write.commentpost" ||
+    normalizedKind === "write.comment" ||
+    normalizedKind === "write.like" ||
+    normalizedKind === "write.votepost" ||
+    normalizedKind === "write.repost" ||
+    normalizedKind === "write.repostpost"
+  ) {
+    if (!postId) return null;
+    return {
+      postId,
+      commentId:
+        normalizedKind === "write.commentpost" || normalizedKind === "write.comment"
+          ? commentId
+          : null,
+    };
+  }
+  if (normalizedKind === "brain.generateandqueue") {
+    const goal =
+      typeof payload.goal === "string" ? payload.goal.trim().toLowerCase() : "";
+    if (!["comment", "like", "repost"].includes(goal)) return null;
+    if (!postId) return null;
+    return {
+      postId,
+      commentId: goal === "comment" ? commentId : null,
+    };
+  }
+  return null;
 };
 
 export class DirectiveManager implements DirectiveManagerLike {
@@ -241,14 +295,20 @@ export class DirectiveManager implements DirectiveManagerLike {
       ? (directive.createdAt as string).trim() : nowIso();
     const directiveGrantId = typeof directive.grantId === "string" && directive.grantId.trim().length
       ? (directive.grantId as string).trim() : null;
+    const commandPayload = isRecord(directive.payload)
+      ? ({ ...(directive.payload as Record<string, unknown>) } as Record<string, unknown>)
+      : null;
+    const target = resolveDirectiveTarget({ kind, payload: commandPayload });
+    if (commandPayload && target) {
+      applyTargetLock(commandPayload, target);
+    }
+
     const baseCommand: Command = {
       id,
       createdAt,
       kind,
       grantId: directiveGrantId,
-      payload: isRecord(directive.payload)
-        ? (directive.payload as Record<string, unknown>)
-        : null,
+      payload: commandPayload,
       sig: null,
       sourceDirectiveId: id,
       pendingDirectiveId: null,
