@@ -140,7 +140,7 @@ export const createRuntimeConfig = (): RuntimeConfig => {
   const fileGenerateCmd = trimEnv("MG_AGENT_FILE_GENERATE_CMD");
   const imageGenerateTimeoutMs = Math.max(
     5_000,
-    parseIntEnv("MG_AGENT_IMAGE_GENERATE_TIMEOUT_MS", 90_000),
+    parseIntEnv("MG_AGENT_IMAGE_GENERATE_TIMEOUT_MS", 300_000),
   );
   const botSessionTokenTtlSeconds = Math.max(
     10,
@@ -271,7 +271,7 @@ export const createRuntimeConfig = (): RuntimeConfig => {
   );
   const queueRunnerConcurrency = Math.max(
     1,
-    Math.min(8, parseIntEnv("MG_AGENT_QUEUE_CONCURRENCY", 2)),
+    Math.min(8, parseIntEnv("MG_AGENT_QUEUE_CONCURRENCY", 4)),
   );
   const currentEventsMaxLines = Math.max(
     20,

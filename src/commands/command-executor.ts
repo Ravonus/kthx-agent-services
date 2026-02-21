@@ -161,6 +161,19 @@ const truncateText = (value: string, maxChars: number): string => {
   return `${text.slice(0, Math.max(8, maxChars - 1))}…`;
 };
 
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+
+const isMissingFileError = (error: unknown): boolean => {
+  if (!(error instanceof Error)) return false;
+  const code =
+    typeof (error as { code?: unknown }).code === "string"
+      ? String((error as { code?: unknown }).code)
+      : "";
+  if (code.toUpperCase() === "ENOENT") return true;
+  return /enoent|no such file or directory/iu.test(error.message);
+};
+
 const constrainGifPromptTo256 = (value: string): string => {
   const trimmed = value.trim();
   if (!trimmed.length) return trimmed;
@@ -626,7 +639,23 @@ export class CommandExecutor {
       }
     }
 
-    const sealError = verifyRuntimeCommandSeal(this.ctx.commandSeal, command);
+    let sealError = verifyRuntimeCommandSeal(this.ctx.commandSeal, command);
+    if (
+      sealError === "command_not_issued_by_runtime" &&
+      this.tryRehydrateRuntimeIssuedSeal(command)
+    ) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "inbox_command_seal_rehydrated",
+          at: nowIso(),
+          inboxFile,
+          commandId: command.id,
+          kind: command.kind,
+          runtimeOrigin: command.runtimeOrigin ?? null,
+        })
+        .catch(() => undefined);
+      sealError = verifyRuntimeCommandSeal(this.ctx.commandSeal, command);
+    }
     if (sealError) {
       const outcome: CommandOutcome = {
         at: nowIso(),
@@ -778,6 +807,25 @@ export class CommandExecutor {
       kind: command.kind,
     }).catch(() => undefined);
     return { processed: true, outcome };
+  }
+
+  private tryRehydrateRuntimeIssuedSeal(command: Command): boolean {
+    const commandId = command.id.trim();
+    if (!commandId.length) return false;
+    if (this.ctx.commandSeal.runtimeIssuedCommandIds.has(commandId)) {
+      return false;
+    }
+    const runtimeSessionId = asNonEmptyString(command.runtimeSessionId);
+    const runtimeOrigin = asNonEmptyString(command.runtimeOrigin);
+    const runtimeSig = asNonEmptyString(command.runtimeSig);
+    if (!runtimeSessionId || !runtimeOrigin || !runtimeSig) {
+      return false;
+    }
+    if (runtimeSessionId !== this.ctx.commandSeal.runtimeCommandSessionId) {
+      return false;
+    }
+    this.ctx.commandSeal.runtimeIssuedCommandIds.add(commandId);
+    return true;
   }
 
   private grantActionKeysFor(action: "comment" | "like" | "repost"): string[] {
@@ -4894,17 +4942,86 @@ export class CommandExecutor {
       throw new Error(String(reason));
     }
 
-    const resolvedSource = await this.resolveGeneratedMediaSource({
+    const resolvedSource = await this.resolveGeneratedMediaSourceWithRetry({
       requestDir,
       outputPath,
       stdout: execResult.stdout,
+      maxWaitMs: Math.min(
+        30_000,
+        Math.max(3_000, Math.floor(this.ctx.config.imageGenerateTimeoutMs / 10)),
+      ),
     });
     if (!resolvedSource) {
       throw new Error("no_media_url");
     }
-    return this.uploadResolvedMediaSource(resolvedSource, {
-      keepOriginal: opts?.keepOriginal === true,
-    });
+    try {
+      return await this.uploadResolvedMediaSource(resolvedSource, {
+        keepOriginal: opts?.keepOriginal === true,
+      });
+    } catch (error: unknown) {
+      if (!isMissingFileError(error)) {
+        throw error;
+      }
+      await this.ctx.memory
+        .recordWrite({
+          type: "image_generation_source_missing_retrying",
+          at: nowIso(),
+          mode,
+          generatedAssetType,
+          sourcePreview: truncateText(resolvedSource, 260),
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      const retrySource = await this.resolveGeneratedMediaSourceWithRetry({
+        requestDir,
+        outputPath,
+        stdout: execResult.stdout,
+        maxWaitMs: 12_000,
+      });
+      if (!retrySource) {
+        throw error;
+      }
+      return this.uploadResolvedMediaSource(retrySource, {
+        keepOriginal: opts?.keepOriginal === true,
+      });
+    }
+  }
+
+  private async resolveGeneratedMediaSourceWithRetry(input: {
+    requestDir: string;
+    outputPath: string;
+    stdout: string;
+    maxWaitMs: number;
+  }): Promise<string | null> {
+    const deadlineMs = Date.now() + Math.max(0, Math.floor(input.maxWaitMs));
+    let lastCandidate: string | null = null;
+    do {
+      const candidate = await this.resolveGeneratedMediaSource({
+        requestDir: input.requestDir,
+        outputPath: input.outputPath,
+        stdout: input.stdout,
+      });
+      if (candidate) {
+        if (isHttpUrl(candidate) || isDataUri(candidate)) {
+          return candidate;
+        }
+        const absolute = path.isAbsolute(candidate)
+          ? candidate
+          : path.resolve(input.requestDir, candidate);
+        const exists = await fs
+          .access(absolute)
+          .then(() => true)
+          .catch(() => false);
+        if (exists) {
+          return absolute;
+        }
+        lastCandidate = absolute;
+      }
+      if (Date.now() >= deadlineMs) {
+        return lastCandidate;
+      }
+      await sleep(300);
+    } while (true);
   }
 
   private async resolveGeneratedMediaSource(input: {
