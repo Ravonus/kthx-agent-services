@@ -451,6 +451,14 @@ type EngagementDecisionContext = {
   memorySummary: string | null;
 };
 
+type PostDraftContext = {
+  targetPostId: number | null;
+  postText: string | null;
+  mediaSummary: string | null;
+  payloadHint: string | null;
+  memorySummary: string | null;
+};
+
 type EngagementDecision = {
   shouldExecute: boolean;
   reason: string;
@@ -1099,15 +1107,57 @@ export class CommandExecutor {
       ...(command.grantId ? { grantId: command.grantId } : {}),
     };
 
+    const targetPostId = this.extractTargetPostIdForPostDraft(payload);
+    const postDraftContext = await this.loadPostDraftContext({
+      postId: targetPostId,
+      payload,
+    });
+
     if (postType === "text") {
       const textBody = asNonEmptyString(payload.textBody);
       if (!textBody) {
         return this.failedOutcome(command, "textBody is required for text posts.");
       }
+      const candidate = [asNonEmptyString(payload.caption), textBody]
+        .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+        .join("\n");
+      const sourceEchoReason = this.detectPostDraftSourceEcho({
+        candidate,
+        context: postDraftContext,
+      });
+      if (sourceEchoReason) {
+        return this.failedOutcome(
+          command,
+          `Post blocked: draft mirrors source context (${sourceEchoReason}).`,
+          "post_source_echo_blocked",
+        );
+      }
+      const recentDupReason = await this.detectRecentPostDuplicateFromMemory({
+        candidate,
+        context: postDraftContext,
+      });
+      if (recentDupReason) {
+        return this.failedOutcome(
+          command,
+          `Post blocked: near-duplicate recent memory match (${recentDupReason}).`,
+          "post_duplicate_memory_blocked",
+        );
+      }
       const result = await this.agent().createPost.mutate({
         ...base,
         textBody,
       });
+      await this.ctx.memory
+        .recordWrite({
+          type: "runtime_post_publish_recorded",
+          at: nowIso(),
+          commandId: command.id,
+          kind: postKind,
+          postType,
+          targetPostId: postDraftContext.targetPostId,
+          bodyPreview: truncateText(candidate, 260),
+        })
+        .catch(() => undefined);
       return this.successOutcome(command, result);
     }
 
@@ -1119,6 +1169,36 @@ export class CommandExecutor {
         asNonEmptyString(payload.imagePrompt),
       ],
     });
+    const mediaCandidate = [
+      asNonEmptyString(payload.caption),
+      asNonEmptyString(payload.mediaPrompt),
+      asNonEmptyString(payload.imagePrompt),
+      asNonEmptyString(payload.prompt),
+    ]
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .join("\n");
+    const sourceEchoReason = this.detectPostDraftSourceEcho({
+      candidate: mediaCandidate,
+      context: postDraftContext,
+    });
+    if (sourceEchoReason) {
+      return this.failedOutcome(
+        command,
+        `Post blocked: draft mirrors source context (${sourceEchoReason}).`,
+        "post_source_echo_blocked",
+      );
+    }
+    const recentDupReason = await this.detectRecentPostDuplicateFromMemory({
+      candidate: mediaCandidate,
+      context: postDraftContext,
+    });
+    if (recentDupReason) {
+      return this.failedOutcome(
+        command,
+        `Post blocked: near-duplicate recent memory match (${recentDupReason}).`,
+        "post_duplicate_memory_blocked",
+      );
+    }
     const result = await this.agent().createPost.mutate({
       ...base,
       mediaUrl: media.mediaUrl,
@@ -1129,7 +1209,265 @@ export class CommandExecutor {
       ...(typeof media.mediaSizeBytes === "number" ? { mediaSizeBytes: media.mediaSizeBytes } : {}),
       ...(media.mediaType ? { mediaType: media.mediaType } : {}),
     });
+    await this.ctx.memory
+      .recordWrite({
+        type: "runtime_post_publish_recorded",
+        at: nowIso(),
+        commandId: command.id,
+        kind: postKind,
+        postType,
+        targetPostId: postDraftContext.targetPostId,
+        bodyPreview: truncateText(mediaCandidate, 260),
+        mediaUrl: media.mediaUrl,
+      })
+      .catch(() => undefined);
     return this.successOutcome(command, result);
+  }
+
+  private extractTargetPostIdForPostDraft(payload: Record<string, unknown>): number | null {
+    const directPostId = asPositiveInt(payload.postId);
+    if (directPostId) return directPostId;
+    const targetPostId = asPositiveInt(payload.targetPostId);
+    if (targetPostId) return targetPostId;
+    const scope = isRecord(payload.directiveScope) ? payload.directiveScope : null;
+    if (scope) {
+      const scopedPostId = asPositiveInt(scope.targetPostId);
+      if (scopedPostId) return scopedPostId;
+      const scopedPost = isRecord(scope.target) ? scope.target : null;
+      if (scopedPost) {
+        const nestedPostId = asPositiveInt(scopedPost.postId);
+        if (nestedPostId) return nestedPostId;
+      }
+    }
+    return null;
+  }
+
+  private async loadPostDraftContext(input: {
+    postId: number | null;
+    payload: Record<string, unknown>;
+  }): Promise<PostDraftContext> {
+    const context: PostDraftContext = {
+      targetPostId: input.postId,
+      postText: null,
+      mediaSummary: null,
+      payloadHint: this.extractCommentPayloadHint(input.payload),
+      memorySummary: await this.loadPostDraftMemorySummary({
+        postId: input.postId,
+        payload: input.payload,
+      }),
+    };
+    if (!input.postId) return context;
+    const callAgentChatBridge = this.ctx.callAgentChatBridge;
+    if (!callAgentChatBridge) return context;
+    try {
+      const postResponse = await callAgentChatBridge({
+        action: "find_post",
+        postId: input.postId,
+      });
+      const postRecord = this.extractPostRecordForCommentCuration(postResponse, input.postId);
+      if (!postRecord) return context;
+      context.postText =
+        asNonEmptyString(postRecord.textBody) ??
+        asNonEmptyString(postRecord.caption) ??
+        asNonEmptyString(postRecord.body);
+      context.mediaSummary = this.summarizePostMediaForComment(postRecord);
+      return context;
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "post_context_lookup_failed",
+          at: nowIso(),
+          postId: input.postId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return context;
+    }
+  }
+
+  private async loadPostDraftMemorySummary(input: {
+    postId: number | null;
+    payload: Record<string, unknown>;
+  }): Promise<string | null> {
+    if (typeof this.ctx.memory.buildContext !== "function") {
+      return null;
+    }
+    try {
+      const payloadHint = this.extractCommentPayloadHint(input.payload);
+      const retrievalQuery = [
+        "post draft context",
+        typeof input.postId === "number" ? `post ${input.postId}` : "",
+        payloadHint ? `hint ${payloadHint}` : "",
+      ]
+        .filter((value) => value.length > 0)
+        .join(" · ");
+      const request: ContextRequest = {
+        mode: "directive",
+        audience: "runtime_write",
+        ...(typeof input.postId === "number" ? { postId: input.postId } : {}),
+        maxRecentEvents: 120,
+        maxArchiveEvents: 40,
+        includeViewState: true,
+        viewStateMaxItems: 10,
+        includeKeywordRetrieval: true,
+        retrievalIntent: "directive",
+        retrievalMaxItems: 10,
+        retrievalQuery,
+      };
+      const bundle = await this.ctx.memory.buildContext(request);
+      return this.buildCompactEngagementMemorySummary(bundle);
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "post_memory_context_failed",
+          at: nowIso(),
+          postId: input.postId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return null;
+    }
+  }
+
+  private detectPostDraftSourceEcho(input: {
+    candidate: string;
+    context: PostDraftContext;
+  }): string | null {
+    const candidate = input.candidate.trim();
+    if (candidate.length < 12) return null;
+    const contextParts = [
+      input.context.postText,
+      input.context.mediaSummary,
+      input.context.payloadHint,
+    ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+    for (const part of contextParts) {
+      const normalizedCandidate = normalizeCommentText(candidate);
+      const normalizedPart = normalizeCommentText(part);
+      if (normalizedCandidate.length > 0 && normalizedCandidate === normalizedPart) {
+        return "exact_match";
+      }
+      const overlapForward = computeTokenOverlapRatio(candidate, part);
+      const overlapReverse = computeTokenOverlapRatio(part, candidate);
+      const overlap = Math.max(overlapForward, overlapReverse);
+      if (overlap >= 0.86) {
+        return "high_token_overlap";
+      }
+      if (hasLongNormalizedPhraseOverlap(candidate, part)) {
+        return "long_phrase_overlap";
+      }
+    }
+    return null;
+  }
+
+  private async detectRecentPostDuplicateFromMemory(input: {
+    candidate: string;
+    context: PostDraftContext;
+  }): Promise<string | null> {
+    const candidate = input.candidate.trim();
+    if (candidate.length < 16) return null;
+    if (typeof this.ctx.memory.buildContext !== "function") return null;
+    try {
+      const request: ContextRequest = {
+        mode: "directive",
+        audience: "runtime_write",
+        ...(typeof input.context.targetPostId === "number"
+          ? { postId: input.context.targetPostId }
+          : {}),
+        maxRecentEvents: 180,
+        maxArchiveEvents: 60,
+        includeViewState: false,
+        includeKeywordRetrieval: true,
+        retrievalIntent: "directive",
+        retrievalMaxItems: 20,
+        retrievalQuery: [
+          "most recent post",
+          truncateText(candidate, 180),
+          input.context.memorySummary ? truncateText(input.context.memorySummary, 220) : "",
+        ]
+          .filter((value) => value.length > 0)
+          .join(" · "),
+      };
+      const bundle = await this.ctx.memory.buildContext(request);
+      const envelopes: unknown[] = [
+        ...(Array.isArray(bundle.recent) ? bundle.recent : []),
+        ...(Array.isArray(bundle.archive) ? bundle.archive : []),
+        ...(Array.isArray(bundle.target?.events) ? bundle.target.events : []),
+      ];
+      for (const envelope of envelopes.slice(0, 120)) {
+        if (!isRecord(envelope)) continue;
+        const payload = envelope.payload;
+        const candidates = this.extractPostTextCandidatesFromMemoryPayload(payload);
+        for (const previous of candidates) {
+          const normalizedCandidate = normalizeCommentText(candidate);
+          const normalizedPrevious = normalizeCommentText(previous);
+          if (!normalizedPrevious.length) continue;
+          if (normalizedCandidate === normalizedPrevious) {
+            return "memory_exact_match";
+          }
+          const overlapForward = computeTokenOverlapRatio(candidate, previous);
+          const overlapReverse = computeTokenOverlapRatio(previous, candidate);
+          const overlap = Math.max(overlapForward, overlapReverse);
+          if (overlap >= 0.9) {
+            return "memory_high_token_overlap";
+          }
+          if (hasLongNormalizedPhraseOverlap(candidate, previous)) {
+            return "memory_long_phrase_overlap";
+          }
+        }
+      }
+      return null;
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "post_duplicate_memory_check_failed",
+          at: nowIso(),
+          targetPostId: input.context.targetPostId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return null;
+    }
+  }
+
+  private extractPostTextCandidatesFromMemoryPayload(value: unknown): string[] {
+    const collected: string[] = [];
+    const seen = new Set<string>();
+    const pushCandidate = (raw: unknown): void => {
+      if (typeof raw !== "string") return;
+      const trimmed = raw.trim();
+      if (trimmed.length < 16) return;
+      const normalized = normalizeCommentText(trimmed);
+      if (!normalized.length || seen.has(normalized)) return;
+      seen.add(normalized);
+      collected.push(trimmed);
+    };
+    const walk = (node: unknown, depth: number): void => {
+      if (depth > 3) return;
+      if (typeof node === "string") {
+        pushCandidate(node);
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (const entry of node.slice(0, 12)) {
+          walk(entry, depth + 1);
+        }
+        return;
+      }
+      if (!isRecord(node)) return;
+      pushCandidate(node.textBody);
+      pushCandidate(node.caption);
+      pushCandidate(node.body);
+      pushCandidate(node.content);
+      pushCandidate(node.summary);
+      pushCandidate(node.postText);
+      pushCandidate(node.message);
+      pushCandidate(node.bodyPreview);
+      for (const key of ["post", "payload", "data", "item", "result", "draft"] as const) {
+        walk(node[key], depth + 1);
+      }
+    };
+    walk(value, 0);
+    return collected.slice(0, 24);
   }
 
   private async executeWriteCreateStory(command: Command): Promise<CommandOutcome> {
