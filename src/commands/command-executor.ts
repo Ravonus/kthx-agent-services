@@ -125,6 +125,73 @@ const extToMime = (filePath: string): string => {
   return "application/octet-stream";
 };
 
+const sniffMimeTypeFromBytes = (bytes: Buffer): string | null => {
+  if (bytes.byteLength < 4) return null;
+  if (
+    bytes.byteLength >= 6 &&
+    (bytes.subarray(0, 6).toString("ascii") === "GIF87a" ||
+      bytes.subarray(0, 6).toString("ascii") === "GIF89a")
+  ) {
+    return "image/gif";
+  }
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  if (
+    bytes.byteLength >= 3 &&
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[2] === 0xff
+  ) {
+    return "image/jpeg";
+  }
+  if (
+    bytes.byteLength >= 12 &&
+    bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
+    bytes.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  if (
+    bytes.byteLength >= 12 &&
+    bytes.subarray(4, 8).toString("ascii") === "ftyp"
+  ) {
+    const brand = bytes.subarray(8, 12).toString("ascii");
+    if (brand === "avif" || brand === "avis") return "image/avif";
+    return "video/mp4";
+  }
+  if (
+    bytes.byteLength >= 4 &&
+    bytes[0] === 0x1a &&
+    bytes[1] === 0x45 &&
+    bytes[2] === 0xdf &&
+    bytes[3] === 0xa3
+  ) {
+    return "video/webm";
+  }
+  if (
+    bytes.byteLength >= 5 &&
+    bytes.subarray(0, 5).toString("ascii") === "%PDF-"
+  ) {
+    return "application/pdf";
+  }
+  const head = bytes.subarray(0, 512).toString("utf8").trimStart().toLowerCase();
+  if (head.startsWith("<svg") || head.startsWith("<?xml")) {
+    if (head.includes("<svg")) return "image/svg+xml";
+  }
+  return null;
+};
+
 const mimeToExt = (mime: string): string => {
   const normalized = mime.trim().toLowerCase();
   if (normalized === "image/png") return "png";
@@ -4547,7 +4614,11 @@ export class CommandExecutor {
     if (!bytes.byteLength) {
       throw new Error("media_source_empty");
     }
-    const mime = extToMime(localPath);
+    const mimeByExt = extToMime(localPath);
+    const mime =
+      mimeByExt === "application/octet-stream"
+        ? sniffMimeTypeFromBytes(bytes) ?? mimeByExt
+        : mimeByExt;
     const uploadedByChunk = await this.uploadBytesViaChunkRoute({
       bytes,
       mimeType: mime,

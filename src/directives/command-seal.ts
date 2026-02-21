@@ -135,9 +135,6 @@ export const verifyRuntimeCommandSeal = (
       : "";
   if (!commandId.length) return "missing_command_id";
 
-  if (!state.runtimeIssuedCommandIds.has(commandId)) {
-    return "command_not_issued_by_runtime";
-  }
   if (state.runtimeConsumedCommandIds.has(commandId)) {
     return "command_replay_detected";
   }
@@ -165,17 +162,26 @@ export const verifyRuntimeCommandSeal = (
   ) {
     return "missing_runtime_sig";
   }
+  const runtimeSessionId = command.runtimeSessionId;
+  const runtimeOrigin = command.runtimeOrigin;
 
   const expected = hmacSha256Hex(
     state.runtimeCommandSealKey,
     buildSealMessage(
       command,
-      command.runtimeSessionId as string,
-      command.runtimeOrigin as string,
+      runtimeSessionId,
+      runtimeOrigin,
     ),
   );
 
   if (expected !== command.runtimeSig) return "invalid_runtime_sig";
+
+  // Rehydrate issued-set after restarts/state loss when the seal is valid for
+  // the current session. This prevents false stale rejections on legitimate
+  // inbox commands while preserving signature validation and replay checks.
+  if (!state.runtimeIssuedCommandIds.has(commandId)) {
+    state.runtimeIssuedCommandIds.add(commandId);
+  }
 
   // Mark consumed so replays are detected
   state.runtimeConsumedCommandIds.add(commandId);
