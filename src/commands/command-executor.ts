@@ -3711,6 +3711,7 @@ export class CommandExecutor {
     let previewMessageId: string | null = null;
     let previewProgressFingerprint = "";
     let previewProgressUpdatedAtMs = 0;
+    let latestMediaProgress: MediaGenerationProgress | null = null;
     const buildProcessingActionPreview = (progress?: MediaGenerationProgress) => ({
       type: previewType,
       status: "processing",
@@ -3727,6 +3728,7 @@ export class CommandExecutor {
           }
         : {}),
     });
+    const previewClientMessageId = `runtime_generate_${command.id}`;
     const sendOrEditPreviewMessage = async (input: {
       body: string;
       attachments?: Array<{
@@ -3751,15 +3753,13 @@ export class CommandExecutor {
           });
           return;
         } catch {
-          // Fall through and send a new message.
+          // Keep a single preview message thread. Do not spawn a duplicate box.
+          return;
         }
       }
       const created = await callAgentChatBridge({
         action: "send_message",
-        clientMessageId: `runtime_generate_${input.kind}_${Date.now().toString(36)}_${crypto
-          .randomUUID()
-          .replaceAll("-", "")
-          .slice(0, 10)}`,
+        clientMessageId: previewClientMessageId,
         ...chatRoute,
         body: input.body,
         format: "markdown",
@@ -3769,6 +3769,7 @@ export class CommandExecutor {
       previewMessageId ??= extractBridgeMessageId(created);
     };
     const emitStreamProgress = async (progress: MediaGenerationProgress): Promise<void> => {
+      latestMediaProgress = progress;
       if (!previewMessageId) return;
       const nowMs = Date.now();
       if (nowMs - previewProgressUpdatedAtMs < 220) return;
@@ -3853,6 +3854,25 @@ export class CommandExecutor {
         const avatarProfileHref = avatarTarget === "owner" && avatarHandle
           ? `/u/${avatarHandle.replace(/^@+/u, "")}?edit=avatar&crop=1`
           : null;
+        const streamedFrames = latestMediaProgress?.streamFrames ?? [];
+        const needsExplicitFinalFrame =
+          streamedFrames.length === 0 ||
+          streamedFrames[streamedFrames.length - 1]?.previewUrl !== media.mediaUrl;
+        const streamFramesForSuccess = needsExplicitFinalFrame
+          ? [
+              ...streamedFrames,
+              {
+                sourceFileName: null,
+                isStreamPart: false,
+                streamPartIndex: null,
+                isFinalStreamFrame: true,
+                previewUrl: media.mediaUrl,
+                outputPath: null,
+                metadataId: null,
+                source: "runtime.final",
+              },
+            ]
+          : streamedFrames;
         const completionText =
           avatarTarget === "owner"
             ? "Done. Here is your new avatar. If framing looks off, tap Crop avatar and keep your face in the center safe zone."
@@ -3881,8 +3901,18 @@ export class CommandExecutor {
               status: "success",
               title: "Persona avatar updated",
               summary,
+              previewUrl: media.mediaUrl,
               href: media.mediaUrl,
               hrefLabel: "Open avatar image",
+              ...(streamFramesForSuccess.length > 0
+                ? {
+                    streamFrames: streamFramesForSuccess,
+                    streamFrameCount: streamFramesForSuccess.length,
+                    latestStreamFrameIndex: streamFramesForSuccess.length - 1,
+                    hasFinalStreamFrame: true,
+                    streamRevealProgress: 1,
+                  }
+                : {}),
               cropHint: avatarCropSpec.guidance,
               cropZones: avatarCropSpec,
               ...(avatarProfileHref
@@ -3945,6 +3975,25 @@ export class CommandExecutor {
         const bannerProfileHref = bannerTarget === "owner" && bannerHandle
           ? `/u/${bannerHandle.replace(/^@+/u, "")}?edit=banner&crop=1`
           : null;
+        const streamedFrames = latestMediaProgress?.streamFrames ?? [];
+        const needsExplicitFinalFrame =
+          streamedFrames.length === 0 ||
+          streamedFrames[streamedFrames.length - 1]?.previewUrl !== media.mediaUrl;
+        const streamFramesForSuccess = needsExplicitFinalFrame
+          ? [
+              ...streamedFrames,
+              {
+                sourceFileName: null,
+                isStreamPart: false,
+                streamPartIndex: null,
+                isFinalStreamFrame: true,
+                previewUrl: media.mediaUrl,
+                outputPath: null,
+                metadataId: null,
+                source: "runtime.final",
+              },
+            ]
+          : streamedFrames;
         const completionText =
           bannerTarget === "owner"
             ? "Done. Here is your new banner. If framing looks off, tap Crop banner and keep key details in the center safe zone."
@@ -3972,8 +4021,18 @@ export class CommandExecutor {
               status: "success",
               title: "Profile banner updated",
               summary,
+              previewUrl: media.mediaUrl,
               href: media.mediaUrl,
               hrefLabel: "Open banner image",
+              ...(streamFramesForSuccess.length > 0
+                ? {
+                    streamFrames: streamFramesForSuccess,
+                    streamFrameCount: streamFramesForSuccess.length,
+                    latestStreamFrameIndex: streamFramesForSuccess.length - 1,
+                    hasFinalStreamFrame: true,
+                    streamRevealProgress: 1,
+                  }
+                : {}),
               cropHint: bannerCropSpec.guidance,
               cropZones: bannerCropSpec,
               ...(bannerProfileHref
@@ -4010,6 +4069,25 @@ export class CommandExecutor {
         });
       }
 
+      const streamedFrames = latestMediaProgress?.streamFrames ?? [];
+      const needsExplicitFinalFrame =
+        streamedFrames.length === 0 ||
+        streamedFrames[streamedFrames.length - 1]?.previewUrl !== media.mediaUrl;
+      const streamFramesForSuccess = needsExplicitFinalFrame
+        ? [
+            ...streamedFrames,
+            {
+              sourceFileName: null,
+              isStreamPart: false,
+              streamPartIndex: null,
+              isFinalStreamFrame: true,
+              previewUrl: media.mediaUrl,
+              outputPath: null,
+              metadataId: null,
+              source: "runtime.final",
+            },
+          ]
+        : streamedFrames;
       await sendOrEditPreviewMessage({
         kind: "success",
         body: `Generated ${generatedLabel} for "${summary}".`,
@@ -4032,8 +4110,18 @@ export class CommandExecutor {
             status: "success",
             title: `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generated`,
             summary,
+            previewUrl: media.mediaUrl,
             href: media.mediaUrl,
             hrefLabel: `Open ${generatedLabel}`,
+            ...(streamFramesForSuccess.length > 0
+              ? {
+                  streamFrames: streamFramesForSuccess,
+                  streamFrameCount: streamFramesForSuccess.length,
+                  latestStreamFrameIndex: streamFramesForSuccess.length - 1,
+                  hasFinalStreamFrame: true,
+                  streamRevealProgress: 1,
+                }
+              : {}),
           },
         },
       });
@@ -5208,6 +5296,7 @@ export class CommandExecutor {
     const baseUrl = this.resolveMediaGeneratorBaseUrl();
     if (!baseUrl) return null;
     const useFileGenerator = input.generatedAssetType !== "image";
+    const requiresFinalStreamFrame = !useFileGenerator;
     const requestBody: Record<string, unknown> = {
       prompt: input.prompt,
       command: useFileGenerator ? "generateFile" : "generateImage",
@@ -5223,6 +5312,27 @@ export class CommandExecutor {
     if (useFileGenerator) {
       requestBody.type = input.generatedAssetType === "gif" ? "gif" : "file";
     }
+
+    const hasFinalArtifactInList = (value: unknown): boolean => {
+      const items = toUnknownArray(value);
+      for (const item of items) {
+        const direct =
+          asNonEmptyString(item) ??
+          (isRecord(item)
+            ? asNonEmptyString(item.outputPath) ??
+              asNonEmptyString(item.savedOutputPath) ??
+              asNonEmptyString(item.path) ??
+              asNonEmptyString(item.fileUrl) ??
+              asNonEmptyString(item.mediaUrl) ??
+              asNonEmptyString(item.outputUrl) ??
+              asNonEmptyString(item.downloadUrl) ??
+              asNonEmptyString(item.url)
+            : null);
+        if (!direct) continue;
+        if (!/\.part\d+(?:\D|$)/iu.test(direct)) return true;
+      }
+      return false;
+    };
 
     const controller = new AbortController();
     const openTimeout = setTimeout(
@@ -5307,21 +5417,31 @@ export class CommandExecutor {
           continue;
         }
         latestPayload = contextPayload;
-        latestFingerprint = await emitProgress(
-          latestPayload,
-          false,
-          latestFingerprint,
-        );
+        const progress = this.parseMediaGenerationProgress(contextPayload, false);
+        latestFingerprint = await emitProgress(latestPayload, false, latestFingerprint);
         const context = this.extractMediaGeneratorContextRecord(contextPayload);
         const status = context ? asNonEmptyString(context.status) : null;
-        const savedFilesCount = toUnknownArray(context?.savedFiles).length;
-        const observedOutputFilesCount = toUnknownArray(context?.observedOutputFiles).length;
-        const hasArtifacts = Boolean(
-          savedFilesCount > 0 ||
-            observedOutputFilesCount > 0 ||
-            this.parseMediaGenerationProgress(contextPayload, false).hasFinalStreamFrame,
+        const savedFiles = toUnknownArray(context?.savedFiles);
+        const observedOutputFiles = toUnknownArray(context?.observedOutputFiles);
+        const savedFilesCount = savedFiles.length;
+        const observedOutputFilesCount = observedOutputFiles.length;
+        const hasArtifacts = savedFilesCount > 0 || observedOutputFilesCount > 0;
+        const hasFinalStreamFrame = progress.hasFinalStreamFrame;
+        const hasFinalStreamArtifact = progress.streamFrames.some(
+          (frame) =>
+            frame.isFinalStreamFrame &&
+            typeof frame.outputPath === "string" &&
+            frame.outputPath.trim().length > 0,
         );
-        if (this.isTerminalMediaGeneratorStatus(status) || hasArtifacts) {
+        const hasFinalArtifactFile =
+          hasFinalArtifactInList(savedFiles) || hasFinalArtifactInList(observedOutputFiles);
+        const generationReady = requiresFinalStreamFrame
+          ? hasFinalStreamArtifact ||
+            hasFinalArtifactFile ||
+            (this.isTerminalMediaGeneratorStatus(status) &&
+              (hasFinalStreamArtifact || hasFinalArtifactFile || !hasArtifacts))
+          : hasArtifacts || this.isTerminalMediaGeneratorStatus(status);
+        if (generationReady) {
           return { payload: latestPayload, timedOut: false };
         }
       } catch {
@@ -5596,7 +5716,60 @@ export class CommandExecutor {
       return absolute;
     };
 
+    const resolveFromStreamEvents = (value: unknown): string | null => {
+      const events = toUnknownArray(value);
+      if (events.length === 0) return null;
+      const resolveFromEntry = (
+        entry: Record<string, unknown>,
+      ): { resolved: string | null; isFinalStreamFrame: boolean } => {
+        const sourceFileName =
+          asNonEmptyString(entry.sourceFileName) ??
+          asNonEmptyString(entry.file_name);
+        const isStreamPartFromName =
+          sourceFileName !== null && /\.part\d+(?:\D|$)/iu.test(sourceFileName);
+        const isFinalStreamFrame =
+          entry.isFinalStreamFrame === true ||
+          entry.streamIsFinalFrame === true ||
+          (sourceFileName !== null && !isStreamPartFromName);
+        const artifactCandidates: unknown[] = [
+          entry.outputPath,
+          entry.savedOutputPath,
+          entry.path,
+          entry.lastOutputPath,
+          entry.lastOutputFile,
+          entry.fileUrl,
+          entry.mediaUrl,
+          entry.outputUrl,
+          entry.downloadUrl,
+        ];
+        for (const candidate of artifactCandidates) {
+          const resolved = resolveCandidate(candidate);
+          if (resolved) return { resolved, isFinalStreamFrame };
+        }
+        return { resolved: null, isFinalStreamFrame };
+      };
+      for (let i = events.length - 1; i >= 0; i -= 1) {
+        const entry = events[i];
+        if (!isRecord(entry)) continue;
+        const resolved = resolveFromEntry(entry);
+        if (resolved.isFinalStreamFrame && resolved.resolved) {
+          return resolved.resolved;
+        }
+      }
+      for (let i = events.length - 1; i >= 0; i -= 1) {
+        const entry = events[i];
+        if (!isRecord(entry)) continue;
+        const resolved = resolveFromEntry(entry);
+        if (resolved.resolved) {
+          return resolved.resolved;
+        }
+      }
+      return null;
+    };
+
     if (!isRecord(parsed)) return null;
+    const streamResolved = resolveFromStreamEvents(parsed.streamEvents);
+    if (streamResolved) return streamResolved;
     const urlKeys = [
       "lastOutputPath",
       "lastOutputFile",
@@ -5609,11 +5782,6 @@ export class CommandExecutor {
       "fileUrl",
       "imageUrl",
     ];
-    for (const key of urlKeys) {
-      const resolved = resolveCandidate(parsed[key]);
-      if (resolved) return resolved;
-    }
-
     const scanStringArray = (value: unknown): string | null => {
       const items = toUnknownArray(value);
       if (items.length === 0) return null;
@@ -5634,9 +5802,15 @@ export class CommandExecutor {
       const resolved = scanStringArray(parsed[key]);
       if (resolved) return resolved;
     }
+    for (const key of urlKeys) {
+      const resolved = resolveCandidate(parsed[key]);
+      if (resolved) return resolved;
+    }
 
     const context = isRecord(parsed.context) ? parsed.context : null;
     if (context) {
+      const contextStreamResolved = resolveFromStreamEvents(context.streamEvents);
+      if (contextStreamResolved) return contextStreamResolved;
       for (const key of arrayKeys) {
         const resolved = scanStringArray(context[key]);
         if (resolved) return resolved;
@@ -5657,6 +5831,8 @@ export class CommandExecutor {
     if (Array.isArray(parsed.runs)) {
       for (const run of parsed.runs) {
         if (!isRecord(run)) continue;
+        const runStreamResolved = resolveFromStreamEvents(run.streamEvents);
+        if (runStreamResolved) return runStreamResolved;
         for (const key of arrayKeys) {
           const resolved = scanStringArray(run[key]);
           if (resolved) return resolved;
@@ -5667,6 +5843,8 @@ export class CommandExecutor {
         }
         const runContext = isRecord(run.context) ? run.context : null;
         if (runContext) {
+          const runContextStreamResolved = resolveFromStreamEvents(runContext.streamEvents);
+          if (runContextStreamResolved) return runContextStreamResolved;
           for (const key of arrayKeys) {
             const resolved = scanStringArray(runContext[key]);
             if (resolved) return resolved;
