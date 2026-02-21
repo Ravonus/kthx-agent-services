@@ -50,6 +50,9 @@ const COMMENT_PROMPT_WRAPPER_PATTERN =
 const ACTION_IDEMPOTENCY_IN_FLIGHT_WINDOW_MS = 45_000;
 const ACTION_REQUEUE_BACKOFF_MS = 15_000;
 const OWNER_CAPABILITY_COOLDOWN_MS = 60_000;
+const MEDIA_GENERATOR_DEFAULT_BASE_URL = "http://127.0.0.1:4280";
+const MEDIA_GENERATOR_POLL_MS = 700;
+const MEDIA_GENERATOR_OPEN_TIMEOUT_MS = 45_000;
 const COMMENT_TOKEN_STOP_WORDS = new Set([
   "a",
   "an",
@@ -230,6 +233,24 @@ const truncateText = (value: string, maxChars: number): string => {
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+
+const toUnknownArray = (value: unknown): unknown[] =>
+  Array.isArray(value) ? value : [];
+
+const extractBridgeMessageId = (value: unknown): string | null => {
+  const fromRecord = (record: Record<string, unknown>): string | null => {
+    const direct = asNonEmptyString(record.id);
+    if (direct) return direct;
+    const message = isRecord(record.message) ? record.message : null;
+    const messageId = message ? asNonEmptyString(message.id) : null;
+    if (messageId) return messageId;
+    const nestedData = isRecord(record.data) ? record.data : null;
+    if (!nestedData) return null;
+    return fromRecord(nestedData);
+  };
+  if (!isRecord(value)) return null;
+  return fromRecord(value);
+};
 
 const isMissingFileError = (error: unknown): boolean => {
   if (!(error instanceof Error)) return false;
@@ -519,6 +540,27 @@ type GeneratedDraft = {
 };
 
 type GeneratedAssetType = "image" | "gif" | "pdf" | "csv" | "code" | "file" | "txt" | "md";
+type MediaGeneratorStreamFrame = {
+  sourceFileName: string | null;
+  isStreamPart: boolean;
+  streamPartIndex: number | null;
+  isFinalStreamFrame: boolean;
+  previewUrl: string | null;
+  outputPath: string | null;
+  metadataId: string | null;
+  source: string | null;
+};
+type MediaGenerationProgress = {
+  contextId: string | null;
+  contextStatus: string | null;
+  latestPreviewUrl: string | null;
+  streamFrameCount: number;
+  latestStreamFrameIndex: number | null;
+  hasFinalStreamFrame: boolean;
+  streamRevealProgress: number;
+  streamFrames: MediaGeneratorStreamFrame[];
+  timedOut: boolean;
+};
 type OpenClawPromptExecutionResult = {
   parsed: unknown;
   raw: string;
@@ -3645,7 +3687,125 @@ export class CommandExecutor {
         : generatedAssetType === "gif"
           ? "GIF"
           : "image";
+    const summary = truncateText(basePrompt, 220);
+    const chatRoute = chatTarget.conversationId
+      ? { conversationId: chatTarget.conversationId }
+      : { channelId: chatTarget.channelId };
+    const previewType = avatarRequest
+      ? "persona"
+      : bannerRequest
+        ? "banner"
+        : generatedAssetType;
+    const processingTitle =
+      avatarRequest
+        ? "Generating avatar"
+        : bannerRequest
+          ? "Generating banner"
+          : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} in progress`;
+    const processingBody =
+      avatarRequest
+        ? "Working on your avatar now..."
+        : bannerRequest
+          ? "Working on your banner now..."
+          : `Generating ${generatedLabel} for "${summary}".`;
+    let previewMessageId: string | null = null;
+    let previewProgressFingerprint = "";
+    let previewProgressUpdatedAtMs = 0;
+    const buildProcessingActionPreview = (progress?: MediaGenerationProgress) => ({
+      type: previewType,
+      status: "processing",
+      title: processingTitle,
+      summary,
+      ...(progress?.latestPreviewUrl ? { previewUrl: progress.latestPreviewUrl } : {}),
+      ...(progress
+        ? {
+            streamFrames: progress.streamFrames,
+            streamFrameCount: progress.streamFrameCount,
+            latestStreamFrameIndex: progress.latestStreamFrameIndex,
+            hasFinalStreamFrame: progress.hasFinalStreamFrame,
+            streamRevealProgress: progress.streamRevealProgress,
+          }
+        : {}),
+    });
+    const sendOrEditPreviewMessage = async (input: {
+      body: string;
+      attachments?: Array<{
+        url: string;
+        mimeType: string;
+        sizeBytes: number;
+        metadata?: Record<string, unknown>;
+      }>;
+      metadata: Record<string, unknown>;
+      kind: "processing" | "success" | "failed";
+    }): Promise<void> => {
+      const callAgentChatBridge = this.ctx.callAgentChatBridge;
+      if (!callAgentChatBridge) return;
+      if (previewMessageId) {
+        try {
+          await callAgentChatBridge({
+            action: "edit_message",
+            messageId: previewMessageId,
+            body: input.body,
+            ...(input.attachments ? { attachments: input.attachments } : {}),
+            metadata: input.metadata,
+          });
+          return;
+        } catch {
+          // Fall through and send a new message.
+        }
+      }
+      const created = await callAgentChatBridge({
+        action: "send_message",
+        clientMessageId: `runtime_generate_${input.kind}_${Date.now().toString(36)}_${crypto
+          .randomUUID()
+          .replaceAll("-", "")
+          .slice(0, 10)}`,
+        ...chatRoute,
+        body: input.body,
+        format: "markdown",
+        ...(input.attachments ? { attachments: input.attachments } : {}),
+        metadata: input.metadata,
+      });
+      previewMessageId ??= extractBridgeMessageId(created);
+    };
+    const emitStreamProgress = async (progress: MediaGenerationProgress): Promise<void> => {
+      if (!previewMessageId) return;
+      const nowMs = Date.now();
+      if (nowMs - previewProgressUpdatedAtMs < 220) return;
+      const fingerprint = [
+        progress.contextId ?? "",
+        progress.contextStatus ?? "",
+        progress.latestPreviewUrl ?? "",
+        progress.streamFrameCount,
+        progress.latestStreamFrameIndex ?? "",
+        progress.hasFinalStreamFrame ? "1" : "0",
+        progress.streamRevealProgress,
+        progress.timedOut ? "1" : "0",
+      ].join("|");
+      if (fingerprint === previewProgressFingerprint) return;
+      previewProgressFingerprint = fingerprint;
+      previewProgressUpdatedAtMs = nowMs;
+      await this.ctx.callAgentChatBridge?.({
+        action: "edit_message",
+        messageId: previewMessageId,
+        body: processingBody,
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: buildProcessingActionPreview(progress),
+        },
+      }).catch(() => undefined);
+    };
     try {
+      await sendOrEditPreviewMessage({
+        kind: "processing",
+        body: processingBody,
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: buildProcessingActionPreview(),
+        },
+      });
       const media = await this.generateAndUploadMediaFromPrompt(prompt, {
         generatedAssetType: avatarRequest || bannerRequest ? "image" : generatedAssetType,
         mode: avatarRequest
@@ -3654,6 +3814,7 @@ export class CommandExecutor {
             ? "chat_banner_update"
             : "chat_literal_generate",
         referenceInputs,
+        onProgress: emitStreamProgress,
       });
       const mimeType = this.resolveGeneratedAttachmentMimeType({
         generatedAssetType,
@@ -3666,7 +3827,6 @@ export class CommandExecutor {
         media.mediaSizeBytes > 0
           ? Math.max(1, Math.floor(media.mediaSizeBytes))
           : 1;
-      const summary = truncateText(basePrompt, 220);
       if (avatarRequest) {
         const avatarCropSpec =
           profileCropSpec?.target === "avatar"
@@ -3697,17 +3857,9 @@ export class CommandExecutor {
           avatarTarget === "owner"
             ? "Done. Here is your new avatar. If framing looks off, tap Crop avatar and keep your face in the center safe zone."
             : "Done. Here is my new avatar. If framing looks off, tap Crop avatar and keep the face in the center safe zone.";
-        await this.ctx.callAgentChatBridge({
-          action: "send_message",
-          clientMessageId: `runtime_avatar_result_${Date.now().toString(36)}_${crypto
-            .randomUUID()
-            .replaceAll("-", "")
-            .slice(0, 10)}`,
-          ...(chatTarget.conversationId
-            ? { conversationId: chatTarget.conversationId }
-            : { channelId: chatTarget.channelId }),
+        await sendOrEditPreviewMessage({
+          kind: "success",
           body: completionText,
-          format: "markdown",
           attachments: [
             {
               url: media.mediaUrl,
@@ -3797,17 +3949,9 @@ export class CommandExecutor {
           bannerTarget === "owner"
             ? "Done. Here is your new banner. If framing looks off, tap Crop banner and keep key details in the center safe zone."
             : "Done. Here is my new banner. If framing looks off, keep key details in the center safe zone.";
-        await this.ctx.callAgentChatBridge({
-          action: "send_message",
-          clientMessageId: `runtime_banner_result_${Date.now().toString(36)}_${crypto
-            .randomUUID()
-            .replaceAll("-", "")
-            .slice(0, 10)}`,
-          ...(chatTarget.conversationId
-            ? { conversationId: chatTarget.conversationId }
-            : { channelId: chatTarget.channelId }),
+        await sendOrEditPreviewMessage({
+          kind: "success",
           body: completionText,
-          format: "markdown",
           attachments: [
             {
               url: media.mediaUrl,
@@ -3866,17 +4010,9 @@ export class CommandExecutor {
         });
       }
 
-      await this.ctx.callAgentChatBridge({
-        action: "send_message",
-        clientMessageId: `runtime_generate_result_${Date.now().toString(36)}_${crypto
-          .randomUUID()
-          .replaceAll("-", "")
-          .slice(0, 10)}`,
-        ...(chatTarget.conversationId
-          ? { conversationId: chatTarget.conversationId }
-          : { channelId: chatTarget.channelId }),
+      await sendOrEditPreviewMessage({
+        kind: "success",
         body: `Generated ${generatedLabel} for "${summary}".`,
-        format: "markdown",
         attachments: [
           {
             url: media.mediaUrl,
@@ -3920,23 +4056,15 @@ export class CommandExecutor {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       const isPromptCurationFailure = /prompt_curation_/iu.test(message);
-      await this.ctx.callAgentChatBridge({
-        action: "send_message",
-        clientMessageId: `runtime_generate_error_${Date.now().toString(36)}_${crypto
-          .randomUUID()
-          .replaceAll("-", "")
-          .slice(0, 10)}`,
-        ...(chatTarget.conversationId
-          ? { conversationId: chatTarget.conversationId }
-          : { channelId: chatTarget.channelId }),
+      await sendOrEditPreviewMessage({
+        kind: "failed",
         body: avatarRequest
           ? "I could not update that avatar right now. Please retry in a moment."
           : bannerRequest
             ? "I could not update that banner right now. Please retry in a moment."
-          : isPromptCurationFailure
-            ? `I could not prepare a generation prompt for that ${generatedLabel} right now. Please retry in a moment.`
-            : `I could not generate that ${generatedLabel} right now. Please retry in a moment.`,
-        format: "markdown",
+            : isPromptCurationFailure
+              ? `I could not prepare a generation prompt for that ${generatedLabel} right now. Please retry in a moment.`
+              : `I could not generate that ${generatedLabel} right now. Please retry in a moment.`,
         metadata: {
           automated: true,
           sourceContext: "CHAT",
@@ -3948,9 +4076,9 @@ export class CommandExecutor {
                 ? "Avatar update failed"
                 : bannerRequest
                   ? "Banner update failed"
-                : isPromptCurationFailure
-                  ? "Prompt curation failed"
-                  : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
+                  : isPromptCurationFailure
+                    ? "Prompt curation failed"
+                    : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
             error: truncateText(message, 240),
           },
         },
@@ -4884,6 +5012,331 @@ export class CommandExecutor {
     return curatedPrompt;
   }
 
+  private resolveMediaGeneratorBaseUrl(): string | null {
+    const explicit = asNonEmptyString(process.env.MG_AGENT_MEDIA_GENERATOR_BASE_URL);
+    if (explicit) {
+      return explicit.replace(/\/+$/u, "");
+    }
+    const portRaw = asNonEmptyString(process.env.PW_PORT);
+    if (portRaw) {
+      const port = Number.parseInt(portRaw, 10);
+      if (Number.isFinite(port) && port > 0 && port <= 65535) {
+        return `http://127.0.0.1:${port}`;
+      }
+    }
+    return MEDIA_GENERATOR_DEFAULT_BASE_URL;
+  }
+
+  private extractMediaGeneratorContextId(payload: unknown): string | null {
+    if (!isRecord(payload)) return null;
+    const direct = asNonEmptyString(payload.contextId);
+    if (direct) return direct;
+    const context = isRecord(payload.context) ? payload.context : null;
+    if (!context) return null;
+    return asNonEmptyString(context.id);
+  }
+
+  private extractMediaGeneratorContextRecord(payload: unknown): Record<string, unknown> | null {
+    if (!isRecord(payload)) return null;
+    const nested = isRecord(payload.context) ? payload.context : null;
+    if (nested) return nested;
+    const hasContextShape =
+      payload.status !== undefined ||
+      payload.streamEvents !== undefined ||
+      payload.savedFiles !== undefined ||
+      payload.observedOutputFiles !== undefined;
+    return hasContextShape ? payload : null;
+  }
+
+  private isTerminalMediaGeneratorStatus(status: string | null): boolean {
+    if (!status) return false;
+    const normalized = status.trim().toLowerCase();
+    return (
+      normalized === "done" ||
+      normalized === "completed" ||
+      normalized === "complete" ||
+      normalized === "success" ||
+      normalized === "failed" ||
+      normalized === "error" ||
+      normalized === "cancelled" ||
+      normalized === "canceled"
+    );
+  }
+
+  private parseMediaGenerationProgress(
+    payload: unknown,
+    timedOut: boolean,
+  ): MediaGenerationProgress {
+    const context = this.extractMediaGeneratorContextRecord(payload);
+    const contextId =
+      this.extractMediaGeneratorContextId(payload) ??
+      (context ? asNonEmptyString(context.id) : null);
+    const contextStatus = context ? asNonEmptyString(context.status) : null;
+    const streamEvents = context ? toUnknownArray(context.streamEvents) : [];
+    const streamFrames: MediaGeneratorStreamFrame[] = [];
+    let latestPreviewUrl: string | null = null;
+
+    for (const rawEntry of streamEvents) {
+      if (!isRecord(rawEntry)) continue;
+      const sourceFileName =
+        asNonEmptyString(rawEntry.sourceFileName) ??
+        asNonEmptyString(rawEntry.file_name);
+      const streamPartIndexFromName =
+        sourceFileName && /\.part(\d+)(?:\D|$)/iu.test(sourceFileName)
+          ? Number.parseInt(
+              /\.part(\d+)(?:\D|$)/iu.exec(sourceFileName)?.[1] ?? "",
+              10,
+            )
+          : null;
+      const streamPartIndexRaw =
+        typeof rawEntry.streamPartIndex === "number" &&
+        Number.isFinite(rawEntry.streamPartIndex)
+          ? Math.max(0, Math.floor(rawEntry.streamPartIndex))
+          : streamPartIndexFromName !== null && Number.isFinite(streamPartIndexFromName)
+            ? Math.max(0, Math.floor(streamPartIndexFromName))
+            : null;
+      const isStreamPartFromName =
+        sourceFileName !== null && /\.part\d+(?:\D|$)/iu.test(sourceFileName);
+      const isStreamPart =
+        rawEntry.isStreamPart === true ||
+        (typeof streamPartIndexRaw === "number" && Number.isFinite(streamPartIndexRaw)) ||
+        isStreamPartFromName;
+      const isFinalStreamFrame =
+        rawEntry.isFinalStreamFrame === true ||
+        rawEntry.streamIsFinalFrame === true ||
+        (sourceFileName !== null && !isStreamPartFromName);
+      const previewCandidate =
+        asNonEmptyString(rawEntry.previewUrl) ??
+        asNonEmptyString(rawEntry.url) ??
+        asNonEmptyString(rawEntry.resolvedUrl) ??
+        asNonEmptyString(rawEntry.fileUrl) ??
+        asNonEmptyString(rawEntry.mediaUrl) ??
+        asNonEmptyString(rawEntry.outputUrl) ??
+        asNonEmptyString(rawEntry.downloadUrl) ??
+        asNonEmptyString(rawEntry.dataUri);
+      const previewUrl =
+        previewCandidate &&
+        (isHttpUrl(previewCandidate) || isDataUri(previewCandidate))
+          ? previewCandidate
+          : null;
+      if (previewUrl) {
+        latestPreviewUrl = previewUrl;
+      }
+      const outputPath =
+        asNonEmptyString(rawEntry.outputPath) ??
+        asNonEmptyString(rawEntry.savedOutputPath) ??
+        asNonEmptyString(rawEntry.path);
+      const metadataId = asNonEmptyString(rawEntry.metadataId);
+      const source = asNonEmptyString(rawEntry.source);
+      if (!previewUrl && !sourceFileName && !outputPath && !isStreamPart && !isFinalStreamFrame) {
+        continue;
+      }
+      streamFrames.push({
+        sourceFileName,
+        isStreamPart,
+        streamPartIndex:
+          typeof streamPartIndexRaw === "number" && Number.isFinite(streamPartIndexRaw)
+            ? streamPartIndexRaw
+            : null,
+        isFinalStreamFrame,
+        previewUrl,
+        outputPath,
+        metadataId,
+        source,
+      });
+    }
+
+    const latestFromFinalFrame =
+      [...streamFrames]
+        .reverse()
+        .find((entry) => entry.isFinalStreamFrame && typeof entry.previewUrl === "string")
+        ?.previewUrl ?? null;
+    const latestFromAnyFrame =
+      [...streamFrames]
+        .reverse()
+        .map((entry) => entry.previewUrl)
+        .find((entry): entry is string => typeof entry === "string" && entry.length > 0) ?? null;
+    const latestPreview =
+      latestFromFinalFrame ??
+      latestFromAnyFrame ??
+      latestPreviewUrl ??
+      (context
+        ? asNonEmptyString(context.latestPreviewUrl) ??
+          asNonEmptyString(context.previewUrl)
+        : null);
+    const streamFrameCount = streamFrames.length;
+    const hasFinalStreamFrame = streamFrames.some((entry) => entry.isFinalStreamFrame);
+    const latestStreamFrameIndex = streamFrameCount > 0 ? streamFrameCount - 1 : null;
+    const revealBase = 1 - Math.exp(-streamFrameCount * 0.45);
+    const streamRevealProgress = hasFinalStreamFrame
+      ? 1
+      : Math.min(0.92, Number(revealBase.toFixed(3)));
+    return {
+      contextId,
+      contextStatus,
+      latestPreviewUrl: latestPreview,
+      streamFrameCount,
+      latestStreamFrameIndex,
+      hasFinalStreamFrame,
+      streamRevealProgress,
+      streamFrames,
+      timedOut,
+    };
+  }
+
+  private mediaGenerationProgressFingerprint(progress: MediaGenerationProgress): string {
+    return [
+      progress.contextId ?? "",
+      progress.contextStatus ?? "",
+      progress.latestPreviewUrl ?? "",
+      progress.streamFrameCount,
+      progress.latestStreamFrameIndex ?? "",
+      progress.hasFinalStreamFrame ? "1" : "0",
+      progress.streamRevealProgress,
+      progress.timedOut ? "1" : "0",
+    ].join("|");
+  }
+
+  private async runMediaGeneratorViaHttp(input: {
+    prompt: string;
+    generatedAssetType: GeneratedAssetType;
+    requestDir: string;
+    referenceFiles: string[];
+    timeoutMs: number;
+    onProgress?: ((progress: MediaGenerationProgress) => Promise<void> | void) | undefined;
+  }): Promise<{ payload: unknown; timedOut: boolean } | null> {
+    const baseUrl = this.resolveMediaGeneratorBaseUrl();
+    if (!baseUrl) return null;
+    const useFileGenerator = input.generatedAssetType !== "image";
+    const requestBody: Record<string, unknown> = {
+      prompt: input.prompt,
+      command: useFileGenerator ? "generateFile" : "generateImage",
+      mode: useFileGenerator ? "file" : "image",
+      stream: true,
+      sync: false,
+      count: 1,
+      dir: input.requestDir,
+    };
+    if (input.referenceFiles.length > 0) {
+      requestBody.files = input.referenceFiles;
+    }
+    if (useFileGenerator) {
+      requestBody.type = input.generatedAssetType === "gif" ? "gif" : "file";
+    }
+
+    const controller = new AbortController();
+    const openTimeout = setTimeout(
+      () => controller.abort(),
+      Math.max(5_000, Math.min(MEDIA_GENERATOR_OPEN_TIMEOUT_MS, input.timeoutMs)),
+    );
+    let payload: unknown = null;
+    try {
+      const response = await fetch(`${baseUrl}/open`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      payload = text.length > 0 ? (JSON.parse(text) as unknown) : null;
+      if (!response.ok) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "media_generation_service_http_failed",
+            at: nowIso(),
+            status: response.status,
+            generatedAssetType: input.generatedAssetType,
+          })
+          .catch(() => undefined);
+        return null;
+      }
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "media_generation_service_unavailable",
+          at: nowIso(),
+          generatedAssetType: input.generatedAssetType,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return null;
+    } finally {
+      clearTimeout(openTimeout);
+    }
+
+    const emitProgress = async (
+      progressPayload: unknown,
+      timedOut: boolean,
+      previousFingerprint: string | null,
+    ): Promise<string | null> => {
+      if (!input.onProgress) return previousFingerprint;
+      const progress = this.parseMediaGenerationProgress(progressPayload, timedOut);
+      const fingerprint = this.mediaGenerationProgressFingerprint(progress);
+      if (fingerprint === previousFingerprint) return previousFingerprint;
+      try {
+        await input.onProgress(progress);
+      } catch {
+        // Ignore progress callback failures.
+      }
+      return fingerprint;
+    };
+
+    let latestPayload: unknown = payload;
+    let latestFingerprint: string | null = await emitProgress(
+      latestPayload,
+      false,
+      null,
+    );
+    const contextId = this.extractMediaGeneratorContextId(payload);
+    if (!contextId) {
+      return { payload: latestPayload, timedOut: false };
+    }
+
+    const deadlineMs = Date.now() + Math.max(5_000, input.timeoutMs);
+    while (Date.now() <= deadlineMs) {
+      try {
+        const response = await fetch(
+          `${baseUrl}/context?id=${encodeURIComponent(contextId)}`,
+        );
+        const text = await response.text();
+        const contextPayload = text.length > 0 ? (JSON.parse(text) as unknown) : null;
+        if (!response.ok) {
+          await sleep(MEDIA_GENERATOR_POLL_MS);
+          continue;
+        }
+        latestPayload = contextPayload;
+        latestFingerprint = await emitProgress(
+          latestPayload,
+          false,
+          latestFingerprint,
+        );
+        const context = this.extractMediaGeneratorContextRecord(contextPayload);
+        const status = context ? asNonEmptyString(context.status) : null;
+        const savedFilesCount = toUnknownArray(context?.savedFiles).length;
+        const observedOutputFilesCount = toUnknownArray(context?.observedOutputFiles).length;
+        const hasArtifacts = Boolean(
+          savedFilesCount > 0 ||
+            observedOutputFilesCount > 0 ||
+            this.parseMediaGenerationProgress(contextPayload, false).hasFinalStreamFrame,
+        );
+        if (this.isTerminalMediaGeneratorStatus(status) || hasArtifacts) {
+          return { payload: latestPayload, timedOut: false };
+        }
+      } catch {
+        // keep polling until timeout
+      }
+      await sleep(MEDIA_GENERATOR_POLL_MS);
+    }
+
+    latestFingerprint = await emitProgress(latestPayload, true, latestFingerprint);
+    return {
+      payload: latestPayload,
+      timedOut: true,
+    };
+  }
+
   private async generateAndUploadMediaFromPrompt(
     prompt: string,
     opts?: {
@@ -4892,6 +5345,7 @@ export class CommandExecutor {
       referenceInputs?: string[];
       maxReferenceInputs?: number;
       keepOriginal?: boolean;
+      onProgress?: ((progress: MediaGenerationProgress) => Promise<void> | void) | undefined;
     },
   ): Promise<ResolvedMediaUpload> {
     const sourcePrompt = prompt.trim();
@@ -4992,14 +5446,30 @@ export class CommandExecutor {
       commandPreview: command.slice(0, 240),
     }).catch(() => undefined);
 
-    const execResult = await this.runShellCommand(command, {
-      MG_IMAGE_PROMPT: curatedPrompt,
-      MG_IMAGE_PROMPT_DIR: requestDir,
-      MG_IMAGE_OUTPUT: outputPath,
-      MG_IMAGE_PROMPT_FILE: promptFilePath,
-      MG_IMAGE_FILES: referenceFiles.join(","),
-      MG_IMAGE_TYPE: generatedAssetType,
+    const serviceRun = await this.runMediaGeneratorViaHttp({
+      prompt: curatedPrompt,
+      generatedAssetType,
+      requestDir,
+      referenceFiles,
+      timeoutMs: this.ctx.config.imageGenerateTimeoutMs,
+      onProgress: opts?.onProgress,
     });
+    const execResult = serviceRun
+      ? {
+          ok: true,
+          stdout: JSON.stringify(serviceRun.payload),
+          stderr: "",
+          error: null,
+          timedOut: serviceRun.timedOut,
+        }
+      : await this.runShellCommand(command, {
+          MG_IMAGE_PROMPT: curatedPrompt,
+          MG_IMAGE_PROMPT_DIR: requestDir,
+          MG_IMAGE_OUTPUT: outputPath,
+          MG_IMAGE_PROMPT_FILE: promptFilePath,
+          MG_IMAGE_FILES: referenceFiles.join(","),
+          MG_IMAGE_TYPE: generatedAssetType,
+        });
     if (!execResult.ok) {
       const reason = execResult.timedOut
         ? `image_generation_timeout_after_${this.ctx.config.imageGenerateTimeoutMs}ms`
@@ -5127,15 +5597,28 @@ export class CommandExecutor {
     };
 
     if (!isRecord(parsed)) return null;
-    const urlKeys = ["url", "mediaUrl", "outputUrl", "fileUrl", "imageUrl", "savedPath"];
+    const urlKeys = [
+      "lastOutputPath",
+      "lastOutputFile",
+      "outputPath",
+      "savedOutputPath",
+      "savedPath",
+      "url",
+      "mediaUrl",
+      "outputUrl",
+      "fileUrl",
+      "imageUrl",
+    ];
     for (const key of urlKeys) {
       const resolved = resolveCandidate(parsed[key]);
       if (resolved) return resolved;
     }
 
     const scanStringArray = (value: unknown): string | null => {
-      if (!Array.isArray(value)) return null;
-      for (const entry of value) {
+      const items = toUnknownArray(value);
+      if (items.length === 0) return null;
+      for (let i = items.length - 1; i >= 0; i -= 1) {
+        const entry = items[i];
         const resolved = resolveCandidate(entry);
         if (resolved) return resolved;
       }
@@ -5158,6 +5641,13 @@ export class CommandExecutor {
         const resolved = scanStringArray(context[key]);
         if (resolved) return resolved;
       }
+      const keepAlive = isRecord(context.keepAlive) ? context.keepAlive : null;
+      if (keepAlive) {
+        for (const key of urlKeys) {
+          const resolved = resolveCandidate(keepAlive[key]);
+          if (resolved) return resolved;
+        }
+      }
       for (const key of urlKeys) {
         const resolved = resolveCandidate(context[key]);
         if (resolved) return resolved;
@@ -5174,6 +5664,26 @@ export class CommandExecutor {
         for (const key of urlKeys) {
           const resolved = resolveCandidate(run[key]);
           if (resolved) return resolved;
+        }
+        const runContext = isRecord(run.context) ? run.context : null;
+        if (runContext) {
+          for (const key of arrayKeys) {
+            const resolved = scanStringArray(runContext[key]);
+            if (resolved) return resolved;
+          }
+          const runKeepAlive = isRecord(runContext.keepAlive)
+            ? runContext.keepAlive
+            : null;
+          if (runKeepAlive) {
+            for (const key of urlKeys) {
+              const resolved = resolveCandidate(runKeepAlive[key]);
+              if (resolved) return resolved;
+            }
+          }
+          for (const key of urlKeys) {
+            const resolved = resolveCandidate(runContext[key]);
+            if (resolved) return resolved;
+          }
         }
       }
     }
