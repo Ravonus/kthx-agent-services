@@ -804,7 +804,7 @@ export class CommandExecutor {
     state: CommandLifecycleState;
   }): { allowed: boolean; reason: string; requeue: boolean } {
     const stateDb = this.ctx.stateDb;
-    if (!stateDb || !stateDb.enabled) {
+    if (!stateDb?.enabled) {
       return { allowed: true, reason: "state_db_disabled", requeue: false };
     }
     const existing = stateDb.getCommandLifecycleByIdempotencyKey(
@@ -867,7 +867,7 @@ export class CommandExecutor {
     lastError?: string | null;
   }): void {
     const stateDb = this.ctx.stateDb;
-    if (!stateDb || !stateDb.enabled) return;
+    if (!stateDb?.enabled) return;
     stateDb.upsertCommandLifecycle({
       commandId: input.command.id,
       directiveId: input.command.sourceDirectiveId ?? input.command.id,
@@ -3380,6 +3380,8 @@ export class CommandExecutor {
       asNonEmptyString(payload.kind)?.toLowerCase() ??
       "story";
     const mappedKind = this.mapGoalToGenerateKind(goal);
+    const requestedKinds = this.resolveRequestedGenerateKinds(payload, mappedKind);
+    const primaryKind = requestedKinds[0] ?? mappedKind;
     const postId = asPositiveInt(payload.postId);
     const commentId = asPositiveInt(payload.commentId);
     const count = asPositiveInt(payload.count);
@@ -3404,7 +3406,8 @@ export class CommandExecutor {
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce;
     return {
-      kind: mappedKind,
+      kind: primaryKind,
+      ...(requestedKinds.length > 0 ? { kinds: requestedKinds } : {}),
       ...(count ? { count } : {}),
       ...(topic ? { topic } : {}),
       ...(mood ? { mood } : {}),
@@ -3416,6 +3419,82 @@ export class CommandExecutor {
       ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       ...(command.grantId ? { grantId: command.grantId } : {}),
     };
+  }
+
+  private normalizeRequestedGenerateKind(value: unknown): string | null {
+    const raw = asNonEmptyString(value)?.toLowerCase();
+    if (!raw) return null;
+    const normalized = raw.replace(/[\s-]+/gu, "_");
+    if (
+      normalized === "story" ||
+      normalized === "thread" ||
+      normalized === "comment" ||
+      normalized === "like" ||
+      normalized === "repost" ||
+      normalized === "media" ||
+      normalized === "multi_media"
+    ) {
+      return normalized;
+    }
+    if (normalized === "reply") return "comment";
+    if (normalized === "engagement") return "like";
+    if (normalized === "boost") return "repost";
+    if (
+      normalized === "post" ||
+      normalized === "image" ||
+      normalized === "avatar" ||
+      normalized === "banner"
+    ) {
+      return "media";
+    }
+    if (normalized === "carousel") return "multi_media";
+    return null;
+  }
+
+  private resolveRequestedGenerateKinds(
+    payload: Record<string, unknown>,
+    fallbackKind: string,
+  ): string[] {
+    const kinds: string[] = [];
+    const seen = new Set<string>();
+    const pushKind = (value: unknown): void => {
+      const normalized = this.normalizeRequestedGenerateKind(value);
+      if (!normalized || seen.has(normalized)) return;
+      seen.add(normalized);
+      kinds.push(normalized);
+    };
+    const pushArray = (value: unknown): void => {
+      if (!Array.isArray(value)) return;
+      for (const entry of value) {
+        pushKind(entry);
+      }
+    };
+    const pushCsvLike = (value: unknown): void => {
+      const text = asNonEmptyString(value);
+      if (!text) return;
+      for (const token of text.split(/[,|]/u)) {
+        pushKind(token);
+      }
+    };
+
+    pushArray(payload.kinds);
+    pushArray(payload.generateKinds);
+    if (!Array.isArray(payload.kinds)) {
+      pushCsvLike(payload.kinds);
+    }
+    if (!Array.isArray(payload.generateKinds)) {
+      pushCsvLike(payload.generateKinds);
+    }
+    if (Array.isArray(payload.generateKind)) {
+      pushArray(payload.generateKind);
+    } else {
+      pushKind(payload.generateKind);
+    }
+
+    if (kinds.length === 0) pushKind(payload.goal);
+    if (kinds.length === 0) pushKind(payload.kind);
+    if (kinds.length === 0) pushKind(fallbackKind);
+    return kinds.slice(0, 6);
   }
 
   private mapGoalToGenerateKind(goal: string): string {
