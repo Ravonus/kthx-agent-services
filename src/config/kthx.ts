@@ -30,6 +30,8 @@ const DEFAULT_KTHX_HOME_DIR = path.resolve(process.cwd(), "kthx-agents");
 
 const DEFAULT_IMAGE_COMMAND_TEMPLATE =
   'generateImage --sync --dir "{dir}" --files "{files}" "{prompt}"';
+const DEFAULT_FILE_COMMAND_TEMPLATE =
+  'generateFile --sync --type "{type}" --dir "{dir}" --output "{output}" --files "{files}" "{prompt}"';
 
 const DEFAULT_OPENCLAW_PROMPT_TEMPLATE =
   'openclaw agent --agent "{agent}" --json --thinking medium -m "{prompt}"';
@@ -104,6 +106,7 @@ export const buildDefaultKthxConfig = (homeDir: string): KthxConfig => ({
   },
   image: {
     commandTemplate: DEFAULT_IMAGE_COMMAND_TEMPLATE,
+    fileCommandTemplate: DEFAULT_FILE_COMMAND_TEMPLATE,
     defaultPersona: "default",
     mediaIndexMaxEntries: 800,
     referenceLookback: 3,
@@ -226,18 +229,18 @@ export const normalizeKthxConfig = (
   // -- paths ----------------------------------------------------------------
   const resolvedHomeDir: string =
     typeof sourcePaths.homeDir === "string" &&
-    (sourcePaths.homeDir as string).trim().length > 0
-      ? path.resolve((sourcePaths.homeDir as string).trim())
+    sourcePaths.homeDir.trim().length > 0
+      ? path.resolve(sourcePaths.homeDir.trim())
       : defaults.paths.homeDir;
   const resolvedStateDir: string =
     typeof sourcePaths.stateDir === "string" &&
-    (sourcePaths.stateDir as string).trim().length > 0
-      ? path.resolve((sourcePaths.stateDir as string).trim())
+    sourcePaths.stateDir.trim().length > 0
+      ? path.resolve(sourcePaths.stateDir.trim())
       : path.join(resolvedHomeDir, "state");
   const resolvedGeneratedDir: string =
     typeof sourcePaths.generatedDir === "string" &&
-    (sourcePaths.generatedDir as string).trim().length > 0
-      ? path.resolve((sourcePaths.generatedDir as string).trim())
+    sourcePaths.generatedDir.trim().length > 0
+      ? path.resolve(sourcePaths.generatedDir.trim())
       : path.join(resolvedStateDir, "ipc", "generated");
 
   // -- openclaw strings -----------------------------------------------------
@@ -260,10 +263,18 @@ export const normalizeKthxConfig = (
     sourceImage.commandTemplate,
     "",
   );
+  const sourceFileCommandTemplate = safeString(
+    sourceImage.fileCommandTemplate,
+    "",
+  );
   const imageCommandTemplate =
     sourceImageCommandTemplate.length > 0
       ? sourceImageCommandTemplate
       : defaults.image.commandTemplate;
+  const fileCommandTemplate =
+    sourceFileCommandTemplate.length > 0
+      ? sourceFileCommandTemplate
+      : defaults.image.fileCommandTemplate;
 
   const defaultPersonaRaw = normalizePersonaToken(sourceImage.defaultPersona);
   const defaultPersona =
@@ -465,6 +476,7 @@ export const normalizeKthxConfig = (
     },
     image: {
       commandTemplate: imageCommandTemplate,
+      fileCommandTemplate,
       defaultPersona,
       mediaIndexMaxEntries: Math.max(
         100,

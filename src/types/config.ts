@@ -69,6 +69,7 @@ export type KthxMemoryConfig = {
 
 export type KthxImageConfig = {
   commandTemplate: string;
+  fileCommandTemplate: string;
   defaultPersona: string;
   mediaIndexMaxEntries: number;
   referenceLookback: number;
@@ -141,6 +142,7 @@ export type RuntimeConfig = {
 
   // Image generation
   imageGenerateCmd: string | null;
+  fileGenerateCmd: string | null;
   imageGenerateTimeoutMs: number;
 
   // Bot session
@@ -196,6 +198,7 @@ export type RuntimeConfig = {
   autoRetryPendingMs: number;
   terminalTriggerOnly: boolean;
   queueRunnerDefaultEnabled: boolean;
+  queueRunnerConcurrency: number;
   executionStateResetOnStart: boolean;
   pendingRetryMaxAttempts: number;
 

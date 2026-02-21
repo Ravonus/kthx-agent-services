@@ -1091,7 +1091,10 @@ const main = async (): Promise<void> => {
 
   const commandExecutor = new CommandExecutor({
     config: {
-      imageGenerateCmd: config.imageGenerateCmd,
+      imageGenerateCmd:
+        config.imageGenerateCmd ?? ctx.kthxConfig.image.commandTemplate,
+      fileGenerateCmd:
+        config.fileGenerateCmd ?? ctx.kthxConfig.image.fileCommandTemplate,
       imageGenerateTimeoutMs: config.imageGenerateTimeoutMs,
     },
     ipcPaths: {
@@ -1121,7 +1124,10 @@ const main = async (): Promise<void> => {
 
   // -- QueueManager
   const queueManager = new QueueManager({
-    config: { terminalTriggerOnly: config.terminalTriggerOnly },
+    config: {
+      terminalTriggerOnly: config.terminalTriggerOnly,
+      queueRunnerConcurrency: config.queueRunnerConcurrency,
+    },
     ipcPaths: {
       queueStatePath: ipcPaths.queueStatePath,
       inboxDir: ipcPaths.inboxDir,

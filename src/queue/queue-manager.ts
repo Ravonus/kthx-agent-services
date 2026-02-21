@@ -28,6 +28,7 @@ import {
 export interface QueueManagerContext {
   config: {
     terminalTriggerOnly: boolean;
+    queueRunnerConcurrency: number;
   };
   ipcPaths: {
     queueStatePath: string;
@@ -82,6 +83,7 @@ const parseIsoToMs = (value: unknown): number | null => {
 
 export class QueueManager implements QueueManagerLike {
   private readonly ctx: QueueManagerContext;
+  private readonly activeExecutions = new Set<string>();
 
   constructor(ctx: QueueManagerContext) {
     this.ctx = ctx;
@@ -212,12 +214,23 @@ export class QueueManager implements QueueManagerLike {
       // Deterministic plan first
       await this.planQueueDeterministic("queue_runner_tick");
 
+      const maxConcurrency = Math.max(
+        1,
+        Math.floor(this.ctx.config.queueRunnerConcurrency),
+      );
+      const availableSlots = Math.max(
+        0,
+        maxConcurrency - this.activeExecutions.size,
+      );
+      if (availableSlots === 0) return;
+
       const state = await this.readQueueState();
       const candidates = state.items
         .filter(
           (item) =>
             item.status === "queued" || item.status === "scheduled",
         )
+        .filter((item) => !this.activeExecutions.has(item.id))
         .filter((item) => !item.completedAt)
         .map((item) => {
           const dueMs = parseIsoToMs(item.dueAt);
@@ -242,112 +255,53 @@ export class QueueManager implements QueueManagerLike {
         });
 
       if (!candidates.length) return;
-      const candidate = candidates[0];
-      if (!candidate) return;
-      if (
-        candidate.dueMs > Date.now() &&
-        candidate.item.forceNow !== true
-      )
-        return;
-
-      // Verify inbox file exists
-      const inboxPath = path.join(
-        this.ctx.ipcPaths.inboxDir,
-        candidate.item.inboxFile,
-      );
-      const inboxExists = await fs
-        .access(inboxPath)
-        .then(() => true)
-        .catch(() => false);
-      if (!inboxExists) {
-        await this.markCompleted(candidate.item.inboxFile, "missing", "inbox file missing");
-        return;
-      }
-
-      // Mark as running
-      await this.mutateQueueState((current) => {
-        const next = { ...current };
-        next.items = current.items.map((qi) => {
-          if (qi.id !== candidate.item.id) return qi;
-          return {
-            ...qi,
-            status: "running" as const,
-            startedAt: nowIso(),
-            lastAttemptAt: nowIso(),
-            attempts: qi.attempts + 1,
-            lastError: null,
-          };
-        });
-        return next;
-      });
-
-      // Execute
-      try {
-        await this.ctx
-          .runMemoryCheckpoint({
-            force: true,
-            source: "queue_execution",
-            allowAgentCompression: true,
-          })
-          .catch(() => {});
-
-        const processed = await this.ctx.processCommandFile(
+      const nowMs = Date.now();
+      const dueCandidates = candidates
+        .filter(
+          (candidate) =>
+            candidate.item.forceNow === true || candidate.dueMs <= nowMs,
+        )
+        .slice(0, availableSlots);
+      for (const candidate of dueCandidates) {
+        const inboxPath = path.join(
+          this.ctx.ipcPaths.inboxDir,
           candidate.item.inboxFile,
         );
-        if (!processed) {
-          // Revert to previous state
-          await this.mutateQueueState((current) => {
-            const next = { ...current };
-            next.items = current.items.map((qi) => {
-              if (qi.id !== candidate.item.id) return qi;
-              const preservedError =
-                typeof qi.lastError === "string" &&
-                qi.lastError.trim().length > 0
-                  ? qi.lastError.trim()
-                  : "not_ready";
-              const retryDelaySeconds = Math.max(
-                2,
-                Math.min(60, (typeof qi.attempts === "number" ? qi.attempts : 1) * 2),
-              );
-              const nextDueAt = new Date(
-                Date.now() + retryDelaySeconds * 1000,
-              ).toISOString();
-              return {
-                ...qi,
-                status: "scheduled" as QueueItem["status"],
-                dueAt: nextDueAt,
-                scheduledBy: "queue_not_ready_backoff",
-                lastError: preservedError,
-              };
-            });
-            return next;
-          });
-          return;
+        const inboxExists = await fs
+          .access(inboxPath)
+          .then(() => true)
+          .catch(() => false);
+        if (!inboxExists) {
+          await this.markCompleted(
+            candidate.item.inboxFile,
+            "missing",
+            "inbox file missing",
+          );
+          continue;
         }
 
-        await this.ctx.memory.recordWrite({
-          type: "directive_queue_executed",
-          at: nowIso(),
-          source: "queue_runner",
-          directiveId: candidate.item.directiveId,
-          inboxFile: candidate.item.inboxFile,
+        await this.mutateQueueState((current) => {
+          const next = { ...current };
+          next.items = current.items.map((qi) => {
+            if (qi.id !== candidate.item.id) return qi;
+            return {
+              ...qi,
+              status: "running" as const,
+              startedAt: nowIso(),
+              lastAttemptAt: nowIso(),
+              attempts: qi.attempts + 1,
+              lastError: null,
+            };
+          });
+          return next;
         });
-      } catch (error: unknown) {
-        const message =
-          error instanceof Error ? error.message : String(error);
-        await this.markCompleted(
-          candidate.item.inboxFile,
-          "failed",
-          message,
-        );
-        await this.ctx.memory.recordWrite({
-          type: "directive_queue_execution_failed",
-          at: nowIso(),
-          source: "queue_runner",
-          directiveId: candidate.item.directiveId,
-          inboxFile: candidate.item.inboxFile,
-          error: message,
-        });
+
+        this.activeExecutions.add(candidate.item.id);
+        void this.executeCandidate(candidate.item)
+          .catch(() => undefined)
+          .finally(() => {
+            this.activeExecutions.delete(candidate.item.id);
+          });
       }
     } finally {
       this.ctx.queue.queueRunnerTickInFlight = false;
@@ -359,7 +313,69 @@ export class QueueManager implements QueueManagerLike {
   // -----------------------------------------------------------------------
 
   dispose(): void {
-    // No timers to clear -- the runtime owns the interval.
+    this.activeExecutions.clear();
+  }
+
+  private async executeCandidate(item: QueueItem): Promise<void> {
+    try {
+      await this.ctx
+        .runMemoryCheckpoint({
+          force: true,
+          source: "queue_execution",
+          allowAgentCompression: true,
+        })
+        .catch(() => undefined);
+
+      const processed = await this.ctx.processCommandFile(item.inboxFile);
+      if (!processed) {
+        await this.mutateQueueState((current) => {
+          const next = { ...current };
+          next.items = current.items.map((qi) => {
+            if (qi.id !== item.id) return qi;
+            const preservedError =
+              typeof qi.lastError === "string" &&
+              qi.lastError.trim().length > 0
+                ? qi.lastError.trim()
+                : "not_ready";
+            const retryDelaySeconds = Math.max(
+              2,
+              Math.min(60, (typeof qi.attempts === "number" ? qi.attempts : 1) * 2),
+            );
+            const nextDueAt = new Date(
+              Date.now() + retryDelaySeconds * 1000,
+            ).toISOString();
+            return {
+              ...qi,
+              status: "scheduled" as QueueItem["status"],
+              dueAt: nextDueAt,
+              scheduledBy: "queue_not_ready_backoff",
+              lastError: preservedError,
+            };
+          });
+          return next;
+        });
+        return;
+      }
+
+      await this.ctx.memory.recordWrite({
+        type: "directive_queue_executed",
+        at: nowIso(),
+        source: "queue_runner",
+        directiveId: item.directiveId,
+        inboxFile: item.inboxFile,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.markCompleted(item.inboxFile, "failed", message);
+      await this.ctx.memory.recordWrite({
+        type: "directive_queue_execution_failed",
+        at: nowIso(),
+        source: "queue_runner",
+        directiveId: item.directiveId,
+        inboxFile: item.inboxFile,
+        error: message,
+      });
+    }
   }
 
   // -----------------------------------------------------------------------

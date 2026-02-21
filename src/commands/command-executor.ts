@@ -40,7 +40,8 @@ import type { QueueState } from "../types/ipc.js";
 import type { Command } from "../types/ipc.js";
 import type { ContextBundle, ContextRequest } from "../types/memory.js";
 
-const MEDIA_FILE_RE = /\.(png|jpe?g|webp|gif|svg|mp4|mov|webm)$/iu;
+const MEDIA_FILE_RE =
+  /\.(png|jpe?g|webp|gif|svg|mp4|mov|webm|pdf|csv|txt|md|json|js)$/iu;
 const MAX_MEDIA_REFERENCE_INPUTS = 8;
 const MAX_COLLECTED_REFERENCE_INPUTS = 12;
 const COMMENT_ECHO_PREFIX_PATTERN = /^frame\s*\d+\s*[:.-]/iu;
@@ -115,6 +116,12 @@ const extToMime = (filePath: string): string => {
   if (ext === ".mp4") return "video/mp4";
   if (ext === ".mov") return "video/quicktime";
   if (ext === ".webm") return "video/webm";
+  if (ext === ".pdf") return "application/pdf";
+  if (ext === ".csv") return "text/csv";
+  if (ext === ".md") return "text/markdown";
+  if (ext === ".txt") return "text/plain";
+  if (ext === ".json") return "application/json";
+  if (ext === ".js") return "text/javascript";
   return "application/octet-stream";
 };
 
@@ -128,6 +135,12 @@ const mimeToExt = (mime: string): string => {
   if (normalized === "video/mp4") return "mp4";
   if (normalized === "video/quicktime") return "mov";
   if (normalized === "video/webm") return "webm";
+  if (normalized === "application/pdf") return "pdf";
+  if (normalized === "text/csv") return "csv";
+  if (normalized === "text/markdown") return "md";
+  if (normalized === "text/plain") return "txt";
+  if (normalized === "application/json") return "json";
+  if (normalized === "text/javascript") return "js";
   return "bin";
 };
 
@@ -146,6 +159,26 @@ const truncateText = (value: string, maxChars: number): string => {
   const text = value.trim();
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(8, maxChars - 1))}…`;
+};
+
+const constrainGifPromptTo256 = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed.length) return trimmed;
+  if (/\b256\s*[x×]\s*256\b/iu.test(trimmed)) return trimmed;
+  return `${trimmed}. Exact output size: 256x256. Keep subject centered, motion readable, and loop-friendly.`;
+};
+
+const outputExtensionForGeneratedAssetType = (
+  generatedAssetType: GeneratedAssetType,
+): string => {
+  if (generatedAssetType === "image") return "png";
+  if (generatedAssetType === "gif") return "gif";
+  if (generatedAssetType === "pdf") return "pdf";
+  if (generatedAssetType === "csv") return "csv";
+  if (generatedAssetType === "md") return "md";
+  if (generatedAssetType === "txt") return "txt";
+  if (generatedAssetType === "code") return "js";
+  return "bin";
 };
 
 const normalizeCommentText = (value: string): string =>
@@ -359,6 +392,7 @@ type QueueTrackingStateLike = {
 type CommandExecutorContext = {
   config: {
     imageGenerateCmd: string | null;
+    fileGenerateCmd: string | null;
     imageGenerateTimeoutMs: number;
   };
   ipcPaths: {
@@ -455,6 +489,7 @@ type PostDraftContext = {
   targetPostId: number | null;
   postText: string | null;
   mediaSummary: string | null;
+  commentSummary: string | null;
   payloadHint: string | null;
   memorySummary: string | null;
 };
@@ -1096,56 +1131,55 @@ export class CommandExecutor {
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
       null;
-
-    const base: Record<string, unknown> = {
+    const buildBase = (caption: string | null): Record<string, unknown> => ({
       kind: postKind,
       postType,
-      ...(asNonEmptyString(payload.caption) ? { caption: asNonEmptyString(payload.caption) } : {}),
+      ...(caption ? { caption } : {}),
       ...(provenance ? { provenance } : {}),
       ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
       ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       ...(command.grantId ? { grantId: command.grantId } : {}),
-    };
+    });
 
     const targetPostId = this.extractTargetPostIdForPostDraft(payload);
     const postDraftContext = await this.loadPostDraftContext({
       postId: targetPostId,
       payload,
     });
+    const requiresCuration = Boolean(sourceDirectiveId);
+    const directiveSeedHints = this.collectDirectiveSeedHints(payload);
 
     if (postType === "text") {
-      const textBody = asNonEmptyString(payload.textBody);
-      if (!textBody) {
+      const textBodyInitial = asNonEmptyString(payload.textBody);
+      if (!textBodyInitial) {
         return this.failedOutcome(command, "textBody is required for text posts.");
       }
-      const candidate = [asNonEmptyString(payload.caption), textBody]
+      const captionInitial = asNonEmptyString(payload.caption);
+      const curatedTextDraft = await this.curatePostDraftWithOpenClaw({
+        commandId: command.id,
+        postType: "text",
+        caption: captionInitial,
+        textBody: textBodyInitial,
+        mediaPrompt: null,
+        context: postDraftContext,
+        seedHints: directiveSeedHints,
+      });
+      if (requiresCuration && !curatedTextDraft) {
+        throw new RequeueCommandError(
+          "post_curation_waiting_for_openclaw:text_curation_unavailable",
+        );
+      }
+      const captionForWrite = curatedTextDraft?.caption ?? captionInitial;
+      const textBodyForWrite = curatedTextDraft?.textBody ?? textBodyInitial;
+      if (!textBodyForWrite) {
+        return this.failedOutcome(command, "textBody is required for text posts.");
+      }
+      const candidate = [captionForWrite, textBodyForWrite]
         .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
         .join("\n");
-      const sourceEchoReason = this.detectPostDraftSourceEcho({
-        candidate,
-        context: postDraftContext,
-      });
-      if (sourceEchoReason) {
-        return this.failedOutcome(
-          command,
-          `Post blocked: draft mirrors source context (${sourceEchoReason}).`,
-          "post_source_echo_blocked",
-        );
-      }
-      const recentDupReason = await this.detectRecentPostDuplicateFromMemory({
-        candidate,
-        context: postDraftContext,
-      });
-      if (recentDupReason) {
-        return this.failedOutcome(
-          command,
-          `Post blocked: near-duplicate recent memory match (${recentDupReason}).`,
-          "post_duplicate_memory_blocked",
-        );
-      }
       const result = await this.agent().createPost.mutate({
-        ...base,
-        textBody,
+        ...buildBase(captionForWrite),
+        textBody: textBodyForWrite,
       });
       await this.ctx.memory
         .recordWrite({
@@ -1161,46 +1195,54 @@ export class CommandExecutor {
       return this.successOutcome(command, result);
     }
 
+    const captionInitial = asNonEmptyString(payload.caption);
+    const mediaPromptInitial =
+      asNonEmptyString(payload.mediaPrompt) ??
+      asNonEmptyString(payload.imagePrompt) ??
+      asNonEmptyString(payload.prompt);
+    const curatedMediaDraft = await this.curatePostDraftWithOpenClaw({
+      commandId: command.id,
+      postType: "media",
+      caption: captionInitial,
+      textBody: null,
+      mediaPrompt: mediaPromptInitial,
+      context: postDraftContext,
+      seedHints: directiveSeedHints,
+    });
+    if (requiresCuration && !curatedMediaDraft) {
+      throw new RequeueCommandError(
+        "post_curation_waiting_for_openclaw:media_curation_unavailable",
+      );
+    }
+    const captionForWrite = curatedMediaDraft?.caption ?? captionInitial;
+    const mediaPromptForWrite = curatedMediaDraft?.mediaPrompt ?? mediaPromptInitial;
+    const payloadForMedia: Record<string, unknown> = {
+      ...payload,
+      ...(captionForWrite ? { caption: captionForWrite } : {}),
+      ...(mediaPromptForWrite
+        ? {
+            mediaPrompt: mediaPromptForWrite,
+            imagePrompt: mediaPromptForWrite,
+            prompt: mediaPromptForWrite,
+          }
+        : {}),
+    };
     const media = await this.resolveMediaUpload({
-      payload,
+      payload: payloadForMedia,
       keepOriginal: true,
       promptFallbacks: [
-        asNonEmptyString(payload.mediaPrompt),
-        asNonEmptyString(payload.imagePrompt),
+        mediaPromptForWrite,
+        asNonEmptyString(payload.prompt),
       ],
     });
     const mediaCandidate = [
-      asNonEmptyString(payload.caption),
-      asNonEmptyString(payload.mediaPrompt),
-      asNonEmptyString(payload.imagePrompt),
-      asNonEmptyString(payload.prompt),
+      captionForWrite,
+      mediaPromptForWrite,
     ]
       .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
       .join("\n");
-    const sourceEchoReason = this.detectPostDraftSourceEcho({
-      candidate: mediaCandidate,
-      context: postDraftContext,
-    });
-    if (sourceEchoReason) {
-      return this.failedOutcome(
-        command,
-        `Post blocked: draft mirrors source context (${sourceEchoReason}).`,
-        "post_source_echo_blocked",
-      );
-    }
-    const recentDupReason = await this.detectRecentPostDuplicateFromMemory({
-      candidate: mediaCandidate,
-      context: postDraftContext,
-    });
-    if (recentDupReason) {
-      return this.failedOutcome(
-        command,
-        `Post blocked: near-duplicate recent memory match (${recentDupReason}).`,
-        "post_duplicate_memory_blocked",
-      );
-    }
     const result = await this.agent().createPost.mutate({
-      ...base,
+      ...buildBase(captionForWrite),
       mediaUrl: media.mediaUrl,
       ...(media.mediaOriginalUrl ? { mediaOriginalUrl: media.mediaOriginalUrl } : {}),
       ...(media.mediaOptimizedUrl ? { mediaOptimizedUrl: media.mediaOptimizedUrl } : {}),
@@ -1250,6 +1292,7 @@ export class CommandExecutor {
       targetPostId: input.postId,
       postText: null,
       mediaSummary: null,
+      commentSummary: null,
       payloadHint: this.extractCommentPayloadHint(input.payload),
       memorySummary: await this.loadPostDraftMemorySummary({
         postId: input.postId,
@@ -1271,6 +1314,22 @@ export class CommandExecutor {
         asNonEmptyString(postRecord.caption) ??
         asNonEmptyString(postRecord.body);
       context.mediaSummary = this.summarizePostMediaForComment(postRecord);
+      try {
+        const commentResponse = await callAgentChatBridge({
+          action: "find_comment",
+          postId: input.postId,
+        });
+        context.commentSummary = this.summarizeCommentsForPostDraft(commentResponse);
+      } catch (error: unknown) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "post_context_comments_lookup_failed",
+            at: nowIso(),
+            postId: input.postId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          .catch(() => undefined);
+      }
       return context;
     } catch (error: unknown) {
       await this.ctx.memory
@@ -1329,99 +1388,187 @@ export class CommandExecutor {
     }
   }
 
-  private detectPostDraftSourceEcho(input: {
-    candidate: string;
+  private buildPostDraftCurationPrompt(input: {
+    postType: "text" | "media";
+    caption: string | null;
+    textBody: string | null;
+    mediaPrompt: string | null;
     context: PostDraftContext;
-  }): string | null {
-    const candidate = input.candidate.trim();
-    if (candidate.length < 12) return null;
-    const contextParts = [
-      input.context.postText,
-      input.context.mediaSummary,
-      input.context.payloadHint,
-    ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
-    for (const part of contextParts) {
-      const normalizedCandidate = normalizeCommentText(candidate);
-      const normalizedPart = normalizeCommentText(part);
-      if (normalizedCandidate.length > 0 && normalizedCandidate === normalizedPart) {
-        return "exact_match";
+    seedHints: string[];
+  }): string {
+    const contextLines = [
+      typeof input.context.targetPostId === "number"
+        ? `targetPostId: ${input.context.targetPostId}`
+        : null,
+      input.context.postText ? `targetPostText: ${input.context.postText}` : null,
+      input.context.mediaSummary ? `targetMedia: ${input.context.mediaSummary}` : null,
+      input.context.commentSummary ? `targetComments: ${input.context.commentSummary}` : null,
+      input.context.payloadHint ? `directiveHint: ${input.context.payloadHint}` : null,
+      input.context.memorySummary ? `memoryContext: ${input.context.memorySummary}` : null,
+    ].filter((entry): entry is string => Boolean(entry));
+    if (input.postType === "text") {
+      return [
+        "Rewrite this directive-generated POST so it is original, social, and context-aware.",
+        "Use memoryContext + targetPostText + targetComments as grounding, then produce a fresh thought.",
+        "Do not echo or paraphrase target post text/comments. Synthesize a new opinion or angle.",
+        "Return strict JSON only with exactly this shape: {\"caption\":\"...\",\"textBody\":\"...\"}.",
+        "Rules:",
+        "- textBody: 40-240 chars, natural voice, no hashtags, no emojis.",
+        "- caption: optional, 0-140 chars.",
+        "- Must not reuse long phrases from targetPostText/targetMedia/directiveHint.",
+        "- Must not reuse long phrases from directive seed text.",
+        `draftCaption: ${input.caption ?? ""}`,
+        `draftTextBody: ${input.textBody ?? ""}`,
+        ...(input.seedHints.length > 0
+          ? [
+              "Directive seeds (avoid echo):",
+              ...input.seedHints.slice(0, 8).map((entry) => `- ${entry}`),
+            ]
+          : []),
+        "Context:",
+        ...contextLines.map((line) => `- ${line}`),
+      ].join("\n");
+    }
+    return [
+      "Rewrite this directive-generated MEDIA POST so it is original and not an echo.",
+      "Use memoryContext + targetPostText + targetComments to create a new media direction.",
+      "Do not copy title/caption/prompt from source post/comments/directive.",
+      "Return strict JSON only with exactly this shape: {\"caption\":\"...\",\"mediaPrompt\":\"...\"}.",
+      "Rules:",
+      "- caption: 10-220 chars, natural social voice, no hashtags, no emojis.",
+      "- mediaPrompt: 20-320 chars, concrete visual prompt, no wrappers like 'Generate an image of'.",
+      "- Must be materially different from targetPostText/targetMedia/directiveHint.",
+      "- Must be materially different from directive seed text.",
+      `draftCaption: ${input.caption ?? ""}`,
+      `draftMediaPrompt: ${input.mediaPrompt ?? ""}`,
+      ...(input.seedHints.length > 0
+        ? [
+            "Directive seeds (avoid echo):",
+            ...input.seedHints.slice(0, 8).map((entry) => `- ${entry}`),
+          ]
+        : []),
+      "Context:",
+      ...contextLines.map((line) => `- ${line}`),
+    ].join("\n");
+  }
+
+  private extractCuratedPostDraftFromUnknown(
+    value: unknown,
+    postType: "text" | "media",
+  ): { caption: string | null; textBody: string | null; mediaPrompt: string | null } | null {
+    const fromString = (raw: string) => {
+      const trimmed = raw.trim();
+      if (!trimmed.length) return null;
+      const parsed = parseJsonFromMixedText(trimmed);
+      if (parsed !== null && parsed !== raw) {
+        return this.extractCuratedPostDraftFromUnknown(parsed, postType);
       }
-      const overlapForward = computeTokenOverlapRatio(candidate, part);
-      const overlapReverse = computeTokenOverlapRatio(part, candidate);
-      const overlap = Math.max(overlapForward, overlapReverse);
-      if (overlap >= 0.86) {
-        return "high_token_overlap";
+      return null;
+    };
+    if (typeof value === "string") {
+      return fromString(value);
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        const parsed = this.extractCuratedPostDraftFromUnknown(entry, postType);
+        if (parsed) return parsed;
       }
-      if (hasLongNormalizedPhraseOverlap(candidate, part)) {
-        return "long_phrase_overlap";
-      }
+      return null;
+    }
+    if (!isRecord(value)) return null;
+    const caption =
+      asNonEmptyString(value.caption) ??
+      asNonEmptyString(value.title) ??
+      null;
+    const textBody =
+      asNonEmptyString(value.textBody) ??
+      asNonEmptyString(value.body) ??
+      asNonEmptyString(value.text) ??
+      null;
+    const mediaPrompt =
+      asNonEmptyString(value.mediaPrompt) ??
+      asNonEmptyString(value.imagePrompt) ??
+      asNonEmptyString(value.prompt) ??
+      null;
+    if (postType === "text" && textBody) {
+      return {
+        caption,
+        textBody: truncateText(textBody, 240),
+        mediaPrompt: null,
+      };
+    }
+    if (postType === "media" && (mediaPrompt || caption)) {
+      return {
+        caption: caption ? truncateText(caption, 2200) : null,
+        textBody: null,
+        mediaPrompt: mediaPrompt ? truncateText(mediaPrompt, 320) : null,
+      };
+    }
+    for (const key of ["draft", "payload", "result", "output", "data", "content"] as const) {
+      const nested = this.extractCuratedPostDraftFromUnknown(value[key], postType);
+      if (nested) return nested;
     }
     return null;
   }
 
-  private async detectRecentPostDuplicateFromMemory(input: {
-    candidate: string;
+  private async curatePostDraftWithOpenClaw(input: {
+    commandId: string;
+    postType: "text" | "media";
+    caption: string | null;
+    textBody: string | null;
+    mediaPrompt: string | null;
     context: PostDraftContext;
-  }): Promise<string | null> {
-    const candidate = input.candidate.trim();
-    if (candidate.length < 16) return null;
-    if (typeof this.ctx.memory.buildContext !== "function") return null;
+    seedHints: string[];
+  }): Promise<{ caption: string | null; textBody: string | null; mediaPrompt: string | null } | null> {
+    const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
+    if (!runOpenClawPrompt) return null;
+    const prompt = this.buildPostDraftCurationPrompt({
+      postType: input.postType,
+      caption: input.caption,
+      textBody: input.textBody,
+      mediaPrompt: input.mediaPrompt,
+      context: input.context,
+      seedHints: input.seedHints,
+    });
     try {
-      const request: ContextRequest = {
-        mode: "directive",
-        audience: "runtime_write",
-        ...(typeof input.context.targetPostId === "number"
-          ? { postId: input.context.targetPostId }
-          : {}),
-        maxRecentEvents: 180,
-        maxArchiveEvents: 60,
-        includeViewState: false,
-        includeKeywordRetrieval: true,
-        retrievalIntent: "directive",
-        retrievalMaxItems: 20,
-        retrievalQuery: [
-          "most recent post",
-          truncateText(candidate, 180),
-          input.context.memorySummary ? truncateText(input.context.memorySummary, 220) : "",
-        ]
-          .filter((value) => value.length > 0)
-          .join(" · "),
-      };
-      const bundle = await this.ctx.memory.buildContext(request);
-      const envelopes: unknown[] = [
-        ...(Array.isArray(bundle.recent) ? bundle.recent : []),
-        ...(Array.isArray(bundle.archive) ? bundle.archive : []),
-        ...(Array.isArray(bundle.target?.events) ? bundle.target.events : []),
-      ];
-      for (const envelope of envelopes.slice(0, 120)) {
-        if (!isRecord(envelope)) continue;
-        const payload = envelope.payload;
-        const candidates = this.extractPostTextCandidatesFromMemoryPayload(payload);
-        for (const previous of candidates) {
-          const normalizedCandidate = normalizeCommentText(candidate);
-          const normalizedPrevious = normalizeCommentText(previous);
-          if (!normalizedPrevious.length) continue;
-          if (normalizedCandidate === normalizedPrevious) {
-            return "memory_exact_match";
-          }
-          const overlapForward = computeTokenOverlapRatio(candidate, previous);
-          const overlapReverse = computeTokenOverlapRatio(previous, candidate);
-          const overlap = Math.max(overlapForward, overlapReverse);
-          if (overlap >= 0.9) {
-            return "memory_high_token_overlap";
-          }
-          if (hasLongNormalizedPhraseOverlap(candidate, previous)) {
-            return "memory_long_phrase_overlap";
-          }
-        }
-      }
-      return null;
+      const result = await runOpenClawPrompt({
+        prompt,
+        purpose: "post_draft_curation",
+      });
+      const curated =
+        (result
+          ? this.extractCuratedPostDraftFromUnknown(result.parsed, input.postType) ??
+            this.extractCuratedPostDraftFromUnknown(result.payloadText, input.postType) ??
+            this.extractCuratedPostDraftFromUnknown(result.raw, input.postType)
+          : null) ?? null;
+      if (!curated) return null;
+      const candidate = [
+        curated.caption ?? input.caption ?? "",
+        curated.textBody ?? "",
+        curated.mediaPrompt ?? "",
+      ]
+        .filter((value) => value.trim().length > 0)
+        .join("\n");
+      if (candidate.length < 12) return null;
+      await this.ctx.memory
+        .recordWrite({
+          type: "post_draft_curated",
+          at: nowIso(),
+          commandId: input.commandId,
+          postType: input.postType,
+          caption: curated.caption,
+          textBody: curated.textBody,
+          mediaPrompt: curated.mediaPrompt,
+        })
+        .catch(() => undefined);
+      return curated;
     } catch (error: unknown) {
       await this.ctx.memory
         .recordWrite({
-          type: "post_duplicate_memory_check_failed",
+          type: "post_draft_curation_failed",
           at: nowIso(),
-          targetPostId: input.context.targetPostId,
+          commandId: input.commandId,
+          postType: input.postType,
           error: error instanceof Error ? error.message : String(error),
         })
         .catch(() => undefined);
@@ -1429,45 +1576,43 @@ export class CommandExecutor {
     }
   }
 
-  private extractPostTextCandidatesFromMemoryPayload(value: unknown): string[] {
-    const collected: string[] = [];
-    const seen = new Set<string>();
-    const pushCandidate = (raw: unknown): void => {
-      if (typeof raw !== "string") return;
-      const trimmed = raw.trim();
-      if (trimmed.length < 16) return;
-      const normalized = normalizeCommentText(trimmed);
-      if (!normalized.length || seen.has(normalized)) return;
-      seen.add(normalized);
-      collected.push(trimmed);
+  private collectDirectiveSeedHints(payload: Record<string, unknown>): string[] {
+    const candidates: string[] = [];
+    const push = (value: unknown): void => {
+      const text = asNonEmptyString(value);
+      if (!text) return;
+      candidates.push(text);
     };
-    const walk = (node: unknown, depth: number): void => {
-      if (depth > 3) return;
-      if (typeof node === "string") {
-        pushCandidate(node);
-        return;
+    push(payload.requestText);
+    push(payload.topic);
+    push(payload.prompt);
+    push(payload.mediaPrompt);
+    push(payload.imagePrompt);
+    push(payload.caption);
+    push(payload.textBody);
+    push(payload.title);
+    const scope = isRecord(payload.directiveScope) ? payload.directiveScope : null;
+    if (scope) {
+      push(scope.reason);
+      push(scope.note);
+      push(scope.topic);
+      const target = isRecord(scope.target) ? scope.target : null;
+      if (target) {
+        push(target.caption);
+        push(target.textBody);
+        push(target.body);
       }
-      if (Array.isArray(node)) {
-        for (const entry of node.slice(0, 12)) {
-          walk(entry, depth + 1);
-        }
-        return;
-      }
-      if (!isRecord(node)) return;
-      pushCandidate(node.textBody);
-      pushCandidate(node.caption);
-      pushCandidate(node.body);
-      pushCandidate(node.content);
-      pushCandidate(node.summary);
-      pushCandidate(node.postText);
-      pushCandidate(node.message);
-      pushCandidate(node.bodyPreview);
-      for (const key of ["post", "payload", "data", "item", "result", "draft"] as const) {
-        walk(node[key], depth + 1);
-      }
-    };
-    walk(value, 0);
-    return collected.slice(0, 24);
+    }
+    const normalized = new Set<string>();
+    const deduped: string[] = [];
+    for (const entry of candidates) {
+      const clean = truncateText(entry, 320);
+      const key = normalizeCommentText(clean);
+      if (!key.length || normalized.has(key)) continue;
+      normalized.add(key);
+      deduped.push(clean);
+    }
+    return deduped.slice(0, 12);
   }
 
   private async executeWriteCreateStory(command: Command): Promise<CommandOutcome> {
@@ -2219,6 +2364,31 @@ export class CommandExecutor {
       return null;
     }
     return value;
+  }
+
+  private summarizeCommentsForPostDraft(value: unknown): string | null {
+    if (!isRecord(value)) return null;
+    const root = isRecord(value.data) ? value.data : value;
+    const commentsRaw = Array.isArray(root.comments) ? root.comments : [];
+    if (commentsRaw.length === 0) return null;
+    const snippets: string[] = [];
+    for (const item of commentsRaw) {
+      if (!isRecord(item)) continue;
+      const author = isRecord(item.author) ? item.author : null;
+      const handle =
+        asNonEmptyString(author?.handle) ??
+        asNonEmptyString(item.authorHandle) ??
+        "user";
+      const body =
+        asNonEmptyString(item.body) ??
+        asNonEmptyString(item.textBody) ??
+        null;
+      if (!body) continue;
+      snippets.push(`@${handle}: ${truncateText(body, 100)}`);
+      if (snippets.length >= 5) break;
+    }
+    if (snippets.length === 0) return null;
+    return truncateText(snippets.join(" | "), 600);
   }
 
   private summarizePostMediaForComment(post: Record<string, unknown>): string | null {
@@ -3093,10 +3263,14 @@ export class CommandExecutor {
     const provenance = asNonEmptyString(payload.provenance);
 
     const inlineDrafts = this.extractInlineDrafts(payload);
+    const generateInput =
+      inlineDrafts.length > 0
+        ? null
+        : await this.buildGenerateInputWithRuntimeContext(payload, command);
     const generatedResult =
       inlineDrafts.length > 0
         ? null
-        : await this.agent().generate.mutate(this.buildGenerateInput(payload, command));
+        : await this.agent().generate.mutate(generateInput ?? this.buildGenerateInput(payload, command));
     const drafts =
       inlineDrafts.length > 0
         ? inlineDrafts
@@ -3720,8 +3894,22 @@ export class CommandExecutor {
     const mappedKind = this.mapGoalToGenerateKind(goal);
     const requestedKinds = this.resolveRequestedGenerateKinds(payload, mappedKind);
     const primaryKind = requestedKinds[0] ?? mappedKind;
-    const postId = asPositiveInt(payload.postId);
-    const commentId = asPositiveInt(payload.commentId);
+    const scope = isRecord(payload.directiveScope) ? payload.directiveScope : null;
+    const scopedTarget = scope && isRecord(scope.target) ? scope.target : null;
+    const postId =
+      asPositiveInt(payload.postId) ??
+      asPositiveInt(payload.targetPostId) ??
+      (scope
+        ? asPositiveInt(scope.targetPostId) ??
+          (scopedTarget ? asPositiveInt(scopedTarget.postId) : null)
+        : null);
+    const commentId =
+      asPositiveInt(payload.commentId) ??
+      asPositiveInt(payload.targetCommentId) ??
+      (scope
+        ? asPositiveInt(scope.targetCommentId) ??
+          (scopedTarget ? asPositiveInt(scopedTarget.commentId) : null)
+        : null);
     const count = asPositiveInt(payload.count);
     const topic =
       asNonEmptyString(payload.topic) ??
@@ -3756,6 +3944,109 @@ export class CommandExecutor {
       ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
       ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       ...(command.grantId ? { grantId: command.grantId } : {}),
+    };
+  }
+
+  private async buildGenerateInputWithRuntimeContext(
+    payload: Record<string, unknown>,
+    command: Command,
+  ): Promise<Record<string, unknown>> {
+    const base = this.buildGenerateInput(payload, command);
+    const postId = asPositiveInt(base.postId);
+    const commentId = asPositiveInt(base.commentId);
+    const payloadHint = this.extractCommentPayloadHint(payload);
+    const contextLines: string[] = [];
+
+    if (postId && this.ctx.callAgentChatBridge) {
+      try {
+        const postResponse = await this.ctx.callAgentChatBridge({
+          action: "find_post",
+          postId,
+        });
+        const postRecord = this.extractPostRecordForCommentCuration(postResponse, postId);
+        if (postRecord) {
+          const postText =
+            asNonEmptyString(postRecord.textBody) ??
+            asNonEmptyString(postRecord.caption) ??
+            asNonEmptyString(postRecord.body);
+          if (postText) contextLines.push(`targetPostText: ${truncateText(postText, 260)}`);
+          const mediaSummary = this.summarizePostMediaForComment(postRecord);
+          if (mediaSummary) contextLines.push(`targetMedia: ${mediaSummary}`);
+        }
+      } catch {
+        // best effort context enrichment only
+      }
+    }
+
+    if (postId && commentId && this.ctx.callAgentChatBridge) {
+      try {
+        const commentResponse = await this.ctx.callAgentChatBridge({
+          action: "find_comment",
+          postId,
+          commentId,
+        });
+        const commentRecord = this.extractCommentRecordForCommentCuration(commentResponse);
+        if (commentRecord) {
+          const body =
+            asNonEmptyString(commentRecord.body) ??
+            asNonEmptyString(commentRecord.textBody);
+          if (body) contextLines.push(`targetComment: ${truncateText(body, 220)}`);
+        }
+      } catch {
+        // best effort context enrichment only
+      }
+    }
+
+    if (typeof this.ctx.memory.buildContext === "function") {
+      try {
+        const bundle = await this.ctx.memory.buildContext({
+          mode: "directive",
+          audience: "runtime_generate",
+          ...(postId ? { postId } : {}),
+          ...(commentId ? { commentId } : {}),
+          maxRecentEvents: 120,
+          maxArchiveEvents: 40,
+          includeViewState: true,
+          viewStateMaxItems: 10,
+          includeKeywordRetrieval: true,
+          retrievalIntent: "directive",
+          retrievalMaxItems: 10,
+          retrievalQuery: [
+            payloadHint ?? "",
+            postId ? `post ${postId}` : "",
+            commentId ? `comment ${commentId}` : "",
+          ]
+            .filter((value) => value.length > 0)
+            .join(" · "),
+        });
+        const memorySummary = this.buildCompactEngagementMemorySummary(bundle);
+        if (memorySummary) {
+          contextLines.push(`memory: ${truncateText(memorySummary, 900)}`);
+        }
+      } catch {
+        // best effort context enrichment only
+      }
+    }
+
+    const contextHint = truncateText(
+      [
+        payloadHint ? `directiveHint: ${payloadHint}` : "",
+        ...contextLines,
+      ]
+        .filter((value) => value.length > 0)
+        .join("\n"),
+      2200,
+    );
+
+    const topic =
+      asNonEmptyString(base.topic) ??
+      payloadHint ??
+      (contextLines.length > 0 ? truncateText(contextLines.join(" | "), 120) : null);
+
+    return {
+      ...base,
+      ...(topic ? { topic: truncateText(topic, 120) } : {}),
+      ...(contextHint.length > 0 ? { contextHint } : {}),
     };
   }
 
@@ -4403,6 +4694,19 @@ export class CommandExecutor {
                   : input.generatedAssetType === "file"
                     ? "file"
                     : "image";
+    const rules = [
+      "- Do not include wrappers like \"Generate an image of\".",
+      "- Do not mention social-app internals, APIs, tools, or instructions.",
+      "- Keep it concrete, visual/technical, and production-ready.",
+      "- Preserve user intent and style.",
+    ];
+    if (input.generatedAssetType === "gif") {
+      rules.push(
+        "- For GIF output include explicit animation direction and motion beats.",
+        "- Include exact output size 256x256 and keep the main subject centered.",
+        "- Favor a seamless loop and avoid tiny unreadable details.",
+      );
+    }
     return [
       "You are Clawdbot prompt-crafter for media/file generation.",
       `Target output type: ${assetLabel}.`,
@@ -4410,10 +4714,7 @@ export class CommandExecutor {
       "Rewrite the user request into one high-quality generator prompt.",
       "Return strict JSON only with exactly this shape: {\"prompt\":\"...\"}.",
       "Rules:",
-      "- Do not include wrappers like \"Generate an image of\".",
-      "- Do not mention social-app internals, APIs, tools, or instructions.",
-      "- Keep it concrete, visual/technical, and production-ready.",
-      "- Preserve user intent and style.",
+      ...rules,
       `User request: ${input.sourcePrompt}`,
     ].join("\n");
   }
@@ -4480,14 +4781,25 @@ export class CommandExecutor {
     }
     const generatedAssetType = opts?.generatedAssetType ?? "image";
     const mode = opts?.mode ?? "media_generation";
-    const curatedPrompt = await this.curateMediaPromptWithOpenClaw({
+    const curatedPromptBase = await this.curateMediaPromptWithOpenClaw({
       sourcePrompt,
       generatedAssetType,
       mode,
     });
-    const template = this.ctx.config.imageGenerateCmd;
+    const curatedPrompt =
+      generatedAssetType === "gif"
+        ? constrainGifPromptTo256(curatedPromptBase)
+        : curatedPromptBase;
+    const useFileGenerator = generatedAssetType !== "image";
+    const template = useFileGenerator
+      ? this.ctx.config.fileGenerateCmd
+      : this.ctx.config.imageGenerateCmd;
     if (!template?.trim().length) {
-      throw new Error("image_generator_unconfigured");
+      throw new Error(
+        useFileGenerator
+          ? "file_generator_unconfigured"
+          : "image_generator_unconfigured",
+      );
     }
     const requestDir = path.join(
       this.ctx.ipcPaths.generatedDir,
@@ -4496,7 +4808,10 @@ export class CommandExecutor {
     await ensureDir(requestDir);
 
     const promptFilePath = path.join(requestDir, "prompt.txt");
-    const outputPath = path.join(requestDir, "output.png");
+    const outputPath = path.join(
+      requestDir,
+      `output.${outputExtensionForGeneratedAssetType(generatedAssetType)}`,
+    );
     await fs.writeFile(promptFilePath, `${curatedPrompt}\n`, "utf8").catch(() => undefined);
     const referenceInputs = Array.isArray(opts?.referenceInputs)
       ? opts.referenceInputs.filter(
@@ -4520,6 +4835,7 @@ export class CommandExecutor {
             output: "%MG_IMAGE_OUTPUT%",
             promptFile: "%MG_IMAGE_PROMPT_FILE%",
             files: "%MG_IMAGE_FILES%",
+            type: "%MG_IMAGE_TYPE%",
           }
         : {
             prompt: "$MG_IMAGE_PROMPT",
@@ -4527,6 +4843,7 @@ export class CommandExecutor {
             output: "$MG_IMAGE_OUTPUT",
             promptFile: "$MG_IMAGE_PROMPT_FILE",
             files: "$MG_IMAGE_FILES",
+            type: "$MG_IMAGE_TYPE",
           };
     let command = template
       .replaceAll("{prompt}", refs.prompt)
@@ -4534,6 +4851,7 @@ export class CommandExecutor {
       .replaceAll("{output}", refs.output)
       .replaceAll("{prompt_file}", refs.promptFile)
       .replaceAll("{files}", refs.files)
+      .replaceAll("{type}", refs.type)
       .trim();
     if (referenceFiles.length === 0) {
       command = stripEmptyFilesFlag(command, refs.files);
@@ -4561,6 +4879,7 @@ export class CommandExecutor {
       MG_IMAGE_OUTPUT: outputPath,
       MG_IMAGE_PROMPT_FILE: promptFilePath,
       MG_IMAGE_FILES: referenceFiles.join(","),
+      MG_IMAGE_TYPE: generatedAssetType,
     });
     if (!execResult.ok) {
       const reason = execResult.timedOut

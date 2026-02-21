@@ -31,6 +31,8 @@ type CheckResult = {
 
 const DEFAULT_IMAGE_COMMAND_TEMPLATE =
   'generateImage --sync --dir "{dir}" --files "{files}" "{prompt}"';
+const DEFAULT_FILE_COMMAND_TEMPLATE =
+  'generateFile --sync --type "{type}" --dir "{dir}" --output "{output}" --files "{files}" "{prompt}"';
 
 const CHECK_ORDER: ReadonlyArray<CheckStatus> = ["fail", "warn", "ok"];
 
@@ -101,7 +103,7 @@ const resolveCommandOnPath = (token: string): string | null => {
   return null;
 };
 
-const readJsonFile = async (targetPath: string): Promise<unknown | null> => {
+const readJsonFile = async (targetPath: string): Promise<unknown> => {
   const raw = await fsp.readFile(targetPath, "utf8").catch(() => null);
   if (!raw) return null;
   try {
@@ -286,6 +288,10 @@ const main = async (): Promise<number> => {
     imageConfig && typeof imageConfig.commandTemplate === "string"
       ? imageConfig.commandTemplate.trim()
       : "";
+  const configFileCommand =
+    imageConfig && typeof imageConfig.fileCommandTemplate === "string"
+      ? imageConfig.fileCommandTemplate.trim()
+      : "";
 
   // Auth sources
   const keyBoxEnv = trimEnv("MG_AGENT_KEY_BOX");
@@ -423,6 +429,62 @@ const main = async (): Promise<number> => {
     }
   }
 
+  // File generation command (gif/pdf/csv/txt/etc.)
+  const envFileCommand = trimEnv("MG_AGENT_FILE_GENERATE_CMD");
+  const fileCommand =
+    envFileCommand ??
+    (configFileCommand.length > 0
+      ? configFileCommand
+      : DEFAULT_FILE_COMMAND_TEMPLATE);
+  if (!fileCommand.trim().length) {
+    addResult(
+      results,
+      "fail",
+      "file generation command",
+      "No command configured (MG_AGENT_FILE_GENERATE_CMD / kthx image.fileCommandTemplate).",
+    );
+  } else {
+    const token = parseFirstCommandToken(fileCommand);
+    if (!token) {
+      addResult(
+        results,
+        "fail",
+        "file generation command",
+        "Could not parse command token from file command template.",
+      );
+    } else if (token.includes("{") || token.startsWith("$") || token.startsWith("%")) {
+      addResult(
+        results,
+        "warn",
+        "file generation command",
+        `Command token is dynamic (${token}); executable check skipped.`,
+      );
+    } else {
+      let resolvedExecutable: string | null = null;
+      if (looksPathLike(token)) {
+        const abs = path.isAbsolute(token) ? token : path.resolve(token);
+        resolvedExecutable = isExecutableFile(abs) ? abs : null;
+      } else {
+        resolvedExecutable = resolveCommandOnPath(token);
+      }
+      if (!resolvedExecutable) {
+        addResult(
+          results,
+          "fail",
+          "file generation command",
+          `Executable not found for token: ${token}`,
+        );
+      } else {
+        addResult(
+          results,
+          "ok",
+          "file generation command",
+          `Template wired and executable resolved: ${resolvedExecutable}`,
+        );
+      }
+    }
+  }
+
   // Bot session file
   const botSessionPath = path.join(stateDir, "ipc", "auth", "bot-session.json");
   const botSessionJson = await readJsonFile(botSessionPath);
@@ -486,15 +548,13 @@ const main = async (): Promise<number> => {
     );
   } else {
     const processes = Array.isArray(supervisorStatusJson.processes)
-      ? supervisorStatusJson.processes
+      ? (supervisorStatusJson.processes as unknown[])
       : [];
     const runtime = processes.find(
-      (proc) => isRecord(proc) && proc.name === "runtime",
+      (proc): proc is { name?: unknown; running?: unknown } =>
+        isRecord(proc) && proc.name === "runtime",
     );
-    const runtimeRunning =
-      isRecord(runtime) && typeof runtime.running === "boolean"
-        ? runtime.running
-        : false;
+    const runtimeRunning = runtime?.running === true;
     if (runtimeRunning) {
       addResult(results, "ok", "supervisor runtime", "runtime is running.");
     } else {

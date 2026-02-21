@@ -137,6 +137,7 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     parseIntEnv("MG_AGENT_LENS_REFRESH_MIN_MS", 0),
   );
   const imageGenerateCmd = trimEnv("MG_AGENT_IMAGE_GENERATE_CMD");
+  const fileGenerateCmd = trimEnv("MG_AGENT_FILE_GENERATE_CMD");
   const imageGenerateTimeoutMs = Math.max(
     5_000,
     parseIntEnv("MG_AGENT_IMAGE_GENERATE_TIMEOUT_MS", 90_000),
@@ -268,6 +269,10 @@ export const createRuntimeConfig = (): RuntimeConfig => {
       parseIntEnv("MG_AGENT_PENDING_RETRY_MAX_ATTEMPTS", 3),
     ),
   );
+  const queueRunnerConcurrency = Math.max(
+    1,
+    Math.min(8, parseIntEnv("MG_AGENT_QUEUE_CONCURRENCY", 2)),
+  );
   const currentEventsMaxLines = Math.max(
     20,
     Math.min(
@@ -341,6 +346,7 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     consoleEnabled,
     consoleAllowNonTty,
     imageGenerateCmd,
+    fileGenerateCmd,
     imageGenerateTimeoutMs,
     botSessionTokenTtlSeconds,
     botSessionMaxUses,
@@ -380,6 +386,7 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     autoRetryPendingMs,
     terminalTriggerOnly: false,
     queueRunnerDefaultEnabled,
+    queueRunnerConcurrency,
     executionStateResetOnStart: true,
     pendingRetryMaxAttempts,
     eventsResetOnStart,
