@@ -51,7 +51,7 @@ const ACTION_IDEMPOTENCY_IN_FLIGHT_WINDOW_MS = 45_000;
 const ACTION_REQUEUE_BACKOFF_MS = 15_000;
 const OWNER_CAPABILITY_COOLDOWN_MS = 60_000;
 const MEDIA_GENERATOR_DEFAULT_BASE_URL = "http://127.0.0.1:4280";
-const MEDIA_GENERATOR_POLL_MS = 700;
+const MEDIA_GENERATOR_POLL_MS = 200;
 const MEDIA_GENERATOR_OPEN_TIMEOUT_MS = 45_000;
 const COMMENT_TOKEN_STOP_WORDS = new Set([
   "a",
@@ -3742,6 +3742,26 @@ export class CommandExecutor {
     }): Promise<void> => {
       const callAgentChatBridge = this.ctx.callAgentChatBridge;
       if (!callAgentChatBridge) return;
+      const sendFreshPreviewMessage = async (attachments?: Array<{
+        url: string;
+        mimeType: string;
+        sizeBytes: number;
+        metadata?: Record<string, unknown>;
+      }>): Promise<void> => {
+        const created = await callAgentChatBridge({
+          action: "send_message",
+          clientMessageId:
+            input.kind === "processing"
+              ? previewClientMessageId
+              : `${previewClientMessageId}_${input.kind}_${Date.now()}`,
+          ...chatRoute,
+          body: input.body,
+          format: "markdown",
+          ...(attachments ? { attachments } : {}),
+          metadata: input.metadata,
+        });
+        previewMessageId ??= extractBridgeMessageId(created);
+      };
       if (previewMessageId) {
         try {
           await callAgentChatBridge({
@@ -3752,27 +3772,67 @@ export class CommandExecutor {
             metadata: input.metadata,
           });
           return;
-        } catch {
+        } catch (error: unknown) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "chat_literal_generate_preview_edit_failed",
+              at: nowIso(),
+              commandId: command.id,
+              kind: input.kind,
+              message:
+                error instanceof Error ? error.message : String(error),
+            })
+            .catch(() => undefined);
           // Keep a single preview message thread. Do not spawn a duplicate box.
-          return;
+          if (input.kind === "processing") {
+            return;
+          }
+          try {
+            await sendFreshPreviewMessage(input.attachments);
+            return;
+          } catch (fallbackError: unknown) {
+            await this.ctx.memory
+              .recordWrite({
+                type: "chat_literal_generate_preview_terminal_send_failed",
+                at: nowIso(),
+                commandId: command.id,
+                kind: input.kind,
+                message:
+                  fallbackError instanceof Error
+                    ? fallbackError.message
+                    : String(fallbackError),
+              })
+              .catch(() => undefined);
+            if (input.attachments && input.attachments.length > 0) {
+              try {
+                await sendFreshPreviewMessage(undefined);
+                return;
+              } catch (fallbackWithoutAttachmentError: unknown) {
+                await this.ctx.memory
+                  .recordWrite({
+                    type: "chat_literal_generate_preview_terminal_send_without_attachment_failed",
+                    at: nowIso(),
+                    commandId: command.id,
+                    kind: input.kind,
+                    message:
+                      fallbackWithoutAttachmentError instanceof Error
+                        ? fallbackWithoutAttachmentError.message
+                        : String(fallbackWithoutAttachmentError),
+                  })
+                  .catch(() => undefined);
+              }
+            }
+            return;
+          }
         }
       }
-      const created = await callAgentChatBridge({
-        action: "send_message",
-        clientMessageId: previewClientMessageId,
-        ...chatRoute,
-        body: input.body,
-        format: "markdown",
-        ...(input.attachments ? { attachments: input.attachments } : {}),
-        metadata: input.metadata,
-      });
-      previewMessageId ??= extractBridgeMessageId(created);
+      await sendFreshPreviewMessage(input.attachments);
     };
     const emitStreamProgress = async (progress: MediaGenerationProgress): Promise<void> => {
       latestMediaProgress = progress;
       if (!previewMessageId) return;
       const nowMs = Date.now();
-      if (nowMs - previewProgressUpdatedAtMs < 220) return;
+      if (nowMs - previewProgressUpdatedAtMs < 120) return;
       const fingerprint = [
         progress.contextId ?? "",
         progress.contextStatus ?? "",
@@ -5436,10 +5496,14 @@ export class CommandExecutor {
         const hasFinalArtifactFile =
           hasFinalArtifactInList(savedFiles) || hasFinalArtifactInList(observedOutputFiles);
         const generationReady = requiresFinalStreamFrame
-          ? hasFinalStreamArtifact ||
+          ? hasFinalStreamFrame ||
+            hasFinalStreamArtifact ||
             hasFinalArtifactFile ||
             (this.isTerminalMediaGeneratorStatus(status) &&
-              (hasFinalStreamArtifact || hasFinalArtifactFile || !hasArtifacts))
+              (hasFinalStreamFrame ||
+                hasFinalStreamArtifact ||
+                hasFinalArtifactFile ||
+                !hasArtifacts))
           : hasArtifacts || this.isTerminalMediaGeneratorStatus(status);
         if (generationReady) {
           return { payload: latestPayload, timedOut: false };
@@ -5721,7 +5785,11 @@ export class CommandExecutor {
       if (events.length === 0) return null;
       const resolveFromEntry = (
         entry: Record<string, unknown>,
-      ): { resolved: string | null; isFinalStreamFrame: boolean } => {
+      ): {
+        resolved: string | null;
+        finalFramePreview: string | null;
+        isFinalStreamFrame: boolean;
+      } => {
         const sourceFileName =
           asNonEmptyString(entry.sourceFileName) ??
           asNonEmptyString(entry.file_name);
@@ -5744,9 +5812,30 @@ export class CommandExecutor {
         ];
         for (const candidate of artifactCandidates) {
           const resolved = resolveCandidate(candidate);
-          if (resolved) return { resolved, isFinalStreamFrame };
+          if (resolved) {
+            return { resolved, finalFramePreview: null, isFinalStreamFrame };
+          }
         }
-        return { resolved: null, isFinalStreamFrame };
+        const finalFramePreviewCandidates: unknown[] =
+          isFinalStreamFrame
+            ? [
+                entry.previewUrl,
+                entry.resolvedUrl,
+                entry.url,
+                entry.dataUri,
+              ]
+            : [];
+        for (const candidate of finalFramePreviewCandidates) {
+          const resolved = resolveCandidate(candidate);
+          if (resolved) {
+            return {
+              resolved: null,
+              finalFramePreview: resolved,
+              isFinalStreamFrame,
+            };
+          }
+        }
+        return { resolved: null, finalFramePreview: null, isFinalStreamFrame };
       };
       for (let i = events.length - 1; i >= 0; i -= 1) {
         const entry = events[i];
@@ -5754,6 +5843,9 @@ export class CommandExecutor {
         const resolved = resolveFromEntry(entry);
         if (resolved.isFinalStreamFrame && resolved.resolved) {
           return resolved.resolved;
+        }
+        if (resolved.isFinalStreamFrame && resolved.finalFramePreview) {
+          return resolved.finalFramePreview;
         }
       }
       for (let i = events.length - 1; i >= 0; i -= 1) {
