@@ -683,6 +683,12 @@ export class CommandExecutor {
     this.ctx = ctx;
   }
 
+  private releaseReplayConsumedForRetry(commandId: string): void {
+    const normalizedCommandId = commandId.trim();
+    if (!normalizedCommandId.length) return;
+    this.ctx.commandSeal.runtimeConsumedCommandIds.delete(normalizedCommandId);
+  }
+
   async processCommandFile(
     fileName: string,
     _opts?: { interactiveRl?: unknown },
@@ -848,6 +854,7 @@ export class CommandExecutor {
 
     const result = await this.executeCommand(command).catch((error: unknown) => {
       if (error instanceof RequeueCommandError) {
+        this.releaseReplayConsumedForRetry(command.id);
         void this.ctx.memory
           .recordWrite({
             type: "inbox_command_requeued",
@@ -856,6 +863,7 @@ export class CommandExecutor {
             commandId: command.id,
             kind: command.kind,
             reason: error.message,
+            replayConsumedReleased: true,
           })
           .catch(() => undefined);
         return {

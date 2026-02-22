@@ -130,6 +130,12 @@ const parseRetryAfterMs = (input: {
   return Math.max(1000, input.fallbackMs);
 };
 
+const isEnabledEnvFlag = (value: string | null): boolean => {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+};
+
 const isBotTokenAuthFailureMessage = (message: string): boolean =>
   /bot token is invalid/iu.test(message) ||
   /bot token invalid/iu.test(message) ||
@@ -792,7 +798,8 @@ const main = async (): Promise<void> => {
       Number.parseInt(trimEnv("MG_AUTO_CREDIT_MAX_REPOSTS_PER_PLAN") ?? "2", 10) || 2,
     ),
   };
-  const autoCreditPlannerEnabled = trimEnv("MG_AUTO_CREDIT_PLANNER_ENABLED") !== "0";
+  // Push-first director model: disabled by default. Explicitly opt-in only.
+  const autoCreditPlannerEnabled = isEnabledEnvFlag(trimEnv("MG_AUTO_CREDIT_PLANNER_ENABLED"));
   const autoCreditPlannerMinIntervalMs = Math.max(
     5_000,
     Number.parseInt(trimEnv("MG_AUTO_CREDIT_PLANNER_MIN_INTERVAL_MS") ?? "20000", 10) || 20_000,
