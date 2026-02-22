@@ -1022,6 +1022,12 @@ export class CommandExecutor {
 
     let sealError = verifyRuntimeCommandSeal(this.ctx.commandSeal, command);
     if (
+      sealError === "command_replay_detected" &&
+      this.tryAllowTrustedReplay(command)
+    ) {
+      sealError = verifyRuntimeCommandSeal(this.ctx.commandSeal, command);
+    }
+    if (
       sealError === "command_not_issued_by_runtime" &&
       this.tryRehydrateRuntimeIssuedSeal(command)
     ) {
@@ -1282,6 +1288,29 @@ export class CommandExecutor {
       return false;
     }
     this.ctx.commandSeal.runtimeIssuedCommandIds.add(commandId);
+    return true;
+  }
+
+  private tryAllowTrustedReplay(command: Command): boolean {
+    const commandId = command.id.trim();
+    if (!commandId.length) return false;
+    const runtimeSessionId = asNonEmptyString(command.runtimeSessionId);
+    if (!runtimeSessionId) return false;
+    if (runtimeSessionId !== this.ctx.commandSeal.runtimeCommandSessionId) {
+      return false;
+    }
+    const runtimeOrigin = asNonEmptyString(command.runtimeOrigin)?.toLowerCase() ?? "";
+    const trustedOrigin =
+      runtimeOrigin === "director_directive" ||
+      runtimeOrigin === "pending_promotion" ||
+      runtimeOrigin === "runtime_resealed";
+    if (!trustedOrigin) return false;
+    const sourceDirectiveId = asNonEmptyString(command.sourceDirectiveId);
+    const pendingDirectiveId = asNonEmptyString(command.pendingDirectiveId);
+    const directiveLinked =
+      sourceDirectiveId === commandId || pendingDirectiveId === commandId;
+    if (!directiveLinked) return false;
+    this.ctx.commandSeal.runtimeConsumedCommandIds.delete(commandId);
     return true;
   }
 
