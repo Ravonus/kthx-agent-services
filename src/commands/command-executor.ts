@@ -58,6 +58,9 @@ const COMMENT_PROMPT_WRAPPER_PATTERN =
 const ACTION_IDEMPOTENCY_IN_FLIGHT_WINDOW_MS = 45_000;
 const ACTION_REQUEUE_BACKOFF_MS = 15_000;
 const OWNER_CAPABILITY_COOLDOWN_MS = 60_000;
+const POST_NOVELTY_HISTORY_WINDOW_MS = 1000 * 60 * 60 * 24 * 7;
+const POST_NOVELTY_HISTORY_MAX_ITEMS = 80;
+const POST_NOVELTY_MAX_AVOID_REFERENCES = 8;
 const MEDIA_GENERATOR_DEFAULT_BASE_URL = "http://127.0.0.1:4280";
 const MEDIA_GENERATOR_POLL_MS = 200;
 const MEDIA_GENERATOR_OPEN_TIMEOUT_MS = 45_000;
@@ -637,6 +640,15 @@ type PostDraftContext = {
   memorySummary: string | null;
 };
 
+type RecentPostNoveltyEntry = {
+  atMs: number;
+  postType: "text" | "media";
+  text: string;
+  normalized: string;
+  commandId: string;
+  targetPostId: number | null;
+};
+
 type EngagementDecision = {
   shouldExecute: boolean;
   reason: string;
@@ -665,6 +677,7 @@ export class CommandExecutor {
   private readonly ctx: CommandExecutorContext;
   private readonly inFlight = new Set<string>();
   private readonly ownerCapabilityDeniedByTarget = new Map<string, OwnerCapabilityCooldown>();
+  private readonly recentPostNoveltyHistory: RecentPostNoveltyEntry[] = [];
 
   constructor(ctx: CommandExecutorContext) {
     this.ctx = ctx;
@@ -1409,6 +1422,7 @@ export class CommandExecutor {
         return this.failedOutcome(command, "textBody is required for text posts.");
       }
       const captionInitial = asNonEmptyString(payload.caption);
+      const noveltyAvoidReferences = this.snapshotRecentPostNoveltyReferences("text");
       const curatedTextDraft = await this.curatePostDraftWithOpenClaw({
         commandId: command.id,
         postType: "text",
@@ -1417,23 +1431,120 @@ export class CommandExecutor {
         mediaPrompt: null,
         context: postDraftContext,
         seedHints: directiveSeedHints,
+        avoidReferences: noveltyAvoidReferences,
       });
       if (requiresCuration && !curatedTextDraft) {
         throw new RequeueCommandError(
           "post_curation_waiting_for_openclaw:text_curation_unavailable",
         );
       }
-      const captionForWrite = curatedTextDraft?.caption ?? captionInitial;
-      const textBodyForWrite = curatedTextDraft?.textBody ?? textBodyInitial;
+      let captionForWrite = curatedTextDraft?.caption ?? captionInitial;
+      let textBodyForWrite = curatedTextDraft?.textBody ?? textBodyInitial;
       if (!textBodyForWrite) {
         return this.failedOutcome(command, "textBody is required for text posts.");
       }
-      const candidate = [captionForWrite, textBodyForWrite]
-        .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-        .join("\n");
+      let noveltyValidation = this.validatePostDraftNovelty({
+        postType: "text",
+        caption: captionForWrite,
+        textBody: textBodyForWrite,
+        mediaPrompt: null,
+        context: postDraftContext,
+        seedHints: directiveSeedHints,
+      });
+      if (!noveltyValidation.ok) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "post_novelty_rejected",
+            at: nowIso(),
+            commandId: command.id,
+            postType: "text",
+            reason: noveltyValidation.reason,
+            candidatePreview: truncateText(noveltyValidation.candidateText, 240),
+            referencePreview: noveltyValidation.referencePreview,
+          })
+          .catch(() => undefined);
+        const recurationReferences = Array.from(
+          new Set<string>(
+            [
+              ...noveltyAvoidReferences,
+              noveltyValidation.referencePreview ?? "",
+              truncateText(noveltyValidation.candidateText, 260),
+            ]
+              .map((value) => value.trim())
+              .filter((value) => value.length > 0),
+          ),
+        );
+        const recuratedTextDraft = await this.curatePostDraftWithOpenClaw({
+          commandId: command.id,
+          postType: "text",
+          caption: captionForWrite,
+          textBody: textBodyForWrite,
+          mediaPrompt: null,
+          context: postDraftContext,
+          seedHints: directiveSeedHints,
+          avoidReferences: recurationReferences,
+        });
+        if (!recuratedTextDraft) {
+          if (requiresCuration) {
+            throw new RequeueCommandError(
+              "post_curation_waiting_for_openclaw:text_novelty_recuration_unavailable",
+            );
+          }
+          return this.failedOutcome(
+            command,
+            `Blocked text post draft due to low novelty (${noveltyValidation.reason}).`,
+            "post_novelty_rejected",
+          );
+        }
+        captionForWrite = recuratedTextDraft.caption ?? captionForWrite;
+        textBodyForWrite = recuratedTextDraft.textBody ?? textBodyForWrite;
+        noveltyValidation = this.validatePostDraftNovelty({
+          postType: "text",
+          caption: captionForWrite,
+          textBody: textBodyForWrite,
+          mediaPrompt: null,
+          context: postDraftContext,
+          seedHints: directiveSeedHints,
+        });
+        if (!noveltyValidation.ok) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "post_novelty_blocked",
+              at: nowIso(),
+              commandId: command.id,
+              postType: "text",
+              reason: noveltyValidation.reason,
+              candidatePreview: truncateText(noveltyValidation.candidateText, 240),
+              referencePreview: noveltyValidation.referencePreview,
+            })
+            .catch(() => undefined);
+          return this.failedOutcome(
+            command,
+            `Blocked text post draft due to low novelty (${noveltyValidation.reason}).`,
+            "post_novelty_blocked",
+          );
+        }
+        await this.ctx.memory
+          .recordWrite({
+            type: "post_novelty_recurated",
+            at: nowIso(),
+            commandId: command.id,
+            postType: "text",
+          })
+          .catch(() => undefined);
+      }
+      const candidate = noveltyValidation.candidateText;
       const result = await this.agent().createPost.mutate({
         ...buildBase(captionForWrite),
         textBody: textBodyForWrite,
+      });
+      this.notePublishedPostForNoveltyHistory({
+        postType: "text",
+        caption: captionForWrite,
+        textBody: textBodyForWrite,
+        mediaPrompt: null,
+        commandId: command.id,
+        targetPostId: postDraftContext.targetPostId,
       });
       await this.ctx.memory
         .recordWrite({
@@ -1454,6 +1565,7 @@ export class CommandExecutor {
       asNonEmptyString(payload.mediaPrompt) ??
       asNonEmptyString(payload.imagePrompt) ??
       asNonEmptyString(payload.prompt);
+    const noveltyAvoidReferences = this.snapshotRecentPostNoveltyReferences("media");
     const curatedMediaDraft = await this.curatePostDraftWithOpenClaw({
       commandId: command.id,
       postType: "media",
@@ -1462,14 +1574,105 @@ export class CommandExecutor {
       mediaPrompt: mediaPromptInitial,
       context: postDraftContext,
       seedHints: directiveSeedHints,
+      avoidReferences: noveltyAvoidReferences,
     });
     if (requiresCuration && !curatedMediaDraft) {
       throw new RequeueCommandError(
         "post_curation_waiting_for_openclaw:media_curation_unavailable",
       );
     }
-    const captionForWrite = curatedMediaDraft?.caption ?? captionInitial;
-    const mediaPromptForWrite = curatedMediaDraft?.mediaPrompt ?? mediaPromptInitial;
+    let captionForWrite = curatedMediaDraft?.caption ?? captionInitial;
+    let mediaPromptForWrite = curatedMediaDraft?.mediaPrompt ?? mediaPromptInitial;
+    let noveltyValidation = this.validatePostDraftNovelty({
+      postType: "media",
+      caption: captionForWrite,
+      textBody: null,
+      mediaPrompt: mediaPromptForWrite,
+      context: postDraftContext,
+      seedHints: directiveSeedHints,
+    });
+    if (!noveltyValidation.ok) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "post_novelty_rejected",
+          at: nowIso(),
+          commandId: command.id,
+          postType: "media",
+          reason: noveltyValidation.reason,
+          candidatePreview: truncateText(noveltyValidation.candidateText, 240),
+          referencePreview: noveltyValidation.referencePreview,
+        })
+        .catch(() => undefined);
+      const recurationReferences = Array.from(
+        new Set<string>(
+          [
+            ...noveltyAvoidReferences,
+            noveltyValidation.referencePreview ?? "",
+            truncateText(noveltyValidation.candidateText, 260),
+          ]
+            .map((value) => value.trim())
+            .filter((value) => value.length > 0),
+        ),
+      );
+      const recuratedMediaDraft = await this.curatePostDraftWithOpenClaw({
+        commandId: command.id,
+        postType: "media",
+        caption: captionForWrite,
+        textBody: null,
+        mediaPrompt: mediaPromptForWrite,
+        context: postDraftContext,
+        seedHints: directiveSeedHints,
+        avoidReferences: recurationReferences,
+      });
+      if (!recuratedMediaDraft) {
+        if (requiresCuration) {
+          throw new RequeueCommandError(
+            "post_curation_waiting_for_openclaw:media_novelty_recuration_unavailable",
+          );
+        }
+        return this.failedOutcome(
+          command,
+          `Blocked media post draft due to low novelty (${noveltyValidation.reason}).`,
+          "post_novelty_rejected",
+        );
+      }
+      captionForWrite = recuratedMediaDraft.caption ?? captionForWrite;
+      mediaPromptForWrite = recuratedMediaDraft.mediaPrompt ?? mediaPromptForWrite;
+      noveltyValidation = this.validatePostDraftNovelty({
+        postType: "media",
+        caption: captionForWrite,
+        textBody: null,
+        mediaPrompt: mediaPromptForWrite,
+        context: postDraftContext,
+        seedHints: directiveSeedHints,
+      });
+      if (!noveltyValidation.ok) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "post_novelty_blocked",
+            at: nowIso(),
+            commandId: command.id,
+            postType: "media",
+            reason: noveltyValidation.reason,
+            candidatePreview: truncateText(noveltyValidation.candidateText, 240),
+            referencePreview: noveltyValidation.referencePreview,
+          })
+          .catch(() => undefined);
+        return this.failedOutcome(
+          command,
+          `Blocked media post draft due to low novelty (${noveltyValidation.reason}).`,
+          "post_novelty_blocked",
+        );
+      }
+      await this.ctx.memory
+        .recordWrite({
+          type: "post_novelty_recurated",
+          at: nowIso(),
+          commandId: command.id,
+          postType: "media",
+        })
+        .catch(() => undefined);
+    }
     const payloadForMedia: Record<string, unknown> = {
       ...payload,
       ...(captionForWrite ? { caption: captionForWrite } : {}),
@@ -1489,12 +1692,7 @@ export class CommandExecutor {
         asNonEmptyString(payload.prompt),
       ],
     });
-    const mediaCandidate = [
-      captionForWrite,
-      mediaPromptForWrite,
-    ]
-      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-      .join("\n");
+    const mediaCandidate = noveltyValidation.candidateText;
     const result = await this.agent().createPost.mutate({
       ...buildBase(captionForWrite),
       mediaUrl: media.mediaUrl,
@@ -1504,6 +1702,14 @@ export class CommandExecutor {
       ...(media.mediaIpfsCid ? { mediaIpfsCid: media.mediaIpfsCid } : {}),
       ...(typeof media.mediaSizeBytes === "number" ? { mediaSizeBytes: media.mediaSizeBytes } : {}),
       ...(media.mediaType ? { mediaType: media.mediaType } : {}),
+    });
+    this.notePublishedPostForNoveltyHistory({
+      postType: "media",
+      caption: captionForWrite,
+      textBody: null,
+      mediaPrompt: mediaPromptForWrite,
+      commandId: command.id,
+      targetPostId: postDraftContext.targetPostId,
     });
     await this.ctx.memory
       .recordWrite({
@@ -1642,6 +1848,248 @@ export class CommandExecutor {
     }
   }
 
+  private buildPostNoveltyCandidateText(input: {
+    postType: "text" | "media";
+    caption: string | null;
+    textBody: string | null;
+    mediaPrompt: string | null;
+  }): string {
+    if (input.postType === "text") {
+      return [input.caption ?? "", input.textBody ?? ""]
+        .filter((value) => value.trim().length > 0)
+        .join("\n")
+        .trim();
+    }
+    return [input.caption ?? "", input.mediaPrompt ?? ""]
+      .filter((value) => value.trim().length > 0)
+      .join("\n")
+      .trim();
+  }
+
+  private pruneRecentPostNoveltyHistory(nowMs: number): void {
+    let writeIndex = 0;
+    for (const entry of this.recentPostNoveltyHistory) {
+      if (nowMs - entry.atMs > POST_NOVELTY_HISTORY_WINDOW_MS) continue;
+      this.recentPostNoveltyHistory[writeIndex] = entry;
+      writeIndex += 1;
+    }
+    this.recentPostNoveltyHistory.length = writeIndex;
+    if (this.recentPostNoveltyHistory.length <= POST_NOVELTY_HISTORY_MAX_ITEMS) {
+      return;
+    }
+    const trimStart = this.recentPostNoveltyHistory.length - POST_NOVELTY_HISTORY_MAX_ITEMS;
+    this.recentPostNoveltyHistory.splice(0, trimStart);
+  }
+
+  private snapshotRecentPostNoveltyReferences(postType: "text" | "media"): string[] {
+    const nowMs = Date.now();
+    this.pruneRecentPostNoveltyHistory(nowMs);
+    const references: string[] = [];
+    const seen = new Set<string>();
+    for (let index = this.recentPostNoveltyHistory.length - 1; index >= 0; index -= 1) {
+      const entry = this.recentPostNoveltyHistory[index];
+      if (!entry) continue;
+      if (entry.postType !== postType) continue;
+      if (seen.has(entry.normalized)) continue;
+      seen.add(entry.normalized);
+      references.push(entry.text);
+      if (references.length >= POST_NOVELTY_MAX_AVOID_REFERENCES) break;
+    }
+    return references;
+  }
+
+  private computeBidirectionalTokenOverlap(first: string, second: string): number {
+    return Math.max(
+      computeTokenOverlapRatio(first, second),
+      computeTokenOverlapRatio(second, first),
+    );
+  }
+
+  private validatePostDraftNovelty(input: {
+    postType: "text" | "media";
+    caption: string | null;
+    textBody: string | null;
+    mediaPrompt: string | null;
+    context: PostDraftContext;
+    seedHints: string[];
+  }):
+    | { ok: true; candidateText: string }
+    | { ok: false; reason: string; candidateText: string; referencePreview: string | null } {
+    const candidateText = this.buildPostNoveltyCandidateText({
+      postType: input.postType,
+      caption: input.caption,
+      textBody: input.textBody,
+      mediaPrompt: input.mediaPrompt,
+    });
+    if (candidateText.length < 12) {
+      return {
+        ok: false,
+        reason: "candidate_too_short",
+        candidateText,
+        referencePreview: null,
+      };
+    }
+    if (
+      input.postType === "media" &&
+      input.mediaPrompt &&
+      COMMENT_PROMPT_WRAPPER_PATTERN.test(input.mediaPrompt)
+    ) {
+      return {
+        ok: false,
+        reason: "media_prompt_wrapper",
+        candidateText,
+        referencePreview: input.mediaPrompt,
+      };
+    }
+    const normalizedCandidate = normalizeCommentText(candidateText);
+    if (!normalizedCandidate.length) {
+      return {
+        ok: false,
+        reason: "candidate_empty_after_normalization",
+        candidateText,
+        referencePreview: null,
+      };
+    }
+    const compareAgainstReference = (
+      reference: string,
+      threshold: number,
+      reasonPrefix: string,
+    ): { ok: true } | { ok: false; reason: string; referencePreview: string } => {
+      const trimmedReference = reference.trim();
+      if (trimmedReference.length < 12) return { ok: true };
+      const normalizedReference = normalizeCommentText(trimmedReference);
+      if (!normalizedReference.length) return { ok: true };
+      if (normalizedCandidate === normalizedReference) {
+        return { ok: false, reason: `same_as_${reasonPrefix}`, referencePreview: trimmedReference };
+      }
+      const overlap = this.computeBidirectionalTokenOverlap(candidateText, trimmedReference);
+      if (overlap >= threshold) {
+        return {
+          ok: false,
+          reason: `too_similar_to_${reasonPrefix}`,
+          referencePreview: trimmedReference,
+        };
+      }
+      if (
+        hasLongNormalizedPhraseOverlap(candidateText, trimmedReference) &&
+        overlap >= Math.max(0.42, threshold - 0.24)
+      ) {
+        return {
+          ok: false,
+          reason: `contains_${reasonPrefix}_phrase`,
+          referencePreview: trimmedReference,
+        };
+      }
+      return { ok: true };
+    };
+
+    const contextReferences = [
+      input.context.postText,
+      input.context.mediaSummary,
+      input.context.commentSummary,
+      input.context.payloadHint,
+    ].filter((value): value is string => typeof value === "string" && value.trim().length >= 12);
+    const contextThreshold = input.postType === "media" ? 0.72 : 0.78;
+    for (const reference of contextReferences) {
+      const check = compareAgainstReference(reference, contextThreshold, "target_context");
+      if (!check.ok) {
+        return {
+          ok: false,
+          reason: check.reason,
+          candidateText,
+          referencePreview: truncateText(check.referencePreview, 240),
+        };
+      }
+    }
+
+    const seedThreshold = input.postType === "media" ? 0.74 : 0.8;
+    for (const seed of input.seedHints) {
+      const check = compareAgainstReference(seed, seedThreshold, "directive_seed");
+      if (!check.ok) {
+        return {
+          ok: false,
+          reason: check.reason,
+          candidateText,
+          referencePreview: truncateText(check.referencePreview, 240),
+        };
+      }
+    }
+
+    const nowMs = Date.now();
+    this.pruneRecentPostNoveltyHistory(nowMs);
+    const historyThreshold = input.postType === "media" ? 0.68 : 0.76;
+    for (let index = this.recentPostNoveltyHistory.length - 1; index >= 0; index -= 1) {
+      const entry = this.recentPostNoveltyHistory[index];
+      if (!entry) continue;
+      if (entry.postType !== input.postType) continue;
+      if (entry.normalized === normalizedCandidate) {
+        return {
+          ok: false,
+          reason: "same_as_recent_self_post",
+          candidateText,
+          referencePreview: truncateText(entry.text, 240),
+        };
+      }
+      const overlap = this.computeBidirectionalTokenOverlap(candidateText, entry.text);
+      if (overlap >= historyThreshold) {
+        return {
+          ok: false,
+          reason: "too_similar_to_recent_self_post",
+          candidateText,
+          referencePreview: truncateText(entry.text, 240),
+        };
+      }
+      if (
+        hasLongNormalizedPhraseOverlap(candidateText, entry.text) &&
+        overlap >= Math.max(0.4, historyThreshold - 0.24)
+      ) {
+        return {
+          ok: false,
+          reason: "contains_recent_self_phrase",
+          candidateText,
+          referencePreview: truncateText(entry.text, 240),
+        };
+      }
+    }
+    return { ok: true, candidateText };
+  }
+
+  private notePublishedPostForNoveltyHistory(input: {
+    postType: "text" | "media";
+    caption: string | null;
+    textBody: string | null;
+    mediaPrompt: string | null;
+    commandId: string;
+    targetPostId: number | null;
+  }): void {
+    const text = this.buildPostNoveltyCandidateText({
+      postType: input.postType,
+      caption: input.caption,
+      textBody: input.textBody,
+      mediaPrompt: input.mediaPrompt,
+    });
+    if (text.length < 12) return;
+    const normalized = normalizeCommentText(text);
+    if (!normalized.length) return;
+    const nowMs = Date.now();
+    this.pruneRecentPostNoveltyHistory(nowMs);
+    for (let index = this.recentPostNoveltyHistory.length - 1; index >= 0; index -= 1) {
+      const entry = this.recentPostNoveltyHistory[index];
+      if (!entry) continue;
+      if (entry.normalized !== normalized) continue;
+      this.recentPostNoveltyHistory.splice(index, 1);
+    }
+    this.recentPostNoveltyHistory.push({
+      atMs: nowMs,
+      postType: input.postType,
+      text,
+      normalized,
+      commandId: input.commandId,
+      targetPostId: input.targetPostId,
+    });
+    this.pruneRecentPostNoveltyHistory(nowMs);
+  }
+
   private buildPostDraftCurationPrompt(input: {
     postType: "text" | "media";
     caption: string | null;
@@ -1649,6 +2097,7 @@ export class CommandExecutor {
     mediaPrompt: string | null;
     context: PostDraftContext;
     seedHints: string[];
+    avoidReferences: string[];
   }): string {
     const contextLines = [
       typeof input.context.targetPostId === "number"
@@ -1671,12 +2120,19 @@ export class CommandExecutor {
         "- caption: optional, 0-140 chars.",
         "- Must not reuse long phrases from targetPostText/targetMedia/directiveHint.",
         "- Must not reuse long phrases from directive seed text.",
+        "- Must not reuse long phrases from recent self-post references.",
         `draftCaption: ${input.caption ?? ""}`,
         `draftTextBody: ${input.textBody ?? ""}`,
         ...(input.seedHints.length > 0
           ? [
               "Directive seeds (avoid echo):",
               ...input.seedHints.slice(0, 8).map((entry) => `- ${entry}`),
+            ]
+          : []),
+        ...(input.avoidReferences.length > 0
+          ? [
+              "Recent self-post references (must differ):",
+              ...input.avoidReferences.slice(0, POST_NOVELTY_MAX_AVOID_REFERENCES).map((entry) => `- ${entry}`),
             ]
           : []),
         "Context:",
@@ -1693,12 +2149,19 @@ export class CommandExecutor {
       "- mediaPrompt: 20-320 chars, concrete visual prompt, no wrappers like 'Generate an image of'.",
       "- Must be materially different from targetPostText/targetMedia/directiveHint.",
       "- Must be materially different from directive seed text.",
+      "- Must be materially different from recent self-post references.",
       `draftCaption: ${input.caption ?? ""}`,
       `draftMediaPrompt: ${input.mediaPrompt ?? ""}`,
       ...(input.seedHints.length > 0
         ? [
             "Directive seeds (avoid echo):",
             ...input.seedHints.slice(0, 8).map((entry) => `- ${entry}`),
+          ]
+        : []),
+      ...(input.avoidReferences.length > 0
+        ? [
+            "Recent self-post references (must differ):",
+            ...input.avoidReferences.slice(0, POST_NOVELTY_MAX_AVOID_REFERENCES).map((entry) => `- ${entry}`),
           ]
         : []),
       "Context:",
@@ -1773,6 +2236,7 @@ export class CommandExecutor {
     mediaPrompt: string | null;
     context: PostDraftContext;
     seedHints: string[];
+    avoidReferences: string[];
   }): Promise<{ caption: string | null; textBody: string | null; mediaPrompt: string | null } | null> {
     const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
     if (!runOpenClawPrompt) return null;
@@ -1783,6 +2247,7 @@ export class CommandExecutor {
       mediaPrompt: input.mediaPrompt,
       context: input.context,
       seedHints: input.seedHints,
+      avoidReferences: input.avoidReferences,
     });
     try {
       const result = await runOpenClawPrompt({
@@ -3535,7 +4000,35 @@ export class CommandExecutor {
       inlineDrafts.length > 0
         ? inlineDrafts
         : this.extractGeneratedDrafts(generatedResult);
-    if (drafts.length === 0) {
+    const enforcedDraftAction = this.resolveEnforcedDraftAction(payload);
+    const executableDrafts =
+      enforcedDraftAction === null
+        ? drafts
+        : drafts.filter(
+            (draft) => draft.action.trim().toLowerCase() === enforcedDraftAction,
+          );
+    if (enforcedDraftAction !== null && executableDrafts.length === 0) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "generate_draft_action_mismatch",
+          at: nowIso(),
+          commandId: command.id,
+          commandKind: command.kind,
+          enforcedAction: enforcedDraftAction,
+          generatedActions: drafts
+            .map((draft) => draft.action.trim().toLowerCase())
+            .filter((action) => action.length > 0)
+            .slice(0, 12),
+          sourceDirectiveId: command.sourceDirectiveId ?? null,
+        })
+        .catch(() => undefined);
+      return this.failedOutcome(
+        command,
+        `generate returned no executable ${enforcedDraftAction} draft.`,
+        "no_executable_draft",
+      );
+    }
+    if (executableDrafts.length === 0) {
       if (payload.requireDraftOnly === true) {
         await this.sendDraftFailureMessage({
           payload,
@@ -3547,7 +4040,7 @@ export class CommandExecutor {
 
     const requireDraftOnly = payload.requireDraftOnly === true;
     if (requireDraftOnly) {
-      const draftPreview = this.buildDraftPreviewPayload(drafts);
+      const draftPreview = this.buildDraftPreviewPayload(executableDrafts);
       if (!draftPreview) {
         await this.sendDraftFailureMessage({
           payload,
@@ -3566,7 +4059,7 @@ export class CommandExecutor {
       return this.successOutcome(command, {
         generated: generatedResult,
         draftOnly: true,
-        draftCount: drafts.length,
+        draftCount: executableDrafts.length,
         preview: {
           summary: draftPreview.summary,
           postKind: draftPreview.draftPostKind,
@@ -3583,7 +4076,7 @@ export class CommandExecutor {
       !explicitPublishRequested &&
       this.shouldEnforceExplicitPublishGate(payload)
     ) {
-      const blockedDraftCount = drafts.filter((draft) => {
+      const blockedDraftCount = executableDrafts.filter((draft) => {
         const action = draft.action.trim().toLowerCase();
         return action === "post" || action === "story";
       }).length;
@@ -3605,7 +4098,7 @@ export class CommandExecutor {
     }
 
     const executedOutcomes: CommandOutcome[] = [];
-    for (const draft of drafts) {
+    for (const draft of executableDrafts) {
       if (!draft) continue;
       const draftCommand = this.mapDraftToWriteCommand({
         draft,
@@ -5222,6 +5715,22 @@ export class CommandExecutor {
     if (goal === "multi_media" || goal === "carousel") return "multi_media";
     if (goal === "media" || goal === "image" || goal === "post") return "media";
     return "story";
+  }
+
+  private resolveEnforcedDraftAction(
+    payload: Record<string, unknown>,
+  ): "comment" | "like" | "repost" | null {
+    const goal = asNonEmptyString(payload.goal)?.toLowerCase() ?? "";
+    if (goal === "comment" || goal === "like" || goal === "repost") return goal;
+
+    const normalizedKinds = this.resolveRequestedGenerateKinds(payload, "story");
+    if (normalizedKinds.length === 1) {
+      const onlyKind = normalizedKinds[0];
+      if (onlyKind === "comment" || onlyKind === "like" || onlyKind === "repost") {
+        return onlyKind;
+      }
+    }
+    return null;
   }
 
   private extractInlineDrafts(payload: Record<string, unknown>): GeneratedDraft[] {

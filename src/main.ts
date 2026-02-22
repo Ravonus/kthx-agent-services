@@ -44,6 +44,7 @@ import { SubscriptionManager } from "./ws/subscription-manager.js";
 import { EventsManager } from "./ipc/events-manager.js";
 import { DirectiveManager } from "./directives/directive-manager.js";
 import { QueueManager } from "./queue/queue-manager.js";
+import { parseGrantCandidatesFromPermissionState } from "./grants/grant-state.js";
 import { CommandExecutor } from "./commands/command-executor.js";
 import { OpenClawManager } from "./openclaw/openclaw-manager.js";
 import {
@@ -768,6 +769,46 @@ const main = async (): Promise<void> => {
     await socketBatchFlushInFlight;
   };
 
+  type EngagementAction = "like" | "comment" | "repost";
+  type AutoCreditPostTarget = {
+    postId: number;
+    commentId: number | null;
+    authorId: string | null;
+    source: string;
+  };
+  const AUTO_CREDIT_ACTION_KEYS: Record<EngagementAction, readonly string[]> = {
+    like: ["like", "write.votePost"],
+    comment: ["comment", "write.commentPost"],
+    repost: ["repost", "write.repostPost"],
+  };
+  const AUTO_CREDIT_ACTION_CAPS: Record<EngagementAction, number> = {
+    like: Math.max(1, Number.parseInt(trimEnv("MG_AUTO_CREDIT_MAX_LIKES_PER_PLAN") ?? "4", 10) || 4),
+    comment: Math.max(
+      1,
+      Number.parseInt(trimEnv("MG_AUTO_CREDIT_MAX_COMMENTS_PER_PLAN") ?? "2", 10) || 2,
+    ),
+    repost: Math.max(
+      1,
+      Number.parseInt(trimEnv("MG_AUTO_CREDIT_MAX_REPOSTS_PER_PLAN") ?? "2", 10) || 2,
+    ),
+  };
+  const autoCreditPlannerEnabled = trimEnv("MG_AUTO_CREDIT_PLANNER_ENABLED") !== "0";
+  const autoCreditPlannerMinIntervalMs = Math.max(
+    5_000,
+    Number.parseInt(trimEnv("MG_AUTO_CREDIT_PLANNER_MIN_INTERVAL_MS") ?? "20000", 10) || 20_000,
+  );
+  const autoCreditPlannerRecentTargetTtlMs = Math.max(
+    60_000,
+    Number.parseInt(trimEnv("MG_AUTO_CREDIT_TARGET_TTL_MS") ?? `${6 * 60 * 60 * 1000}`, 10) ||
+      6 * 60 * 60 * 1000,
+  );
+  let autoCreditPlanInFlight: Promise<void> | null = null;
+  let autoCreditPlanLastAtMs = 0;
+  const autoCreditRecentTargets = new Map<string, number>();
+  let triggerAutoCreditPlanner:
+    | ((opts: { trigger: string; permissionState?: unknown }) => void)
+    | null = null;
+
   const handleEnvelope = async (envelope: {
     receivedAt: string;
     source: "user" | "public";
@@ -832,6 +873,10 @@ const main = async (): Promise<void> => {
     if (eventType === "permission_state" && isRecord(payload.state)) {
       ctx.debugSnapshot.permission = payload.state as Record<string, unknown>;
       await writeDebugSnapshot(ipcPaths, ctx.debugSnapshot);
+      triggerAutoCreditPlanner?.({
+        trigger: "permission_state",
+        permissionState: payload.state,
+      });
     }
 
     // Lens subscriptions are event-driven: when lens-affecting notifications
@@ -919,6 +964,7 @@ const main = async (): Promise<void> => {
         payload.credit as Record<string, unknown>,
         envelope.receivedAt,
       );
+      triggerAutoCreditPlanner?.({ trigger: "director_credit" });
     }
 
     // OpenClaw wake
@@ -1089,6 +1135,310 @@ const main = async (): Promise<void> => {
     }
   };
 
+  triggerAutoCreditPlanner = (opts: {
+    trigger: string;
+    permissionState?: unknown;
+  }) => {
+    if (!autoCreditPlannerEnabled) return;
+    if (!ctx.directiveManager) return;
+    if (ctx.queueManager && !ctx.queueManager.isRunnerEnabled()) return;
+    const nowMs = Date.now();
+    if (autoCreditPlanInFlight) return;
+    if (nowMs - autoCreditPlanLastAtMs < autoCreditPlannerMinIntervalMs) return;
+
+    autoCreditPlanInFlight = (async () => {
+      const permissionState = opts.permissionState ?? ctx.debugSnapshot.permission;
+      const grantCandidates = parseGrantCandidatesFromPermissionState(permissionState);
+      if (!grantCandidates.length) return;
+
+      const budgets: Record<
+        EngagementAction,
+        { available: number; grantId: string | null; strongestCount: number }
+      > = {
+        like: { available: 0, grantId: null, strongestCount: 0 },
+        comment: { available: 0, grantId: null, strongestCount: 0 },
+        repost: { available: 0, grantId: null, strongestCount: 0 },
+      };
+      const now = Date.now();
+      for (const candidate of grantCandidates) {
+        if (candidate.expiresAtMs <= now) continue;
+        const grantId = candidate.id.trim();
+        for (const action of Object.keys(AUTO_CREDIT_ACTION_KEYS) as EngagementAction[]) {
+          for (const key of AUTO_CREDIT_ACTION_KEYS[action]) {
+            const actionState = candidate.actions.get(key);
+            if (!actionState || actionState.remainingCount <= 0) continue;
+            const notBeforeAtMs =
+              typeof actionState.notBeforeAtMs === "number" &&
+              Number.isFinite(actionState.notBeforeAtMs)
+                ? actionState.notBeforeAtMs
+                : candidate.issuedAtMs + actionState.notBeforeSeconds * 1000;
+            if (notBeforeAtMs > now) continue;
+            budgets[action].available += actionState.remainingCount;
+            if (actionState.remainingCount > budgets[action].strongestCount) {
+              budgets[action].strongestCount = actionState.remainingCount;
+              budgets[action].grantId = grantId.length > 0 ? grantId : null;
+            }
+          }
+        }
+      }
+
+      const requestedActions = (Object.keys(AUTO_CREDIT_ACTION_CAPS) as EngagementAction[])
+        .filter((action) => budgets[action].available > 0 && AUTO_CREDIT_ACTION_CAPS[action] > 0);
+      if (requestedActions.length === 0) return;
+
+      const parsePositiveInt = (value: unknown): number | null => {
+        if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+          return Math.floor(value);
+        }
+        if (typeof value === "string" && value.trim().length > 0) {
+          const parsed = Number.parseInt(value.trim(), 10);
+          if (Number.isFinite(parsed) && parsed > 0) return parsed;
+        }
+        return null;
+      };
+      const parsePostTarget = (
+        value: unknown,
+        source: string,
+      ): AutoCreditPostTarget | null => {
+        if (!isRecord(value)) return null;
+        const postId =
+          parsePositiveInt(value.id) ??
+          parsePositiveInt(value.postId) ??
+          parsePositiveInt(value.targetPostId);
+        if (!postId) return null;
+        const commentId =
+          parsePositiveInt(value.commentId) ??
+          parsePositiveInt(value.parentId) ??
+          parsePositiveInt(value.targetCommentId);
+        const author = isRecord(value.author) ? value.author : null;
+        const authorId =
+          (typeof value.authorId === "string" && value.authorId.trim().length > 0
+            ? value.authorId.trim()
+            : null) ??
+          (typeof author?.id === "string" && author.id.trim().length > 0
+            ? author.id.trim()
+            : null);
+        return {
+          postId,
+          commentId,
+          authorId,
+          source,
+        };
+      };
+      const parseRecordItems = (value: unknown): Record<string, unknown>[] => {
+        if (!isRecord(value)) return [];
+        const items = Array.isArray(value.items) ? value.items : [];
+        return items.filter((entry): entry is Record<string, unknown> => isRecord(entry));
+      };
+
+      let agentMainUserId: string | null = null;
+      let agentHandle: string | null = null;
+      const profileData = await callAgentChatBridge({ action: "agent_profile" }).catch(
+        () => null,
+      );
+      if (isRecord(profileData) && isRecord(profileData.agent)) {
+        const agentRecord = profileData.agent;
+        agentMainUserId =
+          typeof agentRecord.mainUserId === "string" &&
+          agentRecord.mainUserId.trim().length > 0
+            ? agentRecord.mainUserId.trim()
+            : null;
+        agentHandle =
+          typeof agentRecord.handle === "string" && agentRecord.handle.trim().length > 0
+            ? agentRecord.handle.trim().toLowerCase()
+            : null;
+      }
+
+      const targets: AutoCreditPostTarget[] = [];
+      const seenTargetKeys = new Set<string>();
+      const pushTarget = (candidate: AutoCreditPostTarget | null): void => {
+        if (!candidate) return;
+        const key = `${candidate.postId}:${candidate.commentId ?? 0}`;
+        if (seenTargetKeys.has(key)) return;
+        seenTargetKeys.add(key);
+        targets.push(candidate);
+      };
+
+      if (agentHandle) {
+        const ownLatest = await callAgentChatBridge({
+          action: "find_post",
+          authorHandle: `@${agentHandle}`,
+          latest: true,
+        }).catch(() => null);
+        const ownCandidate = parsePostTarget(ownLatest, "own_latest");
+        if (ownCandidate) {
+          pushTarget({
+            ...ownCandidate,
+            authorId: agentMainUserId ?? ownCandidate.authorId,
+          });
+        }
+      }
+
+      const mentionsData = await callAgentChatBridge({
+        action: "browse_unanswered_mentions",
+        limit: 16,
+        sinceHours: 24 * 7,
+      }).catch(() => null);
+      for (const mention of parseRecordItems(mentionsData)) {
+        const targetType =
+          typeof mention.targetType === "string" ? mention.targetType.trim().toLowerCase() : "";
+        if (targetType !== "post") continue;
+        const targetId = parsePositiveInt(mention.targetId);
+        if (!targetId) continue;
+        pushTarget({
+          postId: targetId,
+          commentId: null,
+          authorId: null,
+          source: "unanswered_mention",
+        });
+      }
+
+      const [homeData, trendingData, exploreData] = await Promise.all([
+        callAgentChatBridge({ action: "browse_home_feed", limit: 24 }).catch(() => null),
+        callAgentChatBridge({ action: "browse_trending", limit: 24 }).catch(() => null),
+        callAgentChatBridge({ action: "browse_posts", limit: 24 }).catch(() => null),
+      ]);
+      for (const item of parseRecordItems(homeData)) {
+        pushTarget(parsePostTarget(item, "home_feed"));
+      }
+      for (const item of parseRecordItems(trendingData)) {
+        pushTarget(parsePostTarget(item, "trending"));
+      }
+      for (const item of parseRecordItems(exploreData)) {
+        pushTarget(parsePostTarget(item, "explore"));
+      }
+
+      if (targets.length === 0) {
+        await memory.recordWrite({
+          type: "auto_credit_planner_skipped",
+          at: nowIso(),
+          trigger: opts.trigger,
+          reason: "no_targets",
+          budgets: {
+            like: budgets.like.available,
+            comment: budgets.comment.available,
+            repost: budgets.repost.available,
+          },
+        }).catch(() => {});
+        return;
+      }
+
+      const pruneRecentTargets = (): void => {
+        const cutoff = Date.now() - autoCreditPlannerRecentTargetTtlMs;
+        for (const [key, seenAt] of autoCreditRecentTargets) {
+          if (seenAt < cutoff) autoCreditRecentTargets.delete(key);
+        }
+      };
+      pruneRecentTargets();
+
+      const ownTargets = agentMainUserId
+        ? targets.filter((entry) => entry.authorId === agentMainUserId)
+        : [];
+      const nonOwnTargets = agentMainUserId
+        ? targets.filter((entry) => entry.authorId !== agentMainUserId)
+        : targets.slice();
+      const commentTargets = [...ownTargets, ...nonOwnTargets];
+      const engagementTargets = nonOwnTargets.length > 0 ? nonOwnTargets : targets;
+
+      const allowedWriteKindForAction: Record<EngagementAction, string> = {
+        comment: "write.commentPost",
+        like: "write.votePost",
+        repost: "write.repostPost",
+      };
+
+      const plannedCounts: Record<EngagementAction, number> = {
+        like: 0,
+        comment: 0,
+        repost: 0,
+      };
+
+      for (const action of requestedActions) {
+        const cap = Math.min(AUTO_CREDIT_ACTION_CAPS[action], budgets[action].available);
+        if (cap <= 0) continue;
+        const targetPool = action === "comment" ? commentTargets : engagementTargets;
+        for (const target of targetPool) {
+          if (plannedCounts[action] >= cap) break;
+          const targetKey = `${action}:${target.postId}:${action === "comment" ? (target.commentId ?? 0) : 0}`;
+          const lastSeenAt = autoCreditRecentTargets.get(targetKey) ?? 0;
+          if (Date.now() - lastSeenAt < autoCreditPlannerRecentTargetTtlMs) continue;
+
+          const directiveId = `auto_credit_${action}_${Date.now().toString(36)}_${crypto
+            .randomUUID()
+            .replaceAll("-", "")
+            .slice(0, 12)}`;
+          const directivePayload: Record<string, unknown> = {
+            id: directiveId,
+            kind: "brain.generateAndQueue",
+            createdAt: nowIso(),
+            ...(budgets[action].grantId ? { grantId: budgets[action].grantId } : {}),
+            forceNow: true,
+            payload: {
+              goal: action,
+              kinds: [action],
+              postId: target.postId,
+              ...(action === "comment" && target.commentId
+                ? {
+                    commentId: target.commentId,
+                    parentId: target.commentId,
+                  }
+                : {}),
+              forceNow: true,
+              provenance: "runtime_auto_credit",
+              requireExplicitPublishVerb: false,
+              explicitPublishRequested: false,
+              directiveScope: {
+                allowedCommandKinds: [allowedWriteKindForAction[action]],
+                targetPostId: target.postId,
+                ...(action === "comment" && target.commentId
+                  ? { targetCommentId: target.commentId }
+                  : {}),
+                target: {
+                  postId: target.postId,
+                  commentId: action === "comment" ? (target.commentId ?? null) : null,
+                },
+              },
+              autoPlanned: {
+                trigger: opts.trigger,
+                source: target.source,
+              },
+            },
+          };
+          await ctx.directiveManager?.intake(directivePayload);
+          autoCreditRecentTargets.set(targetKey, Date.now());
+          plannedCounts[action] += 1;
+        }
+      }
+
+      const totalPlanned =
+        plannedCounts.like + plannedCounts.comment + plannedCounts.repost;
+      await memory.recordWrite({
+        type: totalPlanned > 0 ? "auto_credit_planner_enqueued" : "auto_credit_planner_skipped",
+        at: nowIso(),
+        trigger: opts.trigger,
+        reason: totalPlanned > 0 ? "planned" : "no_plan_targets",
+        budgets: {
+          like: budgets.like.available,
+          comment: budgets.comment.available,
+          repost: budgets.repost.available,
+        },
+        planned: plannedCounts,
+        targetPoolSize: targets.length,
+      }).catch(() => {});
+    })()
+      .catch(async (error: unknown) => {
+        await memory.recordWrite({
+          type: "auto_credit_planner_failed",
+          at: nowIso(),
+          trigger: opts.trigger,
+          error: error instanceof Error ? error.message : String(error),
+        }).catch(() => {});
+      })
+      .finally(() => {
+        autoCreditPlanLastAtMs = Date.now();
+        autoCreditPlanInFlight = null;
+      });
+  };
+
   const commandExecutor = new CommandExecutor({
     config: {
       imageGenerateCmd:
@@ -1179,6 +1529,7 @@ const main = async (): Promise<void> => {
     touchWake,
   });
   ctx.directiveManager = directiveManager;
+  triggerAutoCreditPlanner?.({ trigger: "runtime_startup" });
 
   // -- ChatManager
   const chatManager = new ChatManager({

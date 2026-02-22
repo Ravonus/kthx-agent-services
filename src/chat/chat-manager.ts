@@ -119,6 +119,15 @@ interface ReplyTargetContext {
   retrievalQueryFragment: string;
 }
 
+interface LinkedOwnerIdentity {
+  agentMainUserId: string;
+  agentHandle: string | null;
+  agentName: string | null;
+  ownerMainUserId: string;
+  ownerHandle: string;
+  ownerName: string | null;
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 const DOC_CONTEXT_RELEVANT_LINE_PATTERN =
@@ -391,9 +400,45 @@ const SUGGESTED_FOLLOW_LOOKUP_PATTERN =
   /\b(suggest|recommended?|recommend|discover|find)\b[\s\S]*\b(follow|accounts?|people|users?|agents?|creators?|vibe)\b|\bwho\s+should\s+(?:i|we|you)\s+follow\b/iu;
 const BROWSE_POST_LOOKUP_PATTERN =
   /\b(browse|explore|discover|trending|doom\s*scroll|look\s+around)\b[\s\S]*\b(feed|posts?|timeline|platform|around)\b|\bwhat(?:'s| is)\s+trending\b/iu;
+const BROWSE_COMMENT_LOOKUP_PATTERN =
+  /\b(browse|explore|discover|read|scan|find|show|look\s+at)\b[\s\S]*\b(comments?|replies?|threads?)\b|\bwhat\s+are\s+people\s+saying\b/iu;
+const BROWSE_AGENT_LOOKUP_PATTERN =
+  /\b(browse|explore|discover|find|show)\b[\s\S]*\b(agents?|bots?|creators?)\b|\bagents?\s+(?:to\s+follow|you(?:'d| would)?\s+vibe)\b/iu;
 const GIF_LOOKUP_PATTERN = /\b(gif|gifs|meme|reaction)\b/iu;
 const CUSTOM_ASSET_LOOKUP_PATTERN =
   /\b(emote|emotes|sticker|stickers|gif|gifs|reaction|reactions|emoji|asset|assets)\b/iu;
+const BROWSE_NOTIFICATIONS_LOOKUP_PATTERN =
+  /\b(notification|notifications|mention|mentions|unread|inbox|alerts?)\b/iu;
+const BROWSE_HOME_FEED_LOOKUP_PATTERN =
+  /\b(home\s+feed|my\s+feed|following\s+feed|for\s+you\s+feed|home\s+timeline)\b/iu;
+const BROWSE_TRENDING_LOOKUP_PATTERN =
+  /\b(trending|explore|discover|what(?:'s| is)\s+hot|what(?:'s| is)\s+popular)\b/iu;
+const BROWSE_POST_ACTIVITY_LOOKUP_PATTERN =
+  /\bpost\b[\s\S]{0,80}\b(activity|engagement|likes?|reposts?|comments?|views?)\b|\bwho\s+(?:liked|reposted|commented|viewed)\b/iu;
+const BROWSE_COMMENT_ACTIVITY_LOOKUP_PATTERN =
+  /\bcomment\b[\s\S]{0,80}\b(activity|engagement|replies?|likes?|views?)\b|\bwho\s+(?:replied|viewed)\b[\s\S]{0,40}\bcomment\b/iu;
+const BROWSE_TOP_ENGAGERS_LOOKUP_PATTERN =
+  /\b(top|biggest|best|most)\b[\s\S]{0,40}\b(engagers?|engagement|supporters|fans)\b/iu;
+const BROWSE_UNANSWERED_MENTIONS_LOOKUP_PATTERN =
+  /\b(unanswered|unreplied|pending)\b[\s\S]{0,40}\b(mentions?|tags?)\b|\bmentions?\s+i\s+(?:haven't|have not)\s+answered\b/iu;
+const BROWSE_DRAFTS_LOOKUP_PATTERN = /\b(draft|drafts|wip|unfinished)\b/iu;
+const BROWSE_DIRECTIVE_QUEUE_LOOKUP_PATTERN =
+  /\b(directive|queue|queued|pending\s+actions?|scheduled\s+actions?)\b/iu;
+const BROWSE_SERVERS_LOOKUP_PATTERN =
+  /\b(server|servers|guild|guilds|community|communities)\b/iu;
+const BROWSE_CHANNELS_LOOKUP_PATTERN = /\b(channel|channels|room|rooms)\b/iu;
+const BROWSE_MEMBERS_LOOKUP_PATTERN =
+  /\b(member|members|participants?|people|users?)\b[\s\S]{0,40}\b(chat|dm|group|server|channel|conversation|here)\b|\bwho(?:'s| is)\s+here\b/iu;
+const BROWSE_LENSES_LOOKUP_PATTERN =
+  /\b(lens|lenses|filter|filters)\b/iu;
+const BROWSE_ASSETS_LOOKUP_PATTERN =
+  /\b(asset|assets|library|vault|media\s+library)\b/iu;
+const SEARCH_GLOBAL_LOOKUP_PATTERN =
+  /\b(search|lookup|find)\b[\s\S]{0,40}\b(platform|global|site|everywhere)\b/iu;
+const RESOLVE_REFERENCE_LOOKUP_PATTERN =
+  /\b(resolve|reference|lookup|check|open)\b[\s\S]{0,40}\b(post|comment|message|thread)\b|(?:\bpost(?:\s+number)?\s*#?\s*\d+\b)|(?:\bcomment(?:\s+number)?\s*#?\s*\d+\b)|(?:\/(?:post|comment)\/\d+\b)|(?:^|\s)#\d+\b/iu;
+const BROWSE_RECENT_ACTIONS_LOOKUP_PATTERN =
+  /\b(recent|last)\b[\s\S]{0,40}\b(actions?|events?|audits?|logs?)\b/iu;
 
 const toFinitePositiveInt = (value: unknown): number | null => {
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
@@ -457,6 +502,49 @@ const extractCustomAssetSearchQuery = (value: string): string | null => {
   return toAnswerPreview(compact, 140);
 };
 
+const extractLookupQueryTerm = (value: string): string | null => {
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  if (!normalized.length) return null;
+  const cleaned = normalized
+    .replace(
+      /\b(?:show|find|search|lookup|look|pull|fetch|get|give|send|share|browse|explore|discover|check|checkout|who|what|where|when|why|how|please|can you|could you|would you|for me|for us)\b/giu,
+      " ",
+    )
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (!cleaned.length) return null;
+  return toAnswerPreview(cleaned, 140);
+};
+
+const parseLookupWindowHours = (value: string): number | null => {
+  const normalized = value.toLowerCase();
+  const parseBy = (pattern: RegExp, multiplier: number): number | null => {
+    const match = pattern.exec(normalized);
+    if (!match?.[1]) return null;
+    const raw = Number.parseFloat(match[1]);
+    if (!Number.isFinite(raw) || raw <= 0) return null;
+    return clampInt(Math.round(raw * multiplier), 1, 24 * 30);
+  };
+  const hours =
+    parseBy(/\b(?:last|past)\s+(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\b/iu, 1) ??
+    parseBy(/\b(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\b/iu, 1);
+  if (hours !== null) return hours;
+  const days =
+    parseBy(/\b(?:last|past)\s+(\d+(?:\.\d+)?)\s*(?:days?|d)\b/iu, 24) ??
+    parseBy(/\b(\d+(?:\.\d+)?)\s*(?:days?|d)\b/iu, 24);
+  if (days !== null) return days;
+  const weeks =
+    parseBy(/\b(?:last|past)\s+(\d+(?:\.\d+)?)\s*(?:weeks?|w)\b/iu, 24 * 7) ??
+    parseBy(/\b(\d+(?:\.\d+)?)\s*(?:weeks?|w)\b/iu, 24 * 7);
+  if (weeks !== null) return weeks;
+  if (/\b(today|last\s+24\s*hours?|past\s+24\s*hours?)\b/iu.test(normalized)) {
+    return 24;
+  }
+  if (/\b(this\s+week|last\s+week)\b/iu.test(normalized)) return 24 * 7;
+  if (/\b(this\s+month|last\s+month)\b/iu.test(normalized)) return 24 * 30;
+  return null;
+};
+
 const parseRetrievalHitCount = (bundle: ContextBundle): number => {
   if (
     !isRecord(bundle.retrieval) ||
@@ -510,6 +598,11 @@ const pickCommentRecordsFromLookup = (
 ): Array<Record<string, unknown>> => {
   if (!isRecord(value)) return [];
   if (isRecord(value.comment)) return [value.comment];
+  if (Array.isArray(value.items)) {
+    return value.items.filter((entry): entry is Record<string, unknown> =>
+      isRecord(entry),
+    );
+  }
   if (Array.isArray(value.comments)) {
     return value.comments.filter((entry): entry is Record<string, unknown> =>
       isRecord(entry),
@@ -1146,6 +1239,9 @@ export class ChatManager implements ChatManagerLike {
   private systemDocContextCached: string | null = null;
   private systemDocContextCachedAtMs = 0;
   private systemDocContextInFlight: Promise<string | null> | null = null;
+  private linkedOwnerIdentityCached: LinkedOwnerIdentity | null = null;
+  private linkedOwnerIdentityCachedAtMs = 0;
+  private linkedOwnerIdentityInFlight: Promise<LinkedOwnerIdentity | null> | null = null;
   constructor(ctx: ChatManagerContext) { this.ctx = ctx; }
 
   async pollInbox(): Promise<void> {
@@ -2102,7 +2198,23 @@ export class ChatManager implements ChatManagerLike {
         bundle,
       });
       const systemDocContext = await this.loadSystemDocContext();
+      const linkedOwnerIdentity = await this.loadLinkedOwnerIdentity();
       const replyTargetLines = buildReplyTargetSummaryLines(replyTargetContext);
+      const linkedOwnerLines = linkedOwnerIdentity
+        ? [
+            `- owner (authoritative) = @${linkedOwnerIdentity.ownerHandle}${
+              linkedOwnerIdentity.ownerName
+                ? ` (${linkedOwnerIdentity.ownerName})`
+                : ""
+            }`,
+            `- agent (self) = ${
+              linkedOwnerIdentity.agentHandle
+                ? `@${linkedOwnerIdentity.agentHandle}`
+                : linkedOwnerIdentity.agentName ?? "unknown"
+            }`,
+            "- if owner/permissions are mentioned, use this owner handle only; never guess from display names or memory aliases",
+          ]
+        : [];
 
       const historyLines = conversationHistory
         .map((item) => {
@@ -2135,17 +2247,25 @@ export class ChatManager implements ChatManagerLike {
         "- memory retrieval supports: most recent post, most engaged posts/comments, last comments/likes/views, and top participants by engagement or memory presence",
         "- if memory misses, use live site lookup results below before asking for clarification",
         "- if exact target unclear, ask one concise clarifying question",
+        "- permissions/account ownership: use linked owner identity below as source of truth; do not infer from similar handles",
         "",
         "## Runtime Capability Map",
+        "- agent_profile: authoritative owner linkage for this agent (owner handle + id)",
         "- list_messages: fetch DM/channel history and reply target content",
-        "- find_post / find_comment / find_user / find_gif / find_custom_assets / suggest_followers / browse_posts: live site lookups",
+        "- find_post / find_comment / find_user / find_gif / find_custom_assets / browse_assets / suggest_followers / browse_posts / browse_comments / browse_agents / browse_notifications / browse_home_feed / browse_trending / browse_post_activity / browse_comment_activity / browse_top_engagers / browse_unanswered_mentions / browse_drafts / browse_directive_queue / browse_servers / browse_channels / browse_members / browse_lenses / search_global / resolve_reference / browse_recent_actions: live site lookups",
         "- send_message / edit_message / typing: conversational response + status updates",
         "- memory context: keyword retrieval, long-term archive retrieval, view state, engagement presets",
         "- retention control (DM-only): guided retention policy updates",
         "- when conversion is ambiguous, use these capabilities first; ask follow-up only when no route can resolve the request",
+        "- route names are exact snake_case tokens; do not invent aliases (for example never say findAgents)",
+        "- only claim a route/action was run when the lookup result exists in context for this turn",
+        "- if user asks about a route name and it is unknown, say so and use the closest real route from this map",
         "",
         ...(systemDocContext
           ? ["## System Docs Capability Context", systemDocContext, ""]
+          : []),
+        ...(linkedOwnerLines.length > 0
+          ? ["## Linked Owner Identity", ...linkedOwnerLines, ""]
           : []),
         "## Recent Chat History",
         ...(historyLines.length > 0 ? historyLines : ["(none)"]),
@@ -2207,6 +2327,73 @@ export class ChatManager implements ChatManagerLike {
     }
   }
 
+  private async loadLinkedOwnerIdentity(): Promise<LinkedOwnerIdentity | null> {
+    const nowMs = Date.now();
+    if (
+      this.linkedOwnerIdentityCached &&
+      nowMs - this.linkedOwnerIdentityCachedAtMs < 5 * 60_000
+    ) {
+      return this.linkedOwnerIdentityCached;
+    }
+    if (this.linkedOwnerIdentityInFlight) {
+      return this.linkedOwnerIdentityInFlight;
+    }
+    this.linkedOwnerIdentityInFlight = (async () => {
+      try {
+        const response = await this.ctx.callAgentChatBridge({
+          action: "agent_profile",
+        });
+        if (!isRecord(response)) return null;
+        const agent = isRecord(response.agent) ? response.agent : null;
+        const owner = isRecord(response.owner) ? response.owner : null;
+        if (!agent || !owner) return null;
+        const agentMainUserId =
+          typeof agent.mainUserId === "string" ? agent.mainUserId.trim() : "";
+        const ownerMainUserId =
+          typeof owner.mainUserId === "string" ? owner.mainUserId.trim() : "";
+        const ownerHandleRaw =
+          typeof owner.handle === "string" ? owner.handle.trim() : "";
+        const ownerHandle = ownerHandleRaw.replace(/^@+/u, "").toLowerCase();
+        if (
+          !agentMainUserId.length ||
+          !ownerMainUserId.length ||
+          !ownerHandle.length
+        ) {
+          return null;
+        }
+        const agentHandleRaw =
+          typeof agent.handle === "string" ? agent.handle.trim() : "";
+        const agentHandleNormalized = agentHandleRaw.replace(/^@+/u, "").toLowerCase();
+        const agentName =
+          typeof agent.name === "string" && agent.name.trim().length > 0
+            ? agent.name.trim()
+            : null;
+        const ownerName =
+          typeof owner.name === "string" && owner.name.trim().length > 0
+            ? owner.name.trim()
+            : null;
+        const parsed: LinkedOwnerIdentity = {
+          agentMainUserId,
+          agentHandle: agentHandleNormalized.length > 0 ? agentHandleNormalized : null,
+          agentName,
+          ownerMainUserId,
+          ownerHandle,
+          ownerName,
+        };
+        this.linkedOwnerIdentityCached = parsed;
+        this.linkedOwnerIdentityCachedAtMs = Date.now();
+        return parsed;
+      } catch {
+        return null;
+      }
+    })();
+    try {
+      return await this.linkedOwnerIdentityInFlight;
+    } finally {
+      this.linkedOwnerIdentityInFlight = null;
+    }
+  }
+
   private shouldRunLiveSiteLookup(input: {
     entry: ChatInboxEntry;
     retrievalQuery: string;
@@ -2223,7 +2410,26 @@ export class ChatManager implements ChatManagerLike {
     if (!query.length) return false;
     if (SUGGESTED_FOLLOW_LOOKUP_PATTERN.test(query)) return true;
     if (BROWSE_POST_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_COMMENT_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_AGENT_LOOKUP_PATTERN.test(query)) return true;
     if (GIF_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_NOTIFICATIONS_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_HOME_FEED_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_TRENDING_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_POST_ACTIVITY_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_COMMENT_ACTIVITY_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_TOP_ENGAGERS_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_UNANSWERED_MENTIONS_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_DRAFTS_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_DIRECTIVE_QUEUE_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_SERVERS_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_CHANNELS_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_MEMBERS_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_LENSES_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_ASSETS_LOOKUP_PATTERN.test(query)) return true;
+    if (SEARCH_GLOBAL_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_RECENT_ACTIONS_LOOKUP_PATTERN.test(query)) return true;
+    if (RESOLVE_REFERENCE_LOOKUP_PATTERN.test(query)) return true;
     if (!SITE_LOOKUP_TRIGGER_PATTERN.test(query)) return false;
     if (LOOKUP_FORCE_PATTERN.test(query)) return true;
     if (LATEST_POST_LOOKUP_PATTERN.test(query)) return true;
@@ -2254,6 +2460,25 @@ export class ChatManager implements ChatManagerLike {
 
     const lookupCall = async (payload: Record<string, unknown>) =>
       this.ctx.callAgentChatBridge(payload);
+
+    let cachedServerRows: Array<Record<string, unknown>> | null = null;
+    const listServers = async (): Promise<Array<Record<string, unknown>>> => {
+      if (cachedServerRows) return cachedServerRows;
+      const query = extractLookupQueryTerm(input.retrievalQuery);
+      const response = await lookupCall({
+        action: "browse_servers",
+        ...(query ? { query } : {}),
+        limit: 12,
+      });
+      const rows =
+        isRecord(response) && Array.isArray(response.items)
+          ? response.items.filter((entry): entry is Record<string, unknown> =>
+              isRecord(entry),
+            )
+          : [];
+      cachedServerRows = rows;
+      return rows;
+    };
 
     if (typeof input.hints.postId === "number") {
       try {
@@ -2356,6 +2581,136 @@ export class ChatManager implements ChatManagerLike {
           found: false,
           postId: input.hints.postId,
           commentId: input.hints.commentId ?? null,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    const wantsPostActivityLookup =
+      typeof input.hints.postId === "number" &&
+      BROWSE_POST_ACTIVITY_LOOKUP_PATTERN.test(input.retrievalQuery);
+    if (wantsPostActivityLookup && typeof input.hints.postId === "number") {
+      try {
+        const response = await lookupCall({
+          action: "browse_post_activity",
+          postId: input.hints.postId,
+          limit: 12,
+          includeLikes: true,
+          includeReposts: true,
+          includeComments: true,
+          includeViews: true,
+        });
+        const responseRecord = isRecord(response) ? response : null;
+        const totalsRecord =
+          responseRecord && isRecord(responseRecord.totals) ? responseRecord.totals : null;
+        const totals = {
+          likes: toFinitePositiveInt(totalsRecord?.likes) ?? 0,
+          reposts: toFinitePositiveInt(totalsRecord?.reposts) ?? 0,
+          comments: toFinitePositiveInt(totalsRecord?.comments) ?? 0,
+          views: toFinitePositiveInt(totalsRecord?.views) ?? 0,
+        };
+        const itemsRecord =
+          responseRecord && isRecord(responseRecord.items) ? responseRecord.items : null;
+        const likes = Array.isArray(itemsRecord?.likes) ? itemsRecord.likes : [];
+        const reposts = Array.isArray(itemsRecord?.reposts) ? itemsRecord.reposts : [];
+        const comments = Array.isArray(itemsRecord?.comments) ? itemsRecord.comments : [];
+        const firstActorHandle = (() => {
+          const firstLike = likes.find((entry) => isRecord(entry));
+          if (isRecord(firstLike?.author) && typeof firstLike.author.handle === "string") {
+            return firstLike.author.handle.trim().replace(/^@+/u, "");
+          }
+          if (isRecord(firstLike?.user) && typeof firstLike.user.handle === "string") {
+            return firstLike.user.handle.trim().replace(/^@+/u, "");
+          }
+          return null;
+        })();
+        const line = [
+          `lookup: post:${input.hints.postId} activity`,
+          `likes=${totals.likes}`,
+          `reposts=${totals.reposts}`,
+          `comments=${totals.comments}`,
+          `views=${totals.views}`,
+          firstActorHandle ? `firstLiker=@${firstActorHandle}` : "",
+        ]
+          .filter((part) => part.length > 0)
+          .join(" · ");
+        lines.push(line);
+        await remember({
+          lookupKind: "post_activity",
+          found: true,
+          postId: input.hints.postId,
+          likes: totals.likes,
+          reposts: totals.reposts,
+          comments: totals.comments,
+          views: totals.views,
+          sampleLikeCount: likes.length,
+          sampleRepostCount: reposts.length,
+          sampleCommentCount: comments.length,
+          summary: line,
+        });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: post:${input.hints.postId} activity failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "post_activity",
+          found: false,
+          postId: input.hints.postId,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    const wantsCommentActivityLookup =
+      typeof input.hints.commentId === "number" &&
+      BROWSE_COMMENT_ACTIVITY_LOOKUP_PATTERN.test(input.retrievalQuery);
+    if (wantsCommentActivityLookup && typeof input.hints.commentId === "number") {
+      try {
+        const response = await lookupCall({
+          action: "browse_comment_activity",
+          commentId: input.hints.commentId,
+          limit: 12,
+          includeReplies: true,
+          includeViews: true,
+        });
+        const responseRecord = isRecord(response) ? response : null;
+        const totalsRecord =
+          responseRecord && isRecord(responseRecord.totals) ? responseRecord.totals : null;
+        const replies = toFinitePositiveInt(totalsRecord?.replies) ?? 0;
+        const views = toFinitePositiveInt(totalsRecord?.views) ?? 0;
+        const commentRecord =
+          responseRecord && isRecord(responseRecord.comment) ? responseRecord.comment : null;
+        const bodyRaw = commentRecord && typeof commentRecord.body === "string"
+          ? commentRecord.body
+          : "";
+        const line = [
+          `lookup: comment:${input.hints.commentId} activity`,
+          `replies=${replies}`,
+          `views=${views}`,
+          bodyRaw.trim().length > 0 ? `summary=${toAnswerPreview(bodyRaw, 100)}` : "",
+        ]
+          .filter((part) => part.length > 0)
+          .join(" · ");
+        lines.push(line);
+        await remember({
+          lookupKind: "comment_activity",
+          found: true,
+          commentId: input.hints.commentId,
+          postId: toFinitePositiveInt(commentRecord?.postId),
+          replies,
+          views,
+          summary: line,
+        });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: comment:${input.hints.commentId} activity failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "comment_activity",
+          found: false,
+          commentId: input.hints.commentId,
           error: toAnswerPreview(message, 180),
         });
       }
@@ -2541,6 +2896,1056 @@ export class ChatManager implements ChatManagerLike {
       }
     }
 
+    if (BROWSE_COMMENT_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const response = await lookupCall({
+          action: "browse_comments",
+          limit: 10,
+          ...(typeof input.hints.postId === "number"
+            ? { postId: input.hints.postId }
+            : {
+                searchText: toAnswerPreview(input.retrievalQuery, 160),
+              }),
+        });
+        const comments = pickCommentRecordsFromLookup(response)
+          .map((entry) => summarizeCommentRecord(entry))
+          .slice(0, 4);
+        if (comments.length === 0) {
+          lines.push("lookup: browse comments returned no items");
+          await remember({
+            lookupKind: "browse_comments",
+            found: false,
+            postId: input.hints.postId ?? null,
+            summary: "browse comments returned no items",
+          });
+        } else {
+          for (const comment of comments) {
+            lines.push(`lookup: browse comments -> ${comment.line}`);
+            await remember({
+              lookupKind: "browse_comments",
+              found: true,
+              postId: comment.postId,
+              commentId: comment.commentId,
+              summary: comment.bodyPreview ?? comment.line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: browse_comments failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_comments",
+          found: false,
+          postId: input.hints.postId ?? null,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_AGENT_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const response = await lookupCall({
+          action: "browse_agents",
+          query: toAnswerPreview(input.retrievalQuery, 90),
+          limit: 8,
+          includeFollowing: true,
+          includeFollowers: true,
+          includeRecentPosters: true,
+        });
+        const users = pickUserRecordsFromLookup(response)
+          .map((entry) => summarizeUserRecord(entry))
+          .slice(0, 4);
+        if (users.length === 0) {
+          lines.push("lookup: browse agents returned no items");
+          await remember({
+            lookupKind: "browse_agents",
+            found: false,
+            summary: "browse agents returned no items",
+          });
+        } else {
+          for (const user of users) {
+            lines.push(`lookup: browse agents -> ${user.line}`);
+            await remember({
+              lookupKind: "browse_agents",
+              found: true,
+              handle: user.handle,
+              userId: user.userId,
+              summary: user.reason ?? user.line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: browse_agents failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_agents",
+          found: false,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_NOTIFICATIONS_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      const unreadOnly =
+        /\b(unread|unanswered|pending)\b/iu.test(input.retrievalQuery);
+      try {
+        const response = await lookupCall({
+          action: "browse_notifications",
+          unreadOnly,
+          limit: 12,
+        });
+        const rows =
+          isRecord(response) && Array.isArray(response.items)
+            ? response.items.filter((entry): entry is Record<string, unknown> =>
+                isRecord(entry),
+              )
+            : [];
+        if (rows.length === 0) {
+          lines.push(
+            unreadOnly
+              ? "lookup: no unread notifications right now"
+              : "lookup: notifications feed is empty right now",
+          );
+          await remember({
+            lookupKind: "browse_notifications",
+            found: false,
+            unreadOnly,
+            summary: unreadOnly
+              ? "no unread notifications"
+              : "notifications feed is empty",
+          });
+        } else {
+          for (const row of rows.slice(0, 4)) {
+            const actor =
+              isRecord(row.actor) && typeof row.actor.handle === "string"
+                ? row.actor.handle.trim().replace(/^@+/u, "")
+                : null;
+            const type = typeof row.type === "string" ? row.type.trim() : "unknown";
+            const entityType =
+              typeof row.entityType === "string" ? row.entityType.trim() : "entity";
+            const entityId = toFinitePositiveInt(row.entityId);
+            const readAt =
+              typeof row.readAt === "string" && row.readAt.trim().length > 0
+                ? row.readAt.trim()
+                : null;
+            const line = [
+              `lookup: notification:${type}`,
+              actor ? `actor=@${actor}` : "",
+              entityId ? `${entityType}:${entityId}` : entityType,
+              readAt ? "read" : "unread",
+            ]
+              .filter((part) => part.length > 0)
+              .join(" · ");
+            lines.push(line);
+            await remember({
+              lookupKind: "browse_notifications",
+              found: true,
+              unreadOnly,
+              notificationType: type,
+              entityType,
+              entityId,
+              actorHandle: actor,
+              readAt,
+              summary: line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: notifications fetch failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_notifications",
+          found: false,
+          unreadOnly,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_HOME_FEED_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const response = await lookupCall({
+          action: "browse_home_feed",
+          limit: 10,
+        });
+        const posts = pickPostRecordsFromLookup(response)
+          .map((entry) => summarizePostRecord(entry))
+          .slice(0, 4);
+        if (posts.length === 0) {
+          lines.push("lookup: home feed returned no items");
+          await remember({
+            lookupKind: "browse_home_feed",
+            found: false,
+            summary: "home feed returned no items",
+          });
+        } else {
+          for (const post of posts) {
+            lines.push(`lookup: home -> ${post.line}`);
+            await remember({
+              lookupKind: "browse_home_feed",
+              found: true,
+              postId: post.postId,
+              summary: post.bodyPreview ?? post.line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: home feed failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_home_feed",
+          found: false,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_TRENDING_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const response = await lookupCall({
+          action: "browse_trending",
+          limit: 10,
+        });
+        const posts = pickPostRecordsFromLookup(response)
+          .map((entry) => summarizePostRecord(entry))
+          .slice(0, 4);
+        if (posts.length === 0) {
+          lines.push("lookup: trending returned no items");
+          await remember({
+            lookupKind: "browse_trending",
+            found: false,
+            summary: "trending returned no items",
+          });
+        } else {
+          for (const post of posts) {
+            lines.push(`lookup: trending -> ${post.line}`);
+            await remember({
+              lookupKind: "browse_trending",
+              found: true,
+              postId: post.postId,
+              summary: post.bodyPreview ?? post.line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: trending failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_trending",
+          found: false,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_TOP_ENGAGERS_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      const windowHours = parseLookupWindowHours(input.retrievalQuery) ?? 24 * 7;
+      try {
+        const response = await lookupCall({
+          action: "browse_top_engagers",
+          limit: 8,
+          windowHours,
+        });
+        const rows =
+          isRecord(response) && Array.isArray(response.items)
+            ? response.items.filter((entry): entry is Record<string, unknown> =>
+                isRecord(entry),
+              )
+            : [];
+        if (rows.length === 0) {
+          lines.push(`lookup: no top engagers found in last ${windowHours}h`);
+          await remember({
+            lookupKind: "browse_top_engagers",
+            found: false,
+            windowHours,
+            summary: `no top engagers in last ${windowHours}h`,
+          });
+        } else {
+          for (const row of rows.slice(0, 4)) {
+            const user =
+              isRecord(row.user) && typeof row.user.handle === "string"
+                ? row.user.handle.trim().replace(/^@+/u, "")
+                : "unknown";
+            const likeCount = toFinitePositiveInt(row.likeCount) ?? 0;
+            const repostCount = toFinitePositiveInt(row.repostCount) ?? 0;
+            const commentCount = toFinitePositiveInt(row.commentCount) ?? 0;
+            const viewCount = toFinitePositiveInt(row.viewCount) ?? 0;
+            const score =
+              typeof row.score === "number" && Number.isFinite(row.score)
+                ? row.score
+                : commentCount * 3 + repostCount * 2 + likeCount * 2 + viewCount;
+            const line = [
+              `lookup: engager=@${user}`,
+              `score=${score}`,
+              `likes=${likeCount}`,
+              `reposts=${repostCount}`,
+              `comments=${commentCount}`,
+              `views=${viewCount}`,
+            ]
+              .filter((part) => part.length > 0)
+              .join(" · ");
+            lines.push(line);
+            await remember({
+              lookupKind: "browse_top_engagers",
+              found: true,
+              windowHours,
+              handle: user,
+              score,
+              likeCount,
+              repostCount,
+              commentCount,
+              viewCount,
+              summary: line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: top engagers failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_top_engagers",
+          found: false,
+          windowHours,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_UNANSWERED_MENTIONS_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      const sinceHours = parseLookupWindowHours(input.retrievalQuery) ?? 24 * 7;
+      try {
+        const response = await lookupCall({
+          action: "browse_unanswered_mentions",
+          limit: 12,
+          sinceHours,
+        });
+        const rows =
+          isRecord(response) && Array.isArray(response.items)
+            ? response.items.filter((entry): entry is Record<string, unknown> =>
+                isRecord(entry),
+              )
+            : [];
+        if (rows.length === 0) {
+          lines.push(`lookup: no unanswered mentions in last ${sinceHours}h`);
+          await remember({
+            lookupKind: "browse_unanswered_mentions",
+            found: false,
+            sinceHours,
+            summary: `no unanswered mentions in last ${sinceHours}h`,
+          });
+        } else {
+          for (const row of rows.slice(0, 6)) {
+            const targetType =
+              typeof row.targetType === "string" ? row.targetType.trim() : "target";
+            const targetId = toFinitePositiveInt(row.targetId);
+            const line = [
+              "lookup: unanswered mention",
+              targetId ? `${targetType}:${targetId}` : targetType,
+              typeof row.createdAt === "string" ? `at=${row.createdAt}` : "",
+            ]
+              .filter((part) => part.length > 0)
+              .join(" · ");
+            lines.push(line);
+            await remember({
+              lookupKind: "browse_unanswered_mentions",
+              found: true,
+              sinceHours,
+              targetType,
+              targetId,
+              summary: line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: unanswered mentions failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_unanswered_mentions",
+          found: false,
+          sinceHours,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_DRAFTS_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const response = await lookupCall({
+          action: "browse_drafts",
+          limit: 10,
+          ...(input.entry.conversationId
+            ? { conversationId: input.entry.conversationId }
+            : {}),
+          ...(input.entry.channelId ? { channelId: input.entry.channelId } : {}),
+        });
+        const rows =
+          isRecord(response) && Array.isArray(response.items)
+            ? response.items.filter((entry): entry is Record<string, unknown> =>
+                isRecord(entry),
+              )
+            : [];
+        if (rows.length === 0) {
+          lines.push("lookup: no recent drafts found");
+          await remember({
+            lookupKind: "browse_drafts",
+            found: false,
+            summary: "no recent drafts found",
+          });
+        } else {
+          for (const row of rows.slice(0, 4)) {
+            const draftId = typeof row.id === "string" ? row.id.trim() : "";
+            const body =
+              typeof row.body === "string" && row.body.trim().length > 0
+                ? toAnswerPreview(row.body, 110)
+                : null;
+            const line = [
+              `lookup: draft:${draftId || "n/a"}`,
+              body ? `summary=${body}` : "",
+              typeof row.createdAt === "string" ? `createdAt=${row.createdAt}` : "",
+            ]
+              .filter((part) => part.length > 0)
+              .join(" · ");
+            lines.push(line);
+            await remember({
+              lookupKind: "browse_drafts",
+              found: true,
+              draftId: draftId || null,
+              summary: line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(`lookup: drafts failed (${toAnswerPreview(message, 120)})`);
+        await remember({
+          lookupKind: "browse_drafts",
+          found: false,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_DIRECTIVE_QUEUE_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      const includeCompleted = /\b(done|completed|failed|history|past)\b/iu.test(
+        input.retrievalQuery,
+      );
+      try {
+        const response = await lookupCall({
+          action: "browse_directive_queue",
+          includeCompleted,
+          limit: 24,
+        });
+        const rows =
+          isRecord(response) && Array.isArray(response.items)
+            ? response.items.filter((entry): entry is Record<string, unknown> =>
+                isRecord(entry),
+              )
+            : [];
+        if (rows.length === 0) {
+          lines.push("lookup: directive queue is empty");
+          await remember({
+            lookupKind: "browse_directive_queue",
+            found: false,
+            includeCompleted,
+            summary: "directive queue is empty",
+          });
+        } else {
+          for (const row of rows.slice(0, 6)) {
+            const queueId = typeof row.id === "string" ? row.id.trim() : "";
+            const status =
+              typeof row.status === "string" ? row.status.trim() : "unknown";
+            const actionKind =
+              typeof row.actionKind === "string" ? row.actionKind.trim() : "unknown";
+            const line = [
+              `lookup: directive:${queueId || "n/a"}`,
+              `status=${status}`,
+              `action=${actionKind}`,
+              typeof row.runAt === "string" ? `runAt=${row.runAt}` : "",
+            ]
+              .filter((part) => part.length > 0)
+              .join(" · ");
+            lines.push(line);
+            await remember({
+              lookupKind: "browse_directive_queue",
+              found: true,
+              includeCompleted,
+              queueId: queueId || null,
+              status,
+              actionKind,
+              summary: line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: directive queue failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_directive_queue",
+          found: false,
+          includeCompleted,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_SERVERS_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const rows = await listServers();
+        if (rows.length === 0) {
+          lines.push("lookup: no servers found");
+          await remember({
+            lookupKind: "browse_servers",
+            found: false,
+            summary: "no servers found",
+          });
+        } else {
+          for (const row of rows.slice(0, 4)) {
+            const id = typeof row.id === "string" ? row.id.trim() : "";
+            const name = typeof row.name === "string" ? row.name.trim() : "unknown";
+            const channelCount = toFinitePositiveInt(row.channelCount) ?? 0;
+            const line = [
+              `lookup: server:${id || "n/a"}`,
+              `name=${toAnswerPreview(name, 48)}`,
+              `channels=${channelCount}`,
+            ]
+              .filter((part) => part.length > 0)
+              .join(" · ");
+            lines.push(line);
+            await remember({
+              lookupKind: "browse_servers",
+              found: true,
+              serverId: id || null,
+              summary: line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(`lookup: servers failed (${toAnswerPreview(message, 120)})`);
+        await remember({
+          lookupKind: "browse_servers",
+          found: false,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_CHANNELS_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const query = extractLookupQueryTerm(input.retrievalQuery);
+        const response = await lookupCall({
+          action: "browse_channels",
+          ...(query ? { query } : {}),
+          limit: 20,
+        });
+        const rows =
+          isRecord(response) && Array.isArray(response.items)
+            ? response.items.filter((entry): entry is Record<string, unknown> =>
+                isRecord(entry),
+              )
+            : [];
+        if (rows.length === 0) {
+          lines.push("lookup: no channels found");
+          await remember({
+            lookupKind: "browse_channels",
+            found: false,
+            query,
+            summary: "no channels found",
+          });
+        } else {
+          for (const row of rows.slice(0, 5)) {
+            const id = typeof row.id === "string" ? row.id.trim() : "";
+            const name = typeof row.name === "string" ? row.name.trim() : "unknown";
+            const serverName =
+              typeof row.serverName === "string" ? row.serverName.trim() : null;
+            const line = [
+              `lookup: channel:${id || "n/a"}`,
+              `name=${toAnswerPreview(name, 48)}`,
+              serverName ? `server=${toAnswerPreview(serverName, 36)}` : "",
+            ]
+              .filter((part) => part.length > 0)
+              .join(" · ");
+            lines.push(line);
+            await remember({
+              lookupKind: "browse_channels",
+              found: true,
+              query,
+              channelId: id || null,
+              summary: line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(`lookup: channels failed (${toAnswerPreview(message, 120)})`);
+        await remember({
+          lookupKind: "browse_channels",
+          found: false,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_MEMBERS_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const query = extractLookupQueryTerm(input.retrievalQuery);
+        const payload: Record<string, unknown> = {
+          action: "browse_members",
+          ...(query ? { query } : {}),
+          limit: 20,
+          includeAgents: true,
+          includeHumans: true,
+        };
+        if (input.entry.conversationId) {
+          payload.conversationId = input.entry.conversationId;
+        } else {
+          const servers = await listServers();
+          const first = servers[0];
+          if (isRecord(first) && typeof first.id === "string" && first.id.trim().length > 0) {
+            payload.serverId = first.id.trim();
+          }
+        }
+        if (!("conversationId" in payload) && !("serverId" in payload)) {
+          lines.push("lookup: members lookup needs a chat or server context");
+          await remember({
+            lookupKind: "browse_members",
+            found: false,
+            summary: "members lookup missing conversation/server context",
+          });
+        } else {
+          const response = await lookupCall(payload);
+          const rows =
+            isRecord(response) && Array.isArray(response.items)
+              ? response.items.filter((entry): entry is Record<string, unknown> =>
+                  isRecord(entry),
+                )
+              : [];
+          if (rows.length === 0) {
+            lines.push("lookup: no members found for this context");
+            await remember({
+              lookupKind: "browse_members",
+              found: false,
+              query,
+              summary: "no members found for this context",
+            });
+          } else {
+            for (const row of rows.slice(0, 6)) {
+              const handle =
+                typeof row.handle === "string" ? row.handle.trim().replace(/^@+/u, "") : "unknown";
+              const role = typeof row.role === "string" ? row.role.trim() : null;
+              const isAgent = row.isAgent === true;
+              const line = [
+                `lookup: member=@${handle}`,
+                `type=${isAgent ? "agent" : "human"}`,
+                role ? `role=${role}` : "",
+              ]
+                .filter((part) => part.length > 0)
+                .join(" · ");
+              lines.push(line);
+              await remember({
+                lookupKind: "browse_members",
+                found: true,
+                handle,
+                role,
+                isAgent,
+                summary: line,
+              });
+            }
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(`lookup: members failed (${toAnswerPreview(message, 120)})`);
+        await remember({
+          lookupKind: "browse_members",
+          found: false,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_LENSES_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const query = extractLookupQueryTerm(input.retrievalQuery);
+        const response = await lookupCall({
+          action: "browse_lenses",
+          ...(query ? { query } : {}),
+          includeRules: /\b(rule|rules)\b/iu.test(input.retrievalQuery),
+          limit: 12,
+        });
+        const rows =
+          isRecord(response) && Array.isArray(response.items)
+            ? response.items.filter((entry): entry is Record<string, unknown> =>
+                isRecord(entry),
+              )
+            : [];
+        if (rows.length === 0) {
+          lines.push("lookup: no lenses found");
+          await remember({
+            lookupKind: "browse_lenses",
+            found: false,
+            query,
+            summary: "no lenses found",
+          });
+        } else {
+          for (const row of rows.slice(0, 4)) {
+            const lensRecord = isRecord(row.lens) ? row.lens : null;
+            const lensName =
+              lensRecord && typeof lensRecord.name === "string"
+                ? lensRecord.name.trim()
+                : "unknown";
+            const lensId = lensRecord ? toFinitePositiveInt(lensRecord.id) : null;
+            const line = [
+              `lookup: lens:${lensId ?? "n/a"}`,
+              `name=${toAnswerPreview(lensName, 54)}`,
+            ]
+              .filter((part) => part.length > 0)
+              .join(" · ");
+            lines.push(line);
+            await remember({
+              lookupKind: "browse_lenses",
+              found: true,
+              query,
+              lensId,
+              summary: line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(`lookup: lenses failed (${toAnswerPreview(message, 120)})`);
+        await remember({
+          lookupKind: "browse_lenses",
+          found: false,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    const wantsAssetBrowse =
+      BROWSE_ASSETS_LOOKUP_PATTERN.test(input.retrievalQuery) &&
+      !CUSTOM_ASSET_LOOKUP_PATTERN.test(input.retrievalQuery);
+    if (wantsAssetBrowse) {
+      const assetQuery = extractLookupQueryTerm(input.retrievalQuery);
+      try {
+        const response = await lookupCall({
+          action: "browse_assets",
+          ...(assetQuery ? { query: assetQuery } : {}),
+          limit: 12,
+          includeOwnerSelections: true,
+          ...(input.entry.conversationId
+            ? { conversationId: input.entry.conversationId }
+            : {}),
+          ...(input.entry.channelId ? { channelId: input.entry.channelId } : {}),
+        });
+        const assets = pickCustomAssetRecordsFromLookup(response)
+          .map((entry) => summarizeCustomAssetRecord(entry))
+          .slice(0, 4);
+        if (assets.length === 0) {
+          lines.push(
+            assetQuery
+              ? `lookup: assets for "${assetQuery}" not found`
+              : "lookup: no assets found",
+          );
+          await remember({
+            lookupKind: "browse_assets",
+            found: false,
+            query: assetQuery,
+            summary: assetQuery
+              ? `assets for "${assetQuery}" not found`
+              : "no assets found",
+          });
+        } else {
+          for (const asset of assets) {
+            lines.push(`lookup: ${asset.line}`);
+            await remember({
+              lookupKind: "browse_assets",
+              found: true,
+              query: assetQuery,
+              kind: asset.kind,
+              name: asset.name,
+              owner: asset.owner,
+              source: asset.source,
+              url: asset.url,
+              summary: asset.line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: asset browse failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_assets",
+          found: false,
+          query: assetQuery,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (SEARCH_GLOBAL_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      const query = extractLookupQueryTerm(input.retrievalQuery);
+      if (query) {
+        try {
+          const response = await lookupCall({
+            action: "search_global",
+            query,
+            limit: 8,
+            includePeople: true,
+          });
+          const people =
+            isRecord(response) && Array.isArray(response.people)
+              ? response.people.filter((entry): entry is Record<string, unknown> =>
+                  isRecord(entry),
+                )
+              : [];
+          const posts =
+            isRecord(response) && Array.isArray(response.posts)
+              ? response.posts.filter((entry): entry is Record<string, unknown> =>
+                  isRecord(entry),
+                )
+              : [];
+          const postSummaries = posts.map((entry) => summarizePostRecord(entry)).slice(0, 2);
+          const peopleSummaries = people
+            .map((entry) => summarizeUserRecord(entry))
+            .slice(0, 2);
+          if (postSummaries.length === 0 && peopleSummaries.length === 0) {
+            lines.push(`lookup: global search "${query}" returned no matches`);
+            await remember({
+              lookupKind: "search_global",
+              found: false,
+              query,
+              summary: `global search "${query}" returned no matches`,
+            });
+          } else {
+            for (const person of peopleSummaries) {
+              lines.push(`lookup: search person -> ${person.line}`);
+              await remember({
+                lookupKind: "search_global",
+                found: true,
+                query,
+                handle: person.handle,
+                userId: person.userId,
+                summary: person.reason ?? person.line,
+              });
+            }
+            for (const post of postSummaries) {
+              lines.push(`lookup: search post -> ${post.line}`);
+              await remember({
+                lookupKind: "search_global",
+                found: true,
+                query,
+                postId: post.postId,
+                summary: post.bodyPreview ?? post.line,
+              });
+            }
+          }
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          lines.push(
+            `lookup: global search failed (${toAnswerPreview(message, 120)})`,
+          );
+          await remember({
+            lookupKind: "search_global",
+            found: false,
+            query,
+            error: toAnswerPreview(message, 180),
+          });
+        }
+      }
+    }
+
+    const wantsResolveReference =
+      RESOLVE_REFERENCE_LOOKUP_PATTERN.test(input.retrievalQuery) ||
+      typeof input.hints.postId === "number" ||
+      typeof input.hints.commentId === "number";
+    if (wantsResolveReference) {
+      const references = new Set<string>();
+      if (typeof input.hints.postId === "number") references.add(`post ${input.hints.postId}`);
+      if (typeof input.hints.commentId === "number") references.add(`comment ${input.hints.commentId}`);
+      for (const handle of parseHandleMentions(input.retrievalQuery).slice(0, 2)) {
+        references.add(`@${handle}`);
+      }
+      if (references.size === 0) {
+        const single = extractLookupQueryTerm(input.retrievalQuery);
+        if (single) references.add(single);
+      }
+      for (const reference of Array.from(references).slice(0, 3)) {
+        try {
+          const response = await lookupCall({
+            action: "resolve_reference",
+            reference,
+          });
+          const responseRecord = isRecord(response) ? response : null;
+          const type =
+            responseRecord && typeof responseRecord.type === "string"
+              ? responseRecord.type
+              : "unknown";
+          const postRecord = responseRecord && isRecord(responseRecord.post)
+            ? responseRecord.post
+            : null;
+          const commentRecord = responseRecord && isRecord(responseRecord.comment)
+            ? responseRecord.comment
+            : null;
+          const userRecord = responseRecord && isRecord(responseRecord.user)
+            ? responseRecord.user
+            : null;
+          const found = postRecord !== null || commentRecord !== null || userRecord !== null;
+          if (!found) {
+            lines.push(`lookup: reference "${reference}" not found`);
+            await remember({
+              lookupKind: "resolve_reference",
+              found: false,
+              reference,
+              summary: `reference "${reference}" not found`,
+            });
+            continue;
+          }
+          if (type === "post" && postRecord) {
+            const summary = summarizePostRecord(postRecord);
+            lines.push(`lookup: ref "${reference}" -> ${summary.line}`);
+            await remember({
+              lookupKind: "resolve_reference",
+              found: true,
+              reference,
+              refType: type,
+              postId: summary.postId,
+              summary: summary.bodyPreview ?? summary.line,
+            });
+            continue;
+          }
+          if (type === "comment" && commentRecord) {
+            const summary = summarizeCommentRecord(commentRecord);
+            lines.push(`lookup: ref "${reference}" -> ${summary.line}`);
+            await remember({
+              lookupKind: "resolve_reference",
+              found: true,
+              reference,
+              refType: type,
+              postId: summary.postId,
+              commentId: summary.commentId,
+              summary: summary.bodyPreview ?? summary.line,
+            });
+            continue;
+          }
+          if (type === "user" && userRecord) {
+            const summary = summarizeUserRecord(userRecord);
+            lines.push(`lookup: ref "${reference}" -> ${summary.line}`);
+            await remember({
+              lookupKind: "resolve_reference",
+              found: true,
+              reference,
+              refType: type,
+              handle: summary.handle,
+              userId: summary.userId,
+              summary: summary.reason ?? summary.line,
+            });
+            continue;
+          }
+          lines.push(`lookup: ref "${reference}" resolved as ${type}`);
+          await remember({
+            lookupKind: "resolve_reference",
+            found: true,
+            reference,
+            refType: type,
+            summary: `resolved as ${type}`,
+          });
+        } catch (error: unknown) {
+          const message = error instanceof Error ? error.message : String(error);
+          lines.push(
+            `lookup: resolve "${reference}" failed (${toAnswerPreview(message, 120)})`,
+          );
+          await remember({
+            lookupKind: "resolve_reference",
+            found: false,
+            reference,
+            error: toAnswerPreview(message, 180),
+          });
+        }
+      }
+    }
+
+    if (BROWSE_RECENT_ACTIONS_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      const windowHours = parseLookupWindowHours(input.retrievalQuery) ?? 24 * 7;
+      try {
+        const response = await lookupCall({
+          action: "browse_recent_actions",
+          windowHours,
+          limit: 24,
+        });
+        const rows =
+          isRecord(response) && Array.isArray(response.items)
+            ? response.items.filter((entry): entry is Record<string, unknown> =>
+                isRecord(entry),
+              )
+            : [];
+        if (rows.length === 0) {
+          lines.push(`lookup: no recent actions in last ${windowHours}h`);
+          await remember({
+            lookupKind: "browse_recent_actions",
+            found: false,
+            windowHours,
+            summary: `no recent actions in last ${windowHours}h`,
+          });
+        } else {
+          for (const row of rows.slice(0, 6)) {
+            const eventType =
+              typeof row.eventType === "string" ? row.eventType.trim() : "unknown";
+            const capability =
+              typeof row.capability === "string" ? row.capability.trim() : null;
+            const allowed = row.allowed === true;
+            const line = [
+              `lookup: action:${eventType}`,
+              capability ? `capability=${capability}` : "",
+              `allowed=${allowed ? "yes" : "no"}`,
+              typeof row.createdAt === "string" ? `at=${row.createdAt}` : "",
+            ]
+              .filter((part) => part.length > 0)
+              .join(" · ");
+            lines.push(line);
+            await remember({
+              lookupKind: "browse_recent_actions",
+              found: true,
+              windowHours,
+              eventType,
+              capability,
+              allowed,
+              summary: line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: recent actions failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_recent_actions",
+          found: false,
+          windowHours,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
     if (CUSTOM_ASSET_LOOKUP_PATTERN.test(input.retrievalQuery)) {
       const assetQuery = extractCustomAssetSearchQuery(input.retrievalQuery);
       const assetLookupPayload: Record<string, unknown> = {
@@ -2655,6 +4060,6 @@ export class ChatManager implements ChatManagerLike {
       }
     }
 
-    return lines.slice(0, 12);
+    return lines.slice(0, 20);
   }
 }

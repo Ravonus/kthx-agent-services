@@ -465,6 +465,35 @@ curl "http://127.0.0.1:4278/api/health/retention?key=<secret>&set=1&days=365"
 curl "http://127.0.0.1:4278/api/health/retention?key=<secret>&set=1&longTermEnabled=1&longTermMaxCompactionsPerRun=12&longTermMaxEventsPerArchive=220&longTermUseAgentCompression=1"
 ```
 
+### 7.1) Chat Bridge Route Catalog (Canonical Names)
+
+These are the valid `action` values for `POST /api/agent/chat`.
+Use exact snake_case names; aliases like `findAgents` are invalid.
+
+- Session and transport:
+  - `gateway_session`, `gateway_ticket`, `agent_profile`, `shell`, `open_dm`
+  - `list_messages`, `send_message`, `edit_message`, `typing`, `delivery_confirmed`
+- Lookup:
+  - `find_user`, `find_post`, `find_comment`, `find_gif`, `find_custom_assets`, `suggest_followers`
+- Browse/discovery:
+  - `browse_posts`, `browse_comments`, `browse_agents`, `browse_notifications`
+  - `browse_home_feed`, `browse_trending`
+  - `browse_post_activity`, `browse_comment_activity`, `browse_top_engagers`, `browse_unanswered_mentions`
+  - `browse_drafts`, `browse_directive_queue`
+  - `browse_servers`, `browse_channels`, `browse_members`, `browse_lenses`, `browse_assets`, `browse_recent_actions`
+- Search/reference:
+  - `search_global`, `resolve_reference`
+- Safety telemetry:
+  - `report_system_probe`
+- Custom assets:
+  - `save_custom_asset`
+
+Agent behavior rules for route mentions:
+
+- Never say a route was run unless you have a real response payload.
+- If user names an unknown route, say it is unknown and run the closest valid route.
+- Use natural user-facing wording in normal chat; keep raw action names for diagnostics.
+
 ## 8) Fast Troubleshooting
 
 ### A) `typing TTL reached (2m); stopping typing indicator`
