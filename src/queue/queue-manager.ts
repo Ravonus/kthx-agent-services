@@ -77,6 +77,8 @@ const parseIsoToMs = (value: unknown): number | null => {
   return Number.isFinite(ms) ? ms : null;
 };
 
+const MAX_NOT_READY_REQUEUE_ATTEMPTS = 8;
+
 // ---------------------------------------------------------------------------
 // QueueManager
 // ---------------------------------------------------------------------------
@@ -328,6 +330,8 @@ export class QueueManager implements QueueManagerLike {
 
       const processed = await this.ctx.processCommandFile(item.inboxFile);
       if (!processed) {
+        let markedTerminal = false;
+        let terminalError = "not_ready";
         await this.mutateQueueState((current) => {
           const next = { ...current };
           next.items = current.items.map((qi) => {
@@ -337,6 +341,20 @@ export class QueueManager implements QueueManagerLike {
               qi.lastError.trim().length > 0
                 ? qi.lastError.trim()
                 : "not_ready";
+            if (
+              typeof qi.attempts === "number" &&
+              Number.isFinite(qi.attempts) &&
+              qi.attempts >= MAX_NOT_READY_REQUEUE_ATTEMPTS
+            ) {
+              markedTerminal = true;
+              terminalError = `${preservedError}:max_not_ready_retries`;
+              return {
+                ...qi,
+                status: "failed" as QueueItem["status"],
+                completedAt: nowIso(),
+                lastError: terminalError,
+              };
+            }
             const retryDelaySeconds = Math.max(
               2,
               Math.min(60, (typeof qi.attempts === "number" ? qi.attempts : 1) * 2),
@@ -354,6 +372,17 @@ export class QueueManager implements QueueManagerLike {
           });
           return next;
         });
+        if (markedTerminal) {
+          await this.ctx.memory.recordWrite({
+            type: "directive_queue_not_ready_max_retries",
+            at: nowIso(),
+            source: "queue_runner",
+            directiveId: item.directiveId,
+            inboxFile: item.inboxFile,
+            error: terminalError,
+            maxAttempts: MAX_NOT_READY_REQUEUE_ATTEMPTS,
+          });
+        }
         return;
       }
 

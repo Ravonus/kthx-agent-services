@@ -277,6 +277,21 @@ const parseTopParticipantMetric = (
   return "combined";
 };
 
+const parseMetricsBucketMsFromQuery = (
+  query: URLSearchParams,
+  rangeMs: number,
+): number => {
+  const raw = (query.get("bucket") ?? "").trim().toLowerCase();
+  if (raw === "1h" || raw === "60m") return 3_600_000;
+  if (raw === "2h" || raw === "120m") return 2 * 3_600_000;
+  if (raw === "6h" || raw === "360m") return 6 * 3_600_000;
+  if (raw === "12h" || raw === "720m") return 12 * 3_600_000;
+  if (raw === "1d" || raw === "24h" || raw === "1440m") return 24 * 3_600_000;
+  if (rangeMs <= 2 * 24 * 3_600_000) return 3_600_000;
+  if (rangeMs <= 14 * 24 * 3_600_000) return 6 * 3_600_000;
+  return 24 * 3_600_000;
+};
+
 const normalizeParticipantToken = (value: string): string | null => {
   const trimmed = value.trim();
   if (!trimmed.length) return null;
@@ -957,6 +972,722 @@ const buildMemoryEngagementDiagnostics = (input: {
   };
 };
 
+type MemorySourceMetricKey =
+  | "comments"
+  | "likes"
+  | "reposts"
+  | "views"
+  | "notifications";
+
+const resolveMemorySourceMetric = (
+  sourceType: string | null,
+): MemorySourceMetricKey | null => {
+  if (sourceType === "post_comment") return "comments";
+  if (sourceType === "post_like") return "likes";
+  if (sourceType === "post_repost") return "reposts";
+  if (sourceType === "post_view") return "views";
+  if (sourceType === "notification_created") return "notifications";
+  return null;
+};
+
+const metricValueFromParticipant = (
+  participant: {
+    comments: number;
+    likes: number;
+    reposts: number;
+    views: number;
+    notifications: number;
+    presence: number;
+    combined: number;
+  },
+  metric: RetrievalPresetTopParticipantMetric,
+): number => {
+  if (metric === "comments") return participant.comments;
+  if (metric === "likes") return participant.likes;
+  if (metric === "reposts") return participant.reposts;
+  if (metric === "views") return participant.views;
+  if (metric === "notifications") return participant.notifications;
+  if (metric === "presence") return participant.presence;
+  return participant.combined;
+};
+
+const buildMemoryMapDiagnostics = (input: {
+  index: KeywordIndexSnapshot;
+  longTermIndex: LongTermArchiveIndexSnapshot;
+  rangeMs: number;
+  metric: RetrievalPresetTopParticipantMetric;
+  limit: number;
+  postId: number | null;
+  commentId: number | null;
+  intent: RetrievalIntent;
+  query: string;
+}): Record<string, unknown> => {
+  const nowMs = Date.now();
+  const safeRangeMs = Math.max(60_000, Math.min(366 * 86_400_000, input.rangeMs));
+  const sinceMs = nowMs - safeRangeMs;
+  const rangeLabel = formatRangeLabelFromMs(safeRangeMs);
+  const safeLimit = Math.max(3, Math.min(100, Math.floor(input.limit)));
+  const query = input.query.trim();
+  const queryHints = parsePostAndCommentHints(query);
+  const scopedPostId = input.postId ?? queryHints.postId;
+  const scopedCommentId = input.commentId ?? queryHints.commentId;
+  const queryTokens = tokenizeRetrievalText(query).slice(0, 16);
+
+  const candidateDocs = Object.values(input.index.docs)
+    .map((doc) => ({ doc, atMs: Date.parse(doc.receivedAt) }))
+    .filter((entry) => Number.isFinite(entry.atMs))
+    .filter((entry) => entry.atMs >= sinceMs && entry.atMs <= nowMs)
+    .filter((entry) => {
+      if (scopedPostId !== null && entry.doc.postId !== scopedPostId) return false;
+      if (scopedCommentId !== null && entry.doc.commentId !== scopedCommentId) return false;
+      return true;
+    });
+
+  const docMatchesQuery = (doc: KeywordIndexDoc): boolean => {
+    if (!query.length) return true;
+    const summaryLower = doc.summary.toLowerCase();
+    const actorLower = (doc.actor ?? "").toLowerCase();
+    const participantsLower = doc.participants.map((value) => value.toLowerCase());
+    const keywordSet = new Set(doc.keywords);
+    const matchesHints =
+      (queryHints.postId !== null && doc.postId === queryHints.postId) ||
+      (queryHints.commentId !== null && doc.commentId === queryHints.commentId);
+    if (matchesHints) return true;
+    if (!queryTokens.length) return true;
+    for (const token of queryTokens) {
+      if (keywordSet.has(token)) return true;
+      if (summaryLower.includes(token)) return true;
+      if (actorLower.includes(token)) return true;
+      if (participantsLower.some((item) => item.includes(token))) return true;
+    }
+    return false;
+  };
+
+  const scopedDocs = candidateDocs.filter((entry) => docMatchesQuery(entry.doc));
+
+  const participantStats = new Map<
+    string,
+    {
+      participant: string;
+      display: string;
+      comments: number;
+      likes: number;
+      reposts: number;
+      views: number;
+      notifications: number;
+      presence: number;
+      docs: number;
+      combined: number;
+      lastAt: string | null;
+      postCounts: Map<number, number>;
+      commentCounts: Map<number, number>;
+    }
+  >();
+  const postStats = new Map<
+    number,
+    {
+      postId: number;
+      comments: number;
+      likes: number;
+      reposts: number;
+      views: number;
+      notifications: number;
+      docs: number;
+      participants: Set<string>;
+      lastAt: string | null;
+      latestSummary: string | null;
+    }
+  >();
+  const commentStats = new Map<
+    number,
+    {
+      commentId: number;
+      postId: number | null;
+      comments: number;
+      likes: number;
+      reposts: number;
+      views: number;
+      notifications: number;
+      docs: number;
+      participants: Set<string>;
+      lastAt: string | null;
+      latestSummary: string | null;
+    }
+  >();
+  const sourceCounts = new Map<string, number>();
+  const nodeWeights = new Map<string, number>();
+  const edgeWeights = new Map<string, number>();
+  const bucketMs = parseMetricsBucketMsFromQuery(
+    new URLSearchParams([
+      ["bucket", safeRangeMs <= 2 * 24 * 3_600_000 ? "1h" : "1d"],
+    ]),
+    safeRangeMs,
+  );
+  const timeline = new Map<
+    number,
+    {
+      bucketAt: string;
+      comments: number;
+      likes: number;
+      reposts: number;
+      views: number;
+      notifications: number;
+      total: number;
+      docs: number;
+      uniqueParticipants: number;
+    }
+  >();
+
+  const sortedDocEntries = [...scopedDocs].sort((a, b) =>
+    a.atMs < b.atMs ? -1 : a.atMs > b.atMs ? 1 : 0,
+  );
+
+  for (const entry of sortedDocEntries) {
+    const sourceType = entry.doc.sourceType ?? "event";
+    sourceCounts.set(sourceType, (sourceCounts.get(sourceType) ?? 0) + 1);
+    const sourceMetric = resolveMemorySourceMetric(sourceType);
+    const participants = new Set<string>();
+    if (entry.doc.actor) {
+      const normalizedActor = normalizeParticipantToken(entry.doc.actor);
+      if (normalizedActor) participants.add(normalizedActor);
+    }
+    for (const rawParticipant of entry.doc.participants) {
+      const normalized = normalizeParticipantToken(rawParticipant);
+      if (normalized) participants.add(normalized);
+    }
+    const participantList = [...participants].sort((a, b) =>
+      a < b ? -1 : a > b ? 1 : 0,
+    );
+    for (const participant of participantList) {
+      const current =
+        participantStats.get(participant) ??
+        {
+          participant,
+          display: participant.startsWith("id:")
+            ? participant.slice(3)
+            : participant,
+          comments: 0,
+          likes: 0,
+          reposts: 0,
+          views: 0,
+          notifications: 0,
+          presence: 0,
+          docs: 0,
+          combined: 0,
+          lastAt: null,
+          postCounts: new Map<number, number>(),
+          commentCounts: new Map<number, number>(),
+        };
+      current.docs += 1;
+      current.presence += 1;
+      if (sourceMetric) current[sourceMetric] += 1;
+      if (
+        current.lastAt === null ||
+        (entry.doc.receivedAt && current.lastAt < entry.doc.receivedAt)
+      ) {
+        current.lastAt = entry.doc.receivedAt;
+      }
+      if (typeof entry.doc.postId === "number") {
+        current.postCounts.set(
+          entry.doc.postId,
+          (current.postCounts.get(entry.doc.postId) ?? 0) + 1,
+        );
+      }
+      if (typeof entry.doc.commentId === "number") {
+        current.commentCounts.set(
+          entry.doc.commentId,
+          (current.commentCounts.get(entry.doc.commentId) ?? 0) + 1,
+        );
+      }
+      participantStats.set(participant, current);
+      nodeWeights.set(participant, (nodeWeights.get(participant) ?? 0) + 1);
+    }
+
+    if (participantList.length >= 2) {
+      const safeParticipants = participantList.slice(0, 12);
+      for (let i = 0; i < safeParticipants.length; i += 1) {
+        for (let j = i + 1; j < safeParticipants.length; j += 1) {
+          const a = safeParticipants[i] ?? "";
+          const b = safeParticipants[j] ?? "";
+          if (!a || !b) continue;
+          const key = `${a}|${b}`;
+          edgeWeights.set(key, (edgeWeights.get(key) ?? 0) + 1);
+        }
+      }
+    }
+
+    if (typeof entry.doc.postId === "number") {
+      const post =
+        postStats.get(entry.doc.postId) ??
+        {
+          postId: entry.doc.postId,
+          comments: 0,
+          likes: 0,
+          reposts: 0,
+          views: 0,
+          notifications: 0,
+          docs: 0,
+          participants: new Set<string>(),
+          lastAt: null,
+          latestSummary: null,
+        };
+      post.docs += 1;
+      if (sourceMetric) post[sourceMetric] += 1;
+      for (const participant of participantList) {
+        post.participants.add(participant);
+      }
+      if (post.lastAt === null || post.lastAt < entry.doc.receivedAt) {
+        post.lastAt = entry.doc.receivedAt;
+        post.latestSummary = entry.doc.summary;
+      }
+      postStats.set(entry.doc.postId, post);
+    }
+
+    if (typeof entry.doc.commentId === "number") {
+      const comment =
+        commentStats.get(entry.doc.commentId) ??
+        {
+          commentId: entry.doc.commentId,
+          postId: entry.doc.postId,
+          comments: 0,
+          likes: 0,
+          reposts: 0,
+          views: 0,
+          notifications: 0,
+          docs: 0,
+          participants: new Set<string>(),
+          lastAt: null,
+          latestSummary: null,
+        };
+      comment.docs += 1;
+      if (sourceMetric) comment[sourceMetric] += 1;
+      for (const participant of participantList) {
+        comment.participants.add(participant);
+      }
+      if (comment.lastAt === null || comment.lastAt < entry.doc.receivedAt) {
+        comment.lastAt = entry.doc.receivedAt;
+        comment.latestSummary = entry.doc.summary;
+      }
+      commentStats.set(entry.doc.commentId, comment);
+    }
+
+    const bucketStartMs = Math.floor(entry.atMs / bucketMs) * bucketMs;
+    const bucket =
+      timeline.get(bucketStartMs) ??
+      {
+        bucketAt: new Date(bucketStartMs).toISOString(),
+        comments: 0,
+        likes: 0,
+        reposts: 0,
+        views: 0,
+        notifications: 0,
+        total: 0,
+        docs: 0,
+        uniqueParticipants: 0,
+      };
+    bucket.docs += 1;
+    bucket.uniqueParticipants += participantList.length;
+    if (sourceMetric) bucket[sourceMetric] += 1;
+    bucket.total += 1;
+    timeline.set(bucketStartMs, bucket);
+  }
+
+  const selectTopId = (counts: Map<number, number>): number | null => {
+    let bestId: number | null = null;
+    let bestCount = -1;
+    for (const [id, count] of counts.entries()) {
+      if (count > bestCount) {
+        bestId = id;
+        bestCount = count;
+      }
+    }
+    return bestId;
+  };
+
+  const participantLeaders = [...participantStats.values()]
+    .map((participant) => {
+      participant.combined =
+        participant.comments * 4 +
+        participant.likes * 2 +
+        participant.reposts * 3 +
+        participant.views +
+        participant.notifications * 2 +
+        participant.presence;
+      const metricScore = metricValueFromParticipant(participant, input.metric);
+      return {
+        participant: participant.participant,
+        display: participant.display,
+        metricScore,
+        comments: participant.comments,
+        likes: participant.likes,
+        reposts: participant.reposts,
+        views: participant.views,
+        notifications: participant.notifications,
+        presence: participant.presence,
+        docs: participant.docs,
+        combined: participant.combined,
+        lastAt: participant.lastAt,
+        topPostId: selectTopId(participant.postCounts),
+        topCommentId: selectTopId(participant.commentCounts),
+      };
+    })
+    .sort((a, b) =>
+      b.metricScore !== a.metricScore
+        ? b.metricScore - a.metricScore
+        : b.combined !== a.combined
+          ? b.combined - a.combined
+          : (b.lastAt ?? "") < (a.lastAt ?? "")
+            ? -1
+            : 1,
+    )
+    .slice(0, safeLimit);
+
+  const topPosts = [...postStats.values()]
+    .map((post) => {
+      const combined =
+        post.comments * 4 +
+        post.likes * 2 +
+        post.reposts * 3 +
+        post.views +
+        post.notifications * 2 +
+        post.docs;
+      return {
+        postId: post.postId,
+        comments: post.comments,
+        likes: post.likes,
+        reposts: post.reposts,
+        views: post.views,
+        notifications: post.notifications,
+        docs: post.docs,
+        participantCount: post.participants.size,
+        combined,
+        lastAt: post.lastAt,
+        summary: post.latestSummary,
+      };
+    })
+    .sort((a, b) =>
+      b.combined !== a.combined
+        ? b.combined - a.combined
+        : (b.lastAt ?? "") < (a.lastAt ?? "")
+          ? -1
+          : 1,
+    )
+    .slice(0, safeLimit);
+
+  const topComments = [...commentStats.values()]
+    .map((comment) => {
+      const combined =
+        comment.comments * 4 +
+        comment.likes * 2 +
+        comment.reposts * 3 +
+        comment.views +
+        comment.notifications * 2 +
+        comment.docs;
+      return {
+        commentId: comment.commentId,
+        postId: comment.postId,
+        comments: comment.comments,
+        likes: comment.likes,
+        reposts: comment.reposts,
+        views: comment.views,
+        notifications: comment.notifications,
+        docs: comment.docs,
+        participantCount: comment.participants.size,
+        combined,
+        lastAt: comment.lastAt,
+        summary: comment.latestSummary,
+      };
+    })
+    .sort((a, b) =>
+      b.combined !== a.combined
+        ? b.combined - a.combined
+        : (b.lastAt ?? "") < (a.lastAt ?? "")
+          ? -1
+          : 1,
+    )
+    .slice(0, safeLimit);
+
+  const sourceDistribution = [...sourceCounts.entries()]
+    .map(([sourceType, count]) => ({ sourceType, count }))
+    .sort((a, b) => b.count - a.count);
+
+  const networkNodeSet = new Set(
+    participantLeaders.slice(0, Math.max(10, Math.min(40, safeLimit * 2))).map((entry) => entry.participant),
+  );
+  const networkNodes = participantLeaders
+    .filter((entry) => networkNodeSet.has(entry.participant))
+    .map((entry) => ({
+      id: entry.participant,
+      label: entry.display,
+      score: entry.metricScore,
+      combined: entry.combined,
+      weight: nodeWeights.get(entry.participant) ?? 0,
+    }));
+  const networkEdges = [...edgeWeights.entries()]
+    .map(([pair, weight]) => {
+      const [source, target] = pair.split("|");
+      return { source: source ?? "", target: target ?? "", weight };
+    })
+    .filter(
+      (edge) =>
+        edge.source.length > 0 &&
+        edge.target.length > 0 &&
+        networkNodeSet.has(edge.source) &&
+        networkNodeSet.has(edge.target),
+    )
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, Math.max(20, Math.min(200, safeLimit * 5)));
+
+  const timelineRows = [...timeline.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, row]) => row);
+
+  const archiveTop = input.longTermIndex.items
+    .map((capsule) => {
+      const matchedKeywords =
+        queryTokens.length > 0
+          ? capsule.keywords.filter((keyword) => queryTokens.includes(keyword))
+          : [];
+      const matchedPost =
+        scopedPostId !== null && capsule.postIds.includes(scopedPostId);
+      const matchedComment =
+        scopedCommentId !== null && capsule.commentIds.includes(scopedCommentId);
+      const include =
+        query.length === 0 ||
+        matchedKeywords.length > 0 ||
+        matchedPost ||
+        matchedComment;
+      if (!include) return null;
+      const compactedAtMs = Date.parse(capsule.compactedAt);
+      const ageDays =
+        Number.isFinite(compactedAtMs) && compactedAtMs <= nowMs
+          ? (nowMs - compactedAtMs) / 86_400_000
+          : 365;
+      const recencyScore = 1 / (1 + Math.max(0, ageDays / 30));
+      const score =
+        matchedKeywords.length * 2.1 +
+        (matchedPost ? 4.5 : 0) +
+        (matchedComment ? 5 : 0) +
+        recencyScore * 1.4 +
+        Math.min(capsule.eventCount / 80, 3);
+      return {
+        id: capsule.id,
+        stream: capsule.stream,
+        compactedAt: capsule.compactedAt,
+        eventCount: capsule.eventCount,
+        compressedBy: capsule.compressedBy,
+        summary: capsule.summary,
+        matchedKeywords,
+        score: Number.parseFloat(score.toFixed(2)),
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== null)
+    .sort((a, b) =>
+      b.score !== a.score
+        ? b.score - a.score
+        : b.compactedAt < a.compactedAt
+          ? -1
+          : 1,
+    )
+    .slice(0, safeLimit);
+
+  const totalParticipants = participantStats.size;
+  const totalPosts = postStats.size;
+  const totalComments = commentStats.size;
+  const biggestParticipant = participantLeaders[0] ?? null;
+
+  return {
+    range: {
+      label: rangeLabel,
+      maxAgeMs: safeRangeMs,
+      from: new Date(sinceMs).toISOString(),
+      to: new Date(nowMs).toISOString(),
+      bucketMs,
+    },
+    filters: {
+      query: query.length > 0 ? query : null,
+      tokens: queryTokens,
+      metric: input.metric,
+      intent: input.intent,
+      postId: scopedPostId,
+      commentId: scopedCommentId,
+      limit: safeLimit,
+    },
+    totals: {
+      docsInRange: candidateDocs.length,
+      docsMatched: scopedDocs.length,
+      participants: totalParticipants,
+      posts: totalPosts,
+      comments: totalComments,
+      sources: sourceDistribution.length,
+    },
+    biggestParticipant,
+    sourceDistribution,
+    participantLeaders,
+    topPosts,
+    topComments,
+    timeline: timelineRows,
+    network: {
+      nodes: networkNodes,
+      edges: networkEdges,
+    },
+    archive: {
+      capsules: input.longTermIndex.items.length,
+      matched: archiveTop.length,
+      top: archiveTop,
+    },
+  };
+};
+
+const buildRuntimeMetricsDiagnostics = (input: {
+  writeRecords: Record<string, unknown>[];
+  inboxRecords: Record<string, unknown>[];
+  rangeMs: number;
+  bucketMs: number;
+}): Record<string, unknown> => {
+  const nowMs = Date.now();
+  const safeRangeMs = Math.max(60_000, Math.min(366 * 86_400_000, input.rangeMs));
+  const safeBucketMs = Math.max(60_000, Math.min(24 * 3_600_000, input.bucketMs));
+  const sinceMs = nowMs - safeRangeMs;
+  const timeline = new Map<
+    number,
+    {
+      bucketAt: string;
+      publishOk: number;
+      publishFailed: number;
+      directivesStaged: number;
+      directivesExecuted: number;
+      directivesFailed: number;
+      chatAutoReplies: number;
+      memoryRefreshes: number;
+      notificationsFlushed: number;
+      inboundMessages: number;
+      openClawPrompts: number;
+      total: number;
+    }
+  >();
+  const ensureBucket = (atMs: number) => {
+    const bucketStartMs = Math.floor(atMs / safeBucketMs) * safeBucketMs;
+    const existing = timeline.get(bucketStartMs);
+    if (existing) return existing;
+    const created = {
+      bucketAt: new Date(bucketStartMs).toISOString(),
+      publishOk: 0,
+      publishFailed: 0,
+      directivesStaged: 0,
+      directivesExecuted: 0,
+      directivesFailed: 0,
+      chatAutoReplies: 0,
+      memoryRefreshes: 0,
+      notificationsFlushed: 0,
+      inboundMessages: 0,
+      openClawPrompts: 0,
+      total: 0,
+    };
+    timeline.set(bucketStartMs, created);
+    return created;
+  };
+
+  const totals = {
+    publishOk: 0,
+    publishFailed: 0,
+    directivesStaged: 0,
+    directivesExecuted: 0,
+    directivesFailed: 0,
+    chatAutoReplies: 0,
+    memoryRefreshes: 0,
+    notificationsFlushed: 0,
+    inboundMessages: 0,
+    openClawPrompts: 0,
+    total: 0,
+  };
+
+  for (const envelope of input.writeRecords) {
+    const payload = isRecord(envelope.payload) ? envelope.payload : null;
+    if (!payload) continue;
+    const type = str(payload.type);
+    if (!type) continue;
+    const at = eventAt(envelope, payload);
+    const atMs = at ? Date.parse(at) : Number.NaN;
+    if (!Number.isFinite(atMs) || atMs < sinceMs || atMs > nowMs) continue;
+    const bucket = ensureBucket(atMs);
+    let counted = false;
+    if (type === PUBLISH_RESULT) {
+      if (bool(payload.ok) === true) {
+        bucket.publishOk += 1;
+        totals.publishOk += 1;
+      } else {
+        bucket.publishFailed += 1;
+        totals.publishFailed += 1;
+      }
+      counted = true;
+    } else if (DIRECTIVE_STAGED_TYPES.has(type)) {
+      bucket.directivesStaged += 1;
+      totals.directivesStaged += 1;
+      counted = true;
+    } else if (type === DIRECTIVE_EXECUTED) {
+      bucket.directivesExecuted += 1;
+      totals.directivesExecuted += 1;
+      counted = true;
+    } else if (type === DIRECTIVE_FAILED) {
+      bucket.directivesFailed += 1;
+      totals.directivesFailed += 1;
+      counted = true;
+    } else if (type === CHAT_AUTO_REPLY) {
+      bucket.chatAutoReplies += 1;
+      totals.chatAutoReplies += 1;
+      counted = true;
+    } else if (type === MEMORY_REFRESH) {
+      bucket.memoryRefreshes += 1;
+      totals.memoryRefreshes += 1;
+      counted = true;
+    } else if (type === NOTIFICATIONS_FLUSHED) {
+      bucket.notificationsFlushed += 1;
+      totals.notificationsFlushed += 1;
+      counted = true;
+    } else if (type === "openclaw_prompt_result") {
+      bucket.openClawPrompts += 1;
+      totals.openClawPrompts += 1;
+      counted = true;
+    }
+    if (counted) {
+      bucket.total += 1;
+      totals.total += 1;
+    }
+  }
+
+  for (const row of input.inboxRecords) {
+    const atRaw = iso(row.at) ?? iso(row.receivedAt);
+    const atMs = atRaw ? Date.parse(atRaw) : Number.NaN;
+    if (!Number.isFinite(atMs) || atMs < sinceMs || atMs > nowMs) continue;
+    const bucket = ensureBucket(atMs);
+    bucket.inboundMessages += 1;
+    bucket.total += 1;
+    totals.inboundMessages += 1;
+    totals.total += 1;
+  }
+
+  const rows = [...timeline.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, value]) => value);
+  const hours = Math.max(1, safeRangeMs / 3_600_000);
+
+  return {
+    range: {
+      label: formatRangeLabelFromMs(safeRangeMs),
+      maxAgeMs: safeRangeMs,
+      from: new Date(sinceMs).toISOString(),
+      to: new Date(nowMs).toISOString(),
+      bucketMs: safeBucketMs,
+    },
+    totals: {
+      ...totals,
+      perHour: Number.parseFloat((totals.total / hours).toFixed(2)),
+    },
+    buckets: rows,
+  };
+};
+
 const resolveStateDir = (): string => {
   const configured = trimEnv("MG_AGENT_STATE_DIR");
   if (configured) return path.resolve(configured);
@@ -1384,7 +2115,7 @@ button:hover{background:#f1f5f9}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 </style></head><body>
 <div class="wrap">
-<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Read-Only Health</div></div><div class="row"><a href="/graphs" class="badge neutral" style="text-decoration:none">Open Graphs</a><div class="muted" id="ts">refreshing...</div></div></div>
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Read-Only Health</div></div><div class="row"><a href="/graphs" class="badge neutral" style="text-decoration:none">Engagement</a><a href="/map" class="badge neutral" style="text-decoration:none">Memory Map</a><a href="/metrics" class="badge neutral" style="text-decoration:none">Runtime Metrics</a><div class="muted" id="ts">refreshing...</div></div></div>
 <div class="grid">
 <div class="card"><div class="muted">Runtime</div><div id="rt"></div></div>
 <div class="card"><div class="muted">Chat Bridge</div><div id="cb"></div></div>
@@ -1503,7 +2234,7 @@ button{cursor:pointer}button:hover{background:#f1f5f9}
 a{color:#2563eb;text-decoration:none}
 </style></head><body>
 <div class="wrap">
-<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Memory Engagement Graphs</div></div><div class="row"><a href="/" class="muted">Back to health</a><div class="muted" id="ts">loading...</div></div></div>
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Memory Engagement Graphs</div></div><div class="row"><a href="/" class="muted">Health</a><a href="/map" class="muted">Memory map</a><a href="/metrics" class="muted">Runtime metrics</a><div class="muted" id="ts">loading...</div></div></div>
 <div class="card">
 <div class="row">
 <select id="range"><option value="24h">24h</option><option value="7d">7d</option><option value="30d" selected>30d</option><option value="90d">90d</option><option value="365d">365d</option></select>
@@ -1546,6 +2277,157 @@ document.getElementById('meta').textContent='range '+esc(payload.range?.label)+'
 };
 const run=async()=>{const sp=new URLSearchParams();sp.set('range',String(document.getElementById('range').value||'30d'));sp.set('metric',String(document.getElementById('metric').value||'combined'));sp.set('limit',String(document.getElementById('limit').value||'10'));const postId=String(document.getElementById('postId').value||'').trim();const commentId=String(document.getElementById('commentId').value||'').trim();if(postId)sp.set('postId',postId);if(commentId)sp.set('commentId',commentId);document.getElementById('meta').textContent='loading...';try{const res=await fetch('/api/health/memory-engagement?'+sp.toString(),{cache:'no-store'});render(await res.json())}catch(err){document.getElementById('meta').textContent='failed: '+err}};
 document.getElementById('run').addEventListener('click',()=>{void run()});
+void run();
+</script></body></html>`;
+
+const MAP_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Agent Memory Map</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--ink:#0f172a;--muted:#475569;--line:#dbe3ef;--accent:#2563eb;--accent2:#0f766e}
+*{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,sans-serif;background:linear-gradient(145deg,#eef3ff,#f8fafc);color:var(--ink)}
+.wrap{max-width:1280px;margin:24px auto;padding:0 16px;display:grid;gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 8px 22px rgba(15,23,42,.06)}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.h1{font-size:22px;font-weight:700;margin:2px 0}.muted{color:var(--muted);font-size:13px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+input,select,button{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px;background:#fff;color:var(--ink)}
+button{cursor:pointer}button:hover{background:#f1f5f9}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.bars{display:grid;gap:8px}
+.bar{display:grid;grid-template-columns:180px 1fr auto;gap:8px;align-items:center}
+.track{height:12px;background:#e2e8f0;border-radius:999px;overflow:hidden}
+.fill{height:100%;background:linear-gradient(90deg,var(--accent),#60a5fa)}
+.fill2{background:linear-gradient(90deg,var(--accent2),#2dd4bf)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;font-size:13px}.k{color:var(--muted)}
+.list{display:grid;gap:8px}
+.evt{border:1px solid var(--line);border-radius:10px;padding:8px;font-size:13px}
+a{color:#2563eb;text-decoration:none}
+</style></head><body>
+<div class="wrap">
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Memory Map</div></div><div class="row"><a href="/" class="muted">Health</a><a href="/graphs" class="muted">Engagement</a><a href="/metrics" class="muted">Runtime metrics</a><div class="muted" id="ts">loading...</div></div></div>
+<div class="card">
+<div class="row">
+<input id="query" type="text" placeholder="query (keywords, @handle, post 751)" style="min-width:280px;flex:1"/>
+<select id="range"><option value="24h">24h</option><option value="7d">7d</option><option value="30d" selected>30d</option><option value="90d">90d</option><option value="365d">365d</option></select>
+<select id="metric"><option value="combined">combined</option><option value="comments">comments</option><option value="likes">likes</option><option value="reposts">reposts</option><option value="views">views</option><option value="notifications">notifications</option><option value="presence">presence</option></select>
+<select id="intent"><option value="chat">chat</option><option value="directive">directive</option><option value="engagement">engagement</option></select>
+<input id="limit" type="number" min="5" max="100" value="20" style="width:90px"/>
+<input id="postId" type="number" min="1" placeholder="postId" style="width:120px"/>
+<input id="commentId" type="number" min="1" placeholder="commentId" style="width:140px"/>
+<button id="run" type="button">Refresh</button>
+</div>
+<div id="meta" class="muted" style="margin-top:8px">ready</div>
+</div>
+<div class="grid">
+<div class="card"><div class="muted">Summary</div><div id="summary" class="kv"></div></div>
+<div class="card"><div class="muted">Biggest Participant</div><div id="biggest"></div></div>
+<div class="card"><div class="muted">Source Distribution</div><div id="sources" class="bars"></div></div>
+</div>
+<div class="grid">
+<div class="card"><div class="muted">Top Participants (biggest → smallest)</div><div id="participants" class="bars"></div></div>
+<div class="card"><div class="muted">Top Posts In Memory</div><div id="posts" class="list"></div></div>
+<div class="card"><div class="muted">Top Comments In Memory</div><div id="comments" class="list"></div></div>
+</div>
+<div class="grid">
+<div class="card"><div class="muted">Timeline</div><div id="timeline" class="bars"></div></div>
+<div class="card"><div class="muted">Memory Network (top edges)</div><div id="network" class="list"></div></div>
+<div class="card"><div class="muted">Archive Hits</div><div id="archive" class="list"></div></div>
+</div>
+</div>
+<script>
+const esc=v=>String(v??'n/a').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const fmt=iso=>{if(!iso)return'n/a';const ms=Date.parse(iso);return Number.isFinite(ms)?new Date(ms).toLocaleString():'n/a'};
+const kv=obj=>Object.entries(obj).map(([k,v])=>'<div class="k">'+esc(k)+'</div><div>'+esc(v??'n/a')+'</div>').join('');
+const barRow=(label,value,max,alt)=>{const width=max>0?Math.max(2,Math.round((value/max)*100)):0;return '<div class="bar"><div>'+esc(label)+'</div><div class="track"><div class="fill'+(alt?' fill2':'')+'" style="width:'+width+'%"></div></div><div>'+esc(value)+'</div></div>'};
+const renderList=(id,items,render)=>{const el=document.getElementById(id);if(!Array.isArray(items)||!items.length){el.innerHTML='<div class="muted">No data.</div>';return;}el.innerHTML=items.map(render).join('')};
+const render=(payload)=>{
+if(!payload||payload.ok!==true){document.getElementById('meta').textContent='memory map unavailable';return;}
+document.getElementById('ts').textContent='updated '+fmt(payload.generatedAt);
+const totals=payload.totals&&typeof payload.totals==='object'?payload.totals:{};
+const filters=payload.filters&&typeof payload.filters==='object'?payload.filters:{};
+document.getElementById('summary').innerHTML=kv({range:payload.range?.label,bucketMs:payload.range?.bucketMs,query:filters.query??'none',tokens:Array.isArray(filters.tokens)?filters.tokens.join(', '):'none',metric:filters.metric,intent:filters.intent,postId:filters.postId??'n/a',commentId:filters.commentId??'n/a',docsInRange:totals.docsInRange,docsMatched:totals.docsMatched,participants:totals.participants,posts:totals.posts,comments:totals.comments,sources:totals.sources});
+const biggest=payload.biggestParticipant&&typeof payload.biggestParticipant==='object'?payload.biggestParticipant:null;
+document.getElementById('biggest').innerHTML=biggest?'<div class="kv">'+kv({participant:biggest.display??biggest.participant,metricScore:biggest.metricScore,combined:biggest.combined,presence:biggest.presence,comments:biggest.comments,likes:biggest.likes,reposts:biggest.reposts,views:biggest.views,notifications:biggest.notifications,topPostId:biggest.topPostId??'n/a',topCommentId:biggest.topCommentId??'n/a',lastAt:fmt(biggest.lastAt)})+'</div>':'<div class="muted">No participant data.</div>';
+const sources=Array.isArray(payload.sourceDistribution)?payload.sourceDistribution:[];
+const sourceMax=sources.reduce((m,s)=>Math.max(m,Number(s.count)||0),0);
+document.getElementById('sources').innerHTML=sources.length?sources.map((source)=>barRow(source.sourceType??'unknown',Number(source.count)||0,sourceMax,true)).join(''):'<div class="muted">No source data.</div>';
+const participants=Array.isArray(payload.participantLeaders)?payload.participantLeaders:[];
+const partMax=participants.reduce((m,p)=>Math.max(m,Number(p.metricScore)||0),0);
+document.getElementById('participants').innerHTML=participants.length?participants.map((participant)=>barRow((participant.display??participant.participant)+' · c'+(participant.comments||0)+' l'+(participant.likes||0)+' r'+(participant.reposts||0)+' v'+(participant.views||0)+' n'+(participant.notifications||0),Number(participant.metricScore)||0,partMax,false)).join(''):'<div class="muted">No participants.</div>';
+renderList('posts',payload.topPosts,(post)=>'<div class="evt"><strong>post '+esc(post.postId)+'</strong><br/><span class="muted">score '+esc(post.combined)+' · docs '+esc(post.docs)+' · participants '+esc(post.participantCount)+' · '+esc(fmt(post.lastAt))+'</span><br/>'+esc(post.summary??'')+'</div>');
+renderList('comments',payload.topComments,(comment)=>'<div class="evt"><strong>comment '+esc(comment.commentId)+'</strong><br/><span class="muted">post '+esc(comment.postId??'n/a')+' · score '+esc(comment.combined)+' · docs '+esc(comment.docs)+' · participants '+esc(comment.participantCount)+' · '+esc(fmt(comment.lastAt))+'</span><br/>'+esc(comment.summary??'')+'</div>');
+const timeline=Array.isArray(payload.timeline)?payload.timeline:[];
+const timelineRows=timeline.slice(-32);
+const timelineMax=timelineRows.reduce((m,row)=>Math.max(m,Number(row.total)||0),0);
+document.getElementById('timeline').innerHTML=timelineRows.length?timelineRows.map((row)=>barRow(String(row.bucketAt).replace('T',' ').replace('.000Z','Z')+' · total '+(row.total??0)+' · c'+(row.comments??0)+' l'+(row.likes??0)+' r'+(row.reposts??0)+' v'+(row.views??0)+' n'+(row.notifications??0),Number(row.total)||0,timelineMax,false)).join(''):'<div class="muted">No timeline.</div>';
+const network=payload.network&&typeof payload.network==='object'?payload.network:{};
+const edges=Array.isArray(network.edges)?network.edges:[];
+renderList('network',edges.slice(0,24),(edge)=>'<div class="evt"><strong>'+esc(edge.source)+' ↔ '+esc(edge.target)+'</strong><br/><span class="muted">weight '+esc(edge.weight)+'</span></div>');
+const archive=payload.archive&&typeof payload.archive==='object'?payload.archive:{};
+const archiveTop=Array.isArray(archive.top)?archive.top:[];
+renderList('archive',archiveTop,(item)=>'<div class="evt"><strong>'+esc(item.stream)+' · score '+esc(item.score)+'</strong><br/><span class="muted">'+esc(fmt(item.compactedAt))+' · events '+esc(item.eventCount)+' · '+esc(item.compressedBy)+'</span><br/>'+esc(item.summary??'')+'</div>');
+document.getElementById('meta').textContent='docs '+esc(totals.docsMatched??0)+' / '+esc(totals.docsInRange??0)+' · participants '+esc(participants.length)+' · network edges '+esc(edges.length);
+};
+const run=async()=>{const sp=new URLSearchParams();sp.set('range',String(document.getElementById('range').value||'30d'));sp.set('metric',String(document.getElementById('metric').value||'combined'));sp.set('intent',String(document.getElementById('intent').value||'chat'));sp.set('limit',String(document.getElementById('limit').value||'20'));const q=String(document.getElementById('query').value||'').trim();const postId=String(document.getElementById('postId').value||'').trim();const commentId=String(document.getElementById('commentId').value||'').trim();if(q)sp.set('q',q);if(postId)sp.set('postId',postId);if(commentId)sp.set('commentId',commentId);document.getElementById('meta').textContent='loading...';try{const res=await fetch('/api/health/memory-map?'+sp.toString(),{cache:'no-store'});render(await res.json())}catch(err){document.getElementById('meta').textContent='failed: '+err}};
+document.getElementById('run').addEventListener('click',()=>{void run()});
+void run();
+</script></body></html>`;
+
+const METRICS_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Agent Runtime Metrics</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--ink:#0f172a;--muted:#475569;--line:#dbe3ef;--accent:#2563eb}
+*{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,sans-serif;background:linear-gradient(145deg,#eef3ff,#f8fafc);color:var(--ink)}
+.wrap{max-width:1240px;margin:24px auto;padding:0 16px;display:grid;gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 8px 22px rgba(15,23,42,.06)}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.h1{font-size:22px;font-weight:700;margin:2px 0}.muted{color:var(--muted);font-size:13px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+input,select,button{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px;background:#fff;color:var(--ink)}
+button{cursor:pointer}button:hover{background:#f1f5f9}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;font-size:13px}.k{color:var(--muted)}
+.bars{display:grid;gap:8px}
+.bar{display:grid;grid-template-columns:230px 1fr auto;gap:8px;align-items:center}
+.track{height:12px;background:#e2e8f0;border-radius:999px;overflow:hidden}
+.fill{height:100%;background:linear-gradient(90deg,var(--accent),#60a5fa)}
+a{color:#2563eb;text-decoration:none}
+</style></head><body>
+<div class="wrap">
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Runtime Metrics</div></div><div class="row"><a href="/" class="muted">Health</a><a href="/graphs" class="muted">Engagement</a><a href="/map" class="muted">Memory map</a><div class="muted" id="ts">loading...</div></div></div>
+<div class="card">
+<div class="row">
+<select id="range"><option value="24h">24h</option><option value="7d">7d</option><option value="30d" selected>30d</option><option value="90d">90d</option><option value="365d">365d</option></select>
+<select id="bucket"><option value="auto" selected>auto bucket</option><option value="1h">1h</option><option value="2h">2h</option><option value="6h">6h</option><option value="12h">12h</option><option value="1d">1d</option></select>
+<select id="series"><option value="total">total</option><option value="publishOk">publish ok</option><option value="publishFailed">publish failed</option><option value="directivesExecuted">directives executed</option><option value="directivesFailed">directives failed</option><option value="inboundMessages">inbound messages</option><option value="chatAutoReplies">chat auto replies</option><option value="openClawPrompts">openclaw prompts</option></select>
+<button id="run" type="button">Refresh</button>
+</div>
+<div id="meta" class="muted" style="margin-top:8px">ready</div>
+</div>
+<div class="card"><div class="muted">Totals</div><div id="totals" class="kv"></div></div>
+<div class="card"><div class="muted">Timeline</div><div id="timeline" class="bars"></div></div>
+</div>
+<script>
+const esc=v=>String(v??'n/a').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const fmt=iso=>{if(!iso)return'n/a';const ms=Date.parse(iso);return Number.isFinite(ms)?new Date(ms).toLocaleString():'n/a'};
+const kv=obj=>Object.entries(obj).map(([k,v])=>'<div class="k">'+esc(k)+'</div><div>'+esc(v??'n/a')+'</div>').join('');
+const barRow=(label,value,max)=>{const width=max>0?Math.max(2,Math.round((value/max)*100)):0;return '<div class="bar"><div>'+esc(label)+'</div><div class="track"><div class="fill" style="width:'+width+'%"></div></div><div>'+esc(value)+'</div></div>'};
+const render=(payload)=>{
+if(!payload||payload.ok!==true){document.getElementById('meta').textContent='metrics unavailable';return;}
+document.getElementById('ts').textContent='updated '+fmt(payload.generatedAt);
+const totals=payload.totals&&typeof payload.totals==='object'?payload.totals:{};
+document.getElementById('totals').innerHTML=kv({range:payload.range?.label,bucketMs:payload.range?.bucketMs,from:fmt(payload.range?.from),to:fmt(payload.range?.to),total:totals.total,perHour:totals.perHour,publishOk:totals.publishOk,publishFailed:totals.publishFailed,directivesStaged:totals.directivesStaged,directivesExecuted:totals.directivesExecuted,directivesFailed:totals.directivesFailed,inboundMessages:totals.inboundMessages,chatAutoReplies:totals.chatAutoReplies,memoryRefreshes:totals.memoryRefreshes,notificationsFlushed:totals.notificationsFlushed,openClawPrompts:totals.openClawPrompts});
+const series=String(document.getElementById('series').value||'total');
+const rows=Array.isArray(payload.buckets)?payload.buckets:[];
+const max=rows.reduce((m,row)=>Math.max(m,Number(row[series])||0),0);
+const tail=rows.slice(-48);
+document.getElementById('timeline').innerHTML=tail.length?tail.map((row)=>barRow(String(row.bucketAt).replace('T',' ').replace('.000Z','Z')+' · total '+(row.total??0),Number(row[series])||0,max)).join(''):'<div class="muted">No metrics data.</div>';
+document.getElementById('meta').textContent='buckets '+esc(rows.length)+' · series '+esc(series)+' · max '+esc(max);
+};
+const run=async()=>{const sp=new URLSearchParams();sp.set('range',String(document.getElementById('range').value||'30d'));const bucket=String(document.getElementById('bucket').value||'auto');if(bucket!=='auto')sp.set('bucket',bucket);document.getElementById('meta').textContent='loading...';try{const res=await fetch('/api/health/metrics?'+sp.toString(),{cache:'no-store'});render(await res.json())}catch(err){document.getElementById('meta').textContent='failed: '+err}};
+document.getElementById('run').addEventListener('click',()=>{void run()});
+document.getElementById('series').addEventListener('change',()=>{void run()});
 void run();
 </script></body></html>`;
 
@@ -1864,6 +2746,122 @@ const main = async (): Promise<void> => {
         return;
       }
     }
+    if (url.pathname === "/api/health/memory-map") {
+      if (!hasPrivateAccess(req)) {
+        json(res, 403, {
+          ok: false,
+          error: "forbidden",
+          message: "Missing or invalid health private key.",
+        });
+        return;
+      }
+      try {
+        const snapshot = await buildSnapshot();
+        const files = isRecord(snapshot.files) ? snapshot.files : {};
+        const keywordPath =
+          str(files.keywordIndex) ??
+          path.join(resolveStateDir(), "memory", "context", "keyword-index.json");
+        const longTermArchivePath =
+          str(files.longTermArchiveIndex) ??
+          path.join(
+            resolveStateDir(),
+            "memory",
+            "context",
+            "long-term-archive-index.json",
+          );
+        const keywordIndex = normalizeKeywordIndex(
+          await readJsonRecord(keywordPath),
+        );
+        const longTermIndex = normalizeLongTermArchiveIndex(
+          await readJsonRecord(longTermArchivePath),
+        );
+        const diagnostics = buildMemoryMapDiagnostics({
+          index: keywordIndex,
+          longTermIndex,
+          rangeMs: resolveRangeMsFromQuery(url.searchParams),
+          metric: parseTopParticipantMetric(url.searchParams.get("metric")),
+          limit: intFromUnknown(url.searchParams.get("limit")) ?? 20,
+          postId: intFromUnknown(url.searchParams.get("postId")),
+          commentId: intFromUnknown(url.searchParams.get("commentId")),
+          intent: parseRetrievalIntent(url.searchParams.get("intent")),
+          query: (url.searchParams.get("q") ?? "").trim(),
+        });
+        json(res, 200, {
+          ok: true,
+          generatedAt: new Date().toISOString(),
+          stateDir: resolveStateDir(),
+          keywordIndexPath: keywordPath,
+          longTermArchiveIndexPath: longTermArchivePath,
+          keywordIndexUpdatedAt: keywordIndex.updatedAt,
+          longTermArchiveUpdatedAt: longTermIndex.updatedAt,
+          ...diagnostics,
+        });
+        return;
+      } catch (error: unknown) {
+        json(res, 500, {
+          ok: false,
+          error: "memory_map_unavailable",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+    }
+    if (url.pathname === "/api/health/metrics") {
+      if (!hasPrivateAccess(req)) {
+        json(res, 403, {
+          ok: false,
+          error: "forbidden",
+          message: "Missing or invalid health private key.",
+        });
+        return;
+      }
+      try {
+        const snapshot = await buildSnapshot();
+        const files = isRecord(snapshot.files) ? snapshot.files : {};
+        const writesPath =
+          str(files.writes) ?? path.join(resolveStateDir(), "writes.jsonl");
+        const inboxPath =
+          str(files.chatInbox) ??
+          path.join(resolveStateDir(), "ipc", "chat", "inbox.jsonl");
+        const writeLines = await readTailLines(
+          writesPath,
+          TAIL_MAX_BYTES,
+          TAIL_MAX_LINES,
+        );
+        const inboxLines = await readTailLines(
+          inboxPath,
+          TAIL_MAX_BYTES,
+          TAIL_MAX_LINES,
+        );
+        const writeRecords = parseJsonLines(writeLines);
+        const inboxRecords = parseJsonLines(inboxLines);
+        const rangeMs = resolveRangeMsFromQuery(url.searchParams);
+        const diagnostics = buildRuntimeMetricsDiagnostics({
+          writeRecords,
+          inboxRecords,
+          rangeMs,
+          bucketMs: parseMetricsBucketMsFromQuery(url.searchParams, rangeMs),
+        });
+        json(res, 200, {
+          ok: true,
+          generatedAt: new Date().toISOString(),
+          stateDir: resolveStateDir(),
+          writesPath,
+          inboxPath,
+          scannedWrites: writeRecords.length,
+          scannedInbox: inboxRecords.length,
+          ...diagnostics,
+        });
+        return;
+      } catch (error: unknown) {
+        json(res, 500, {
+          ok: false,
+          error: "metrics_unavailable",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+    }
     if (url.pathname === "/api/health/directive-lifecycle") {
       if (!hasPrivateAccess(req)) {
         json(res, 403, {
@@ -1947,6 +2945,18 @@ const main = async (): Promise<void> => {
       res.statusCode = 200;
       res.setHeader("content-type", "text/html; charset=utf-8");
       res.end(GRAPH_PAGE);
+      return;
+    }
+    if (url.pathname === "/map") {
+      res.statusCode = 200;
+      res.setHeader("content-type", "text/html; charset=utf-8");
+      res.end(MAP_PAGE);
+      return;
+    }
+    if (url.pathname === "/metrics") {
+      res.statusCode = 200;
+      res.setHeader("content-type", "text/html; charset=utf-8");
+      res.end(METRICS_PAGE);
       return;
     }
     if (url.pathname !== "/") { res.statusCode = 404; res.end("Not Found"); return; }

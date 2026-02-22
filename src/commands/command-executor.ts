@@ -95,6 +95,49 @@ const COMMENT_TOKEN_STOP_WORDS = new Set([
   "with",
 ]);
 
+const CAPTION_POSITION_KEYS = new Set([
+  "top-left",
+  "top-center",
+  "top-right",
+  "middle-left",
+  "middle-center",
+  "middle-right",
+  "bottom-left",
+  "bottom-center",
+  "bottom-right",
+]);
+
+const TEXT_STYLE_THEME_KEYS = new Set([
+  "warm",
+  "cool",
+  "night",
+  "sunrise",
+  "mint",
+  "ocean",
+  "plum",
+  "sand",
+]);
+
+const TEXT_STYLE_ALIGN_KEYS = new Set(["left", "center", "right"]);
+const TEXT_STYLE_EMPHASIS_KEYS = new Set([
+  "soft",
+  "bold",
+  "serif",
+  "mono",
+  "display",
+]);
+const TEXT_STYLE_FONT_KEYS = new Set(["sans", "serif", "mono", "display"]);
+const TEXT_STYLE_WEIGHT_KEYS = new Set(["regular", "bold"]);
+const TEXT_STYLE_SIZE_KEYS = new Set(["sm", "md", "lg", "xl", "2xl"]);
+const TEXT_STYLE_COLOR_KEYS = new Set([
+  "ink",
+  "paper",
+  "cream",
+  "sunset",
+  "mint",
+  "sky",
+]);
+
 const isHttpUrl = (value: string): boolean => /^https?:\/\//iu.test(value.trim());
 const isDataUri = (value: string): boolean => /^data:/iu.test(value.trim());
 const isFileUrl = (value: string): boolean => /^file:\/\//iu.test(value.trim());
@@ -646,6 +689,19 @@ type PostDraftContext = {
   commentSummary: string | null;
   payloadHint: string | null;
   memorySummary: string | null;
+};
+
+type TextPostVisualSlide = {
+  caption: string | null;
+  imagePrompt: string;
+};
+
+type TextPostVisualPlan = {
+  renderMode: "text" | "slides";
+  captionPosition: string | null;
+  textStyle: Record<string, unknown> | null;
+  backgroundImagePrompt: string | null;
+  slides: TextPostVisualSlide[];
 };
 
 type EngagementTargetCandidate = {
@@ -1403,6 +1459,13 @@ export class CommandExecutor {
     return /owner capability denied/iu.test(error.message);
   }
 
+  private isNoTargetDiscoveryFailure(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    return /engagement_target_unavailable:no_targets_discovered/iu.test(
+      error.message,
+    );
+  }
+
   private async preflightGrantForAction(input: {
     command: Command;
     payload: Record<string, unknown>;
@@ -1578,9 +1641,12 @@ export class CommandExecutor {
     const runtimeOrigin = asNonEmptyString(command.runtimeOrigin)?.toLowerCase() ?? "";
     const isDirectiveRuntimeOrigin =
       runtimeOrigin === "director_directive" || runtimeOrigin === "pending_promotion";
-    const buildBase = (caption: string | null): Record<string, unknown> => ({
+    const buildBase = (
+      caption: string | null,
+      basePostType: "text" | "media" = postType,
+    ): Record<string, unknown> => ({
       kind: postKind,
-      postType,
+      postType: basePostType,
       ...(caption ? { caption } : {}),
       ...(provenance ? { provenance } : {}),
       ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
@@ -1718,9 +1784,234 @@ export class CommandExecutor {
           .catch(() => undefined);
       }
       const candidate = noveltyValidation.candidateText;
-      const result = await this.agent().createPost.mutate({
-        ...buildBase(captionForWrite),
+      const visualPlan = await this.planTextPostVisualWithOpenClaw({
+        commandId: command.id,
+        caption: captionForWrite,
         textBody: textBodyForWrite,
+        context: postDraftContext,
+      });
+      const captionPositionForWrite =
+        this.normalizeCaptionPositionValue(payload.captionPosition) ??
+        visualPlan?.captionPosition ??
+        null;
+      const normalizedTextStyle = this.normalizeAgentTextStyle(
+        this.sanitizeTextStyleValue(payload.textStyle) ?? visualPlan?.textStyle ?? null,
+        captionPositionForWrite,
+      );
+      const planWantsSlides =
+        visualPlan?.renderMode === "slides" && visualPlan.slides.length >= 2;
+      const visualBackgroundPrompt = visualPlan?.backgroundImagePrompt
+        ? stripEmDashCharacters(visualPlan.backgroundImagePrompt).trim()
+        : "";
+      const planWantsImageBackground =
+        !planWantsSlides && visualBackgroundPrompt.length >= 8;
+      if (planWantsSlides) {
+        const slideItems: Array<Record<string, unknown>> = [];
+        const slidePrompts = visualPlan.slides.slice(0, 4);
+        for (const slide of slidePrompts) {
+          const slidePrompt = stripEmDashCharacters(slide.imagePrompt).trim();
+          if (slidePrompt.length < 8) continue;
+          const slideMedia = await this.resolveMediaUpload({
+            payload: {
+              ...payload,
+              generatedAssetType: "image",
+            },
+            keepOriginal: true,
+            promptFallbacks: [slidePrompt],
+          });
+          slideItems.push({
+            mediaUrl: slideMedia.mediaUrl,
+            ...(slideMedia.mediaOriginalUrl
+              ? { mediaOriginalUrl: slideMedia.mediaOriginalUrl }
+              : {}),
+            ...(slideMedia.mediaOptimizedUrl
+              ? { mediaOptimizedUrl: slideMedia.mediaOptimizedUrl }
+              : {}),
+            ...(slideMedia.mediaContentHash
+              ? { mediaContentHash: slideMedia.mediaContentHash }
+              : {}),
+            ...(slideMedia.mediaIpfsCid
+              ? { mediaIpfsCid: slideMedia.mediaIpfsCid }
+              : {}),
+            ...(typeof slideMedia.mediaSizeBytes === "number"
+              ? { mediaSizeBytes: slideMedia.mediaSizeBytes }
+              : {}),
+            ...(slideMedia.mediaType ? { mediaType: slideMedia.mediaType } : {}),
+            ...(slide.caption ? { caption: slide.caption } : {}),
+            ...(captionPositionForWrite
+              ? { captionPosition: captionPositionForWrite }
+              : {}),
+          });
+        }
+        if (slideItems.length >= 2) {
+          const firstSlide = slideItems[0] ?? {};
+          const firstSlideMediaUrl = asNonEmptyString(firstSlide.mediaUrl);
+          if (firstSlideMediaUrl) {
+            const slideResult = await this.agent().createPost.mutate({
+              ...buildBase(captionForWrite, "media"),
+              mediaUrl: firstSlideMediaUrl,
+              ...(asNonEmptyString(firstSlide.mediaOriginalUrl)
+                ? { mediaOriginalUrl: asNonEmptyString(firstSlide.mediaOriginalUrl) }
+                : {}),
+              ...(asNonEmptyString(firstSlide.mediaOptimizedUrl)
+                ? { mediaOptimizedUrl: asNonEmptyString(firstSlide.mediaOptimizedUrl) }
+                : {}),
+              ...(asNonEmptyString(firstSlide.mediaContentHash)
+                ? { mediaContentHash: asNonEmptyString(firstSlide.mediaContentHash) }
+                : {}),
+              ...(asNonEmptyString(firstSlide.mediaIpfsCid)
+                ? { mediaIpfsCid: asNonEmptyString(firstSlide.mediaIpfsCid) }
+                : {}),
+              ...(typeof firstSlide.mediaSizeBytes === "number" &&
+              Number.isFinite(firstSlide.mediaSizeBytes)
+                ? {
+                    mediaSizeBytes: Math.max(
+                      1,
+                      Math.floor(firstSlide.mediaSizeBytes),
+                    ),
+                  }
+                : {}),
+              ...(asNonEmptyString(firstSlide.mediaType)
+                ? { mediaType: asNonEmptyString(firstSlide.mediaType) }
+                : {}),
+              mediaItems: slideItems,
+              ...(captionPositionForWrite
+                ? { captionPosition: captionPositionForWrite }
+                : {}),
+            });
+            this.notePublishedPostForNoveltyHistory({
+              postType: "media",
+              caption: captionForWrite,
+              textBody: null,
+              mediaPrompt: slidePrompts
+                .map((entry) => entry.imagePrompt)
+                .join(" | "),
+              commandId: command.id,
+              targetPostId: postDraftContext.targetPostId,
+            });
+            await this.ctx.memory
+              .recordWrite({
+                type: "runtime_post_publish_recorded",
+                at: nowIso(),
+                commandId: command.id,
+                kind: postKind,
+                postType: "media",
+                targetPostId: postDraftContext.targetPostId,
+                bodyPreview: truncateText(candidate, 260),
+                visualRenderMode: "slides",
+                slideCount: slideItems.length,
+              })
+              .catch(() => undefined);
+            return this.successOutcome(command, slideResult);
+          }
+        }
+      }
+
+      if (planWantsImageBackground) {
+        try {
+          const backgroundMedia = await this.resolveMediaUpload({
+            payload: {
+              ...payload,
+              generatedAssetType: "image",
+            },
+            keepOriginal: true,
+            promptFallbacks: [visualBackgroundPrompt],
+          });
+          const imageTextItem: Record<string, unknown> = {
+            mediaUrl: backgroundMedia.mediaUrl,
+            ...(backgroundMedia.mediaOriginalUrl
+              ? { mediaOriginalUrl: backgroundMedia.mediaOriginalUrl }
+              : {}),
+            ...(backgroundMedia.mediaOptimizedUrl
+              ? { mediaOptimizedUrl: backgroundMedia.mediaOptimizedUrl }
+              : {}),
+            ...(backgroundMedia.mediaContentHash
+              ? { mediaContentHash: backgroundMedia.mediaContentHash }
+              : {}),
+            ...(backgroundMedia.mediaIpfsCid
+              ? { mediaIpfsCid: backgroundMedia.mediaIpfsCid }
+              : {}),
+            ...(typeof backgroundMedia.mediaSizeBytes === "number"
+              ? { mediaSizeBytes: backgroundMedia.mediaSizeBytes }
+              : {}),
+            ...(backgroundMedia.mediaType
+              ? { mediaType: backgroundMedia.mediaType }
+              : {}),
+            caption: textBodyForWrite,
+            ...(captionPositionForWrite
+              ? { captionPosition: captionPositionForWrite }
+              : {}),
+          };
+          const imageTextResult = await this.agent().createPost.mutate({
+            ...buildBase(captionForWrite, "media"),
+            mediaUrl: backgroundMedia.mediaUrl,
+            ...(backgroundMedia.mediaOriginalUrl
+              ? { mediaOriginalUrl: backgroundMedia.mediaOriginalUrl }
+              : {}),
+            ...(backgroundMedia.mediaOptimizedUrl
+              ? { mediaOptimizedUrl: backgroundMedia.mediaOptimizedUrl }
+              : {}),
+            ...(backgroundMedia.mediaContentHash
+              ? { mediaContentHash: backgroundMedia.mediaContentHash }
+              : {}),
+            ...(backgroundMedia.mediaIpfsCid
+              ? { mediaIpfsCid: backgroundMedia.mediaIpfsCid }
+              : {}),
+            ...(typeof backgroundMedia.mediaSizeBytes === "number" &&
+            Number.isFinite(backgroundMedia.mediaSizeBytes)
+              ? {
+                  mediaSizeBytes: Math.max(
+                    1,
+                    Math.floor(backgroundMedia.mediaSizeBytes),
+                  ),
+                }
+              : {}),
+            ...(backgroundMedia.mediaType
+              ? { mediaType: backgroundMedia.mediaType }
+              : {}),
+            mediaItems: [imageTextItem],
+            ...(captionPositionForWrite
+              ? { captionPosition: captionPositionForWrite }
+              : {}),
+          });
+          this.notePublishedPostForNoveltyHistory({
+            postType: "media",
+            caption: captionForWrite,
+            textBody: null,
+            mediaPrompt: visualBackgroundPrompt,
+            commandId: command.id,
+            targetPostId: postDraftContext.targetPostId,
+          });
+          await this.ctx.memory
+            .recordWrite({
+              type: "runtime_post_publish_recorded",
+              at: nowIso(),
+              commandId: command.id,
+              kind: postKind,
+              postType: "media",
+              targetPostId: postDraftContext.targetPostId,
+              bodyPreview: truncateText(candidate, 260),
+              visualRenderMode: "image_text",
+            })
+            .catch(() => undefined);
+          return this.successOutcome(command, imageTextResult);
+        } catch (error: unknown) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "text_post_visual_background_failed",
+              at: nowIso(),
+              commandId: command.id,
+              error: error instanceof Error ? error.message : String(error),
+            })
+            .catch(() => undefined);
+        }
+      }
+
+      const result = await this.agent().createPost.mutate({
+        ...buildBase(captionForWrite, "text"),
+        textBody: textBodyForWrite,
+        textStyle: normalizedTextStyle,
+        ...(captionPositionForWrite ? { captionPosition: captionPositionForWrite } : {}),
       });
       this.notePublishedPostForNoveltyHistory({
         postType: "text",
@@ -1739,6 +2030,13 @@ export class CommandExecutor {
           postType,
           targetPostId: postDraftContext.targetPostId,
           bodyPreview: truncateText(candidate, 260),
+          visualRenderMode: planWantsSlides
+            ? "text_fallback"
+            : planWantsImageBackground
+              ? "text_after_image_background_fallback"
+              : "text",
+          textStyleTheme: asNonEmptyString(normalizedTextStyle.theme),
+          captionPosition: captionPositionForWrite,
         })
         .catch(() => undefined);
       return this.successOutcome(command, result);
@@ -2282,6 +2580,320 @@ export class CommandExecutor {
     this.pruneRecentPostNoveltyHistory(nowMs);
   }
 
+  private normalizeCaptionPositionValue(value: unknown): string | null {
+    const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
+    if (!raw) return null;
+    return CAPTION_POSITION_KEYS.has(raw) ? raw : null;
+  }
+
+  private sanitizeTextStyleValue(value: unknown): Record<string, unknown> | null {
+    if (!isRecord(value)) return null;
+    const style: Record<string, unknown> = {};
+    const setEnum = (
+      key: string,
+      allowed: Set<string>,
+      candidate: unknown,
+    ): void => {
+      const normalized = asNonEmptyString(candidate)?.toLowerCase() ?? null;
+      if (!normalized || !allowed.has(normalized)) return;
+      style[key] = normalized;
+    };
+    setEnum("theme", TEXT_STYLE_THEME_KEYS, value.theme);
+    setEnum("align", TEXT_STYLE_ALIGN_KEYS, value.align);
+    setEnum("emphasis", TEXT_STYLE_EMPHASIS_KEYS, value.emphasis);
+    setEnum("font", TEXT_STYLE_FONT_KEYS, value.font);
+    setEnum("weight", TEXT_STYLE_WEIGHT_KEYS, value.weight);
+    setEnum("size", TEXT_STYLE_SIZE_KEYS, value.size);
+    setEnum("color", TEXT_STYLE_COLOR_KEYS, value.color);
+    const position = this.normalizeCaptionPositionValue(value.position);
+    if (position) style.position = position;
+    if (typeof value.italic === "boolean") {
+      style.italic = value.italic;
+    }
+    const background = asNonEmptyString(value.background);
+    if (background && background.length <= 180) {
+      style.background = stripEmDashCharacters(background);
+    }
+    return Object.keys(style).length > 0 ? style : null;
+  }
+
+  private normalizeAgentTextStyle(
+    style: Record<string, unknown> | null,
+    captionPosition: string | null,
+  ): Record<string, unknown> {
+    const normalizeTheme = (value: unknown): string | null => {
+      const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
+      if (!raw) return null;
+      if (raw === "ocean") return "cool";
+      if (raw === "plum") return "night";
+      if (raw === "sand") return "warm";
+      return ["warm", "cool", "night", "sunrise", "mint"].includes(raw)
+        ? raw
+        : null;
+    };
+    const normalizeAlign = (value: unknown): string | null => {
+      const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
+      if (raw && ["left", "center", "right"].includes(raw)) return raw;
+      if (captionPosition) {
+        const alignFromPosition = captionPosition.split("-")[1] ?? null;
+        if (
+          alignFromPosition &&
+          ["left", "center", "right"].includes(alignFromPosition)
+        ) {
+          return alignFromPosition;
+        }
+      }
+      return null;
+    };
+    const normalizeEmphasis = (value: unknown): string | null => {
+      const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
+      if (!raw) return null;
+      if (raw === "mono") return "serif";
+      if (raw === "display") return "bold";
+      return ["soft", "bold", "serif"].includes(raw) ? raw : null;
+    };
+    const normalizeFont = (value: unknown): string | null => {
+      const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
+      if (!raw || !TEXT_STYLE_FONT_KEYS.has(raw)) return null;
+      return raw;
+    };
+    const normalizeWeight = (value: unknown): string | null => {
+      const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
+      if (!raw || !TEXT_STYLE_WEIGHT_KEYS.has(raw)) return null;
+      return raw;
+    };
+    const normalizeSize = (value: unknown): string | null => {
+      const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
+      if (!raw || !TEXT_STYLE_SIZE_KEYS.has(raw)) return null;
+      return raw;
+    };
+    const normalizeColor = (value: unknown): string | null => {
+      const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
+      if (!raw || !TEXT_STYLE_COLOR_KEYS.has(raw)) return null;
+      return raw;
+    };
+    const normalizePosition = (value: unknown): string | null => {
+      const raw = this.normalizeCaptionPositionValue(value);
+      if (raw) return raw;
+      return captionPosition;
+    };
+    const normalized: Record<string, unknown> = {};
+    const theme = normalizeTheme(style?.theme);
+    const align = normalizeAlign(style?.align);
+    const emphasis = normalizeEmphasis(style?.emphasis);
+    const font = normalizeFont(style?.font);
+    const weight = normalizeWeight(style?.weight);
+    const size = normalizeSize(style?.size);
+    const color = normalizeColor(style?.color);
+    const position = normalizePosition(style?.position);
+    const background = asNonEmptyString(style?.background);
+    if (theme) normalized.theme = theme;
+    if (align) normalized.align = align;
+    if (emphasis) normalized.emphasis = emphasis;
+    if (font) normalized.font = font;
+    if (weight) normalized.weight = weight;
+    if (typeof style?.italic === "boolean") normalized.italic = style.italic;
+    if (size) normalized.size = size;
+    if (color) normalized.color = color;
+    if (position) normalized.position = position;
+    if (background && background.length <= 180) {
+      normalized.background = stripEmDashCharacters(background);
+    }
+    if (Object.keys(normalized).length === 0) {
+      return {
+        theme: "warm",
+        align: "center",
+        emphasis: "soft",
+      };
+    }
+    return normalized;
+  }
+
+  private extractTextPostVisualPlanFromUnknown(value: unknown): TextPostVisualPlan | null {
+    const fromString = (raw: string): TextPostVisualPlan | null => {
+      const trimmed = raw.trim();
+      if (!trimmed.length) return null;
+      const parsed = parseJsonFromMixedText(trimmed);
+      if (parsed !== null && parsed !== raw) {
+        return this.extractTextPostVisualPlanFromUnknown(parsed);
+      }
+      return null;
+    };
+    if (typeof value === "string") return fromString(value);
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        const parsed = this.extractTextPostVisualPlanFromUnknown(entry);
+        if (parsed) return parsed;
+      }
+      return null;
+    }
+    if (!isRecord(value)) return null;
+    const nestedKeys = [
+      "result",
+      "payload",
+      "data",
+      "content",
+      "output",
+      "draft",
+    ] as const;
+    for (const key of nestedKeys) {
+      const nested = this.extractTextPostVisualPlanFromUnknown(value[key]);
+      if (nested) return nested;
+    }
+
+    const renderModeRaw =
+      asNonEmptyString(value.renderMode) ??
+      asNonEmptyString(value.mode) ??
+      asNonEmptyString(value.layout) ??
+      null;
+    const renderMode =
+      renderModeRaw && /(slides|carousel|deck|storyboard)/iu.test(renderModeRaw)
+        ? "slides"
+        : "text";
+    const captionPosition =
+      this.normalizeCaptionPositionValue(value.captionPosition) ??
+      this.normalizeCaptionPositionValue(value.position);
+    const textStyle =
+      this.sanitizeTextStyleValue(value.textStyle) ??
+      this.sanitizeTextStyleValue(value.style);
+    const backgroundImagePrompt = (() => {
+      const prompt =
+        asNonEmptyString(value.backgroundImagePrompt) ??
+        asNonEmptyString(value.textBackgroundPrompt) ??
+        asNonEmptyString(value.backgroundPrompt) ??
+        null;
+      if (!prompt) return null;
+      const cleaned = stripEmDashCharacters(prompt).trim();
+      return cleaned.length > 0 ? truncateText(cleaned, 220) : null;
+    })();
+
+    const rawSlides = Array.isArray(value.slides)
+      ? value.slides
+      : Array.isArray(value.mediaItems)
+        ? value.mediaItems
+        : Array.isArray(value.items)
+          ? value.items
+          : [];
+    const slides: TextPostVisualSlide[] = [];
+    for (const rawSlide of rawSlides) {
+      if (!isRecord(rawSlide)) continue;
+      const imagePrompt =
+        asNonEmptyString(rawSlide.imagePrompt) ??
+        asNonEmptyString(rawSlide.prompt) ??
+        asNonEmptyString(rawSlide.mediaPrompt) ??
+        null;
+      if (!imagePrompt) continue;
+      const normalizedPrompt = stripEmDashCharacters(imagePrompt).trim();
+      if (normalizedPrompt.length < 8) continue;
+      const caption =
+        asNonEmptyString(rawSlide.caption) ??
+        asNonEmptyString(rawSlide.text) ??
+        null;
+      slides.push({
+        caption: caption ? truncateText(stripEmDashCharacters(caption), 2200) : null,
+        imagePrompt: truncateText(normalizedPrompt, 320),
+      });
+      if (slides.length >= 6) break;
+    }
+
+    if (
+      renderMode === "text" &&
+      captionPosition === null &&
+      textStyle === null &&
+      backgroundImagePrompt === null &&
+      slides.length === 0
+    ) {
+      return null;
+    }
+    return {
+      renderMode: renderMode === "slides" && slides.length >= 2 ? "slides" : "text",
+      captionPosition,
+      textStyle,
+      backgroundImagePrompt,
+      slides: slides.slice(0, 4),
+    };
+  }
+
+  private buildTextPostVisualPlanPrompt(input: {
+    caption: string | null;
+    textBody: string;
+    context: PostDraftContext;
+  }): string {
+    const contextLines = [
+      typeof input.context.targetPostId === "number"
+        ? `targetPostId: ${input.context.targetPostId}`
+        : null,
+      input.context.postText ? `targetPostText: ${input.context.postText}` : null,
+      input.context.mediaSummary ? `targetMedia: ${input.context.mediaSummary}` : null,
+      input.context.commentSummary ? `targetComments: ${input.context.commentSummary}` : null,
+      input.context.payloadHint ? `directiveHint: ${input.context.payloadHint}` : null,
+      input.context.memorySummary ? `memoryContext: ${input.context.memorySummary}` : null,
+    ].filter((entry): entry is string => Boolean(entry));
+    return [
+      "Plan visual presentation for this social post. Return strict JSON only.",
+      "Shape:",
+      '{"renderMode":"text|slides","captionPosition":"...|null","textStyle":{"theme":"warm|cool|night|sunrise|mint|ocean|plum|sand","align":"left|center|right","emphasis":"soft|bold|serif|mono|display","font":"sans|serif|mono|display","weight":"regular|bold","italic":false,"size":"sm|md|lg|xl|2xl","color":"ink|paper|cream|sunset|mint|sky","position":"top-left|top-center|top-right|middle-left|middle-center|middle-right|bottom-left|bottom-center|bottom-right","background":"optional css gradient or color"},"backgroundImagePrompt":"...|null","slides":[{"caption":"...","imagePrompt":"..."}]}',
+      "Rules:",
+      "- Never use em dash characters; use '-' or normal punctuation instead.",
+      "- renderMode 'text' for most posts. Use 'slides' only when the text has a sequence/list/compare/story beats.",
+      "- If slides mode: provide 2-4 slides max, each with imagePrompt. Keep captions concise.",
+      "- If text mode: always provide textStyle with a distinct visual identity.",
+      "- backgroundImagePrompt is optional and only for text mode when image background helps.",
+      "- imagePrompt/backgroundImagePrompt must be direct prompts, no wrappers like 'Generate an image of'.",
+      `caption: ${input.caption ?? ""}`,
+      `textBody: ${input.textBody}`,
+      "Context:",
+      ...contextLines.map((line) => `- ${line}`),
+    ].join("\n");
+  }
+
+  private async planTextPostVisualWithOpenClaw(input: {
+    commandId: string;
+    caption: string | null;
+    textBody: string;
+    context: PostDraftContext;
+  }): Promise<TextPostVisualPlan | null> {
+    const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
+    if (!runOpenClawPrompt) return null;
+    const prompt = this.buildTextPostVisualPlanPrompt(input);
+    try {
+      const result = await runOpenClawPrompt({
+        prompt,
+        purpose: "text_post_visual_plan",
+      });
+      const plan =
+        (result
+          ? this.extractTextPostVisualPlanFromUnknown(result.parsed) ??
+            this.extractTextPostVisualPlanFromUnknown(result.payloadText) ??
+            this.extractTextPostVisualPlanFromUnknown(result.raw)
+          : null) ?? null;
+      if (!plan) return null;
+      await this.ctx.memory
+        .recordWrite({
+          type: "text_post_visual_plan_created",
+          at: nowIso(),
+          commandId: input.commandId,
+          renderMode: plan.renderMode,
+          captionPosition: plan.captionPosition,
+          hasTextStyle: plan.textStyle !== null,
+          hasBackgroundImagePrompt: plan.backgroundImagePrompt !== null,
+          slideCount: plan.slides.length,
+        })
+        .catch(() => undefined);
+      return plan;
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "text_post_visual_plan_failed",
+          at: nowIso(),
+          commandId: input.commandId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return null;
+    }
+  }
+
   private buildPostDraftCurationPrompt(input: {
     postType: "text" | "media";
     caption: string | null;
@@ -2678,12 +3290,24 @@ export class CommandExecutor {
       asNonEmptyString(payload.requestText) ??
       asNonEmptyString(payload.prompt) ??
       "Write a concise, relevant reply to the target post.";
-    const resolvedTarget =
-      (await this.resolveEngagementTargetForDirective({
-        payload,
-        action: "comment",
-        commandId: command.id,
-      })) ?? null;
+    let resolvedTarget: EngagementTargetCandidate | null = null;
+    try {
+      resolvedTarget =
+        (await this.resolveEngagementTargetForDirective({
+          payload,
+          action: "comment",
+          commandId: command.id,
+        })) ?? null;
+    } catch (error: unknown) {
+      if (this.isNoTargetDiscoveryFailure(error)) {
+        return this.failedOutcome(
+          command,
+          "No target post/comment candidates found after discovery scan.",
+          "no_target_candidates",
+        );
+      }
+      throw error;
+    }
     if (!resolvedTarget) {
       throw new RequeueCommandError("comment_target_resolution_waiting_for_context:no_target");
     }
@@ -3794,12 +4418,24 @@ export class CommandExecutor {
   private async executeWriteVote(command: Command): Promise<CommandOutcome> {
     const payload = isRecord(command.payload) ? command.payload : null;
     if (!payload) return this.failedOutcome(command, "Invalid payload for write.votePost.");
-    const resolvedTarget =
-      (await this.resolveEngagementTargetForDirective({
-        payload,
-        action: "like",
-        commandId: command.id,
-      })) ?? null;
+    let resolvedTarget: EngagementTargetCandidate | null = null;
+    try {
+      resolvedTarget =
+        (await this.resolveEngagementTargetForDirective({
+          payload,
+          action: "like",
+          commandId: command.id,
+        })) ?? null;
+    } catch (error: unknown) {
+      if (this.isNoTargetDiscoveryFailure(error)) {
+        return this.failedOutcome(
+          command,
+          "No target post candidates found after discovery scan.",
+          "no_target_candidates",
+        );
+      }
+      throw error;
+    }
     if (!resolvedTarget) {
       throw new RequeueCommandError("like_target_resolution_waiting_for_context:no_target");
     }
@@ -4004,12 +4640,24 @@ export class CommandExecutor {
   private async executeWriteRepost(command: Command): Promise<CommandOutcome> {
     const payload = isRecord(command.payload) ? command.payload : null;
     if (!payload) return this.failedOutcome(command, "Invalid payload for write.repostPost.");
-    const resolvedTarget =
-      (await this.resolveEngagementTargetForDirective({
-        payload,
-        action: "repost",
-        commandId: command.id,
-      })) ?? null;
+    let resolvedTarget: EngagementTargetCandidate | null = null;
+    try {
+      resolvedTarget =
+        (await this.resolveEngagementTargetForDirective({
+          payload,
+          action: "repost",
+          commandId: command.id,
+        })) ?? null;
+    } catch (error: unknown) {
+      if (this.isNoTargetDiscoveryFailure(error)) {
+        return this.failedOutcome(
+          command,
+          "No target post candidates found after discovery scan.",
+          "no_target_candidates",
+        );
+      }
+      throw error;
+    }
     if (!resolvedTarget) {
       throw new RequeueCommandError("repost_target_resolution_waiting_for_context:no_target");
     }
@@ -4238,11 +4886,23 @@ export class CommandExecutor {
             (scopedTarget ? asPositiveInt(scopedTarget.postId) : null)
           : null);
       if (!hasTargetPostId) {
-        const resolvedTarget = await this.resolveEngagementTargetForDirective({
-          payload,
-          action: enforcedDraftAction,
-          commandId: command.id,
-        });
+        let resolvedTarget: EngagementTargetCandidate | null = null;
+        try {
+          resolvedTarget = await this.resolveEngagementTargetForDirective({
+            payload,
+            action: enforcedDraftAction,
+            commandId: command.id,
+          });
+        } catch (error: unknown) {
+          if (this.isNoTargetDiscoveryFailure(error)) {
+            return this.failedOutcome(
+              command,
+              `No target candidates found for ${enforcedDraftAction} after discovery scan.`,
+              "no_target_candidates",
+            );
+          }
+          throw error;
+        }
         if (!resolvedTarget) {
           throw new RequeueCommandError(
             `engagement_target_resolution_waiting_for_context:${enforcedDraftAction}:no_target`,
@@ -4274,14 +4934,45 @@ export class CommandExecutor {
     }
 
     const inlineDrafts = this.extractInlineDrafts(payload);
-    const generateInput =
+    const generateInputRaw =
       inlineDrafts.length > 0
         ? null
         : await this.buildGenerateInputWithRuntimeContext(payload, command);
+    const generateInput =
+      generateInputRaw && inlineDrafts.length === 0
+        ? this.applyPermissionGenerateInputConstraints(
+            generateInputRaw,
+            payload.permissionState,
+          )
+        : generateInputRaw;
+    if (
+      generateInputRaw &&
+      generateInput &&
+      generateInput !== generateInputRaw
+    ) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "generate_input_constrained_by_permissions",
+          at: nowIso(),
+          commandId: command.id,
+          sourceDirectiveId: command.sourceDirectiveId ?? null,
+          originalKinds: Array.isArray(generateInputRaw.kinds)
+            ? generateInputRaw.kinds
+            : [],
+          constrainedKinds: Array.isArray(generateInput.kinds)
+            ? generateInput.kinds
+            : [],
+          originalKind: asNonEmptyString(generateInputRaw.kind),
+          constrainedKind: asNonEmptyString(generateInput.kind),
+        })
+        .catch(() => undefined);
+    }
     const generatedResult =
       inlineDrafts.length > 0
         ? null
-        : await this.agent().generate.mutate(generateInput ?? this.buildGenerateInput(payload, command));
+        : await this.agent().generate.mutate(
+            generateInput ?? this.buildGenerateInput(payload, command),
+          );
     const drafts =
       inlineDrafts.length > 0
         ? inlineDrafts
@@ -4292,6 +4983,32 @@ export class CommandExecutor {
         : drafts.filter(
             (draft) => draft.action.trim().toLowerCase() === enforcedDraftAction,
           );
+    const permissionFilteredDrafts = executableDrafts.filter((draft) =>
+      this.isGeneratedDraftAllowedByPermissionState(
+        draft,
+        payload.permissionState,
+      ),
+    );
+    if (
+      executableDrafts.length > 0 &&
+      permissionFilteredDrafts.length !== executableDrafts.length
+    ) {
+      const droppedActions = executableDrafts
+        .filter((draft) => !permissionFilteredDrafts.includes(draft))
+        .map((draft) => draft.action.trim().toLowerCase())
+        .slice(0, 12);
+      await this.ctx.memory
+        .recordWrite({
+          type: "generate_draft_filtered_by_permissions",
+          at: nowIso(),
+          commandId: command.id,
+          sourceDirectiveId: command.sourceDirectiveId ?? null,
+          beforeCount: executableDrafts.length,
+          afterCount: permissionFilteredDrafts.length,
+          droppedActions,
+        })
+        .catch(() => undefined);
+    }
     if (enforcedDraftAction !== null && executableDrafts.length === 0) {
       await this.ctx.memory
         .recordWrite({
@@ -4313,19 +5030,23 @@ export class CommandExecutor {
         "no_executable_draft",
       );
     }
-    if (executableDrafts.length === 0) {
+    if (permissionFilteredDrafts.length === 0) {
       if (payload.requireDraftOnly === true) {
         await this.sendDraftFailureMessage({
           payload,
           message: "I couldn't generate a draft right now. Please try again.",
         }).catch(() => undefined);
       }
-      return this.failedOutcome(command, "generate returned no executable drafts.", "no_drafts");
+      return this.failedOutcome(
+        command,
+        "generate returned no permission-allowed drafts.",
+        "no_permitted_drafts",
+      );
     }
 
     const requireDraftOnly = payload.requireDraftOnly === true;
     if (requireDraftOnly) {
-      const draftPreview = this.buildDraftPreviewPayload(executableDrafts);
+      const draftPreview = this.buildDraftPreviewPayload(permissionFilteredDrafts);
       if (!draftPreview) {
         await this.sendDraftFailureMessage({
           payload,
@@ -4344,7 +5065,7 @@ export class CommandExecutor {
       return this.successOutcome(command, {
         generated: generatedResult,
         draftOnly: true,
-        draftCount: executableDrafts.length,
+        draftCount: permissionFilteredDrafts.length,
         preview: {
           summary: draftPreview.summary,
           postKind: draftPreview.draftPostKind,
@@ -4361,7 +5082,7 @@ export class CommandExecutor {
       !explicitPublishRequested &&
       this.shouldEnforceExplicitPublishGate(payload)
     ) {
-      const blockedDraftCount = executableDrafts.filter((draft) => {
+      const blockedDraftCount = permissionFilteredDrafts.filter((draft) => {
         const action = draft.action.trim().toLowerCase();
         return action === "post" || action === "story";
       }).length;
@@ -4383,7 +5104,7 @@ export class CommandExecutor {
     }
 
     const executedOutcomes: CommandOutcome[] = [];
-    for (const draft of executableDrafts) {
+    for (const draft of permissionFilteredDrafts) {
       if (!draft) continue;
       const draftCommand = this.mapDraftToWriteCommand({
         draft,
@@ -5903,7 +6624,9 @@ export class CommandExecutor {
       };
     }
 
-    if (!this.ctx.callAgentChatBridge) return null;
+    const hasBridge = Boolean(this.ctx.callAgentChatBridge);
+    let bridgeQuerySuccessCount = 0;
+    let bridgeQueryFailureCount = 0;
 
     const cacheKey = this.buildEngagementTargetCacheKey({
       action: input.action,
@@ -5953,13 +6676,14 @@ export class CommandExecutor {
       step: string,
       plans: LookupPlan[],
     ): Promise<void> => {
-      if (plans.length === 0) return;
+      if (!hasBridge || plans.length === 0) return;
       let queryCount = 0;
       let cacheHits = 0;
       let addedCandidates = 0;
       for (const plan of plans) {
         try {
           const result = await this.callAgentBridgeLookupCached(plan.request);
+          bridgeQuerySuccessCount += 1;
           queryCount += 1;
           if (result.cacheHit) cacheHits += 1;
           if (typeof plan.parser === "function") {
@@ -5972,6 +6696,7 @@ export class CommandExecutor {
             addedCandidates += addCandidatesFrom(result.value, plan.source);
           }
         } catch (error: unknown) {
+          bridgeQueryFailureCount += 1;
           await this.ctx.memory
             .recordWrite({
               type: "engagement_target_lookup_failed",
@@ -5997,21 +6722,43 @@ export class CommandExecutor {
 
     let agentMainUserId: string | null = null;
     let agentHandle: string | null = null;
-    const profileResult = await this.callAgentBridgeLookupCached({
-      action: "agent_profile",
-    }).catch(() => ({ value: null, cacheHit: false }));
-    if (isRecord(profileResult.value) && isRecord(profileResult.value.agent)) {
-      const agentRecord = profileResult.value.agent;
-      agentMainUserId = asNonEmptyString(agentRecord.mainUserId) ?? null;
-      agentHandle = asNonEmptyString(agentRecord.handle)?.replace(/^@+/u, "").toLowerCase() ?? null;
+    if (hasBridge) {
+      const profileResult = await this.callAgentBridgeLookupCached({
+        action: "agent_profile",
+      }).catch((error: unknown) => {
+        bridgeQueryFailureCount += 1;
+        void this.ctx.memory
+          .recordWrite({
+            type: "engagement_target_lookup_failed",
+            at: nowIso(),
+            commandId: input.commandId,
+            action: input.action,
+            step: "agent_profile",
+            source: "agent_profile",
+            lookupAction: "agent_profile",
+            error: error instanceof Error ? error.message : String(error),
+          })
+          .catch(() => undefined);
+        return null;
+      });
+      if (profileResult) {
+        bridgeQuerySuccessCount += 1;
+        if (isRecord(profileResult.value) && isRecord(profileResult.value.agent)) {
+          const agentRecord = profileResult.value.agent;
+          agentMainUserId = asNonEmptyString(agentRecord.mainUserId) ?? null;
+          agentHandle =
+            asNonEmptyString(agentRecord.handle)?.replace(/^@+/u, "").toLowerCase() ??
+            null;
+        }
+        trace.push({
+          step: "agent_profile",
+          queryCount: 1,
+          cacheHits: profileResult.cacheHit ? 1 : 0,
+          addedCandidates: 0,
+          totalCandidates: 0,
+        });
+      }
     }
-    trace.push({
-      step: "agent_profile",
-      queryCount: 1,
-      cacheHits: profileResult.cacheHit ? 1 : 0,
-      addedCandidates: 0,
-      totalCandidates: 0,
-    });
 
     if (typeof this.ctx.memory.buildContext === "function") {
       try {
@@ -6141,30 +6888,47 @@ export class CommandExecutor {
     });
     await runLookupStep("high_signal", ownCommentPlans);
 
-    const topEngagerResult = await this.callAgentBridgeLookupCached({
-      action: "browse_top_engagers",
-      limit: 10,
-      windowHours: 24 * 14,
-    }).catch(() => ({ value: null, cacheHit: false }));
-    const topEngagerHandles = this.collectBridgeRecordItems(topEngagerResult.value)
-      .map((row) => {
-        const user = isRecord(row.user) ? row.user : null;
-        return (
-          asNonEmptyString(user?.handle) ??
-          asNonEmptyString(row.handle) ??
-          null
-        );
-      })
-      .filter((entry): entry is string => Boolean(entry))
-      .map((entry) => entry.replace(/^@+/u, "").toLowerCase())
-      .slice(0, 4);
-    trace.push({
-      step: "browse_top_engagers",
-      queryCount: 1,
-      cacheHits: topEngagerResult.cacheHit ? 1 : 0,
-      addedCandidates: 0,
-      totalCandidates: candidates.length,
-    });
+    let topEngagerHandles: string[] = [];
+    if (hasBridge) {
+      const topEngagerResult = await this.callAgentBridgeLookupCached({
+        action: "browse_top_engagers",
+        limit: 10,
+        windowHours: 24 * 14,
+      }).catch((error: unknown) => {
+        bridgeQueryFailureCount += 1;
+        void this.ctx.memory
+          .recordWrite({
+            type: "engagement_target_lookup_failed",
+            at: nowIso(),
+            commandId: input.commandId,
+            action: input.action,
+            step: "browse_top_engagers",
+            source: "browse_top_engagers",
+            lookupAction: "browse_top_engagers",
+            error: error instanceof Error ? error.message : String(error),
+          })
+          .catch(() => undefined);
+        return null;
+      });
+      if (topEngagerResult) {
+        bridgeQuerySuccessCount += 1;
+        topEngagerHandles = this.collectBridgeRecordItems(topEngagerResult.value)
+          .map((row) => {
+            const user = isRecord(row.user) ? row.user : null;
+            return asNonEmptyString(user?.handle) ?? asNonEmptyString(row.handle) ?? null;
+          })
+          .filter((entry): entry is string => Boolean(entry))
+          .map((entry) => entry.replace(/^@+/u, "").toLowerCase())
+          .slice(0, 4);
+        trace.push({
+          step: "browse_top_engagers",
+          queryCount: 1,
+          cacheHits: topEngagerResult.cacheHit ? 1 : 0,
+          addedCandidates: 0,
+          totalCandidates: candidates.length,
+        });
+      }
+    }
     const topEngagerPlans: LookupPlan[] = topEngagerHandles.map((handle) => ({
       source: "top_engager_latest",
       request: {
@@ -6231,11 +6995,23 @@ export class CommandExecutor {
           at: nowIso(),
           commandId: input.commandId,
           action: input.action,
-          reason: "no_candidates",
+          reason:
+            bridgeQuerySuccessCount > 0
+              ? "no_candidates_discovery_exhausted"
+              : bridgeQueryFailureCount > 0
+                ? "lookup_transient_failure"
+                : hasBridge
+                  ? "no_candidates_unknown"
+                  : "bridge_unavailable",
           query: hints.rawQuery,
+          bridgeQuerySuccessCount,
+          bridgeQueryFailureCount,
           trace,
         })
         .catch(() => undefined);
+      if (bridgeQuerySuccessCount > 0) {
+        throw new Error("engagement_target_unavailable:no_targets_discovered");
+      }
       return null;
     }
 
@@ -6610,6 +7386,138 @@ export class CommandExecutor {
     if (kinds.length === 0) pushKind(payload.kind);
     if (kinds.length === 0) pushKind(fallbackKind);
     return kinds.slice(0, 6);
+  }
+
+  private parsePermissionCanState(permissionState: unknown): {
+    hasHints: boolean;
+    can: {
+      postMedia: boolean;
+      postText: boolean;
+      story: boolean;
+      comment: boolean;
+      like: boolean;
+      repost: boolean;
+    };
+  } {
+    const canState = isRecord(permissionState)
+      ? (isRecord(permissionState.can) ? permissionState.can : permissionState)
+      : null;
+    const readBoolean = (key: string): boolean | null => {
+      if (!canState || typeof canState[key] !== "boolean") return null;
+      return canState[key] === true;
+    };
+    const values = {
+      postMedia: readBoolean("postMedia"),
+      postText: readBoolean("postText"),
+      story: readBoolean("story"),
+      comment: readBoolean("comment"),
+      like: readBoolean("like"),
+      repost: readBoolean("repost"),
+    };
+    return {
+      hasHints: Object.values(values).some(
+        (value) => typeof value === "boolean",
+      ),
+      can: {
+        postMedia: values.postMedia === true,
+        postText: values.postText === true,
+        story: values.story === true,
+        comment: values.comment === true,
+        like: values.like === true,
+        repost: values.repost === true,
+      },
+    };
+  }
+
+  private constrainGenerateKindsByPermissionState(
+    kinds: string[],
+    permissionState: unknown,
+  ): string[] {
+    const permission = this.parsePermissionCanState(permissionState);
+    if (!permission.hasHints || kinds.length === 0) return kinds;
+    const allowed = new Set<string>();
+    if (permission.can.postMedia || permission.can.postText) {
+      allowed.add("thread");
+      allowed.add("media");
+      allowed.add("multi_media");
+    }
+    if (permission.can.story) allowed.add("story");
+    if (permission.can.comment) allowed.add("comment");
+    if (permission.can.like) allowed.add("like");
+    if (permission.can.repost) allowed.add("repost");
+    if (allowed.size === 0) return kinds;
+
+    const filtered = kinds.filter((kind) => allowed.has(kind));
+    if (filtered.length > 0) return filtered.slice(0, 6);
+
+    const fallbackOrder = [
+      "comment",
+      "like",
+      "repost",
+      "thread",
+      "media",
+      "multi_media",
+      "story",
+    ] as const;
+    const fallback = fallbackOrder
+      .filter((kind) => allowed.has(kind))
+      .slice(0, 6);
+    return fallback.length > 0 ? fallback : kinds;
+  }
+
+  private applyPermissionGenerateInputConstraints(
+    generateInput: Record<string, unknown>,
+    permissionState: unknown,
+  ): Record<string, unknown> {
+    const normalizedKinds: string[] = [];
+    const seen = new Set<string>();
+    const push = (value: unknown): void => {
+      const normalized = this.normalizeRequestedGenerateKind(value);
+      if (!normalized || seen.has(normalized)) return;
+      seen.add(normalized);
+      normalizedKinds.push(normalized);
+    };
+    if (Array.isArray(generateInput.kinds)) {
+      for (const value of generateInput.kinds) push(value);
+    }
+    push(generateInput.kind);
+    if (normalizedKinds.length === 0) return generateInput;
+    const constrained = this.constrainGenerateKindsByPermissionState(
+      normalizedKinds,
+      permissionState,
+    );
+    if (
+      constrained.length === normalizedKinds.length &&
+      constrained.every((value, index) => value === normalizedKinds[index])
+    ) {
+      return generateInput;
+    }
+    return {
+      ...generateInput,
+      kind: constrained[0] ?? generateInput.kind,
+      kinds: constrained,
+    };
+  }
+
+  private isGeneratedDraftAllowedByPermissionState(
+    draft: GeneratedDraft,
+    permissionState: unknown,
+  ): boolean {
+    const permission = this.parsePermissionCanState(permissionState);
+    if (!permission.hasHints) return true;
+    const action = draft.action.trim().toLowerCase();
+    if (action === "comment") return permission.can.comment;
+    if (action === "like") return permission.can.like;
+    if (action === "repost") return permission.can.repost;
+    if (action === "story") return permission.can.story;
+    if (action === "post") {
+      const payload = isRecord(draft.payload) ? draft.payload : null;
+      const postType = asNonEmptyString(payload?.postType)?.toLowerCase() ?? "";
+      if (postType === "text") return permission.can.postText;
+      if (postType === "media") return permission.can.postMedia;
+      return permission.can.postMedia || permission.can.postText;
+    }
+    return true;
   }
 
   private mapGoalToGenerateKind(goal: string): string {
@@ -7495,17 +8403,19 @@ export class CommandExecutor {
     requestDir: string;
     referenceFiles: string[];
     timeoutMs: number;
+    stream: boolean;
     onProgress?: ((progress: MediaGenerationProgress) => Promise<void> | void) | undefined;
   }): Promise<{ payload: unknown; timedOut: boolean } | null> {
     const baseUrl = this.resolveMediaGeneratorBaseUrl();
     if (!baseUrl) return null;
     const useFileGenerator = input.generatedAssetType !== "image";
-    const requiresFinalStreamFrame = !useFileGenerator;
+    const streamEnabled = !useFileGenerator && input.stream === true;
+    const requiresFinalStreamFrame = streamEnabled;
     const requestBody: Record<string, unknown> = {
       prompt: input.prompt,
       command: useFileGenerator ? "generateFile" : "generateImage",
       mode: useFileGenerator ? "file" : "image",
-      stream: true,
+      stream: streamEnabled,
       sync: false,
       count: 1,
       dir: input.requestDir,
@@ -7640,6 +8550,10 @@ export class CommandExecutor {
         );
         const hasFinalArtifactFile =
           hasFinalArtifactInList(savedFiles) || hasFinalArtifactInList(observedOutputFiles);
+        const resolvedCandidate =
+          this.extractMediaSourceFromParsedOutput(contextPayload, input.requestDir, {
+            requireFinalStreamFrame: requiresFinalStreamFrame,
+          }) ?? null;
         const generationReady = requiresFinalStreamFrame
           ? hasAnyStreamFrames
             ? hasFinalStreamFrame || hasFinalStreamArtifact
@@ -7650,7 +8564,9 @@ export class CommandExecutor {
                 (hasFinalStreamFrame ||
                   hasFinalStreamArtifact ||
                   hasFinalArtifactFile))
-          : hasArtifacts || this.isTerminalMediaGeneratorStatus(status);
+          : useFileGenerator
+            ? hasArtifacts || this.isTerminalMediaGeneratorStatus(status)
+            : Boolean(resolvedCandidate);
         if (generationReady) {
           return { payload: latestPayload, timedOut: false };
         }
@@ -7684,6 +8600,8 @@ export class CommandExecutor {
     }
     const generatedAssetType = opts?.generatedAssetType ?? "image";
     const mode = opts?.mode ?? "media_generation";
+    const streamEnabled =
+      generatedAssetType === "image" && /^chat_/iu.test(mode);
     const curatedPromptBase = await this.curateMediaPromptWithOpenClaw({
       sourcePrompt,
       generatedAssetType,
@@ -7782,7 +8700,8 @@ export class CommandExecutor {
       requestDir,
       referenceFiles,
       timeoutMs: this.ctx.config.imageGenerateTimeoutMs,
-      onProgress: opts?.onProgress,
+      stream: streamEnabled,
+      onProgress: streamEnabled ? opts?.onProgress : undefined,
     });
     const execResult = serviceRun
       ? {
@@ -7821,7 +8740,7 @@ export class CommandExecutor {
         30_000,
         Math.max(3_000, Math.floor(this.ctx.config.imageGenerateTimeoutMs / 10)),
       ),
-      requireFinalStreamFrame: generatedAssetType === "image",
+      requireFinalStreamFrame: generatedAssetType === "image" && streamEnabled,
     });
     if (!resolvedSource) {
       throw new Error("no_media_url");
@@ -7849,7 +8768,7 @@ export class CommandExecutor {
         outputPath,
         stdout: execResult.stdout,
         maxWaitMs: 12_000,
-        requireFinalStreamFrame: generatedAssetType === "image",
+        requireFinalStreamFrame: generatedAssetType === "image" && streamEnabled,
       });
       if (!retrySource) {
         throw error;
@@ -7921,13 +8840,6 @@ export class CommandExecutor {
     );
     if (fromParsed) return fromParsed;
 
-    if (
-      input.requireFinalStreamFrame &&
-      this.hasUnfinalizedStreamFrames(parsed)
-    ) {
-      return null;
-    }
-
     const discovered = await this.findFirstMediaFile(input.requestDir, 3);
     if (discovered) return discovered;
     return null;
@@ -7970,38 +8882,6 @@ export class CommandExecutor {
       hasEvents: true,
       hasFinalStreamFrame,
     };
-  }
-
-  private hasUnfinalizedStreamFrames(parsed: unknown): boolean {
-    if (!isRecord(parsed)) return false;
-    let hasEvents = false;
-    let hasFinalStreamFrame = false;
-    const applySummary = (summary: {
-      hasEvents: boolean;
-      hasFinalStreamFrame: boolean;
-    }): void => {
-      if (summary.hasEvents) {
-        hasEvents = true;
-      }
-      if (summary.hasFinalStreamFrame) {
-        hasFinalStreamFrame = true;
-      }
-    };
-    applySummary(this.summarizeStreamEventsFinality(parsed.streamEvents));
-    const context = isRecord(parsed.context) ? parsed.context : null;
-    if (context) {
-      applySummary(this.summarizeStreamEventsFinality(context.streamEvents));
-    }
-    const runs = toUnknownArray(parsed.runs);
-    for (const run of runs) {
-      if (!isRecord(run)) continue;
-      applySummary(this.summarizeStreamEventsFinality(run.streamEvents));
-      const runContext = isRecord(run.context) ? run.context : null;
-      if (runContext) {
-        applySummary(this.summarizeStreamEventsFinality(runContext.streamEvents));
-      }
-    }
-    return hasEvents && !hasFinalStreamFrame;
   }
 
   private extractMediaSourceFromParsedOutput(
@@ -8150,14 +9030,15 @@ export class CommandExecutor {
     };
 
     if (!isRecord(parsed)) return null;
-    if (requireFinalStreamFrame && this.hasUnfinalizedStreamFrames(parsed)) {
-      return null;
-    }
     const streamResolved = resolveFromStreamEvents(parsed.streamEvents);
     if (streamResolved.resolved) return streamResolved.resolved;
     const urlKeys = [
       "lastOutputPath",
+      "latestOutputPath",
       "lastOutputFile",
+      "latestOutputFile",
+      "finalOutputPath",
+      "finalOutputFile",
       "outputPath",
       "savedOutputPath",
       "savedPath",
@@ -8167,12 +9048,28 @@ export class CommandExecutor {
       "fileUrl",
       "imageUrl",
     ];
-    const scanStringArray = (value: unknown): string | null => {
+    const scanArtifactArray = (value: unknown): string | null => {
       const items = toUnknownArray(value);
       if (items.length === 0) return null;
       for (let i = items.length - 1; i >= 0; i -= 1) {
         const entry = items[i];
-        const resolved = resolveCandidate(entry);
+        const direct = resolveCandidate(entry);
+        if (direct) return direct;
+        if (!isRecord(entry)) continue;
+        const resolved = resolveCandidate(
+          asNonEmptyString(entry.outputPath) ??
+            asNonEmptyString(entry.savedOutputPath) ??
+            asNonEmptyString(entry.path) ??
+            asNonEmptyString(entry.lastOutputPath) ??
+            asNonEmptyString(entry.lastOutputFile) ??
+            asNonEmptyString(entry.latestOutputPath) ??
+            asNonEmptyString(entry.latestOutputFile) ??
+            asNonEmptyString(entry.fileUrl) ??
+            asNonEmptyString(entry.mediaUrl) ??
+            asNonEmptyString(entry.outputUrl) ??
+            asNonEmptyString(entry.downloadUrl) ??
+            asNonEmptyString(entry.url),
+        );
         if (resolved) return resolved;
       }
       return null;
@@ -8184,7 +9081,7 @@ export class CommandExecutor {
       "outputFiles",
     ];
     for (const key of arrayKeys) {
-      const resolved = scanStringArray(parsed[key]);
+      const resolved = scanArtifactArray(parsed[key]);
       if (resolved) return resolved;
     }
     for (const key of urlKeys) {
@@ -8197,7 +9094,7 @@ export class CommandExecutor {
       const contextStreamResolved = resolveFromStreamEvents(context.streamEvents);
       if (contextStreamResolved.resolved) return contextStreamResolved.resolved;
       for (const key of arrayKeys) {
-        const resolved = scanStringArray(context[key]);
+        const resolved = scanArtifactArray(context[key]);
         if (resolved) return resolved;
       }
       const keepAlive = isRecord(context.keepAlive) ? context.keepAlive : null;
@@ -8219,7 +9116,7 @@ export class CommandExecutor {
         const runStreamResolved = resolveFromStreamEvents(run.streamEvents);
         if (runStreamResolved.resolved) return runStreamResolved.resolved;
         for (const key of arrayKeys) {
-          const resolved = scanStringArray(run[key]);
+          const resolved = scanArtifactArray(run[key]);
           if (resolved) return resolved;
         }
         for (const key of urlKeys) {
@@ -8231,7 +9128,7 @@ export class CommandExecutor {
           const runContextStreamResolved = resolveFromStreamEvents(runContext.streamEvents);
           if (runContextStreamResolved.resolved) return runContextStreamResolved.resolved;
           for (const key of arrayKeys) {
-            const resolved = scanStringArray(runContext[key]);
+            const resolved = scanArtifactArray(runContext[key]);
             if (resolved) return resolved;
           }
           const runKeepAlive = isRecord(runContext.keepAlive)
