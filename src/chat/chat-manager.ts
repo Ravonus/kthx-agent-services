@@ -129,6 +129,7 @@ interface LinkedOwnerIdentity {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
+const stripEmDashCharacters = (value: string): string => value.replace(/[—–]/gu, "-");
 
 const DOC_CONTEXT_RELEVANT_LINE_PATTERN =
   /\b(socket|ws|route|api|action|memory|retriev|directive|chat|dm|channel|post|comment|repost|like|follow|view|gif|image|avatar|banner|retention|profile|draft)\b/iu;
@@ -1601,7 +1602,10 @@ export class ChatManager implements ChatManagerLike {
   // -----------------------------------------------------------------------
 
   private async sendReply(entry: ChatInboxEntry, body: string): Promise<unknown> {
-    const trimmedBody = truncateChatReply(body, this.ctx.config.chatRuntimeReplyMaxChars);
+    const trimmedBody = truncateChatReply(
+      stripEmDashCharacters(body),
+      this.ctx.config.chatRuntimeReplyMaxChars,
+    );
     if (!trimmedBody.length || /^(?:\u2026+|\.{3,})$/u.test(trimmedBody)) return null;
     return this.ctx.callAgentChatBridge({
       action: "send_message",
@@ -1612,7 +1616,10 @@ export class ChatManager implements ChatManagerLike {
   }
 
   private async editMessage(messageId: string, body: string): Promise<unknown> {
-    const trimmedBody = truncateChatReply(body, this.ctx.config.chatRuntimeReplyMaxChars);
+    const trimmedBody = truncateChatReply(
+      stripEmDashCharacters(body),
+      this.ctx.config.chatRuntimeReplyMaxChars,
+    );
     if (!trimmedBody.length || /^(?:\u2026+|\.{3,})$/u.test(trimmedBody)) return null;
     return this.ctx.callAgentChatBridge({ action: "edit_message", messageId, body: trimmedBody });
   }
@@ -1633,7 +1640,10 @@ export class ChatManager implements ChatManagerLike {
 
   private async flushStream(state: StreamState, opts?: { force?: boolean }): Promise<boolean> {
     const force = opts?.force ?? false;
-    const nextBody = truncateChatReply(state.targetBody, this.ctx.config.chatRuntimeReplyMaxChars);
+    const nextBody = truncateChatReply(
+      stripEmDashCharacters(state.targetBody),
+      this.ctx.config.chatRuntimeReplyMaxChars,
+    );
     if (!nextBody.length || /^(?:\u2026+|\.{3,})$/u.test(nextBody) || nextBody === state.currentBody) return false;
     if (!force && Date.now() - state.lastUpdateAtMs < this.ctx.config.chatRuntimeTextStreamUpdateMinMs) return false;
     if (typeof state.messageId === "string" && state.messageId.trim().length > 0) {

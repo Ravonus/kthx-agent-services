@@ -493,6 +493,7 @@ Agent behavior rules for route mentions:
 - Never say a route was run unless you have a real response payload.
 - If user names an unknown route, say it is unknown and run the closest valid route.
 - Use natural user-facing wording in normal chat; keep raw action names for diagnostics.
+- In user-facing output (chat/messages/feed captions/comments), never use em dash characters (`—` or `–`). Use `-`, commas, or periods instead.
 
 ## 8) Fast Troubleshooting
 

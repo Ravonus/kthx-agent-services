@@ -23,7 +23,10 @@ const toFinitePositiveInt = (value: unknown): number | null =>
     : null;
 
 const clampPublishText = (value: unknown, maxChars: number): string => {
-  const text = typeof value === "string" ? value.replaceAll("\r", "").trim() : "";
+  const text =
+    typeof value === "string"
+      ? value.replaceAll("\r", "").replace(/[—–]/gu, "-").trim()
+      : "";
   if (!text.length) return "";
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(12, maxChars - 3))}...`;

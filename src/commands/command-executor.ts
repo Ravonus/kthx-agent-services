@@ -55,6 +55,8 @@ const MAX_COLLECTED_REFERENCE_INPUTS = 12;
 const COMMENT_ECHO_PREFIX_PATTERN = /^frame\s*\d+\s*[:.-]/iu;
 const COMMENT_PROMPT_WRAPPER_PATTERN =
   /^(?:generate|create|make|draw|render)\s+(?:an?\s+)?(?:image|gif|avatar|banner|file)\b/iu;
+const STREAM_PART_ARTIFACT_PATTERN = /(?:^|[./_-])part[_-]?\d+(?:\D|$)/iu;
+const STREAM_PART_INDEX_PATTERN = /(?:^|[._-])part[_-]?(\d+)(?:\D|$)/iu;
 const ACTION_IDEMPOTENCY_IN_FLIGHT_WINDOW_MS = 45_000;
 const ACTION_REQUEUE_BACKOFF_MS = 15_000;
 const OWNER_CAPABILITY_COOLDOWN_MS = 60_000;
@@ -244,6 +246,9 @@ const truncateText = (value: string, maxChars: number): string => {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(8, maxChars - 1))}…`;
 };
+
+const stripEmDashCharacters = (value: string): string =>
+  value.replace(/[—–]/gu, "-");
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
@@ -1570,6 +1575,9 @@ export class CommandExecutor {
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
       null;
+    const runtimeOrigin = asNonEmptyString(command.runtimeOrigin)?.toLowerCase() ?? "";
+    const isDirectiveRuntimeOrigin =
+      runtimeOrigin === "director_directive" || runtimeOrigin === "pending_promotion";
     const buildBase = (caption: string | null): Record<string, unknown> => ({
       kind: postKind,
       postType,
@@ -1585,7 +1593,7 @@ export class CommandExecutor {
       postId: targetPostId,
       payload,
     });
-    const requiresCuration = Boolean(sourceDirectiveId);
+    const requiresCuration = sourceDirectiveId !== null ? true : isDirectiveRuntimeOrigin;
     const directiveSeedHints = this.collectDirectiveSeedHints(payload);
 
     if (postType === "text") {
@@ -1612,6 +1620,8 @@ export class CommandExecutor {
       }
       let captionForWrite = curatedTextDraft?.caption ?? captionInitial;
       let textBodyForWrite = curatedTextDraft?.textBody ?? textBodyInitial;
+      captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
+      textBodyForWrite = stripEmDashCharacters(textBodyForWrite);
       if (!textBodyForWrite) {
         return this.failedOutcome(command, "textBody is required for text posts.");
       }
@@ -1670,6 +1680,8 @@ export class CommandExecutor {
         }
         captionForWrite = recuratedTextDraft.caption ?? captionForWrite;
         textBodyForWrite = recuratedTextDraft.textBody ?? textBodyForWrite;
+        captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
+        textBodyForWrite = stripEmDashCharacters(textBodyForWrite);
         noveltyValidation = this.validatePostDraftNovelty({
           postType: "text",
           caption: captionForWrite,
@@ -1755,6 +1767,10 @@ export class CommandExecutor {
     }
     let captionForWrite = curatedMediaDraft?.caption ?? captionInitial;
     let mediaPromptForWrite = curatedMediaDraft?.mediaPrompt ?? mediaPromptInitial;
+    captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
+    mediaPromptForWrite = mediaPromptForWrite
+      ? stripEmDashCharacters(mediaPromptForWrite)
+      : mediaPromptForWrite;
     let noveltyValidation = this.validatePostDraftNovelty({
       postType: "media",
       caption: captionForWrite,
@@ -1810,6 +1826,10 @@ export class CommandExecutor {
       }
       captionForWrite = recuratedMediaDraft.caption ?? captionForWrite;
       mediaPromptForWrite = recuratedMediaDraft.mediaPrompt ?? mediaPromptForWrite;
+      captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
+      mediaPromptForWrite = mediaPromptForWrite
+        ? stripEmDashCharacters(mediaPromptForWrite)
+        : mediaPromptForWrite;
       noveltyValidation = this.validatePostDraftNovelty({
         postType: "media",
         caption: captionForWrite,
@@ -2290,6 +2310,7 @@ export class CommandExecutor {
         "Rules:",
         "- textBody: 40-240 chars, natural voice, no hashtags, no emojis.",
         "- caption: optional, 0-140 chars.",
+        "- Never use em dash characters; use '-' or normal punctuation instead.",
         "- Must not reuse long phrases from targetPostText/targetMedia/directiveHint.",
         "- Must not reuse long phrases from directive seed text.",
         "- Must not reuse long phrases from recent self-post references.",
@@ -2319,6 +2340,7 @@ export class CommandExecutor {
       "Rules:",
       "- caption: 10-220 chars, natural social voice, no hashtags, no emojis.",
       "- mediaPrompt: 20-320 chars, concrete visual prompt, no wrappers like 'Generate an image of'.",
+      "- Never use em dash characters; use '-' or normal punctuation instead.",
       "- Must be materially different from targetPostText/targetMedia/directiveHint.",
       "- Must be materially different from directive seed text.",
       "- Must be materially different from recent self-post references.",
@@ -2381,16 +2403,16 @@ export class CommandExecutor {
       null;
     if (postType === "text" && textBody) {
       return {
-        caption,
-        textBody: truncateText(textBody, 240),
+        caption: caption ? stripEmDashCharacters(caption) : null,
+        textBody: truncateText(stripEmDashCharacters(textBody), 240),
         mediaPrompt: null,
       };
     }
     if (postType === "media" && (mediaPrompt || caption)) {
       return {
-        caption: caption ? truncateText(caption, 2200) : null,
+        caption: caption ? truncateText(stripEmDashCharacters(caption), 2200) : null,
         textBody: null,
-        mediaPrompt: mediaPrompt ? truncateText(mediaPrompt, 320) : null,
+        mediaPrompt: mediaPrompt ? truncateText(stripEmDashCharacters(mediaPrompt), 320) : null,
       };
     }
     for (const key of ["draft", "payload", "result", "output", "data", "content"] as const) {
@@ -2481,12 +2503,19 @@ export class CommandExecutor {
     push(payload.imagePrompt);
     push(payload.caption);
     push(payload.textBody);
+    push(payload.body);
+    push(payload.text);
+    push(payload.message);
     push(payload.title);
     const scope = isRecord(payload.directiveScope) ? payload.directiveScope : null;
     if (scope) {
       push(scope.reason);
       push(scope.note);
       push(scope.topic);
+      push(scope.caption);
+      push(scope.textBody);
+      push(scope.body);
+      push(scope.text);
       const target = isRecord(scope.target) ? scope.target : null;
       if (target) {
         push(target.caption);
@@ -2757,7 +2786,7 @@ export class CommandExecutor {
         target,
         state: "action_running",
       });
-      const finalBody = curatedBody.body;
+      const finalBody = stripEmDashCharacters(curatedBody.body);
       const result = await this.agent().commentPost.mutate({
         postId: target.postId,
         body: finalBody,
@@ -3359,6 +3388,7 @@ export class CommandExecutor {
       "- Do not copy wording from the draft or post text.",
       "- Never start with 'Frame N:' and never output image-prompt wrappers.",
       "- No hashtags, no emojis, no system/tool mentions.",
+      "- Never use em dash characters; use '-' or normal punctuation instead.",
       "Return strict JSON ONLY with this exact shape:",
       `{"action":"comment","target":{"postId":${input.postId},"commentId":${input.parentId ?? "null"},"targetHash":"${input.targetHash}"},"body":"<comment>","reason":"<short reason>","shouldExecute":true}`,
       `Draft comment: ${input.draftBody}`,
@@ -3374,7 +3404,7 @@ export class CommandExecutor {
       .trim();
     const unquoted = unfenced.replace(/^["'`]|["'`]$/gu, "").trim();
     const stripped = unquoted.replace(/^(?:body|comment|reply)\s*:\s*/iu, "").trim();
-    return stripped.replace(/\s+/gu, " ").trim();
+    return stripEmDashCharacters(stripped).replace(/\s+/gu, " ").trim();
   }
 
   private extractCuratedCommentBodyFromUnknown(value: unknown): string | null {
@@ -7141,7 +7171,7 @@ export class CommandExecutor {
       /^(?:please\s+)?(?:generate|create|make|draw|render)\s+(?:an?\s+)?(?:image|gif|avatar|file|video|audio|pdf|csv|code|markdown|md|txt)\s*(?:of|for)?\s*:?\s*/iu,
       "",
     );
-    return withoutGenerationVerb.trim();
+    return stripEmDashCharacters(withoutGenerationVerb).trim();
   }
 
   private extractCuratedMediaPromptFromUnknown(value: unknown): string | null {
@@ -7344,9 +7374,9 @@ export class CommandExecutor {
         asNonEmptyString(rawEntry.sourceFileName) ??
         asNonEmptyString(rawEntry.file_name);
       const streamPartIndexFromName =
-        sourceFileName && /\.part(\d+)(?:\D|$)/iu.test(sourceFileName)
+        sourceFileName && STREAM_PART_INDEX_PATTERN.test(sourceFileName)
           ? Number.parseInt(
-              /\.part(\d+)(?:\D|$)/iu.exec(sourceFileName)?.[1] ?? "",
+              STREAM_PART_INDEX_PATTERN.exec(sourceFileName)?.[1] ?? "",
               10,
             )
           : null;
@@ -7358,7 +7388,7 @@ export class CommandExecutor {
             ? Math.max(0, Math.floor(streamPartIndexFromName))
             : null;
       const isStreamPartFromName =
-        sourceFileName !== null && /\.part\d+(?:\D|$)/iu.test(sourceFileName);
+        sourceFileName !== null && STREAM_PART_ARTIFACT_PATTERN.test(sourceFileName);
       const isStreamPart =
         rawEntry.isStreamPart === true ||
         (typeof streamPartIndexRaw === "number" && Number.isFinite(streamPartIndexRaw)) ||
@@ -7503,7 +7533,7 @@ export class CommandExecutor {
               asNonEmptyString(item.url)
             : null);
         if (!direct) continue;
-        if (!/\.part\d+(?:\D|$)/iu.test(direct)) return true;
+        if (!STREAM_PART_ARTIFACT_PATTERN.test(direct)) return true;
       }
       return false;
     };
@@ -7601,6 +7631,7 @@ export class CommandExecutor {
         const observedOutputFilesCount = observedOutputFiles.length;
         const hasArtifacts = savedFilesCount > 0 || observedOutputFilesCount > 0;
         const hasFinalStreamFrame = progress.hasFinalStreamFrame;
+        const hasAnyStreamFrames = progress.streamFrameCount > 0;
         const hasFinalStreamArtifact = progress.streamFrames.some(
           (frame) =>
             frame.isFinalStreamFrame &&
@@ -7610,14 +7641,15 @@ export class CommandExecutor {
         const hasFinalArtifactFile =
           hasFinalArtifactInList(savedFiles) || hasFinalArtifactInList(observedOutputFiles);
         const generationReady = requiresFinalStreamFrame
-          ? hasFinalStreamFrame ||
-            hasFinalStreamArtifact ||
-            hasFinalArtifactFile ||
-            (this.isTerminalMediaGeneratorStatus(status) &&
-              (hasFinalStreamFrame ||
-                hasFinalStreamArtifact ||
-                hasFinalArtifactFile ||
-                !hasArtifacts))
+          ? hasAnyStreamFrames
+            ? hasFinalStreamFrame || hasFinalStreamArtifact
+            : hasFinalStreamFrame ||
+              hasFinalStreamArtifact ||
+              hasFinalArtifactFile ||
+              (this.isTerminalMediaGeneratorStatus(status) &&
+                (hasFinalStreamFrame ||
+                  hasFinalStreamArtifact ||
+                  hasFinalArtifactFile))
           : hasArtifacts || this.isTerminalMediaGeneratorStatus(status);
         if (generationReady) {
           return { payload: latestPayload, timedOut: false };
@@ -7789,6 +7821,7 @@ export class CommandExecutor {
         30_000,
         Math.max(3_000, Math.floor(this.ctx.config.imageGenerateTimeoutMs / 10)),
       ),
+      requireFinalStreamFrame: generatedAssetType === "image",
     });
     if (!resolvedSource) {
       throw new Error("no_media_url");
@@ -7816,6 +7849,7 @@ export class CommandExecutor {
         outputPath,
         stdout: execResult.stdout,
         maxWaitMs: 12_000,
+        requireFinalStreamFrame: generatedAssetType === "image",
       });
       if (!retrySource) {
         throw error;
@@ -7831,6 +7865,7 @@ export class CommandExecutor {
     outputPath: string;
     stdout: string;
     maxWaitMs: number;
+    requireFinalStreamFrame?: boolean;
   }): Promise<string | null> {
     const deadlineMs = Date.now() + Math.max(0, Math.floor(input.maxWaitMs));
     let lastCandidate: string | null = null;
@@ -7839,6 +7874,7 @@ export class CommandExecutor {
         requestDir: input.requestDir,
         outputPath: input.outputPath,
         stdout: input.stdout,
+        requireFinalStreamFrame: input.requireFinalStreamFrame === true,
       });
       if (candidate) {
         if (isHttpUrl(candidate) || isDataUri(candidate)) {
@@ -7867,6 +7903,7 @@ export class CommandExecutor {
     requestDir: string;
     outputPath: string;
     stdout: string;
+    requireFinalStreamFrame: boolean;
   }): Promise<string | null> {
     const outputExists = await fs
       .access(input.outputPath)
@@ -7875,28 +7912,133 @@ export class CommandExecutor {
     if (outputExists) return input.outputPath;
 
     const parsed = parseJsonFromMixedText(input.stdout);
-    const fromParsed = this.extractMediaSourceFromParsedOutput(parsed, input.requestDir);
+    const fromParsed = this.extractMediaSourceFromParsedOutput(
+      parsed,
+      input.requestDir,
+      {
+        requireFinalStreamFrame: input.requireFinalStreamFrame,
+      },
+    );
     if (fromParsed) return fromParsed;
+
+    if (
+      input.requireFinalStreamFrame &&
+      this.hasUnfinalizedStreamFrames(parsed)
+    ) {
+      return null;
+    }
 
     const discovered = await this.findFirstMediaFile(input.requestDir, 3);
     if (discovered) return discovered;
     return null;
   }
 
-  private extractMediaSourceFromParsedOutput(parsed: unknown, requestDir: string): string | null {
+  private isFinalStreamFrameEntry(entry: Record<string, unknown>): boolean {
+    const sourceFileName =
+      asNonEmptyString(entry.sourceFileName) ??
+      asNonEmptyString(entry.file_name);
+    const isStreamPartFromName =
+      sourceFileName !== null &&
+      STREAM_PART_ARTIFACT_PATTERN.test(sourceFileName);
+    return (
+      entry.isFinalStreamFrame === true ||
+      entry.streamIsFinalFrame === true ||
+      (sourceFileName !== null && !isStreamPartFromName)
+    );
+  }
+
+  private summarizeStreamEventsFinality(value: unknown): {
+    hasEvents: boolean;
+    hasFinalStreamFrame: boolean;
+  } {
+    const events = toUnknownArray(value);
+    if (events.length === 0) {
+      return {
+        hasEvents: false,
+        hasFinalStreamFrame: false,
+      };
+    }
+    let hasFinalStreamFrame = false;
+    for (const rawEntry of events) {
+      if (!isRecord(rawEntry)) continue;
+      if (this.isFinalStreamFrameEntry(rawEntry)) {
+        hasFinalStreamFrame = true;
+        break;
+      }
+    }
+    return {
+      hasEvents: true,
+      hasFinalStreamFrame,
+    };
+  }
+
+  private hasUnfinalizedStreamFrames(parsed: unknown): boolean {
+    if (!isRecord(parsed)) return false;
+    let hasEvents = false;
+    let hasFinalStreamFrame = false;
+    const applySummary = (summary: {
+      hasEvents: boolean;
+      hasFinalStreamFrame: boolean;
+    }): void => {
+      if (summary.hasEvents) {
+        hasEvents = true;
+      }
+      if (summary.hasFinalStreamFrame) {
+        hasFinalStreamFrame = true;
+      }
+    };
+    applySummary(this.summarizeStreamEventsFinality(parsed.streamEvents));
+    const context = isRecord(parsed.context) ? parsed.context : null;
+    if (context) {
+      applySummary(this.summarizeStreamEventsFinality(context.streamEvents));
+    }
+    const runs = toUnknownArray(parsed.runs);
+    for (const run of runs) {
+      if (!isRecord(run)) continue;
+      applySummary(this.summarizeStreamEventsFinality(run.streamEvents));
+      const runContext = isRecord(run.context) ? run.context : null;
+      if (runContext) {
+        applySummary(this.summarizeStreamEventsFinality(runContext.streamEvents));
+      }
+    }
+    return hasEvents && !hasFinalStreamFrame;
+  }
+
+  private extractMediaSourceFromParsedOutput(
+    parsed: unknown,
+    requestDir: string,
+    options?: {
+      requireFinalStreamFrame?: boolean;
+    },
+  ): string | null {
+    const requireFinalStreamFrame = options?.requireFinalStreamFrame === true;
     const resolveCandidate = (value: unknown): string | null => {
       const candidate = asNonEmptyString(value);
       if (!candidate) return null;
+      if (STREAM_PART_ARTIFACT_PATTERN.test(candidate)) return null;
       if (isHttpUrl(candidate) || isDataUri(candidate)) return candidate;
       const absolute = path.isAbsolute(candidate)
         ? candidate
         : path.resolve(requestDir, candidate);
+      if (STREAM_PART_ARTIFACT_PATTERN.test(absolute)) return null;
       return absolute;
     };
 
-    const resolveFromStreamEvents = (value: unknown): string | null => {
+    const resolveFromStreamEvents = (
+      value: unknown,
+    ): {
+      resolved: string | null;
+      hasEvents: boolean;
+      hasFinalStreamFrame: boolean;
+    } => {
       const events = toUnknownArray(value);
-      if (events.length === 0) return null;
+      if (events.length === 0) {
+        return {
+          resolved: null,
+          hasEvents: false,
+          hasFinalStreamFrame: false,
+        };
+      }
       const resolveFromEntry = (
         entry: Record<string, unknown>,
       ): {
@@ -7908,7 +8050,8 @@ export class CommandExecutor {
           asNonEmptyString(entry.sourceFileName) ??
           asNonEmptyString(entry.file_name);
         const isStreamPartFromName =
-          sourceFileName !== null && /\.part\d+(?:\D|$)/iu.test(sourceFileName);
+          sourceFileName !== null &&
+          STREAM_PART_ARTIFACT_PATTERN.test(sourceFileName);
         const isFinalStreamFrame =
           entry.isFinalStreamFrame === true ||
           entry.streamIsFinalFrame === true ||
@@ -7951,31 +8094,67 @@ export class CommandExecutor {
         }
         return { resolved: null, finalFramePreview: null, isFinalStreamFrame };
       };
+      let hasFinalStreamFrame = false;
       for (let i = events.length - 1; i >= 0; i -= 1) {
         const entry = events[i];
         if (!isRecord(entry)) continue;
         const resolved = resolveFromEntry(entry);
+        if (resolved.isFinalStreamFrame) {
+          hasFinalStreamFrame = true;
+        }
         if (resolved.isFinalStreamFrame && resolved.resolved) {
-          return resolved.resolved;
+          return {
+            resolved: resolved.resolved,
+            hasEvents: true,
+            hasFinalStreamFrame,
+          };
         }
         if (resolved.isFinalStreamFrame && resolved.finalFramePreview) {
-          return resolved.finalFramePreview;
+          return {
+            resolved: resolved.finalFramePreview,
+            hasEvents: true,
+            hasFinalStreamFrame,
+          };
         }
+      }
+      if (requireFinalStreamFrame) {
+        return {
+          resolved: null,
+          hasEvents: true,
+          hasFinalStreamFrame,
+        };
       }
       for (let i = events.length - 1; i >= 0; i -= 1) {
         const entry = events[i];
         if (!isRecord(entry)) continue;
         const resolved = resolveFromEntry(entry);
+        if (resolved.isFinalStreamFrame) {
+          hasFinalStreamFrame = true;
+        }
         if (resolved.resolved) {
-          return resolved.resolved;
+          if (!resolved.isFinalStreamFrame && isHttpUrl(resolved.resolved)) {
+            continue;
+          }
+          return {
+            resolved: resolved.resolved,
+            hasEvents: true,
+            hasFinalStreamFrame,
+          };
         }
       }
-      return null;
+      return {
+        resolved: null,
+        hasEvents: true,
+        hasFinalStreamFrame,
+      };
     };
 
     if (!isRecord(parsed)) return null;
+    if (requireFinalStreamFrame && this.hasUnfinalizedStreamFrames(parsed)) {
+      return null;
+    }
     const streamResolved = resolveFromStreamEvents(parsed.streamEvents);
-    if (streamResolved) return streamResolved;
+    if (streamResolved.resolved) return streamResolved.resolved;
     const urlKeys = [
       "lastOutputPath",
       "lastOutputFile",
@@ -8016,7 +8195,7 @@ export class CommandExecutor {
     const context = isRecord(parsed.context) ? parsed.context : null;
     if (context) {
       const contextStreamResolved = resolveFromStreamEvents(context.streamEvents);
-      if (contextStreamResolved) return contextStreamResolved;
+      if (contextStreamResolved.resolved) return contextStreamResolved.resolved;
       for (const key of arrayKeys) {
         const resolved = scanStringArray(context[key]);
         if (resolved) return resolved;
@@ -8038,7 +8217,7 @@ export class CommandExecutor {
       for (const run of parsed.runs) {
         if (!isRecord(run)) continue;
         const runStreamResolved = resolveFromStreamEvents(run.streamEvents);
-        if (runStreamResolved) return runStreamResolved;
+        if (runStreamResolved.resolved) return runStreamResolved.resolved;
         for (const key of arrayKeys) {
           const resolved = scanStringArray(run[key]);
           if (resolved) return resolved;
@@ -8050,7 +8229,7 @@ export class CommandExecutor {
         const runContext = isRecord(run.context) ? run.context : null;
         if (runContext) {
           const runContextStreamResolved = resolveFromStreamEvents(runContext.streamEvents);
-          if (runContextStreamResolved) return runContextStreamResolved;
+          if (runContextStreamResolved.resolved) return runContextStreamResolved.resolved;
           for (const key of arrayKeys) {
             const resolved = scanStringArray(runContext[key]);
             if (resolved) return resolved;
@@ -8078,11 +8257,32 @@ export class CommandExecutor {
     const walk = async (currentPath: string, depth: number): Promise<string | null> => {
       if (depth < 0) return null;
       const entries = await fs.readdir(currentPath, { withFileTypes: true }).catch(() => []);
-      const fileEntries = entries
-        .filter((entry) => entry.isFile() && MEDIA_FILE_RE.test(entry.name))
-        .map((entry) => path.join(currentPath, entry.name))
-        .sort();
-      if (fileEntries.length > 0) return fileEntries[0] ?? null;
+      const fileEntries = entries.filter(
+        (entry) => entry.isFile() && MEDIA_FILE_RE.test(entry.name),
+      );
+      const stableCandidates = fileEntries.filter(
+        (entry) => !STREAM_PART_ARTIFACT_PATTERN.test(entry.name),
+      );
+      const pickNewestPath = async (candidates: typeof fileEntries): Promise<string | null> => {
+        if (candidates.length === 0) return null;
+        const withMtime = await Promise.all(
+          candidates.map(async (entry) => {
+            const filePath = path.join(currentPath, entry.name);
+            const stat = await fs.stat(filePath).catch(() => null);
+            return {
+              filePath,
+              mtimeMs:
+                stat && Number.isFinite(stat.mtimeMs)
+                  ? stat.mtimeMs
+                  : Number.NEGATIVE_INFINITY,
+            };
+          }),
+        );
+        withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs);
+        return withMtime[0]?.filePath ?? null;
+      };
+      const stablePath = await pickNewestPath(stableCandidates);
+      if (stablePath) return stablePath;
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
         const nested = await walk(path.join(currentPath, entry.name), depth - 1);
@@ -8200,7 +8400,7 @@ export class CommandExecutor {
 
     const addPreviewPart = (value: string | null): void => {
       if (!value) return;
-      const normalized = value.trim();
+      const normalized = stripEmDashCharacters(value).trim();
       if (!normalized.length) return;
       previewParts.push(normalized);
     };
