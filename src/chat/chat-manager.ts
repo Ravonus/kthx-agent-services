@@ -133,6 +133,10 @@ const stripEmDashCharacters = (value: string): string => value.replace(/[—–]
 
 const DOC_CONTEXT_RELEVANT_LINE_PATTERN =
   /\b(socket|ws|route|api|action|memory|retriev|directive|chat|dm|channel|post|comment|repost|like|follow|view|gif|image|avatar|banner|retention|profile|draft)\b/iu;
+const DOC_CONTEXT_PRIORITY_HEADING_PATTERN =
+  /\b(chat bridge route catalog|update\/write route matrix|runtime capability map)\b/iu;
+const DOC_CONTEXT_PRIORITY_LINE_PATTERN =
+  /\b(send_message|edit_message|typing|delivery_confirmed|follow_user|unfollow_user|save_custom_asset|settings_update|updatebotprofile|brain\.)\b/iu;
 
 const DOC_CONTEXT_PATH_CANDIDATES = [
   path.resolve(process.cwd(), "public", "chat-system.md"),
@@ -143,29 +147,59 @@ const DOC_CONTEXT_PATH_CANDIDATES = [
 
 const buildSystemDocExcerpt = (sourceName: string, raw: string): string => {
   const lines = raw.split(/\r?\n/u);
-  const picked: string[] = [];
+  const candidates: Array<{
+    heading: string;
+    line: string;
+    priority: boolean;
+  }> = [];
   let activeHeading = "";
-  let lastHeadingWritten = "";
   for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line.length || line.startsWith("```")) continue;
-    if (/^#{1,6}\s+/u.test(line)) {
-      activeHeading = line.replace(/^#{1,6}\s+/u, "").trim();
+    const trimmed = rawLine.trim();
+    if (!trimmed.length || trimmed.startsWith("```")) continue;
+    if (/^#{1,6}\s+/u.test(trimmed)) {
+      activeHeading = trimmed.replace(/^#{1,6}\s+/u, "").trim();
       continue;
     }
-    const isRelevant = DOC_CONTEXT_RELEVANT_LINE_PATTERN.test(line);
+    const isRelevant = DOC_CONTEXT_RELEVANT_LINE_PATTERN.test(trimmed);
     const isStructured =
-      /^[-*]\s+/u.test(line) ||
-      /^\d+[.)]\s+/u.test(line) ||
-      /^(GET|POST|PUT|PATCH|DELETE)\s+/u.test(line) ||
-      /^`[^`]+`$/u.test(line);
-    if (!isRelevant || (!isStructured && line.length > 140)) continue;
-    if (activeHeading.length > 0 && activeHeading !== lastHeadingWritten) {
-      picked.push(`section: ${activeHeading}`);
-      lastHeadingWritten = activeHeading;
+      /^[-*]\s+/u.test(trimmed) ||
+      /^\d+[.)]\s+/u.test(trimmed) ||
+      /^(GET|POST|PUT|PATCH|DELETE)\s+/u.test(trimmed) ||
+      /^`[^`]+`$/u.test(trimmed);
+    if (!isRelevant || (!isStructured && trimmed.length > 140)) continue;
+    const line = trimmed.replace(/^`|`$/gu, "");
+    const priority =
+      DOC_CONTEXT_PRIORITY_HEADING_PATTERN.test(activeHeading) ||
+      DOC_CONTEXT_PRIORITY_LINE_PATTERN.test(line);
+    candidates.push({
+      heading: activeHeading,
+      line,
+      priority,
+    });
+  }
+  const picked: string[] = [];
+  const seen = new Set<string>();
+  let lastHeadingWritten = "";
+  const appendCandidate = (candidate: { heading: string; line: string }) => {
+    const dedupeKey = `${candidate.heading}\u0000${candidate.line}`;
+    if (seen.has(dedupeKey)) return;
+    if (candidate.heading.length > 0 && candidate.heading !== lastHeadingWritten) {
+      picked.push(`section: ${candidate.heading}`);
+      lastHeadingWritten = candidate.heading;
     }
-    picked.push(line.replace(/^`|`$/gu, ""));
+    picked.push(candidate.line);
+    seen.add(dedupeKey);
+  };
+  for (const candidate of candidates) {
+    if (!candidate.priority) continue;
+    appendCandidate(candidate);
     if (picked.length >= 42) break;
+  }
+  if (picked.length < 42) {
+    for (const candidate of candidates) {
+      appendCandidate(candidate);
+      if (picked.length >= 42) break;
+    }
   }
   if (picked.length === 0) return "";
   return [`source: ${sourceName}`, ...picked].join("\n");
@@ -962,6 +996,1111 @@ const parseBooleanChatInput = (value: string): boolean | null => {
   return null;
 };
 
+type ProfileSettingsTarget = "agent" | "owner";
+type DmPolicyValue = "everyone" | "following_only" | "followers_only" | "mutual_only";
+type DmAutomatedPolicyValue = "allow_all" | "allow_followed" | "deny_all";
+type AgentReplyPolicyValue = "allow_all" | "deny_all" | "deny_selected";
+
+type DeterministicRoutePayload =
+  | {
+      action: "update_profile";
+      target: ProfileSettingsTarget;
+      name?: string;
+      bio?: string | null;
+      imageUrl?: string;
+      bannerUrl?: string;
+    }
+  | {
+      action: "update_settings";
+      target: ProfileSettingsTarget;
+      defaultLensId?: number | null;
+      readReceipts?: boolean;
+      dmPolicy?: DmPolicyValue;
+      dmAutomatedPolicy?: DmAutomatedPolicyValue;
+      agentReplyPolicy?: AgentReplyPolicyValue;
+      showOnlineStatus?: boolean;
+    }
+  | {
+      action: "follow_user";
+      target: ProfileSettingsTarget;
+      userId?: string;
+      handle?: string;
+    }
+  | {
+      action: "unfollow_user";
+      target: ProfileSettingsTarget;
+      userId?: string;
+      handle?: string;
+    }
+  | {
+      action: "suggest_followers";
+      limit?: number;
+      includeAgents?: boolean;
+    }
+  | {
+      action: "browse_agents";
+      query?: string;
+      limit?: number;
+      includeFollowing?: boolean;
+      includeFollowers?: boolean;
+      includeRecentPosters?: boolean;
+    }
+  | {
+      action: "agent_profile";
+    }
+  | {
+      action: "find_user";
+      handle?: string;
+      mainUserId?: string;
+    }
+  | {
+      action: "find_post";
+      postId?: number;
+      authorHandle?: string;
+      searchText?: string;
+      latest?: boolean;
+    }
+  | {
+      action: "find_comment";
+      postId: number;
+      commentId?: number;
+      searchText?: string;
+    }
+  | {
+      action: "browse_posts";
+      limit?: number;
+    }
+  | {
+      action: "browse_comments";
+      postId?: number;
+      searchText?: string;
+      limit?: number;
+    }
+  | {
+      action: "browse_notifications";
+      limit?: number;
+      unreadOnly?: boolean;
+    }
+  | {
+      action: "browse_home_feed";
+      limit?: number;
+    }
+  | {
+      action: "browse_top_engagers";
+      limit?: number;
+      windowHours?: number;
+    };
+
+type DeterministicRouteParseResult =
+  | { kind: "action"; payload: DeterministicRoutePayload }
+  | { kind: "clarify"; reply: string };
+
+interface DeterministicRoutePolicy {
+  dmOnly: boolean;
+  allowChannel: boolean;
+  allowedTargets?: readonly ProfileSettingsTarget[];
+  requireLinkedOwnerForOwnerTarget?: boolean;
+}
+
+interface DeterministicRouteRegistration {
+  action: DeterministicRoutePayload["action"];
+  parse: (body: string) => DeterministicRouteParseResult | null;
+  policy: DeterministicRoutePolicy;
+  summarizeSuccess: (
+    payload: DeterministicRoutePayload,
+    response: unknown,
+  ) => string;
+  failureLabel: string;
+}
+
+type DeterministicRouteMatch =
+  | {
+      kind: "action";
+      payload: DeterministicRoutePayload;
+      registration: DeterministicRouteRegistration;
+    }
+  | { kind: "clarify"; reply: string };
+
+type DeterministicRouteTargetedPayload = Extract<
+  DeterministicRoutePayload,
+  { target: ProfileSettingsTarget }
+>;
+
+const hasDeterministicRouteTarget = (
+  payload: DeterministicRoutePayload,
+): payload is DeterministicRouteTargetedPayload =>
+  "target" in payload;
+
+const PROFILE_MUTATION_VERB_PATTERN =
+  /\b(set|update|change|edit|modify|refresh)\b/iu;
+const PROFILE_FIELD_HINT_PATTERN =
+  /\b(profile|display\s+name|name|bio|description|about|avatar|pfp|banner|header|cover)\b/iu;
+const PROFILE_NAME_HINT_PATTERN =
+  /\b(display\s+name|profile\s+name|name)\b/iu;
+const PROFILE_BIO_HINT_PATTERN =
+  /\b(bio|description|about)\b/iu;
+const PROFILE_AVATAR_HINT_PATTERN =
+  /\b(avatar|pfp|profile\s+(?:picture|photo|image)|icon)\b/iu;
+const PROFILE_BANNER_HINT_PATTERN =
+  /\b(banner|header|cover)\b/iu;
+const PROFILE_TARGET_OWNER_PATTERN =
+  /\b(for\s+me|my\s+(?:profile|account|name|bio|description|avatar|pfp|banner|header|cover)|owner)\b/iu;
+const PROFILE_TARGET_AGENT_PATTERN =
+  /\b(for\s+yourself|as\s+agent|agent\s+profile|your\s+(?:profile|account|name|bio|description|avatar|pfp|banner|header|cover))\b/iu;
+
+const SETTINGS_MUTATION_VERB_PATTERN =
+  /\b(set|update|change|configure|adjust|turn|enable|disable)\b/iu;
+const SETTINGS_FIELD_HINT_PATTERN =
+  /\b(settings?|read\s+receipts?|dm\s+policy|direct\s+message|online\s+status|presence|default\s+lens|lens\s+id|agent\s+reply\s+policy)\b/iu;
+const SETTINGS_TARGET_OWNER_PATTERN =
+  /\b(for\s+me|my\s+(?:settings?|account)|owner)\b/iu;
+const SETTINGS_TARGET_AGENT_PATTERN =
+  /\b(for\s+yourself|as\s+agent|agent\s+settings?|your\s+(?:settings?|account))\b/iu;
+const READ_RECEIPTS_HINT_PATTERN = /\bread\s+receipts?\b/iu;
+const ONLINE_STATUS_HINT_PATTERN =
+  /\b(online\s+status|show\s+online|presence)\b/iu;
+const DM_POLICY_HINT_PATTERN =
+  /\b(dm\s+policy|direct\s+messages?\s+policy|who\s+can\s+dm)\b/iu;
+const DM_AUTOMATED_POLICY_HINT_PATTERN =
+  /\b(dm\s+automated\s+policy|automated\s+dm(?:\s+policy)?|bot\s+dm(?:\s+policy)?|agent\s+dm(?:\s+policy)?)\b/iu;
+const AGENT_REPLY_POLICY_HINT_PATTERN =
+  /\b(agent\s+reply\s+policy|reply\s+policy)\b/iu;
+const DEFAULT_LENS_HINT_PATTERN =
+  /\b(default\s+lens(?:\s+id)?|lens(?:\s+id)?)\b/iu;
+const URL_CAPTURE_PATTERN = /https?:\/\/[^\s)]+/giu;
+const FOLLOW_TARGET_OWNER_PATTERN =
+  /\b(for\s+me|on\s+my\s+account|as\s+me|owner)\b/iu;
+const FOLLOW_TARGET_AGENT_PATTERN =
+  /\b(as\s+agent|as\s+yourself|for\s+yourself|on\s+your\s+account)\b/iu;
+const FOLLOW_MUTATION_PATTERN = /\b(follow|unfollow)\b/iu;
+const UNFOLLOW_MUTATION_PATTERN = /\b(unfollow|stop\s+following)\b/iu;
+const FOLLOW_DISCOVERY_PATTERN =
+  /\b(find|discover|show|suggest|recommend)\b[\s\S]*\b(follow|accounts?|agents?|users?|creators?)\b|\bwho\s+should\s+(?:i|we|you)\s+follow\b/iu;
+const AGENT_PROFILE_LOOKUP_PATTERN =
+  /\b(who\s+(?:is|are)\s+your\s+owner|who\s+owns\s+you|show\s+your\s+(?:owner|profile)|agent\s+profile)\b/iu;
+const LOOKUP_REQUEST_VERB_PATTERN =
+  /\b(find|lookup|show|check|open|get|list|browse|who\s+is|who's)\b/iu;
+const USER_LOOKUP_PATTERN =
+  /\b(user|profile|account|handle)\b|\bwho\s+is\b|\bwho's\b/iu;
+
+const stripQuotedValue = (value: string): string =>
+  value
+    .trim()
+    .replace(/^[`"'“”‘’]+/u, "")
+    .replace(/[`"'“”‘’]+$/u, "")
+    .trim();
+
+const stripMutationTail = (value: string): string =>
+  value
+    .replace(
+      /\s+(?:and|plus|,)\s+(?:my|your|the)?\s*(?:name|bio|description|avatar|pfp|banner|header|cover|read\s+receipts?|dm\s+policy|online\s+status|presence|default\s+lens|lens\s+id|agent\s+reply\s+policy)\b[\s\S]*$/iu,
+      "",
+    )
+    .trim();
+
+const extractFirstUrl = (value: string): string | null => {
+  const match = URL_CAPTURE_PATTERN.exec(value);
+  URL_CAPTURE_PATTERN.lastIndex = 0;
+  if (!match?.[0]) return null;
+  return match[0].trim();
+};
+
+const extractAssignedText = (
+  body: string,
+  patterns: readonly RegExp[],
+  maxChars: number,
+): string | null => {
+  for (const pattern of patterns) {
+    const match = pattern.exec(body);
+    const candidateRaw = match?.[1];
+    if (!candidateRaw) continue;
+    const normalized = stripMutationTail(stripQuotedValue(candidateRaw));
+    if (!normalized.length) continue;
+    return normalized.slice(0, maxChars);
+  }
+  return null;
+};
+
+const parseProfileTarget = (body: string): ProfileSettingsTarget => {
+  if (PROFILE_TARGET_OWNER_PATTERN.test(body)) return "owner";
+  if (PROFILE_TARGET_AGENT_PATTERN.test(body)) return "agent";
+  return "agent";
+};
+
+const parseSettingsTarget = (body: string): ProfileSettingsTarget => {
+  if (SETTINGS_TARGET_AGENT_PATTERN.test(body)) return "agent";
+  if (SETTINGS_TARGET_OWNER_PATTERN.test(body)) return "owner";
+  return "owner";
+};
+
+const parseFollowTarget = (body: string): ProfileSettingsTarget => {
+  if (FOLLOW_TARGET_OWNER_PATTERN.test(body)) return "owner";
+  if (FOLLOW_TARGET_AGENT_PATTERN.test(body)) return "agent";
+  return "agent";
+};
+
+const parseDiscoveryLimit = (
+  body: string,
+  fallback = 8,
+): number => {
+  const match =
+    /\b(?:top|first|show|list|give me|find)\s+(\d{1,2})\b/iu.exec(body) ??
+    /\b(\d{1,2})\s+(?:accounts?|agents?|users?|people)\b/iu.exec(body);
+  const raw = match?.[1];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(1, Math.min(20, parsed));
+};
+
+const parseFieldBoolean = (body: string): boolean | null => {
+  const normalized = body.trim().toLowerCase();
+  if (!normalized.length) return null;
+  if (/\b(turn|switch|set)\s+off\b/iu.test(normalized)) return false;
+  if (/\b(turn|switch|set)\s+on\b/iu.test(normalized)) return true;
+  if (/\bhide\b/iu.test(normalized)) return false;
+  if (/\bshow\b/iu.test(normalized)) return true;
+  return parseBooleanChatInput(normalized);
+};
+
+const parseDmPolicyValue = (body: string): DmPolicyValue | null => {
+  if (!DM_POLICY_HINT_PATTERN.test(body)) return null;
+  const normalized = body.toLowerCase();
+  if (/\bmutual(?:\s+only)?\b/iu.test(normalized)) return "mutual_only";
+  if (/\bfollowers?\s+only\b|\bonly\s+followers?\b/iu.test(normalized))
+    return "followers_only";
+  if (
+    /\bfollowing\s+only\b|\bonly\s+following\b|\bpeople\s+i\s+follow\b/iu.test(
+      normalized,
+    )
+  ) {
+    return "following_only";
+  }
+  if (/\beveryone\b|\banyone\b|\ball\b/iu.test(normalized)) return "everyone";
+  return null;
+};
+
+const parseDmAutomatedPolicyValue = (
+  body: string,
+): DmAutomatedPolicyValue | null => {
+  if (!DM_AUTOMATED_POLICY_HINT_PATTERN.test(body)) return null;
+  const normalized = body.toLowerCase();
+  if (/\bdeny\s+all\b|\bblock\s+all\b|\boff\b|\bnone\b/iu.test(normalized))
+    return "deny_all";
+  if (
+    /\ballow\s+followed\b|\bfollowed\s+only\b|\bfollowing\s+only\b/iu.test(
+      normalized,
+    )
+  ) {
+    return "allow_followed";
+  }
+  if (/\ballow\s+all\b|\beveryone\b|\banyone\b|\bon\b/iu.test(normalized))
+    return "allow_all";
+  return null;
+};
+
+const parseAgentReplyPolicyValue = (
+  body: string,
+): AgentReplyPolicyValue | null => {
+  if (!AGENT_REPLY_POLICY_HINT_PATTERN.test(body)) return null;
+  const normalized = body.toLowerCase();
+  if (/\bdeny\s+selected\b|\bselected\s+only\b|\ballow\s+selected\b/iu.test(normalized))
+    return "deny_selected";
+  if (/\bdeny\s+all\b|\boff\b|\bnone\b/iu.test(normalized)) return "deny_all";
+  if (/\ballow\s+all\b|\bon\b|\beveryone\b|\banyone\b/iu.test(normalized))
+    return "allow_all";
+  return null;
+};
+
+const parseDefaultLensIdValue = (body: string): number | null | undefined => {
+  if (!DEFAULT_LENS_HINT_PATTERN.test(body)) return undefined;
+  if (/\b(clear|remove|none|null|off)\b/iu.test(body)) return null;
+  const match =
+    /\bdefault\s+lens(?:\s+id)?\s*(?:to|as|=|:)?\s*(\d+)\b/iu.exec(body) ??
+    /\blens\s+id\s*(?:to|as|=|:)?\s*(\d+)\b/iu.exec(body);
+  const raw = match?.[1];
+  if (!raw) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return parsed;
+};
+
+const parseProfileRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (
+    !PROFILE_MUTATION_VERB_PATTERN.test(body) ||
+    !PROFILE_FIELD_HINT_PATTERN.test(body)
+  ) {
+    return null;
+  }
+  const name = PROFILE_NAME_HINT_PATTERN.test(body)
+    ? extractAssignedText(
+        body,
+        [
+          /\b(?:display\s+name|profile\s+name|name)\s*(?:to|as|=|:)\s*([\s\S]+)$/iu,
+          /\bcall\s+(?:me|you)\s+([\s\S]+)$/iu,
+          /\b(?:display\s+name|profile\s+name|name)\b\s*["“]([^"”]+)["”]/iu,
+        ],
+        80,
+      )
+    : null;
+  const bio = PROFILE_BIO_HINT_PATTERN.test(body)
+    ? extractAssignedText(
+        body,
+        [
+          /\b(?:bio|description|about)\s*(?:to|as|=|:)\s*([\s\S]+)$/iu,
+          /\b(?:bio|description|about)\b\s*["“]([\s\S]+?)["”]/iu,
+        ],
+        2200,
+      )
+    : null;
+  const imageUrl =
+    PROFILE_AVATAR_HINT_PATTERN.test(body) ? extractFirstUrl(body) : null;
+  const bannerUrl =
+    PROFILE_BANNER_HINT_PATTERN.test(body) ? extractFirstUrl(body) : null;
+  const hasAnyUpdate =
+    name !== null ||
+    bio !== null ||
+    typeof imageUrl === "string" ||
+    typeof bannerUrl === "string";
+  if (!hasAnyUpdate) {
+    return {
+      kind: "clarify",
+      reply:
+        "I can apply this directly, but I need exact values. Provide name/bio text or avatar/banner URL.",
+    };
+  }
+  return {
+    kind: "action",
+    payload: {
+      action: "update_profile",
+      target: parseProfileTarget(body),
+      ...(name !== null ? { name } : {}),
+      ...(bio !== null ? { bio } : {}),
+      ...(typeof imageUrl === "string" ? { imageUrl } : {}),
+      ...(typeof bannerUrl === "string" ? { bannerUrl } : {}),
+    },
+  };
+};
+
+const parseSettingsRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (
+    !SETTINGS_FIELD_HINT_PATTERN.test(body) ||
+    !SETTINGS_MUTATION_VERB_PATTERN.test(body)
+  ) {
+    return null;
+  }
+  const readReceipts = READ_RECEIPTS_HINT_PATTERN.test(body)
+    ? parseFieldBoolean(body)
+    : null;
+  const showOnlineStatus = ONLINE_STATUS_HINT_PATTERN.test(body)
+    ? parseFieldBoolean(body)
+    : null;
+  const dmPolicy = parseDmPolicyValue(body);
+  const dmAutomatedPolicy = parseDmAutomatedPolicyValue(body);
+  const agentReplyPolicy = parseAgentReplyPolicyValue(body);
+  const defaultLensId = parseDefaultLensIdValue(body);
+  const hasAnyUpdate =
+    typeof readReceipts === "boolean" ||
+    typeof showOnlineStatus === "boolean" ||
+    dmPolicy !== null ||
+    dmAutomatedPolicy !== null ||
+    agentReplyPolicy !== null ||
+    defaultLensId !== undefined;
+  if (!hasAnyUpdate) {
+    return {
+      kind: "clarify",
+      reply:
+        "I can update settings directly, but I need specific values (for example: read receipts off, dm policy followers only, default lens 12).",
+    };
+  }
+  return {
+    kind: "action",
+    payload: {
+      action: "update_settings",
+      target: parseSettingsTarget(body),
+      ...(typeof readReceipts === "boolean" ? { readReceipts } : {}),
+      ...(typeof showOnlineStatus === "boolean" ? { showOnlineStatus } : {}),
+      ...(dmPolicy ? { dmPolicy } : {}),
+      ...(dmAutomatedPolicy ? { dmAutomatedPolicy } : {}),
+      ...(agentReplyPolicy ? { agentReplyPolicy } : {}),
+      ...(defaultLensId !== undefined ? { defaultLensId } : {}),
+    },
+  };
+};
+
+const parseFollowRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (!FOLLOW_MUTATION_PATTERN.test(body)) return null;
+  if (
+    SUGGESTED_FOLLOW_LOOKUP_PATTERN.test(body) ||
+    BROWSE_AGENT_LOOKUP_PATTERN.test(body)
+  ) {
+    return null;
+  }
+  const handles = parseHandleMentions(body);
+  const primaryHandle = handles[0];
+  if (!primaryHandle) {
+    return {
+      kind: "clarify",
+      reply: "Tell me which handle to follow or unfollow (example: @dev).",
+    };
+  }
+  if (UNFOLLOW_MUTATION_PATTERN.test(body)) {
+    return {
+      kind: "action",
+      payload: {
+        action: "unfollow_user",
+        target: parseFollowTarget(body),
+        handle: primaryHandle,
+      },
+    };
+  }
+  return {
+    kind: "action",
+    payload: {
+      action: "follow_user",
+      target: parseFollowTarget(body),
+      handle: primaryHandle,
+    },
+  };
+};
+
+const parseSuggestFollowersRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (!FOLLOW_DISCOVERY_PATTERN.test(body)) return null;
+  return {
+    kind: "action",
+    payload: {
+      action: "suggest_followers",
+      includeAgents: true,
+      limit: parseDiscoveryLimit(body, 8),
+    },
+  };
+};
+
+const parseBrowseAgentsRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (!BROWSE_AGENT_LOOKUP_PATTERN.test(body)) return null;
+  return {
+    kind: "action",
+    payload: {
+      action: "browse_agents",
+      query: toAnswerPreview(body, 120),
+      limit: parseDiscoveryLimit(body, 8),
+      includeFollowing: true,
+      includeFollowers: true,
+      includeRecentPosters: true,
+    },
+  };
+};
+
+const parseAgentProfileLookupRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (!AGENT_PROFILE_LOOKUP_PATTERN.test(body)) return null;
+  return {
+    kind: "action",
+    payload: {
+      action: "agent_profile",
+    },
+  };
+};
+
+const parseFindUserRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (!LOOKUP_REQUEST_VERB_PATTERN.test(body) || !USER_LOOKUP_PATTERN.test(body)) {
+    return null;
+  }
+  const handles = parseHandleMentions(body);
+  const primaryHandle = handles[0];
+  if (!primaryHandle) return null;
+  return {
+    kind: "action",
+    payload: {
+      action: "find_user",
+      handle: primaryHandle,
+    },
+  };
+};
+
+const parseFindPostRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  const hints = parsePostAndCommentHints(body);
+  const handles = parseHandleMentions(body);
+  const primaryHandle = handles[0];
+  if (LATEST_POST_LOOKUP_PATTERN.test(body) && primaryHandle) {
+    return {
+      kind: "action",
+      payload: {
+        action: "find_post",
+        authorHandle: primaryHandle,
+        latest: true,
+      },
+    };
+  }
+  if (
+    typeof hints.postId === "number" &&
+    (RESOLVE_REFERENCE_LOOKUP_PATTERN.test(body) ||
+      (LOOKUP_REQUEST_VERB_PATTERN.test(body) &&
+        /\b(?:post|thread)\b/iu.test(body)))
+  ) {
+    return {
+      kind: "action",
+      payload: {
+        action: "find_post",
+        postId: hints.postId,
+      },
+    };
+  }
+  return null;
+};
+
+const parseFindCommentRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  const hints = parsePostAndCommentHints(body);
+  if (typeof hints.commentId !== "number") return null;
+  if (typeof hints.postId !== "number") {
+    return {
+      kind: "clarify",
+      reply:
+        "I can look up that comment, but I need the post number too (example: comment 77 on post 12).",
+    };
+  }
+  return {
+    kind: "action",
+    payload: {
+      action: "find_comment",
+      postId: hints.postId,
+      commentId: hints.commentId,
+    },
+  };
+};
+
+const parseBrowsePostsRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (!BROWSE_POST_LOOKUP_PATTERN.test(body)) return null;
+  return {
+    kind: "action",
+    payload: {
+      action: "browse_posts",
+      limit: parseDiscoveryLimit(body, 8),
+    },
+  };
+};
+
+const parseBrowseCommentsRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (!BROWSE_COMMENT_LOOKUP_PATTERN.test(body)) return null;
+  const hints = parsePostAndCommentHints(body);
+  const searchText = toAnswerPreview(body, 160);
+  return {
+    kind: "action",
+    payload: {
+      action: "browse_comments",
+      ...(typeof hints.postId === "number" ? { postId: hints.postId } : {}),
+      ...(typeof hints.postId !== "number" && searchText.length > 0
+        ? { searchText }
+        : {}),
+      limit: parseDiscoveryLimit(body, 10),
+    },
+  };
+};
+
+const parseBrowseNotificationsRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (!BROWSE_NOTIFICATIONS_LOOKUP_PATTERN.test(body)) return null;
+  return {
+    kind: "action",
+    payload: {
+      action: "browse_notifications",
+      unreadOnly: /\b(unread|unanswered|pending)\b/iu.test(body),
+      limit: parseDiscoveryLimit(body, 12),
+    },
+  };
+};
+
+const parseBrowseHomeFeedRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (!BROWSE_HOME_FEED_LOOKUP_PATTERN.test(body)) return null;
+  return {
+    kind: "action",
+    payload: {
+      action: "browse_home_feed",
+      limit: parseDiscoveryLimit(body, 10),
+    },
+  };
+};
+
+const parseBrowseTopEngagersRouteAction = (
+  body: string,
+): DeterministicRouteParseResult | null => {
+  if (!BROWSE_TOP_ENGAGERS_LOOKUP_PATTERN.test(body)) return null;
+  return {
+    kind: "action",
+    payload: {
+      action: "browse_top_engagers",
+      limit: parseDiscoveryLimit(body, 8),
+      windowHours: parseLookupWindowHours(body) ?? 24 * 7,
+    },
+  };
+};
+
+const summarizeProfileRouteSuccess = (
+  payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  if (payload.action !== "update_profile" || !hasDeterministicRouteTarget(payload)) {
+    return "Profile update applied.";
+  }
+  const targetLabel = payload.target === "owner" ? "owner" : "agent";
+  const responseRecord = isRecord(response) ? response : null;
+  const userRecord =
+    responseRecord && isRecord(responseRecord.user) ? responseRecord.user : null;
+  const handleRaw =
+    userRecord && typeof userRecord.handle === "string" ? userRecord.handle.trim() : "";
+  const normalizedHandle = handleRaw.replace(/^@+/u, "");
+  const updatedFields: string[] = [];
+  if (payload.action === "update_profile" && payload.name !== undefined)
+    updatedFields.push("name");
+  if (payload.action === "update_profile" && payload.bio !== undefined)
+    updatedFields.push("bio");
+  if (payload.action === "update_profile" && payload.imageUrl !== undefined)
+    updatedFields.push("avatar");
+  if (payload.action === "update_profile" && payload.bannerUrl !== undefined)
+    updatedFields.push("banner");
+  return `Updated ${targetLabel} profile${
+    normalizedHandle.length > 0 ? ` (@${normalizedHandle})` : ""
+  }: ${updatedFields.join(", ")}.`;
+};
+
+const summarizeSettingsRouteSuccess = (
+  payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  if (payload.action !== "update_settings" || !hasDeterministicRouteTarget(payload)) {
+    return "Settings update applied.";
+  }
+  const targetLabel = payload.target === "owner" ? "owner" : "agent";
+  const responseRecord = isRecord(response) ? response : null;
+  const settingsRecord =
+    responseRecord && isRecord(responseRecord.settings) ? responseRecord.settings : null;
+  const settingSummaries: string[] = [];
+  if (payload.action === "update_settings" && payload.defaultLensId !== undefined) {
+    const value =
+      settingsRecord && typeof settingsRecord.defaultLensId === "number"
+        ? settingsRecord.defaultLensId
+        : payload.defaultLensId;
+    settingSummaries.push(
+      value === null ? "defaultLens=none" : `defaultLens=${String(value)}`,
+    );
+  }
+  if (payload.action === "update_settings" && payload.readReceipts !== undefined) {
+    const value =
+      settingsRecord && typeof settingsRecord.readReceipts === "boolean"
+        ? settingsRecord.readReceipts
+        : payload.readReceipts;
+    settingSummaries.push(`readReceipts=${value ? "on" : "off"}`);
+  }
+  if (payload.action === "update_settings" && payload.dmPolicy !== undefined) {
+    const value =
+      settingsRecord && typeof settingsRecord.dmPolicy === "string"
+        ? settingsRecord.dmPolicy
+        : payload.dmPolicy;
+    settingSummaries.push(`dmPolicy=${value}`);
+  }
+  if (
+    payload.action === "update_settings" &&
+    payload.dmAutomatedPolicy !== undefined
+  ) {
+    const value =
+      settingsRecord && typeof settingsRecord.dmAutomatedPolicy === "string"
+        ? settingsRecord.dmAutomatedPolicy
+        : payload.dmAutomatedPolicy;
+    settingSummaries.push(`dmAutomatedPolicy=${value}`);
+  }
+  if (
+    payload.action === "update_settings" &&
+    payload.agentReplyPolicy !== undefined
+  ) {
+    const value =
+      settingsRecord && typeof settingsRecord.agentReplyPolicy === "string"
+        ? settingsRecord.agentReplyPolicy
+        : payload.agentReplyPolicy;
+    settingSummaries.push(`agentReplyPolicy=${value}`);
+  }
+  if (
+    payload.action === "update_settings" &&
+    payload.showOnlineStatus !== undefined
+  ) {
+    const value =
+      settingsRecord && typeof settingsRecord.showOnlineStatus === "boolean"
+        ? settingsRecord.showOnlineStatus
+        : payload.showOnlineStatus;
+    settingSummaries.push(`showOnlineStatus=${value ? "on" : "off"}`);
+  }
+  return `Updated ${targetLabel} settings: ${settingSummaries.join(", ")}.`;
+};
+
+const summarizeFollowRouteSuccess = (
+  payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  if (payload.action !== "follow_user" && payload.action !== "unfollow_user") {
+    return "Follow action completed.";
+  }
+  const responseRecord = isRecord(response) ? response : null;
+  const userRecord =
+    responseRecord && isRecord(responseRecord.user) ? responseRecord.user : null;
+  const handleRaw =
+    userRecord && typeof userRecord.handle === "string" ? userRecord.handle.trim() : "";
+  const normalizedHandle =
+    handleRaw.length > 0
+      ? handleRaw.replace(/^@+/u, "")
+      : typeof payload.handle === "string"
+        ? payload.handle.replace(/^@+/u, "")
+        : "unknown";
+  const accountLabel =
+    payload.target === "owner" ? "owner account" : "agent account";
+  if (payload.action === "unfollow_user") {
+    const removed =
+      responseRecord && typeof responseRecord.removed === "boolean"
+        ? responseRecord.removed
+        : true;
+    if (!removed) {
+      return `@${normalizedHandle} was already not followed on ${accountLabel}.`;
+    }
+    return `Unfollowed @${normalizedHandle} on ${accountLabel}.`;
+  }
+  const created =
+    responseRecord && typeof responseRecord.created === "boolean"
+      ? responseRecord.created
+      : true;
+  if (!created) {
+    return `Already following @${normalizedHandle} on ${accountLabel}.`;
+  }
+  return `Now following @${normalizedHandle} on ${accountLabel}.`;
+};
+
+const summarizeFollowDiscoveryRouteSuccess = (
+  payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  if (
+    payload.action !== "suggest_followers" &&
+    payload.action !== "browse_agents"
+  ) {
+    return "Lookup completed.";
+  }
+  const responseRecord = isRecord(response) ? response : null;
+  const rows = Array.isArray(responseRecord?.items)
+    ? responseRecord.items
+    : [];
+  const handles = rows
+    .filter((entry): entry is Record<string, unknown> => isRecord(entry))
+    .map((entry) =>
+      typeof entry.handle === "string"
+        ? entry.handle.trim().replace(/^@+/u, "")
+        : "",
+    )
+    .filter((entry) => entry.length > 0)
+    .slice(0, 6);
+  if (handles.length === 0) {
+    return "I couldn’t find good follow suggestions right now.";
+  }
+  return `Top follow suggestions: ${handles.map((handle) => `@${handle}`).join(", ")}.`;
+};
+
+const summarizeAgentProfileLookupSuccess = (
+  _payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  const responseRecord = isRecord(response) ? response : null;
+  const owner =
+    responseRecord && isRecord(responseRecord.owner) ? responseRecord.owner : null;
+  const agent =
+    responseRecord && isRecord(responseRecord.agent) ? responseRecord.agent : null;
+  const ownerHandleRaw =
+    owner && typeof owner.handle === "string" ? owner.handle.trim() : "";
+  const agentHandleRaw =
+    agent && typeof agent.handle === "string" ? agent.handle.trim() : "";
+  const ownerHandle = ownerHandleRaw.replace(/^@+/u, "");
+  const agentHandle = agentHandleRaw.replace(/^@+/u, "");
+  if (!ownerHandle.length && !agentHandle.length) {
+    return "I couldn’t resolve owner/profile linkage right now.";
+  }
+  if (!ownerHandle.length) {
+    return `Agent profile is @${agentHandle}. Owner linkage was not available.`;
+  }
+  if (!agentHandle.length) {
+    return `Owner is @${ownerHandle}.`;
+  }
+  return `Owner is @${ownerHandle}. Agent profile is @${agentHandle}.`;
+};
+
+const summarizeFindUserRouteSuccess = (
+  _payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  const users = pickUserRecordsFromLookup(response).map((entry) => summarizeUserRecord(entry));
+  const first = users[0];
+  if (!first) return "I couldn’t find that account.";
+  const handleLabel = first.handle ? `@${first.handle}` : "that account";
+  const reasonText = first.reason ? ` ${first.reason}.` : "";
+  return `Found ${handleLabel}.${reasonText}`.trim();
+};
+
+const summarizeFindPostRouteSuccess = (
+  _payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  const post = pickPostRecordFromLookup(response);
+  if (!post) return "I couldn’t find that post.";
+  const summary = summarizePostRecord(post);
+  return `Found ${summary.line}.`;
+};
+
+const summarizeFindCommentRouteSuccess = (
+  _payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  const comments = pickCommentRecordsFromLookup(response).map((entry) =>
+    summarizeCommentRecord(entry),
+  );
+  const first = comments[0];
+  if (!first) return "I couldn’t find that comment.";
+  return `Found ${first.line}.`;
+};
+
+const summarizeBrowsePostsRouteSuccess = (
+  _payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  const posts = pickPostRecordsFromLookup(response)
+    .map((entry) => summarizePostRecord(entry))
+    .slice(0, 3);
+  if (posts.length === 0) return "No posts found right now.";
+  return `Top posts: ${posts.map((entry) => entry.line).join(" | ")}.`;
+};
+
+const summarizeBrowseCommentsRouteSuccess = (
+  _payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  const comments = pickCommentRecordsFromLookup(response)
+    .map((entry) => summarizeCommentRecord(entry))
+    .slice(0, 3);
+  if (comments.length === 0) return "No comments found for that request.";
+  return `Top comments: ${comments.map((entry) => entry.line).join(" | ")}.`;
+};
+
+const summarizeBrowseNotificationsRouteSuccess = (
+  _payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  const responseRecord = isRecord(response) ? response : null;
+  const rows = Array.isArray(responseRecord?.items)
+    ? responseRecord.items.filter((entry): entry is Record<string, unknown> =>
+        isRecord(entry),
+      )
+    : [];
+  if (rows.length === 0) return "No matching notifications right now.";
+  const summaries = rows.slice(0, 4).map((row) => {
+    const actor =
+      isRecord(row.actor) && typeof row.actor.handle === "string"
+        ? row.actor.handle.trim().replace(/^@+/u, "")
+        : null;
+    const type =
+      typeof row.type === "string" && row.type.trim().length > 0
+        ? row.type.trim()
+        : "event";
+    const read = typeof row.readAt === "string" && row.readAt.trim().length > 0;
+    return `${type}${actor ? ` from @${actor}` : ""}${read ? " (read)" : " (unread)"}`;
+  });
+  return `Notifications: ${summaries.join("; ")}.`;
+};
+
+const summarizeBrowseTopEngagersRouteSuccess = (
+  _payload: DeterministicRoutePayload,
+  response: unknown,
+): string => {
+  const responseRecord = isRecord(response) ? response : null;
+  const rows = Array.isArray(responseRecord?.items)
+    ? responseRecord.items.filter((entry): entry is Record<string, unknown> =>
+        isRecord(entry),
+      )
+    : [];
+  if (rows.length === 0) return "No top engagers found for that window.";
+  const summaries = rows.slice(0, 4).map((row) => {
+    const handle =
+      isRecord(row.user) && typeof row.user.handle === "string"
+        ? row.user.handle.trim().replace(/^@+/u, "")
+        : "unknown";
+    const score =
+      typeof row.score === "number" && Number.isFinite(row.score)
+        ? Math.round(row.score)
+        : (toFinitePositiveInt(row.commentCount) ?? 0) * 3 +
+          (toFinitePositiveInt(row.repostCount) ?? 0) * 2 +
+          (toFinitePositiveInt(row.likeCount) ?? 0) * 2 +
+          (toFinitePositiveInt(row.viewCount) ?? 0);
+    return `@${handle} (score ${score})`;
+  });
+  return `Top engagers: ${summaries.join(", ")}.`;
+};
+
+const DETERMINISTIC_ROUTE_POLICY_TARGETED_DM: DeterministicRoutePolicy = {
+  dmOnly: true,
+  allowChannel: false,
+  allowedTargets: ["agent", "owner"],
+  requireLinkedOwnerForOwnerTarget: true,
+};
+
+const DETERMINISTIC_ROUTE_POLICY_DM_ONLY: DeterministicRoutePolicy = {
+  dmOnly: true,
+  allowChannel: false,
+};
+
+// Single registration table: add a parser + policy + success formatter here
+// to introduce a new deterministic chat route without touching the executor.
+const DETERMINISTIC_ROUTE_REGISTRATIONS: readonly DeterministicRouteRegistration[] =
+  [
+    {
+      action: "update_profile",
+      parse: parseProfileRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_TARGETED_DM,
+      summarizeSuccess: summarizeProfileRouteSuccess,
+      failureLabel: "profile update",
+    },
+    {
+      action: "update_settings",
+      parse: parseSettingsRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_TARGETED_DM,
+      summarizeSuccess: summarizeSettingsRouteSuccess,
+      failureLabel: "settings update",
+    },
+    {
+      action: "follow_user",
+      parse: parseFollowRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_TARGETED_DM,
+      summarizeSuccess: summarizeFollowRouteSuccess,
+      failureLabel: "follow request",
+    },
+    {
+      action: "unfollow_user",
+      parse: parseFollowRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_TARGETED_DM,
+      summarizeSuccess: summarizeFollowRouteSuccess,
+      failureLabel: "unfollow request",
+    },
+    {
+      action: "browse_agents",
+      parse: parseBrowseAgentsRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeFollowDiscoveryRouteSuccess,
+      failureLabel: "agent discovery lookup",
+    },
+    {
+      action: "suggest_followers",
+      parse: parseSuggestFollowersRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeFollowDiscoveryRouteSuccess,
+      failureLabel: "follower suggestion lookup",
+    },
+    {
+      action: "agent_profile",
+      parse: parseAgentProfileLookupRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeAgentProfileLookupSuccess,
+      failureLabel: "agent profile lookup",
+    },
+    {
+      action: "find_user",
+      parse: parseFindUserRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeFindUserRouteSuccess,
+      failureLabel: "user lookup",
+    },
+    {
+      action: "find_post",
+      parse: parseFindPostRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeFindPostRouteSuccess,
+      failureLabel: "post lookup",
+    },
+    {
+      action: "find_comment",
+      parse: parseFindCommentRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeFindCommentRouteSuccess,
+      failureLabel: "comment lookup",
+    },
+    {
+      action: "browse_posts",
+      parse: parseBrowsePostsRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeBrowsePostsRouteSuccess,
+      failureLabel: "post browse lookup",
+    },
+    {
+      action: "browse_comments",
+      parse: parseBrowseCommentsRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeBrowseCommentsRouteSuccess,
+      failureLabel: "comment browse lookup",
+    },
+    {
+      action: "browse_notifications",
+      parse: parseBrowseNotificationsRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeBrowseNotificationsRouteSuccess,
+      failureLabel: "notification lookup",
+    },
+    {
+      action: "browse_home_feed",
+      parse: parseBrowseHomeFeedRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeBrowsePostsRouteSuccess,
+      failureLabel: "home feed lookup",
+    },
+    {
+      action: "browse_top_engagers",
+      parse: parseBrowseTopEngagersRouteAction,
+      policy: DETERMINISTIC_ROUTE_POLICY_DM_ONLY,
+      summarizeSuccess: summarizeBrowseTopEngagersRouteSuccess,
+      failureLabel: "top engager lookup",
+    },
+  ];
+
+const parseDeterministicRouteAction = (
+  body: string,
+): DeterministicRouteMatch | null => {
+  for (const registration of DETERMINISTIC_ROUTE_REGISTRATIONS) {
+    const parsed = registration.parse(body);
+    if (!parsed) continue;
+    if (parsed.kind === "clarify") return parsed;
+    if (parsed.payload.action !== registration.action) continue;
+    return {
+      kind: "action",
+      payload: parsed.payload,
+      registration,
+    };
+  }
+  return null;
+};
+
 const parseRetentionDaysInput = (value: string): number | null => {
   const normalized = value.trim().toLowerCase();
   if (!normalized.length) return null;
@@ -1322,6 +2461,23 @@ export class ChatManager implements ChatManagerLike {
                 conversationId: entry.conversationId,
                 channelId: entry.channelId,
                 replyPreview: toAnswerPreview(retentionReply, 220),
+              })
+              .catch(() => undefined);
+            continue;
+          }
+          const deterministicRouteReply =
+            await this.handleDeterministicRouteAction(entry);
+          if (deterministicRouteReply) {
+            await this.sendReply(entry, deterministicRouteReply).catch(() => undefined);
+            this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
+            await this.ctx.memory
+              .recordWrite({
+                type: "chat_runtime_route_action_reply_sent",
+                at: nowIso(),
+                messageId: entry.messageId,
+                conversationId: entry.conversationId,
+                channelId: entry.channelId,
+                replyPreview: toAnswerPreview(deterministicRouteReply, 220),
               })
               .catch(() => undefined);
             continue;
@@ -2138,6 +3294,140 @@ export class ChatManager implements ChatManagerLike {
     return this.retentionStepPrompt(dialog.step);
   }
 
+  private async handleDeterministicRouteAction(
+    entry: ChatInboxEntry,
+  ): Promise<string | null> {
+    const body = entry.body.trim();
+    if (!body.length) return null;
+    const matched = parseDeterministicRouteAction(body);
+    if (!matched) return null;
+    if (matched.kind === "clarify") {
+      await this.ctx.memory
+        .recordWrite({
+          type: "chat_runtime_route_action_clarify",
+          at: nowIso(),
+          messageId: entry.messageId,
+          conversationId: entry.conversationId,
+          channelId: entry.channelId,
+          bodyPreview: toAnswerPreview(body, 180),
+          clarification: toAnswerPreview(matched.reply, 220),
+        })
+        .catch(() => undefined);
+      return truncateChatReply(
+        matched.reply,
+        this.ctx.config.chatRuntimeReplyMaxChars,
+      );
+    }
+
+    const { payload, registration } = matched;
+    const policy = registration.policy;
+    if (policy.dmOnly && !entry.conversationId) return null;
+    if (!policy.allowChannel && entry.channelId) return null;
+    const payloadTarget = hasDeterministicRouteTarget(payload)
+      ? payload.target
+      : null;
+    if (
+      payloadTarget &&
+      Array.isArray(policy.allowedTargets) &&
+      !policy.allowedTargets.includes(payloadTarget)
+    ) {
+      const blockedTargetReply = `I can’t apply that route target (${payloadTarget}) for this action.`;
+      await this.ctx.memory
+        .recordWrite({
+          type: "chat_runtime_route_action_permission_denied",
+          at: nowIso(),
+          messageId: entry.messageId,
+          conversationId: entry.conversationId,
+          channelId: entry.channelId,
+          action: payload.action,
+          target: payloadTarget,
+          reason: "target_not_allowed",
+          bodyPreview: toAnswerPreview(body, 180),
+        })
+        .catch(() => undefined);
+      return truncateChatReply(
+        blockedTargetReply,
+        this.ctx.config.chatRuntimeReplyMaxChars,
+      );
+    }
+    if (
+      payloadTarget === "owner" &&
+      policy.requireLinkedOwnerForOwnerTarget
+    ) {
+      const linkedOwner = await this.loadLinkedOwnerIdentity();
+      if (!linkedOwner) {
+        const missingOwnerReply =
+          "This agent is not linked to an owner account, so I can only update agent-side profile/settings right now.";
+        await this.ctx.memory
+          .recordWrite({
+            type: "chat_runtime_route_action_owner_unlinked",
+            at: nowIso(),
+            messageId: entry.messageId,
+            conversationId: entry.conversationId,
+            channelId: entry.channelId,
+            action: payload.action,
+            target: payloadTarget,
+            bodyPreview: toAnswerPreview(body, 180),
+          })
+          .catch(() => undefined);
+        return truncateChatReply(
+          missingOwnerReply,
+          this.ctx.config.chatRuntimeReplyMaxChars,
+        );
+      }
+    }
+
+    await this.ctx.memory
+      .recordWrite({
+        type: "chat_runtime_route_action_started",
+        at: nowIso(),
+        messageId: entry.messageId,
+        conversationId: entry.conversationId,
+        channelId: entry.channelId,
+        action: payload.action,
+        target: payloadTarget,
+        payload,
+      })
+      .catch(() => undefined);
+    try {
+      const response = await this.ctx.callAgentChatBridge(payload);
+      const reply = registration.summarizeSuccess(payload, response);
+      await this.ctx.memory
+        .recordWrite({
+          type: "chat_runtime_route_action_applied",
+          at: nowIso(),
+          messageId: entry.messageId,
+          conversationId: entry.conversationId,
+          channelId: entry.channelId,
+          action: payload.action,
+          target: payloadTarget,
+          payload,
+          response: isRecord(response) ? response : null,
+          replyPreview: toAnswerPreview(reply, 220),
+        })
+        .catch(() => undefined);
+      return truncateChatReply(reply, this.ctx.config.chatRuntimeReplyMaxChars);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      const label = registration.failureLabel;
+      const reply = `I could not apply that ${label} right now: ${toAnswerPreview(message, 200)}.`;
+      await this.ctx.memory
+        .recordWrite({
+          type: "chat_runtime_route_action_failed",
+          at: nowIso(),
+          messageId: entry.messageId,
+          conversationId: entry.conversationId,
+          channelId: entry.channelId,
+          action: payload.action,
+          target: payloadTarget,
+          payload,
+          error: toAnswerPreview(message, 220),
+        })
+        .catch(() => undefined);
+      return truncateChatReply(reply, this.ctx.config.chatRuntimeReplyMaxChars);
+    }
+  }
+
   private async loadDrilldownContext(
     entry: ChatInboxEntry,
     conversationHistory: unknown[],
@@ -2264,6 +3554,7 @@ export class ChatManager implements ChatManagerLike {
         "- list_messages: fetch DM/channel history and reply target content",
         "- find_post / find_comment / find_user / find_gif / find_custom_assets / browse_assets / suggest_followers / browse_posts / browse_comments / browse_agents / browse_notifications / browse_home_feed / browse_trending / browse_post_activity / browse_comment_activity / browse_top_engagers / browse_unanswered_mentions / browse_drafts / browse_directive_queue / browse_servers / browse_channels / browse_members / browse_lenses / search_global / resolve_reference / browse_recent_actions: live site lookups",
         "- send_message / edit_message / typing: conversational response + status updates",
+        "- follow_user / unfollow_user / update_profile / update_settings / save_custom_asset: direct bridge write actions (restricted to agent or linked owner targets)",
         "- memory context: keyword retrieval, long-term archive retrieval, view state, engagement presets",
         "- retention control (DM-only): guided retention policy updates",
         "- when conversion is ambiguous, use these capabilities first; ask follow-up only when no route can resolve the request",

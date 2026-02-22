@@ -77,7 +77,32 @@ const parseIsoToMs = (value: unknown): number | null => {
   return Number.isFinite(ms) ? ms : null;
 };
 
-const MAX_NOT_READY_REQUEUE_ATTEMPTS = 8;
+const NOT_READY_MIN_REQUEUE_DELAY_SECONDS = 2;
+const NOT_READY_MAX_REQUEUE_DELAY_SECONDS = 300;
+
+const computeNotReadyRequeueDelaySeconds = (attempts: number): number => {
+  const normalizedAttempts =
+    Number.isFinite(attempts) && attempts > 0 ? Math.trunc(attempts) : 1;
+  if (normalizedAttempts <= 3) {
+    return Math.max(
+      NOT_READY_MIN_REQUEUE_DELAY_SECONDS,
+      normalizedAttempts * 2,
+    );
+  }
+  if (normalizedAttempts <= 8) {
+    return Math.min(
+      NOT_READY_MAX_REQUEUE_DELAY_SECONDS,
+      12 + (normalizedAttempts - 3) * 8,
+    );
+  }
+  if (normalizedAttempts <= 20) {
+    return Math.min(
+      NOT_READY_MAX_REQUEUE_DELAY_SECONDS,
+      60 + (normalizedAttempts - 8) * 10,
+    );
+  }
+  return NOT_READY_MAX_REQUEUE_DELAY_SECONDS;
+};
 
 // ---------------------------------------------------------------------------
 // QueueManager
@@ -330,36 +355,28 @@ export class QueueManager implements QueueManagerLike {
 
       const processed = await this.ctx.processCommandFile(item.inboxFile);
       if (!processed) {
-        let markedTerminal = false;
-        let terminalError = "not_ready";
+        let nextAttemptCount = 1;
+        let nextDueAt = new Date(Date.now() + 5_000).toISOString();
+        let preservedError = "not_ready";
         await this.mutateQueueState((current) => {
           const next = { ...current };
           next.items = current.items.map((qi) => {
             if (qi.id !== item.id) return qi;
-            const preservedError =
+            preservedError =
               typeof qi.lastError === "string" &&
               qi.lastError.trim().length > 0
                 ? qi.lastError.trim()
                 : "not_ready";
-            if (
+            nextAttemptCount =
               typeof qi.attempts === "number" &&
               Number.isFinite(qi.attempts) &&
-              qi.attempts >= MAX_NOT_READY_REQUEUE_ATTEMPTS
-            ) {
-              markedTerminal = true;
-              terminalError = `${preservedError}:max_not_ready_retries`;
-              return {
-                ...qi,
-                status: "failed" as QueueItem["status"],
-                completedAt: nowIso(),
-                lastError: terminalError,
-              };
-            }
-            const retryDelaySeconds = Math.max(
-              2,
-              Math.min(60, (typeof qi.attempts === "number" ? qi.attempts : 1) * 2),
+              qi.attempts > 0
+                ? Math.trunc(qi.attempts)
+                : 1;
+            const retryDelaySeconds = computeNotReadyRequeueDelaySeconds(
+              nextAttemptCount,
             );
-            const nextDueAt = new Date(
+            nextDueAt = new Date(
               Date.now() + retryDelaySeconds * 1000,
             ).toISOString();
             return {
@@ -372,17 +389,21 @@ export class QueueManager implements QueueManagerLike {
           });
           return next;
         });
-        if (markedTerminal) {
-          await this.ctx.memory.recordWrite({
-            type: "directive_queue_not_ready_max_retries",
-            at: nowIso(),
-            source: "queue_runner",
-            directiveId: item.directiveId,
-            inboxFile: item.inboxFile,
-            error: terminalError,
-            maxAttempts: MAX_NOT_READY_REQUEUE_ATTEMPTS,
-          });
-        }
+        const nextDueAtMs = parseIsoToMs(nextDueAt);
+        const retryInSeconds =
+          typeof nextDueAtMs === "number" && Number.isFinite(nextDueAtMs)
+            ? Math.max(1, Math.round((nextDueAtMs - Date.now()) / 1000))
+            : computeNotReadyRequeueDelaySeconds(nextAttemptCount);
+        await this.ctx.memory.recordWrite({
+          type: "directive_queue_not_ready_requeued",
+          at: nowIso(),
+          source: "queue_runner",
+          directiveId: item.directiveId,
+          inboxFile: item.inboxFile,
+          error: preservedError,
+          attempts: nextAttemptCount,
+          retryInSeconds,
+        });
         return;
       }
 

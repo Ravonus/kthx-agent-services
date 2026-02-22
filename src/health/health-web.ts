@@ -48,6 +48,13 @@ const PUBLISH_RESULT = "publish_attempt_result";
 const CHAT_AUTO_REPLY = "chat_runtime_auto_reply_sent";
 const MEMORY_REFRESH = "memory_temporal_refreshed";
 const NOTIFICATIONS_FLUSHED = "notifications_buffer_flushed";
+const ENGAGEMENT_CONTEXT_SEED = "engagement_context_seed";
+const ENGAGEMENT_CONTEXT_PRIME_COMPLETED = "engagement_context_prime_completed";
+const ENGAGEMENT_CONTEXT_PRIME_EMPTY = "engagement_context_prime_empty";
+const ENGAGEMENT_TARGET_RESOLVED = "engagement_target_resolved";
+const ENGAGEMENT_TARGET_RESOLUTION_FAILED = "engagement_target_resolution_failed";
+const QUEUE_NOT_READY_REQUEUED = "directive_queue_not_ready_requeued";
+const INBOX_COMMAND_REQUEUED = "inbox_command_requeued";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1752,6 +1759,458 @@ const parseJsonLines = (lines: string[]): Record<string, unknown>[] => {
 const eventAt = (envelope: Record<string, unknown>, payload: Record<string, unknown> | null): string | null =>
   iso(envelope.receivedAt) ?? iso(payload?.at) ?? null;
 
+type PipelineEventRow = {
+  at: string;
+  type: string;
+  payload: Record<string, unknown> | null;
+  source: "writes" | "state_events";
+};
+
+type PipelineStageStatus = "ok" | "warn" | "bad" | "idle";
+
+const stageBadgeForPipeline = (
+  status: PipelineStageStatus,
+): { label: string; color: string } => {
+  if (status === "ok") return { label: "OK", color: "ok" };
+  if (status === "warn") return { label: "WARN", color: "warn" };
+  if (status === "bad") return { label: "BAD", color: "bad" };
+  return { label: "IDLE", color: "neutral" };
+};
+
+const parsePipelineEventsFromWrites = (
+  rows: Record<string, unknown>[],
+): PipelineEventRow[] => {
+  const events: PipelineEventRow[] = [];
+  for (const envelope of rows) {
+    const payload = isRecord(envelope.payload) ? envelope.payload : null;
+    if (!payload) continue;
+    const type = str(payload.type);
+    if (!type) continue;
+    const at = eventAt(envelope, payload);
+    if (!at) continue;
+    events.push({ at, type, payload, source: "writes" });
+  }
+  return events;
+};
+
+const parsePipelineEventsFromStateEvents = (
+  rows: Record<string, unknown>[],
+): PipelineEventRow[] => {
+  const events: PipelineEventRow[] = [];
+  for (const row of rows) {
+    const eventType = str(row.eventType);
+    const rowPayload = isRecord(row.payload) ? row.payload : null;
+    const nestedPayload =
+      rowPayload && isRecord(rowPayload.payload) ? rowPayload.payload : null;
+    const payload = nestedPayload ?? rowPayload ?? null;
+    const type = eventType ?? str(payload?.type);
+    const at = iso(row.at) ?? iso(rowPayload?.receivedAt) ?? iso(payload?.at);
+    if (!type || !at) continue;
+    events.push({ at, type, payload, source: "state_events" });
+  }
+  return events;
+};
+
+const parseNotificationItems = (
+  rows: Record<string, unknown>[],
+): Array<{ at: string; payload: Record<string, unknown> | null }> => {
+  const out: Array<{ at: string; payload: Record<string, unknown> | null }> = [];
+  for (const envelope of rows) {
+    const payload = isRecord(envelope.payload) ? envelope.payload : null;
+    const type = str(payload?.type);
+    const at = iso(envelope.receivedAt) ?? iso(payload?.at);
+    if (!at) continue;
+    if (type && type !== "notification_created") continue;
+    out.push({ at, payload });
+  }
+  return out;
+};
+
+const filterRowsByRange = <T extends { at: string }>(
+  rows: T[],
+  sinceMs: number,
+  nowMs: number,
+): T[] =>
+  rows.filter((row) => {
+    const atMs = Date.parse(row.at);
+    return Number.isFinite(atMs) && atMs >= sinceMs && atMs <= nowMs;
+  });
+
+const buildPipelineDiagnostics = (input: {
+  writeRecords: Record<string, unknown>[];
+  stateEvents: Record<string, unknown>[];
+  inboxRecords: Record<string, unknown>[];
+  notificationRecords: Record<string, unknown>[];
+  lifecycleRows: Record<string, unknown>[];
+  rangeMs: number;
+}): Record<string, unknown> => {
+  const nowMs = Date.now();
+  const safeRangeMs = Math.max(60_000, Math.min(366 * 86_400_000, input.rangeMs));
+  const sinceMs = nowMs - safeRangeMs;
+  const writesEvents = parsePipelineEventsFromWrites(input.writeRecords);
+  const stateEvents = parsePipelineEventsFromStateEvents(input.stateEvents);
+  const usingWrites = writesEvents.length > 0;
+  const pipelineEventsAll = usingWrites ? writesEvents : stateEvents;
+  const pipelineEvents = filterRowsByRange(pipelineEventsAll, sinceMs, nowMs);
+  const notificationRows = filterRowsByRange(
+    parseNotificationItems(input.notificationRecords),
+    sinceMs,
+    nowMs,
+  );
+  const inboxRows = filterRowsByRange(
+    input.inboxRecords
+      .map((row) => ({
+        at: iso(row.at) ?? iso(row.receivedAt) ?? "",
+      }))
+      .filter((row): row is { at: string } => row.at.length > 0),
+    sinceMs,
+    nowMs,
+  );
+
+  const eventsByType = new Map<string, PipelineEventRow[]>();
+  for (const event of pipelineEvents) {
+    const bucket = eventsByType.get(event.type) ?? [];
+    bucket.push(event);
+    eventsByType.set(event.type, bucket);
+  }
+  for (const bucket of eventsByType.values()) {
+    bucket.sort((a, b) =>
+      a.at < b.at ? 1 : a.at > b.at ? -1 : 0,
+    );
+  }
+
+  const latestEvent = (types: readonly string[]): PipelineEventRow | null => {
+    let best: PipelineEventRow | null = null;
+    for (const type of types) {
+      const candidate = eventsByType.get(type)?.[0] ?? null;
+      if (!candidate) continue;
+      if (!best || candidate.at > best.at) best = candidate;
+    }
+    return best;
+  };
+  const countEvents = (types: readonly string[]): number =>
+    types.reduce((sum, type) => sum + (eventsByType.get(type)?.length ?? 0), 0);
+
+  const stageRows = {
+    notifications: notificationRows.length,
+    notificationsFlushed: countEvents([NOTIFICATIONS_FLUSHED]),
+    contextSeed: countEvents([ENGAGEMENT_CONTEXT_SEED]),
+    contextPrimeCompleted: countEvents([ENGAGEMENT_CONTEXT_PRIME_COMPLETED]),
+    contextPrimeEmpty: countEvents([ENGAGEMENT_CONTEXT_PRIME_EMPTY]),
+    targetResolved: countEvents([ENGAGEMENT_TARGET_RESOLVED]),
+    targetFailed: countEvents([ENGAGEMENT_TARGET_RESOLUTION_FAILED]),
+    queueNotReadyRequeued: countEvents([QUEUE_NOT_READY_REQUEUED]),
+    inboxCommandRequeued: countEvents([INBOX_COMMAND_REQUEUED]),
+    directivesExecuted: countEvents([DIRECTIVE_EXECUTED]),
+    directivesFailed: countEvents([DIRECTIVE_FAILED]),
+  };
+
+  const notificationsLatestAt = notificationRows[notificationRows.length - 1]?.at ?? null;
+  const flushLatest = latestEvent([NOTIFICATIONS_FLUSHED]);
+  const seedLatest = latestEvent([ENGAGEMENT_CONTEXT_SEED]);
+  const primeLatest = latestEvent([
+    ENGAGEMENT_CONTEXT_PRIME_COMPLETED,
+    ENGAGEMENT_CONTEXT_PRIME_EMPTY,
+  ]);
+  const targetLatest = latestEvent([
+    ENGAGEMENT_TARGET_RESOLVED,
+    ENGAGEMENT_TARGET_RESOLUTION_FAILED,
+  ]);
+  const requeueLatest = latestEvent([
+    QUEUE_NOT_READY_REQUEUED,
+    INBOX_COMMAND_REQUEUED,
+  ]);
+  const directivesLatest = latestEvent([DIRECTIVE_EXECUTED, DIRECTIVE_FAILED]);
+
+  const lifecycleRows = input.lifecycleRows
+    .map((row) => {
+      const updatedAt = iso(row.updatedAt) ?? iso(row.createdAt) ?? null;
+      const state = str(row.state);
+      if (!updatedAt || !state) return null;
+      return {
+        updatedAt,
+        state,
+        attempts: intFromUnknown(row.attempts) ?? 0,
+        directiveId: str(row.directiveId),
+        action: str(row.action),
+        lastError: str(row.lastError),
+      };
+    })
+    .filter(
+      (row): row is {
+        updatedAt: string;
+        state: string;
+        attempts: number;
+        directiveId: string | null;
+        action: string | null;
+        lastError: string | null;
+      } => row !== null,
+    )
+    .filter((row) => {
+      const atMs = Date.parse(row.updatedAt);
+      return Number.isFinite(atMs) && atMs >= sinceMs && atMs <= nowMs;
+    });
+  const lifecycleCounts = new Map<string, number>();
+  for (const row of lifecycleRows) {
+    lifecycleCounts.set(row.state, (lifecycleCounts.get(row.state) ?? 0) + 1);
+  }
+  const lifecycleLatest =
+    lifecycleRows.length > 0
+      ? lifecycleRows.slice().sort((a, b) =>
+          a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0,
+        )[0] ?? null
+      : null;
+  const lifecycleStuck = lifecycleRows.filter((row) => {
+    if (!["queued", "context_ready", "llm_running", "action_running", "requeue"].includes(row.state)) {
+      return false;
+    }
+    const atMs = Date.parse(row.updatedAt);
+    return Number.isFinite(atMs) && nowMs - atMs > 20 * 60_000;
+  }).length;
+
+  const staleMinutes = (at: string | null): number | null => {
+    if (!at) return null;
+    const atMs = Date.parse(at);
+    if (!Number.isFinite(atMs)) return null;
+    return Math.max(0, Math.round((nowMs - atMs) / 60_000));
+  };
+
+  const stageStatus: Record<
+    string,
+    {
+      status: PipelineStageStatus;
+      badge: { label: string; color: string };
+      count: number;
+      latestAt: string | null;
+      staleMinutes: number | null;
+      detail: string;
+    }
+  > = {};
+
+  const setStage = (
+    key: string,
+    inputStage: {
+      status: PipelineStageStatus;
+      count: number;
+      latestAt: string | null;
+      detail: string;
+    },
+  ): void => {
+    stageStatus[key] = {
+      status: inputStage.status,
+      badge: stageBadgeForPipeline(inputStage.status),
+      count: inputStage.count,
+      latestAt: inputStage.latestAt,
+      staleMinutes: staleMinutes(inputStage.latestAt),
+      detail: inputStage.detail,
+    };
+  };
+
+  const notificationsStatus: PipelineStageStatus =
+    notificationRows.length > 0
+      ? "ok"
+      : inboxRows.length > 0
+        ? "warn"
+        : "idle";
+  setStage("notifications", {
+    status: notificationsStatus,
+    count: notificationRows.length,
+    latestAt: notificationsLatestAt,
+    detail:
+      notificationRows.length > 0
+        ? "Notification memory envelopes observed."
+        : inboxRows.length > 0
+          ? "Inbox active but no notification memory entries in range."
+          : "No notification activity in range.",
+  });
+
+  const flushCount = stageRows.notificationsFlushed;
+  const flushStatus: PipelineStageStatus =
+    flushCount > 0
+      ? "ok"
+      : notificationRows.length > 0
+        ? "bad"
+        : "idle";
+  setStage("flush", {
+    status: flushStatus,
+    count: flushCount,
+    latestAt: flushLatest?.at ?? null,
+    detail:
+      flushCount > 0
+        ? "Notification buffer flushes recorded."
+        : notificationRows.length > 0
+          ? "Notifications detected but no buffer flush event."
+          : "No flushes in range.",
+  });
+
+  const primeCompleted = stageRows.contextPrimeCompleted;
+  const primeEmpty = stageRows.contextPrimeEmpty;
+  const seedCount = stageRows.contextSeed;
+  const contextStatus: PipelineStageStatus =
+    primeCompleted > 0
+      ? "ok"
+      : seedCount > 0 || primeEmpty > 0
+        ? "warn"
+        : flushCount > 0
+          ? "warn"
+          : "idle";
+  setStage("context", {
+    status: contextStatus,
+    count: seedCount + primeCompleted + primeEmpty,
+    latestAt: primeLatest?.at ?? seedLatest?.at ?? null,
+    detail:
+      primeCompleted > 0
+        ? `Prime completed=${primeCompleted}, empty=${primeEmpty}.`
+        : seedCount > 0 || primeEmpty > 0
+          ? `Seed=${seedCount}, prime empty=${primeEmpty}.`
+          : "No context seed/prime events in range.",
+  });
+
+  const resolvedCount = stageRows.targetResolved;
+  const failedCount = stageRows.targetFailed;
+  const targetStatus: PipelineStageStatus =
+    resolvedCount > 0 && failedCount === 0
+      ? "ok"
+      : resolvedCount > 0 && failedCount > 0
+        ? "warn"
+        : failedCount > 0
+          ? "bad"
+          : contextStatus === "ok" || contextStatus === "warn"
+            ? "warn"
+            : "idle";
+  setStage("target", {
+    status: targetStatus,
+    count: resolvedCount + failedCount,
+    latestAt: targetLatest?.at ?? null,
+    detail:
+      resolvedCount > 0 || failedCount > 0
+        ? `resolved=${resolvedCount}, failed=${failedCount}.`
+        : "No engagement target events in range.",
+  });
+
+  const requeueCount =
+    stageRows.queueNotReadyRequeued + stageRows.inboxCommandRequeued;
+  const queueStatus: PipelineStageStatus =
+    requeueCount > 0
+      ? stageRows.directivesExecuted > 0
+        ? "warn"
+        : "bad"
+      : stageRows.directivesExecuted > 0
+        ? "ok"
+        : stageRows.directivesFailed > 0
+          ? "bad"
+          : "idle";
+  setStage("queue", {
+    status: queueStatus,
+    count: requeueCount + stageRows.directivesExecuted + stageRows.directivesFailed,
+    latestAt: directivesLatest?.at ?? requeueLatest?.at ?? null,
+    detail:
+      `executed=${stageRows.directivesExecuted}, failed=${stageRows.directivesFailed}, requeued=${requeueCount}.`,
+  });
+
+  const lifecycleFailed = lifecycleCounts.get("failed") ?? 0;
+  const lifecycleAcked = lifecycleCounts.get("acked") ?? 0;
+  const lifecycleStatus: PipelineStageStatus =
+    lifecycleStuck > 0
+      ? "bad"
+      : lifecycleFailed > 0
+        ? lifecycleAcked > 0
+          ? "warn"
+          : "bad"
+        : lifecycleRows.length > 0
+          ? "ok"
+          : "idle";
+  setStage("lifecycle", {
+    status: lifecycleStatus,
+    count: lifecycleRows.length,
+    latestAt: lifecycleLatest?.updatedAt ?? null,
+    detail:
+      `acked=${lifecycleAcked}, failed=${lifecycleFailed}, stuck=${lifecycleStuck}.`,
+  });
+
+  const recentEvents = pipelineEvents
+    .slice()
+    .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
+    .slice(0, 40)
+    .map((event) => ({
+      at: event.at,
+      type: event.type,
+      source: event.source,
+      detail:
+        str(event.payload?.error) ??
+        str(event.payload?.reason) ??
+        str(event.payload?.action) ??
+        str(event.payload?.directiveId) ??
+        null,
+    }));
+
+  const lifecycleRecent = lifecycleRows
+    .slice()
+    .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0))
+    .slice(0, 40);
+
+  return {
+    range: {
+      label: formatRangeLabelFromMs(safeRangeMs),
+      maxAgeMs: safeRangeMs,
+      from: new Date(sinceMs).toISOString(),
+      to: new Date(nowMs).toISOString(),
+    },
+    sources: {
+      pipelineEventsSource: usingWrites ? "writes.jsonl" : "state.sqlite/state_events",
+      writeRecords: input.writeRecords.length,
+      stateEvents: input.stateEvents.length,
+      inboxRecords: input.inboxRecords.length,
+      notificationRecords: input.notificationRecords.length,
+      lifecycleRows: input.lifecycleRows.length,
+      lifecycleRowsInRange: lifecycleRows.length,
+    },
+    totals: {
+      notifications: notificationRows.length,
+      flushes: stageRows.notificationsFlushed,
+      contextSeed: stageRows.contextSeed,
+      contextPrimeCompleted: stageRows.contextPrimeCompleted,
+      contextPrimeEmpty: stageRows.contextPrimeEmpty,
+      targetResolved: stageRows.targetResolved,
+      targetFailed: stageRows.targetFailed,
+      directivesExecuted: stageRows.directivesExecuted,
+      directivesFailed: stageRows.directivesFailed,
+      queueRequeued: requeueCount,
+      lifecycleStuck,
+      inboxMessages: inboxRows.length,
+      pipelineEvents: pipelineEvents.length,
+    },
+    stages: stageStatus,
+    lifecycle: {
+      counts: Object.fromEntries(
+        [...lifecycleCounts.entries()].sort((a, b) => b[1] - a[1]),
+      ),
+      stuck: lifecycleStuck,
+      latest: lifecycleLatest,
+    },
+    recent: {
+      events: recentEvents,
+      lifecycle: lifecycleRecent,
+      notifications: notificationRows
+        .slice(-40)
+        .reverse()
+        .map((row) => ({
+          at: row.at,
+          entityType: str(row.payload?.entityType),
+          entityId: intFromUnknown(row.payload?.entityId),
+          postId: intFromUnknown(row.payload?.postId),
+          commentId: intFromUnknown(row.payload?.commentId),
+          actor:
+            str(
+              isRecord(row.payload?.actor)
+                ? row.payload.actor.handle
+                : row.payload?.actor,
+            ) ?? null,
+        })),
+    },
+  };
+};
+
 const buildPublicProjection = (
   snapshot: Record<string, unknown>,
 ): Record<string, unknown> => {
@@ -1872,6 +2331,8 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
     latestDebug: path.join(debugDir, "latest.json"),
     chatStatus: path.join(chatDir, "status.json"),
     chatRuntimeState: path.join(chatDir, "runtime-state.json"),
+    notifications: path.join(stateDir, "notifications.jsonl"),
+    memoryActivity: path.join(stateDir, "memory-activity.jsonl"),
     agentIdentity: path.join(ipcDir, "auth", "agent-identity.json"),
     mood: path.join(memDir, "mood.json"),
     temporal: path.join(memDir, "context", "temporal.json"),
@@ -2115,7 +2576,7 @@ button:hover{background:#f1f5f9}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 </style></head><body>
 <div class="wrap">
-<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Read-Only Health</div></div><div class="row"><a href="/graphs" class="badge neutral" style="text-decoration:none">Engagement</a><a href="/map" class="badge neutral" style="text-decoration:none">Memory Map</a><a href="/metrics" class="badge neutral" style="text-decoration:none">Runtime Metrics</a><div class="muted" id="ts">refreshing...</div></div></div>
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Read-Only Health</div></div><div class="row"><a href="/pipeline" class="badge neutral" style="text-decoration:none">Pipeline</a><a href="/graphs" class="badge neutral" style="text-decoration:none">Engagement</a><a href="/map" class="badge neutral" style="text-decoration:none">Memory Map</a><a href="/metrics" class="badge neutral" style="text-decoration:none">Runtime Metrics</a><div class="muted" id="ts">refreshing...</div></div></div>
 <div class="grid">
 <div class="card"><div class="muted">Runtime</div><div id="rt"></div></div>
 <div class="card"><div class="muted">Chat Bridge</div><div id="cb"></div></div>
@@ -2234,7 +2695,7 @@ button{cursor:pointer}button:hover{background:#f1f5f9}
 a{color:#2563eb;text-decoration:none}
 </style></head><body>
 <div class="wrap">
-<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Memory Engagement Graphs</div></div><div class="row"><a href="/" class="muted">Health</a><a href="/map" class="muted">Memory map</a><a href="/metrics" class="muted">Runtime metrics</a><div class="muted" id="ts">loading...</div></div></div>
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Memory Engagement Graphs</div></div><div class="row"><a href="/" class="muted">Health</a><a href="/pipeline" class="muted">Pipeline</a><a href="/map" class="muted">Memory map</a><a href="/metrics" class="muted">Runtime metrics</a><div class="muted" id="ts">loading...</div></div></div>
 <div class="card">
 <div class="row">
 <select id="range"><option value="24h">24h</option><option value="7d">7d</option><option value="30d" selected>30d</option><option value="90d">90d</option><option value="365d">365d</option></select>
@@ -2305,7 +2766,7 @@ button{cursor:pointer}button:hover{background:#f1f5f9}
 a{color:#2563eb;text-decoration:none}
 </style></head><body>
 <div class="wrap">
-<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Memory Map</div></div><div class="row"><a href="/" class="muted">Health</a><a href="/graphs" class="muted">Engagement</a><a href="/metrics" class="muted">Runtime metrics</a><div class="muted" id="ts">loading...</div></div></div>
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Memory Map</div></div><div class="row"><a href="/" class="muted">Health</a><a href="/pipeline" class="muted">Pipeline</a><a href="/graphs" class="muted">Engagement</a><a href="/metrics" class="muted">Runtime metrics</a><div class="muted" id="ts">loading...</div></div></div>
 <div class="card">
 <div class="row">
 <input id="query" type="text" placeholder="query (keywords, @handle, post 751)" style="min-width:280px;flex:1"/>
@@ -2395,7 +2856,7 @@ button{cursor:pointer}button:hover{background:#f1f5f9}
 a{color:#2563eb;text-decoration:none}
 </style></head><body>
 <div class="wrap">
-<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Runtime Metrics</div></div><div class="row"><a href="/" class="muted">Health</a><a href="/graphs" class="muted">Engagement</a><a href="/map" class="muted">Memory map</a><div class="muted" id="ts">loading...</div></div></div>
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Runtime Metrics</div></div><div class="row"><a href="/" class="muted">Health</a><a href="/pipeline" class="muted">Pipeline</a><a href="/graphs" class="muted">Engagement</a><a href="/map" class="muted">Memory map</a><div class="muted" id="ts">loading...</div></div></div>
 <div class="card">
 <div class="row">
 <select id="range"><option value="24h">24h</option><option value="7d">7d</option><option value="30d" selected>30d</option><option value="90d">90d</option><option value="365d">365d</option></select>
@@ -2428,6 +2889,104 @@ document.getElementById('meta').textContent='buckets '+esc(rows.length)+' · ser
 const run=async()=>{const sp=new URLSearchParams();sp.set('range',String(document.getElementById('range').value||'30d'));const bucket=String(document.getElementById('bucket').value||'auto');if(bucket!=='auto')sp.set('bucket',bucket);document.getElementById('meta').textContent='loading...';try{const res=await fetch('/api/health/metrics?'+sp.toString(),{cache:'no-store'});render(await res.json())}catch(err){document.getElementById('meta').textContent='failed: '+err}};
 document.getElementById('run').addEventListener('click',()=>{void run()});
 document.getElementById('series').addEventListener('change',()=>{void run()});
+void run();
+</script></body></html>`;
+
+const PIPELINE_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Agent Pipeline Health</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--ink:#0f172a;--muted:#475569;--line:#dbe3ef}
+*{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,sans-serif;background:linear-gradient(145deg,#eef3ff,#f8fafc);color:var(--ink)}
+.wrap{max-width:1280px;margin:24px auto;padding:0 16px;display:grid;gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 8px 22px rgba(15,23,42,.06)}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.h1{font-size:22px;font-weight:700;margin:2px 0}.muted{color:var(--muted);font-size:13px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+input,select,button{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px;background:#fff;color:var(--ink)}
+button{cursor:pointer}button:hover{background:#f1f5f9}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.stage{border:1px solid var(--line);border-radius:12px;padding:10px}
+.badge{display:inline-block;padding:3px 8px;border-radius:999px;font-weight:700;font-size:12px}
+.ok{background:#dcfce7;color:#15803d}.warn{background:#fef3c7;color:#a16207}.bad{background:#fee2e2;color:#b91c1c}.neutral{background:#e2e8f0;color:#334155}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;font-size:13px}.k{color:var(--muted)}
+.list{display:grid;gap:8px}
+.evt{border:1px solid var(--line);border-radius:10px;padding:8px;font-size:13px}
+a{color:#2563eb;text-decoration:none}
+</style></head><body>
+<div class="wrap">
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Pipeline Health</div></div><div class="row"><a href="/" class="muted">Health</a><a href="/graphs" class="muted">Engagement</a><a href="/map" class="muted">Memory map</a><a href="/metrics" class="muted">Runtime metrics</a><div class="muted" id="ts">loading...</div></div></div>
+<div class="card">
+<div class="row">
+<select id="range"><option value="1h">1h</option><option value="6h" selected>6h</option><option value="24h">24h</option><option value="7d">7d</option><option value="30d">30d</option></select>
+<input id="refreshMs" type="number" min="1000" max="60000" value="3000" style="width:110px"/>
+<button id="run" type="button">Refresh now</button>
+<button id="apply" type="button">Apply auto-refresh</button>
+</div>
+<div id="meta" class="muted" style="margin-top:8px">ready</div>
+</div>
+<div class="grid" id="stages"></div>
+<div class="grid">
+<div class="card"><div class="muted">Totals</div><div id="totals" class="kv"></div></div>
+<div class="card"><div class="muted">Sources</div><div id="sources" class="kv"></div></div>
+<div class="card"><div class="muted">Lifecycle</div><div id="lifecycle" class="kv"></div></div>
+</div>
+<div class="grid">
+<div class="card"><div class="muted">Recent Pipeline Events</div><div id="events" class="list"></div></div>
+<div class="card"><div class="muted">Recent Lifecycle Rows</div><div id="lifecycleRows" class="list"></div></div>
+<div class="card"><div class="muted">Recent Notifications</div><div id="notifications" class="list"></div></div>
+</div>
+</div>
+<script>
+const esc=v=>String(v??'n/a').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const fmt=iso=>{if(!iso)return'n/a';const ms=Date.parse(iso);return Number.isFinite(ms)?new Date(ms).toLocaleString():'n/a'};
+const kv=obj=>Object.entries(obj).map(([k,v])=>'<div class="k">'+esc(k)+'</div><div>'+esc(v??'n/a')+'</div>').join('');
+const renderList=(id,items,render)=>{const el=document.getElementById(id);if(!Array.isArray(items)||!items.length){el.innerHTML='<div class="muted">No data.</div>';return;}el.innerHTML=items.map(render).join('')};
+const rangeToMs=(range)=>{if(range==='1h')return 3600000;if(range==='6h')return 21600000;if(range==='24h')return 86400000;if(range==='7d')return 7*86400000;return 30*86400000};
+let timer = null;
+const renderStages=(stages)=>{
+const entries=Object.entries(stages||{});
+const labels={notifications:'Notifications → Memory',flush:'Notifications Buffer Flush',context:'Context Seed/Prime',target:'Target Resolution',queue:'Queue + Requeue',lifecycle:'Command Lifecycle'};
+const html=entries.map(([key,value])=>{
+const label=labels[key]||key;
+const badge=value&&value.badge&&typeof value.badge==='object'?value.badge:{label:'IDLE',color:'neutral'};
+return '<div class="stage"><div class="row"><strong>'+esc(label)+'</strong><span class="badge '+esc(badge.color||'neutral')+'">'+esc(badge.label||'IDLE')+'</span></div><div class="muted" style="margin-top:6px">'+esc(value?.detail??'n/a')+'</div><div class="kv" style="margin-top:8px">'+kv({count:value?.count??0,latestAt:fmt(value?.latestAt),staleMinutes:value?.staleMinutes??'n/a'})+'</div></div>';
+}).join('');
+document.getElementById('stages').innerHTML=html||'<div class="muted">No stage diagnostics.</div>';
+};
+const render=(payload)=>{
+if(!payload||payload.ok!==true){document.getElementById('meta').textContent='pipeline unavailable';return;}
+document.getElementById('ts').textContent='updated '+fmt(payload.generatedAt);
+document.getElementById('meta').textContent='range '+esc(payload.range?.label)+' · events '+esc(payload.totals?.pipelineEvents??0)+' · source '+esc(payload.sources?.pipelineEventsSource??'n/a');
+renderStages(payload.stages);
+document.getElementById('totals').innerHTML=kv(payload.totals&&typeof payload.totals==='object'?payload.totals:{});
+document.getElementById('sources').innerHTML=kv(payload.sources&&typeof payload.sources==='object'?payload.sources:{});
+const lifecycle=payload.lifecycle&&typeof payload.lifecycle==='object'?payload.lifecycle:{};
+document.getElementById('lifecycle').innerHTML=kv({stuck:lifecycle.stuck??0,latestAt:fmt(lifecycle.latest?.updatedAt),counts:JSON.stringify(lifecycle.counts??{})});
+renderList('events',payload.recent?.events,(event)=>'<div class="evt"><strong>'+esc(event.type)+'</strong> <span class="muted">('+esc(event.source)+')</span><br/><span class="muted">'+esc(fmt(event.at))+'</span><br/>'+esc(event.detail??'')+'</div>');
+renderList('lifecycleRows',payload.recent?.lifecycle,(row)=>'<div class="evt"><strong>'+esc(row.state)+'</strong><br/><span class="muted">'+esc(fmt(row.updatedAt))+' · attempts '+esc(row.attempts)+' · action '+esc(row.action??'n/a')+'</span><br/>'+esc(row.lastError??'')+'</div>');
+renderList('notifications',payload.recent?.notifications,(row)=>'<div class="evt"><strong>'+esc(row.entityType??'notification')+' '+esc(row.entityId??'n/a')+'</strong><br/><span class="muted">'+esc(fmt(row.at))+' · post '+esc(row.postId??'n/a')+' · comment '+esc(row.commentId??'n/a')+'</span><br/>'+esc(row.actor??'')+'</div>');
+};
+const run=async()=>{
+const range=String(document.getElementById('range').value||'6h');
+const sp=new URLSearchParams();
+sp.set('rangeMs',String(rangeToMs(range)));
+try{
+const res=await fetch('/api/health/pipeline?'+sp.toString(),{cache:'no-store'});
+render(await res.json());
+}catch(err){
+document.getElementById('meta').textContent='failed: '+err;
+}
+};
+const applyAutoRefresh=()=>{
+if(timer){clearInterval(timer);timer=null;}
+const refreshMs=Math.max(1000,Math.min(60000,Number(document.getElementById('refreshMs').value||3000)));
+timer=setInterval(()=>{void run();},refreshMs);
+};
+document.getElementById('run').addEventListener('click',()=>{void run()});
+document.getElementById('apply').addEventListener('click',()=>{applyAutoRefresh();void run()});
+document.getElementById('range').addEventListener('change',()=>{void run()});
+applyAutoRefresh();
 void run();
 </script></body></html>`;
 
@@ -2862,6 +3421,82 @@ const main = async (): Promise<void> => {
         return;
       }
     }
+    if (url.pathname === "/api/health/pipeline") {
+      if (!hasPrivateAccess(req)) {
+        json(res, 403, {
+          ok: false,
+          error: "forbidden",
+          message: "Missing or invalid health private key.",
+        });
+        return;
+      }
+      try {
+        const snapshot = await buildSnapshot();
+        const files = isRecord(snapshot.files) ? snapshot.files : {};
+        const writesPath =
+          str(files.writes) ?? path.join(resolveStateDir(), "writes.jsonl");
+        const inboxPath =
+          str(files.chatInbox) ??
+          path.join(resolveStateDir(), "ipc", "chat", "inbox.jsonl");
+        const notificationsPath =
+          str(files.notifications) ??
+          path.join(resolveStateDir(), "notifications.jsonl");
+        const [writeLines, inboxLines, notificationLines] = await Promise.all([
+          readTailLines(writesPath, Math.max(TAIL_MAX_BYTES, 450_000), TAIL_MAX_LINES * 2),
+          readTailLines(inboxPath, Math.max(TAIL_MAX_BYTES, 450_000), TAIL_MAX_LINES * 2),
+          readTailLines(
+            notificationsPath,
+            Math.max(TAIL_MAX_BYTES, 450_000),
+            TAIL_MAX_LINES * 2,
+          ),
+        ]);
+        const writeRecords = parseJsonLines(writeLines);
+        const inboxRecords = parseJsonLines(inboxLines);
+        const notificationRecords = parseJsonLines(notificationLines);
+        let stateEvents: Record<string, unknown>[] = [];
+        try {
+          stateEvents = db.getRecentEvents(500, "private");
+        } catch {
+          stateEvents = [];
+        }
+        let lifecycleRows: Record<string, unknown>[] = [];
+        try {
+          lifecycleRows = db
+            .getRecentCommandLifecycle(500)
+            .map((row) => ({ ...row }));
+        } catch {
+          lifecycleRows = [];
+        }
+        const diagnostics = buildPipelineDiagnostics({
+          writeRecords,
+          stateEvents,
+          inboxRecords,
+          notificationRecords,
+          lifecycleRows,
+          rangeMs: resolveRangeMsFromQuery(url.searchParams),
+        });
+        json(res, 200, {
+          ok: true,
+          generatedAt: new Date().toISOString(),
+          stateDir: resolveStateDir(),
+          paths: {
+            writes: writesPath,
+            inbox: inboxPath,
+            notifications: notificationsPath,
+            sqlite: path.join(resolveStateDir(), "ipc", "state.sqlite"),
+          },
+          ...diagnostics,
+        });
+        return;
+      } catch (error: unknown) {
+        json(res, 500, {
+          ok: false,
+          error: "pipeline_unavailable",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+    }
     if (url.pathname === "/api/health/directive-lifecycle") {
       if (!hasPrivateAccess(req)) {
         json(res, 403, {
@@ -2940,6 +3575,12 @@ const main = async (): Promise<void> => {
         });
         return;
       }
+    }
+    if (url.pathname === "/pipeline") {
+      res.statusCode = 200;
+      res.setHeader("content-type", "text/html; charset=utf-8");
+      res.end(PIPELINE_PAGE);
+      return;
     }
     if (url.pathname === "/graphs") {
       res.statusCode = 200;

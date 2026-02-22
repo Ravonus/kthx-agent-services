@@ -19,6 +19,7 @@ import type {
   RefreshTemporalOptions,
   AgentCompressionRequest,
   RetrievalIntent,
+  RetrievalLookupPlan,
   LongTermArchiveCapsule,
   LongTermArchiveIndex,
   ArchiveCompressFn,
@@ -158,6 +159,7 @@ type KeywordIndexDoc = {
   participants: string[];
   summary: string;
   keywords: string[];
+  lookupPlans: RetrievalLookupPlan[];
 };
 
 type KeywordMemoryIndex = {
@@ -285,6 +287,112 @@ const tokenizeKeywordText = (value: string): string[] => {
   return [...uniqueTokens];
 };
 
+const normalizeLookupPlanArgs = (
+  value: unknown,
+): RetrievalLookupPlan["args"] => {
+  if (!isRecord(value)) return {};
+  const normalized: RetrievalLookupPlan["args"] = {};
+  const entries = Object.entries(value).slice(0, 16);
+  for (const [keyRaw, entryValue] of entries) {
+    const key = keyRaw.trim();
+    if (!key.length) continue;
+    if (typeof entryValue === "string") {
+      const trimmed = entryValue.trim();
+      if (!trimmed.length) continue;
+      normalized[key] = trimmed;
+      continue;
+    }
+    if (typeof entryValue === "number" && Number.isFinite(entryValue)) {
+      normalized[key] = entryValue;
+      continue;
+    }
+    if (typeof entryValue === "boolean") {
+      normalized[key] = entryValue;
+      continue;
+    }
+    if (entryValue === null) {
+      normalized[key] = null;
+    }
+  }
+  return normalized;
+};
+
+const normalizeLookupPlans = (value: unknown): RetrievalLookupPlan[] => {
+  if (!Array.isArray(value)) return [];
+  const plans: RetrievalLookupPlan[] = [];
+  const seen = new Set<string>();
+  for (const entry of value.slice(0, 12)) {
+    if (!isRecord(entry)) continue;
+    const action = asNullableString(entry.action);
+    const reason = asNullableString(entry.reason);
+    if (!action || !reason) continue;
+    const args = normalizeLookupPlanArgs(entry.args);
+    const fingerprint = JSON.stringify([action, reason, Object.entries(args)]);
+    if (seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    plans.push({ action, reason, args });
+  }
+  return plans;
+};
+
+const buildDefaultLookupPlansForDoc = (input: {
+  sourceType: string | null;
+  postId: number | null;
+  commentId: number | null;
+  actor: string | null;
+}): RetrievalLookupPlan[] => {
+  const plans: RetrievalLookupPlan[] = [];
+  const seen = new Set<string>();
+  const pushPlan = (plan: RetrievalLookupPlan): void => {
+    const fingerprint = JSON.stringify([
+      plan.action,
+      plan.reason,
+      Object.entries(plan.args).sort((a, b) =>
+        a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
+      ),
+    ]);
+    if (seen.has(fingerprint)) return;
+    seen.add(fingerprint);
+    plans.push(plan);
+  };
+
+  if (typeof input.postId === "number" && input.postId > 0) {
+    pushPlan({
+      action: "find_post",
+      reason: "hydrate_post_context",
+      args: { postId: input.postId },
+    });
+  }
+  if (typeof input.commentId === "number" && input.commentId > 0) {
+    const args: RetrievalLookupPlan["args"] = { commentId: input.commentId };
+    if (typeof input.postId === "number" && input.postId > 0) {
+      args.postId = input.postId;
+    }
+    pushPlan({
+      action: "find_comment",
+      reason: "hydrate_comment_context",
+      args,
+    });
+  }
+  if (input.sourceType === "notification_created") {
+    pushPlan({
+      action: "browse_notifications",
+      reason: "refresh_notification_context",
+      args: { unreadOnly: true, limit: 24 },
+    });
+  }
+  const actor = input.actor?.trim();
+  if (actor?.startsWith("@")) {
+    pushPlan({
+      action: "find_user",
+      reason: "resolve_actor_profile",
+      args: { handle: actor },
+    });
+  }
+
+  return plans.slice(0, 8);
+};
+
 const normalizeKeywordDoc = (
   id: string,
   value: unknown,
@@ -300,14 +408,28 @@ const normalizeKeywordDoc = (
       .filter((item) => item.length >= 3),
   ).slice(0, 24);
   if (keywords.length === 0) return null;
+  const sourceType = asNullableString(value.sourceType);
+  const postId = asFinitePositiveInt(value.postId) ?? null;
+  const commentId = asFinitePositiveInt(value.commentId) ?? null;
+  const actor = asNullableString(value.actor);
+  const lookupPlansRaw = normalizeLookupPlans(value.lookupPlans);
+  const lookupPlans =
+    lookupPlansRaw.length > 0
+      ? lookupPlansRaw
+      : buildDefaultLookupPlansForDoc({
+          sourceType,
+          postId,
+          commentId,
+          actor,
+        });
   return {
     id,
     receivedAt: normalizeIso(asNullableString(value.receivedAt) ?? nowIso()),
-    sourceType: asNullableString(value.sourceType),
+    sourceType,
     topic: asNullableString(value.topic),
-    postId: asFinitePositiveInt(value.postId) ?? null,
-    commentId: asFinitePositiveInt(value.commentId) ?? null,
-    actor: asNullableString(value.actor),
+    postId,
+    commentId,
+    actor,
     participants: Array.isArray(value.participants)
       ? unique(
           value.participants
@@ -318,6 +440,7 @@ const normalizeKeywordDoc = (
       : [],
     summary: toShortLine(summary, 220),
     keywords,
+    lookupPlans,
   };
 };
 
@@ -1141,17 +1264,25 @@ export class MemoryStore {
       signature.length > 0
         ? signature
         : `${normalizeIso(envelope.receivedAt)}|${envelope.topic}|${sourceType ?? "event"}`;
+    const postId = typeof keys.postId === "number" ? keys.postId : null;
+    const commentId = typeof keys.commentId === "number" ? keys.commentId : null;
     return {
       id: docId,
       receivedAt: normalizeIso(envelope.receivedAt),
       sourceType,
       topic: asNullableString(envelope.topic),
-      postId: typeof keys.postId === "number" ? keys.postId : null,
-      commentId: typeof keys.commentId === "number" ? keys.commentId : null,
+      postId,
+      commentId,
       actor,
       participants,
       summary,
       keywords,
+      lookupPlans: buildDefaultLookupPlansForDoc({
+        sourceType,
+        postId,
+        commentId,
+        actor,
+      }),
     };
   }
 
@@ -1494,6 +1625,38 @@ export class MemoryStore {
         typeof request.commentId === "number" ? request.commentId : null,
       maxItems: Math.max(2, Math.min(6, maxItems)),
     });
+    const lookupPlans: RetrievalLookupPlan[] = [];
+    const lookupPlanFingerprints = new Set<string>();
+    const addLookupPlan = (plan: RetrievalLookupPlan): void => {
+      const fingerprint = JSON.stringify([
+        plan.action,
+        Object.entries(plan.args).sort((a, b) =>
+          a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
+        ),
+      ]);
+      if (lookupPlanFingerprints.has(fingerprint)) return;
+      lookupPlanFingerprints.add(fingerprint);
+      lookupPlans.push(plan);
+    };
+    for (const plan of buildDefaultLookupPlansForDoc({
+      sourceType: null,
+      postId: typeof request.postId === "number" ? request.postId : null,
+      commentId: typeof request.commentId === "number" ? request.commentId : null,
+      actor: null,
+    })) {
+      addLookupPlan(plan);
+    }
+    const formatLookupPlanLine = (plan: RetrievalLookupPlan): string => {
+      const tokens: string[] = [plan.action];
+      const postId = asFinitePositiveInt(plan.args.postId);
+      if (postId) tokens.push(`post ${postId}`);
+      const commentId = asFinitePositiveInt(plan.args.commentId);
+      if (commentId) tokens.push(`comment ${commentId}`);
+      const handle =
+        typeof plan.args.handle === "string" ? plan.args.handle.trim() : "";
+      if (handle.length > 0) tokens.push(`handle ${handle}`);
+      return `lookup ${tokens.join(" ")} reason=${plan.reason}`;
+    };
     const candidateScores = new Map<string, number>();
     for (const keyword of keywords) {
       const docIds = this.keywordIndex.inverted[keyword] ?? [];
@@ -1518,12 +1681,18 @@ export class MemoryStore {
     }
 
     if (candidateScores.size === 0) {
+      const lines = [
+        ...presetSummary.lines,
+        ...longTermLines,
+        ...lookupPlans.slice(0, 6).map((plan) => formatLookupPlanLine(plan)),
+      ];
       return {
         enabled: true,
         intent,
         query: baseQuery.length > 0 ? baseQuery : null,
         keywords,
-        lines: [...presetSummary.lines, ...longTermLines],
+        lines,
+        lookupPlans: lookupPlans.slice(0, 8),
       };
     }
 
@@ -1618,6 +1787,15 @@ export class MemoryStore {
       lines.push(
         `${item.doc.receivedAt} score=${item.score.toFixed(2)} ${tokens} :: ${item.doc.summary}`,
       );
+      for (const plan of item.doc.lookupPlans.slice(0, 4)) {
+        addLookupPlan(plan);
+      }
+    }
+    if (lookupPlans.length > 0) {
+      lines.push(`lookupPlans=${lookupPlans.length}`);
+      for (const plan of lookupPlans.slice(0, 8)) {
+        lines.push(formatLookupPlanLine(plan));
+      }
     }
     lines.push(...longTermLines);
 
@@ -1627,6 +1805,7 @@ export class MemoryStore {
       query: baseQuery.length > 0 ? baseQuery : null,
       keywords,
       lines,
+      lookupPlans: lookupPlans.slice(0, 8),
     };
   }
 

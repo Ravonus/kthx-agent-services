@@ -667,6 +667,7 @@ const main = async (): Promise<void> => {
     lastQueuedAt: string | null;
     lastEventType: string | null;
     lastTopic: string | null;
+    notificationItems: NotificationBatchItem[];
   };
   const socketBatchState: SocketBatchState = {
     pendingCount: 0,
@@ -676,6 +677,149 @@ const main = async (): Promise<void> => {
     lastQueuedAt: null,
     lastEventType: null,
     lastTopic: null,
+    notificationItems: [],
+  };
+  type NotificationBatchItem = {
+    at: string;
+    topic: string;
+    eventType: string | null;
+    notificationType: string | null;
+    entityType: string | null;
+    entityId: number | null;
+    postId: number | null;
+    commentId: number | null;
+    actorHandle: string | null;
+    actorMainUserId: string | null;
+    readAt: string | null;
+  };
+  const toFinitePositiveInt = (value: unknown): number | null => {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return Math.floor(value);
+    }
+    if (typeof value === "string" && value.trim().length > 0) {
+      const parsed = Number.parseInt(value.trim(), 10);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return null;
+  };
+  const toNonEmptyString = (value: unknown): string | null => {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  };
+  const readNested = (
+    root: unknown,
+    pathSpec: string,
+  ): unknown => {
+    let cursor: unknown = root;
+    for (const key of pathSpec.split(".")) {
+      if (!isRecord(cursor)) return null;
+      cursor = cursor[key];
+    }
+    return cursor;
+  };
+  const readFirstInt = (root: unknown, paths: readonly string[]): number | null => {
+    for (const pathSpec of paths) {
+      const parsed = toFinitePositiveInt(readNested(root, pathSpec));
+      if (parsed) return parsed;
+    }
+    return null;
+  };
+  const readFirstString = (
+    root: unknown,
+    paths: readonly string[],
+  ): string | null => {
+    for (const pathSpec of paths) {
+      const value = toNonEmptyString(readNested(root, pathSpec));
+      if (value) return value;
+    }
+    return null;
+  };
+  const parseNotificationBatchItem = (input: {
+    envelope: { receivedAt: string; topic: string };
+    payload: unknown;
+    eventType: string;
+  }): NotificationBatchItem | null => {
+    if (!isRecord(input.payload)) return null;
+    const payload = input.payload;
+    const entityType =
+      readFirstString(payload, [
+        "entityType",
+        "targetType",
+        "notification.entityType",
+        "payload.entityType",
+      ])?.toLowerCase() ?? null;
+    const entityId = readFirstInt(payload, [
+      "entityId",
+      "targetId",
+      "notification.entityId",
+      "payload.entityId",
+      "payload.targetId",
+    ]);
+    const postId =
+      readFirstInt(payload, [
+        "postId",
+        "targetPostId",
+        "notification.postId",
+        "payload.postId",
+        "payload.targetPostId",
+        "post.id",
+        "target.postId",
+        "target.post.id",
+        "comment.postId",
+      ]) ??
+      (entityType === "post" ? entityId : null);
+    const commentId =
+      readFirstInt(payload, [
+        "commentId",
+        "targetCommentId",
+        "parentId",
+        "notification.commentId",
+        "payload.commentId",
+        "payload.targetCommentId",
+        "payload.parentId",
+        "comment.id",
+        "target.commentId",
+        "target.comment.id",
+      ]) ??
+      (entityType === "comment" ? entityId : null);
+    const actorHandle =
+      readFirstString(payload, [
+        "actor.handle",
+        "actor.username",
+        "author.handle",
+        "author.username",
+        "from.handle",
+        "from.username",
+      ]) ?? null;
+    const actorMainUserId =
+      readFirstString(payload, [
+        "actor.mainUserId",
+        "author.mainUserId",
+        "from.mainUserId",
+        "actorMainUserId",
+      ]) ?? null;
+    const notificationType =
+      readFirstString(payload, [
+        "notificationType",
+        "type",
+        "notification.type",
+      ]) ?? null;
+    const readAt =
+      readFirstString(payload, ["readAt", "notification.readAt"]) ?? null;
+    return {
+      at: input.envelope.receivedAt,
+      topic: input.envelope.topic,
+      eventType: input.eventType || null,
+      notificationType,
+      entityType,
+      entityId,
+      postId,
+      commentId,
+      actorHandle,
+      actorMainUserId,
+      readAt,
+    };
   };
   let socketBatchFlushInFlight: Promise<void> | null = null;
   const mergeSocketBatch = (
@@ -691,6 +835,14 @@ const main = async (): Promise<void> => {
     target.lastQueuedAt = delta.lastQueuedAt ?? target.lastQueuedAt;
     target.lastEventType = delta.lastEventType ?? target.lastEventType;
     target.lastTopic = delta.lastTopic ?? target.lastTopic;
+    if (Array.isArray(delta.notificationItems) && delta.notificationItems.length > 0) {
+      target.notificationItems.push(...delta.notificationItems);
+      if (target.notificationItems.length > 160) {
+        target.notificationItems = target.notificationItems.slice(
+          target.notificationItems.length - 160,
+        );
+      }
+    }
   };
   const markSocketBatchPending = (
     kind: "notifications" | "feed",
@@ -699,10 +851,24 @@ const main = async (): Promise<void> => {
       topic: string;
     },
     eventType: string,
+    payload?: unknown,
   ): void => {
     socketBatchState.pendingCount += 1;
     if (kind === "notifications") {
       socketBatchState.notificationCount += 1;
+      const item = parseNotificationBatchItem({
+        envelope,
+        payload,
+        eventType,
+      });
+      if (item) {
+        socketBatchState.notificationItems.push(item);
+        if (socketBatchState.notificationItems.length > 160) {
+          socketBatchState.notificationItems = socketBatchState.notificationItems.slice(
+            socketBatchState.notificationItems.length - 160,
+          );
+        }
+      }
     } else {
       socketBatchState.feedCount += 1;
     }
@@ -729,6 +895,7 @@ const main = async (): Promise<void> => {
       lastQueuedAt: socketBatchState.lastQueuedAt,
       lastEventType: socketBatchState.lastEventType,
       lastTopic: socketBatchState.lastTopic,
+      notificationItems: [...socketBatchState.notificationItems],
     };
     socketBatchState.pendingCount = 0;
     socketBatchState.notificationCount = 0;
@@ -737,9 +904,35 @@ const main = async (): Promise<void> => {
     socketBatchState.lastQueuedAt = null;
     socketBatchState.lastEventType = null;
     socketBatchState.lastTopic = null;
+    socketBatchState.notificationItems = [];
 
     socketBatchFlushInFlight = (async () => {
       try {
+        for (const item of snapshot.notificationItems.slice(0, 96)) {
+          await memory
+            .ingest({
+              receivedAt: item.at,
+              source: "local",
+              topic: "notifications:batch",
+              payload: {
+                type: "notification_created",
+                notificationType: item.notificationType,
+                postId: item.postId,
+                commentId: item.commentId,
+                entityType: item.entityType,
+                entityId: item.entityId,
+                actor: {
+                  handle: item.actorHandle,
+                  mainUserId: item.actorMainUserId,
+                },
+                readAt: item.readAt,
+                originTopic: item.topic,
+                originEventType: item.eventType,
+                source: "socket_batch",
+              },
+            })
+            .catch(() => {});
+        }
         await memory
           .refreshTemporalContext({
             force: true,
@@ -752,6 +945,7 @@ const main = async (): Promise<void> => {
           trigger,
           pendingCount: snapshot.pendingCount,
           notificationEvents: snapshot.notificationCount,
+          notificationItems: snapshot.notificationItems.length,
           feedEvents: snapshot.feedCount,
           firstQueuedAt: snapshot.firstQueuedAt,
           lastQueuedAt: snapshot.lastQueuedAt,
@@ -864,10 +1058,10 @@ const main = async (): Promise<void> => {
     }
 
     if (isNotificationEnvelope) {
-      markSocketBatchPending("notifications", envelope, eventType);
+      markSocketBatchPending("notifications", envelope, eventType, payload);
     }
     if (isFeedEnvelope) {
-      markSocketBatchPending("feed", envelope, eventType);
+      markSocketBatchPending("feed", envelope, eventType, payload);
     }
 
     // Auth state updates

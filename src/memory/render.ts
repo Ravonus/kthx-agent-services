@@ -117,6 +117,37 @@ export const renderContextPrompt = (bundle: ContextBundle): string => {
     if (Array.isArray(bundle.retrieval.keywords) && bundle.retrieval.keywords.length > 0) {
       parts.push(`keywords=${bundle.retrieval.keywords.join(",")}`);
     }
+    if (
+      Array.isArray(bundle.retrieval.lookupPlans) &&
+      bundle.retrieval.lookupPlans.length > 0
+    ) {
+      parts.push(`lookupPlans=${bundle.retrieval.lookupPlans.length}`);
+      for (const plan of bundle.retrieval.lookupPlans.slice(0, 8)) {
+        if (!isRecord(plan)) continue;
+        if (typeof plan.action !== "string" || plan.action.trim().length === 0) {
+          continue;
+        }
+        if (typeof plan.reason !== "string" || plan.reason.trim().length === 0) {
+          continue;
+        }
+        if (!isRecord(plan.args)) continue;
+        const argText = Object.entries(plan.args)
+          .filter((entry): entry is [string, string | number | boolean | null] => {
+            const value = entry[1];
+            return (
+              typeof value === "string" ||
+              typeof value === "number" ||
+              typeof value === "boolean" ||
+              value === null
+            );
+          })
+          .map(([key, value]) => `${key}=${String(value)}`)
+          .join(" ");
+        parts.push(
+          `- lookup ${plan.action.trim()} ${argText} reason=${plan.reason.trim()}`.trim(),
+        );
+      }
+    }
     bundle.retrieval.lines
       .filter(
         (line): line is string =>

@@ -20,6 +20,40 @@ import { toShortLine } from "~/lib/time.js";
 // ---------------------------------------------------------------------------
 
 export const extractKeysFromPayload = (payload: unknown): ExtractedKeys => {
+  const toFinitePositiveInt = (value: unknown): number | null => {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return Math.floor(value);
+    }
+    if (typeof value === "string" && value.trim().length > 0) {
+      const parsed = Number.parseInt(value.trim(), 10);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return null;
+  };
+  const readFirstPositiveInt = (
+    root: unknown,
+    paths: readonly string[],
+  ): number | null => {
+    for (const pathSpec of paths) {
+      const value = readNested(root, pathSpec.split("."));
+      const parsed = toFinitePositiveInt(value);
+      if (parsed) return parsed;
+    }
+    return null;
+  };
+  const readFirstString = (
+    root: unknown,
+    paths: readonly string[],
+  ): string | null => {
+    for (const pathSpec of paths) {
+      const value = readNested(root, pathSpec.split("."));
+      if (typeof value === "string" && value.trim().length > 0) {
+        return value.trim();
+      }
+    }
+    return null;
+  };
+
   if (!isRecord(payload)) {
     return {
       type: null,
@@ -29,16 +63,65 @@ export const extractKeysFromPayload = (payload: unknown): ExtractedKeys => {
       categories: [],
     };
   }
-  const type = typeof payload.type === "string" ? payload.type : null;
+  const type =
+    readFirstString(payload, [
+      "type",
+      "eventType",
+      "payload.type",
+      "notification.type",
+    ]) ?? null;
+
+  const entityType =
+    readFirstString(payload, [
+      "entityType",
+      "targetType",
+      "notification.entityType",
+      "payload.entityType",
+      "payload.targetType",
+    ])?.toLowerCase() ?? null;
+  const entityId = readFirstPositiveInt(payload, [
+    "entityId",
+    "targetId",
+    "notification.entityId",
+    "payload.entityId",
+    "payload.targetId",
+  ]);
+
+  const postIdFromFields = readFirstPositiveInt(payload, [
+    "postId",
+    "targetPostId",
+    "notification.postId",
+    "payload.postId",
+    "payload.targetPostId",
+    "post.id",
+    "target.postId",
+    "target.post.id",
+    "entity.postId",
+    "entity.post.id",
+    "comment.postId",
+    "payload.comment.postId",
+  ]);
+  const commentIdFromFields = readFirstPositiveInt(payload, [
+    "commentId",
+    "targetCommentId",
+    "parentId",
+    "notification.commentId",
+    "payload.commentId",
+    "payload.targetCommentId",
+    "payload.parentId",
+    "comment.id",
+    "target.commentId",
+    "target.comment.id",
+    "entity.commentId",
+    "entity.comment.id",
+  ]);
+
   const postId =
-    typeof payload.postId === "number" && Number.isFinite(payload.postId)
-      ? payload.postId
-      : null;
+    postIdFromFields ??
+    (entityType === "post" ? entityId ?? null : null);
   const commentId =
-    typeof payload.commentId === "number" &&
-    Number.isFinite(payload.commentId)
-      ? payload.commentId
-      : null;
+    commentIdFromFields ??
+    (entityType === "comment" ? entityId ?? null : null);
   const tags = Array.isArray(payload.tags)
     ? payload.tags.filter((entry): entry is string => typeof entry === "string")
     : [];

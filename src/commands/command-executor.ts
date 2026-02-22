@@ -960,7 +960,12 @@ export class CommandExecutor {
       await this.markQueueItemCompletedByInbox(inboxFile, "missing", "file missing before execution");
       return true;
     }
-    if (read.status === "not_ready") return false;
+    if (read.status === "not_ready") {
+      await this.markQueueItemNotReadyByInbox(inboxFile, "inbox_json_not_ready").catch(
+        () => undefined,
+      );
+      return false;
+    }
     if (read.status === "invalid") {
       await this.writeOutcome({
         at: nowIso(),
@@ -1077,9 +1082,15 @@ export class CommandExecutor {
       return true;
     }
 
-    const result = await this.executeCommand(command).catch((error: unknown) => {
+    const result = await this.executeCommand(command).catch(async (error: unknown) => {
       if (error instanceof RequeueCommandError) {
         this.releaseReplayConsumedForRetry(command.id);
+        const requeueReason =
+          typeof error.message === "string" && error.message.trim().length > 0
+            ? error.message.trim()
+            : "not_ready";
+        await this.markQueueItemNotReadyByInbox(inboxFile, requeueReason).catch(() => undefined);
+        await this.primeCommandContextForRequeue(command, requeueReason).catch(() => undefined);
         void this.ctx.memory
           .recordWrite({
             type: "inbox_command_requeued",
@@ -1087,7 +1098,7 @@ export class CommandExecutor {
             inboxFile,
             commandId: command.id,
             kind: command.kind,
-            reason: error.message,
+            reason: requeueReason,
             replayConsumedReleased: true,
           })
           .catch(() => undefined);
@@ -5382,31 +5393,36 @@ export class CommandExecutor {
 
     const normalized = sourcePrompt.trim().toLowerCase();
     if (!normalized.length) return null;
-    const hasSaveVerb = /\b(?:attach|add|save|store|put|set)\b/iu.test(normalized);
-    const hasTargetHint = /\b(?:to|as|in|into|for)\b/iu.test(normalized);
-    if (!hasSaveVerb || !hasTargetHint) return null;
-
-    const kindCandidates: Array<{
-      kind: GeneratedCustomAssetKind;
-      index: number;
-    }> = [
-      { kind: "emote" as const, index: normalized.indexOf("emote") },
-      { kind: "sticker" as const, index: normalized.indexOf("sticker") },
-      { kind: "gif" as const, index: normalized.indexOf("gif") },
-    ].filter((entry) => entry.index >= 0);
-    if (!kindCandidates.length) return null;
-    kindCandidates.sort((a, b) => a.index - b.index);
-    const kind = kindCandidates[0]?.kind ?? null;
-    if (!kind) return null;
-
-    const scope =
+    const inferredScope: GeneratedCustomAssetScope =
       /\b(?:group|conversation|this group)\b/iu.test(normalized)
         ? "group"
         : /\b(?:server|guild|channel|this server)\b/iu.test(normalized)
           ? "server"
           : "mine";
+    const kindCandidates: Array<{
+      kind: GeneratedCustomAssetKind;
+      index: number;
+    }> = [
+      { kind: "emote" as const, index: normalized.search(/\bemote(?:s)?\b/iu) },
+      { kind: "sticker" as const, index: normalized.search(/\bsticker(?:s)?\b/iu) },
+      { kind: "gif" as const, index: normalized.search(/\bgif(?:s)?\b/iu) },
+    ].filter((entry) => entry.index >= 0);
+    kindCandidates.sort((a, b) => a.index - b.index);
+    const inferredKind = kindCandidates[0]?.kind ?? null;
 
-    return { kind, scope, nameHint: null };
+    const hasSaveVerb = /\b(?:attach|add|save|store|put|set)\b/iu.test(normalized);
+    const hasTargetHint = /\b(?:to|as|in|into|for)\b/iu.test(normalized);
+    if (hasSaveVerb && hasTargetHint && inferredKind) {
+      return { kind: inferredKind, scope: inferredScope, nameHint: null };
+    }
+
+    const hasGenerateVerb = /\b(?:generate|create|make|render|draw|design)\b/iu.test(
+      normalized,
+    );
+    if (hasGenerateVerb && inferredKind) {
+      return { kind: inferredKind, scope: inferredScope, nameHint: null };
+    }
+    return null;
   }
 
   private buildGeneratedCustomAssetName(input: {
@@ -5918,8 +5934,15 @@ export class CommandExecutor {
         if (edited) {
           return;
         }
-        // Keep a single preview box. Do not create secondary terminal boxes.
         if (input.kind !== "processing") {
+          if (!previewMessageId && !previewMessageCreateAttempted) {
+            try {
+              await sendFreshPreviewMessage(input.attachments);
+            } catch {
+              // Non-fatal: avoid dropping generation result on preview message failures.
+            }
+          }
+          // Keep a single preview box. Do not create secondary terminal boxes.
           return;
         }
       }
@@ -6760,6 +6783,91 @@ export class CommandExecutor {
       }
     }
 
+    const parseNotificationTargets = (
+      value: unknown,
+      source: string,
+    ): EngagementTargetCandidate[] => {
+      const resolved: EngagementTargetCandidate[] = [];
+      const seen = new Set<string>();
+      const push = (candidate: EngagementTargetCandidate | null): void => {
+        if (!candidate) return;
+        if (!candidate.postId || candidate.postId <= 0) return;
+        const key = `${candidate.postId}:${candidate.commentId ?? 0}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        resolved.push(candidate);
+      };
+      for (const row of this.collectBridgeRecordItems(value)) {
+        push(this.extractEngagementTargetCandidateFromRecord(row, source));
+
+        const entityType =
+          asNonEmptyString(row.entityType)?.toLowerCase() ??
+          asNonEmptyString(row.targetType)?.toLowerCase() ??
+          null;
+        const entityId =
+          asPositiveInt(row.entityId) ??
+          asPositiveInt(row.targetId) ??
+          null;
+        const postIdFromFields =
+          asPositiveInt(row.postId) ??
+          asPositiveInt(row.targetPostId) ??
+          (isRecord(row.post) ? asPositiveInt(row.post.id) : null) ??
+          (isRecord(row.target)
+            ? asPositiveInt(row.target.postId) ??
+              (isRecord(row.target.post) ? asPositiveInt(row.target.post.id) : null)
+            : null);
+        const commentIdFromFields =
+          asPositiveInt(row.commentId) ??
+          asPositiveInt(row.targetCommentId) ??
+          asPositiveInt(row.parentId) ??
+          (isRecord(row.comment) ? asPositiveInt(row.comment.id) : null) ??
+          (isRecord(row.target)
+            ? asPositiveInt(row.target.commentId) ??
+              (isRecord(row.target.comment) ? asPositiveInt(row.target.comment.id) : null)
+            : null);
+        const postId =
+          postIdFromFields ??
+          (entityType === "post" ? entityId : null) ??
+          null;
+        const commentId =
+          commentIdFromFields ??
+          (entityType === "comment" ? entityId : null) ??
+          null;
+        if (!postId) continue;
+        push({
+          postId,
+          commentId: input.action === "comment" ? commentId : null,
+          authorId: null,
+          source,
+        });
+      }
+      return resolved;
+    };
+    if (hasBridge) {
+      await runLookupStep("notifications_priority", [
+        {
+          source: "notifications_unread",
+          request: {
+            action: "browse_notifications",
+            unreadOnly: true,
+            limit: 24,
+          },
+          parser: (value: unknown): EngagementTargetCandidate[] =>
+            parseNotificationTargets(value, "notifications_unread"),
+        },
+        {
+          source: "notifications_recent",
+          request: {
+            action: "browse_notifications",
+            unreadOnly: false,
+            limit: 24,
+          },
+          parser: (value: unknown): EngagementTargetCandidate[] =>
+            parseNotificationTargets(value, "notifications_recent"),
+        },
+      ]);
+    }
+
     if (typeof this.ctx.memory.buildContext === "function") {
       try {
         const request: ContextRequest = {
@@ -6804,6 +6912,26 @@ export class CommandExecutor {
               commentId: input.action === "comment" ? (parsedIds.commentId ?? null) : null,
               authorId: null,
               source: "memory_retrieval",
+            });
+          }
+        }
+        if (
+          isRecord(bundle.retrieval) &&
+          Array.isArray(bundle.retrieval.lookupPlans)
+        ) {
+          for (const plan of bundle.retrieval.lookupPlans) {
+            if (!isRecord(plan)) continue;
+            const args = isRecord(plan.args) ? plan.args : null;
+            if (!args) continue;
+            const postId = asPositiveInt(args.postId);
+            const commentId = asPositiveInt(args.commentId) ?? null;
+            if (!postId) continue;
+            pushCandidate({
+              postId,
+              commentId:
+                input.action === "comment" ? (commentId ?? null) : null,
+              authorId: null,
+              source: "memory_lookup_plan",
             });
           }
         }
@@ -6949,9 +7077,16 @@ export class CommandExecutor {
     const hasConfidentCandidate = (): boolean =>
       candidates.some((candidate) => {
         if (input.action === "comment") {
-          return candidate.source === "own_latest" || candidate.source === "unanswered_mention";
+          return (
+            candidate.source === "notifications_unread" ||
+            candidate.source === "notifications_recent" ||
+            candidate.source === "own_latest" ||
+            candidate.source === "unanswered_mention"
+          );
         }
         return (
+          candidate.source === "notifications_unread" ||
+          candidate.source === "notifications_recent" ||
           candidate.source === "unanswered_mention" ||
           candidate.source === "top_engager_latest" ||
           candidate.source === "recent_actions"
@@ -7050,32 +7185,38 @@ export class CommandExecutor {
     );
 
     const preferredSourceOrderComment = new Map<string, number>([
-      ["payload_hint", 0],
-      ["memory_retrieval", 1],
-      ["own_latest", 2],
-      ["unanswered_mention", 3],
-      ["top_engager_latest", 4],
-      ["recent_actions", 5],
-      ["home_feed", 6],
-      ["trending", 7],
-      ["search_global", 8],
-      ["explore", 9],
-      ["memory_event", 10],
-      ["directive_payload", 11],
+      ["notifications_unread", 0],
+      ["notifications_recent", 1],
+      ["payload_hint", 2],
+      ["memory_lookup_plan", 2],
+      ["memory_retrieval", 2],
+      ["own_latest", 3],
+      ["unanswered_mention", 4],
+      ["top_engager_latest", 5],
+      ["recent_actions", 6],
+      ["home_feed", 7],
+      ["trending", 8],
+      ["search_global", 9],
+      ["explore", 10],
+      ["memory_event", 11],
+      ["directive_payload", 12],
     ]);
     const preferredSourceOrderEngagement = new Map<string, number>([
-      ["payload_hint", 0],
-      ["unanswered_mention", 1],
-      ["top_engager_latest", 2],
-      ["recent_actions", 3],
-      ["home_feed", 4],
-      ["trending", 5],
-      ["search_global", 6],
-      ["explore", 7],
-      ["memory_retrieval", 8],
-      ["memory_event", 9],
-      ["own_latest", 10],
-      ["directive_payload", 11],
+      ["notifications_unread", 0],
+      ["notifications_recent", 1],
+      ["payload_hint", 2],
+      ["memory_lookup_plan", 2],
+      ["unanswered_mention", 2],
+      ["top_engager_latest", 3],
+      ["recent_actions", 4],
+      ["home_feed", 5],
+      ["trending", 6],
+      ["search_global", 7],
+      ["explore", 8],
+      ["memory_retrieval", 9],
+      ["memory_event", 10],
+      ["own_latest", 11],
+      ["directive_payload", 12],
     ]);
 
     const rankTable =
@@ -9534,6 +9675,205 @@ export class CommandExecutor {
 
   private async writeOutcome(outcome: CommandOutcome): Promise<void> {
     await appendJsonLine(this.ctx.ipcPaths.resultsPath, outcome).catch(() => undefined);
+  }
+
+  private async markQueueItemNotReadyByInbox(
+    inboxFile: string,
+    reason: string,
+  ): Promise<void> {
+    const normalizedInboxFile = inboxFile.trim();
+    if (!normalizedInboxFile.length) return;
+    const normalizedReason = reason.trim().length > 0 ? reason.trim() : "not_ready";
+
+    this.ctx.queue.queueStateMutation = this.ctx.queue.queueStateMutation
+      .then(async () => {
+        const raw = await readJsonFile(this.ctx.ipcPaths.queueStatePath);
+        const state = normalizeQueueState(raw);
+        const updatedItems = state.items.map((item) => {
+          if (item.inboxFile !== normalizedInboxFile) return item;
+          return {
+            ...item,
+            lastError: normalizedReason,
+          };
+        });
+        const next: QueueState = {
+          ...state,
+          updatedAt: nowIso(),
+          items: updatedItems,
+        };
+        await writeJsonFile(this.ctx.ipcPaths.queueStatePath, next);
+      })
+      .catch(() => undefined);
+
+    await this.ctx.queue.queueStateMutation;
+  }
+
+  private resolveEngagementActionForCommand(command: Command): "comment" | "like" | "repost" | null {
+    const kind = command.kind.trim().toLowerCase();
+    if (kind === "write.commentpost" || kind === "write.comment") return "comment";
+    if (kind === "write.votepost" || kind === "write.like") return "like";
+    if (kind === "write.repostpost" || kind === "write.repost") return "repost";
+    if (kind === "brain.generateandqueue" || kind === "brain.plan") {
+      const payload = isRecord(command.payload) ? command.payload : null;
+      if (!payload) return null;
+      const enforced = this.resolveEnforcedDraftAction(payload);
+      return enforced ?? null;
+    }
+    return null;
+  }
+
+  private async primeCommandContextForRequeue(
+    command: Command,
+    reason: string,
+  ): Promise<void> {
+    const action = this.resolveEngagementActionForCommand(command);
+    if (!action) return;
+    if (!this.ctx.callAgentChatBridge) return;
+    const loweredReason = reason.toLowerCase();
+    const shouldPrime =
+      loweredReason.includes("no_target") ||
+      loweredReason.includes("waiting_for_context") ||
+      loweredReason.includes("missing_target_post_context");
+    if (!shouldPrime) return;
+
+    const payload = isRecord(command.payload) ? command.payload : {};
+    const hints = this.extractEngagementLookupHints(payload);
+    const bridgeRequests: Record<string, unknown>[] = [
+      { action: "browse_notifications", unreadOnly: true, limit: 24 },
+      { action: "browse_notifications", unreadOnly: false, limit: 24 },
+      { action: "browse_unanswered_mentions", limit: 24, sinceHours: 24 * 14 },
+      { action: "browse_recent_actions", limit: 24 },
+      { action: "browse_top_engagers", limit: 12, windowHours: 24 * 14 },
+      { action: "browse_home_feed", limit: 24 },
+      { action: "browse_trending", limit: 24 },
+      { action: "browse_posts", limit: 24 },
+    ];
+    if (hints.rawQuery.trim().length > 2) {
+      bridgeRequests.push({
+        action: "search_global",
+        query: truncateText(hints.rawQuery, 220),
+        limit: 24,
+      });
+    }
+    if (hints.postId) {
+      bridgeRequests.unshift({
+        action: "find_post",
+        postId: hints.postId,
+      });
+    }
+
+    const discovered: EngagementTargetCandidate[] = [];
+    const seenTargets = new Set<string>();
+    for (const request of bridgeRequests) {
+      let result: { value: unknown; cacheHit: boolean } | null = null;
+      try {
+        result = await this.callAgentBridgeLookupCached(request, 5_000);
+      } catch {
+        result = null;
+      }
+      if (!result) continue;
+      for (const row of this.collectBridgeRecordItems(result.value)) {
+        const parsedDirect = this.extractEngagementTargetCandidateFromRecord(
+          row,
+          "requeue_prime",
+        );
+        const entityType =
+          asNonEmptyString(row.entityType)?.toLowerCase() ??
+          asNonEmptyString(row.targetType)?.toLowerCase() ??
+          null;
+        const entityId =
+          asPositiveInt(row.entityId) ??
+          asPositiveInt(row.targetId) ??
+          null;
+        const parsedFallback =
+          parsedDirect ??
+          (() => {
+            const postId =
+              asPositiveInt(row.postId) ??
+              asPositiveInt(row.targetPostId) ??
+              (entityType === "post" ? entityId : null);
+            if (!postId) return null;
+            const commentId =
+              asPositiveInt(row.commentId) ??
+              asPositiveInt(row.targetCommentId) ??
+              asPositiveInt(row.parentId) ??
+              (entityType === "comment" ? entityId : null);
+            return {
+              postId,
+              commentId: action === "comment" ? commentId : null,
+              authorId: null,
+              source: "requeue_prime",
+            } satisfies EngagementTargetCandidate;
+          })();
+        const parsed = parsedFallback;
+        if (!parsed) continue;
+        const key = `${parsed.postId}:${parsed.commentId ?? 0}`;
+        if (seenTargets.has(key)) continue;
+        seenTargets.add(key);
+        discovered.push(parsed);
+        if (discovered.length >= 24) break;
+      }
+      if (discovered.length >= 24) break;
+    }
+
+    if (!discovered.length) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "engagement_context_prime_empty",
+          at: nowIso(),
+          commandId: command.id,
+          action,
+          reason,
+          query: hints.rawQuery,
+        })
+        .catch(() => undefined);
+      return;
+    }
+
+    for (const candidate of discovered.slice(0, 12)) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "engagement_context_seed",
+          at: nowIso(),
+          commandId: command.id,
+          action,
+          postId: candidate.postId,
+          commentId: candidate.commentId,
+          authorId: candidate.authorId,
+          source: candidate.source,
+          query: hints.rawQuery,
+        })
+        .catch(() => undefined);
+    }
+
+    const cacheSeed = discovered[0] ?? null;
+    if (cacheSeed) {
+      const cacheKey = this.buildEngagementTargetCacheKey({
+        action,
+        payload,
+        hints,
+      });
+      this.engagementTargetCache.set(cacheKey, {
+        expiresAtMs: Date.now() + ENGAGEMENT_TARGET_CACHE_TTL_MS,
+        candidate: {
+          ...cacheSeed,
+          commentId: action === "comment" ? cacheSeed.commentId : null,
+        },
+      });
+      this.pruneEngagementTargetCache(Date.now());
+    }
+
+    await this.ctx.memory
+      .recordWrite({
+        type: "engagement_context_prime_completed",
+        at: nowIso(),
+        commandId: command.id,
+        action,
+        reason,
+        discoveredCount: discovered.length,
+        query: hints.rawQuery,
+      })
+      .catch(() => undefined);
   }
 
   private async markQueueItemCompletedByInbox(

@@ -164,9 +164,16 @@ export type RetrievalContextSummary = {
   query: string | null;
   keywords: string[];
   lines: string[];
+  lookupPlans?: RetrievalLookupPlan[];
 };
 
 export type RetrievalIntent = "chat" | "directive" | "engagement";
+
+export type RetrievalLookupPlan = {
+  action: string;
+  args: Record<string, string | number | boolean | null>;
+  reason: string;
+};
 
 // ---------------------------------------------------------------------------
 // Memory notes
