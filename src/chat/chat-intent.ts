@@ -37,6 +37,11 @@ export const normalizeInboxEntry = (value: unknown): ChatInboxEntry | null => {
   if (!messageId.length) return null;
   const body = typeof message.body === "string" && message.body.trim().length > 0 ? message.body.trim() : "";
   if (!body.length) return null;
+  const replyToMessageIdRaw =
+    typeof message.replyToMessageId === "string" ? message.replyToMessageId
+    : typeof message.reply_to_message_id === "string" ? message.reply_to_message_id
+    : "";
+  const replyToMessageId = replyToMessageIdRaw.trim();
   const commandKind = typeof message.commandKind === "string" && message.commandKind.trim().length > 0
     ? message.commandKind.trim() : "none";
   const context = isRecord(value.context) ? value.context : null;
@@ -72,6 +77,7 @@ export const normalizeInboxEntry = (value: unknown): ChatInboxEntry | null => {
       : null;
   return {
     messageId, body,
+    replyToMessageId: replyToMessageId.length > 0 ? replyToMessageId : null,
     topic: typeof value.topic === "string" ? value.topic : null,
     eventType: eventType || "message.created",
     conversationId: conversationId.length > 0 ? conversationId : null,

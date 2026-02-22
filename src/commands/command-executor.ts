@@ -21,8 +21,16 @@ import {
   resolveChatTargetFromPayload,
   sendChatResultMessageFromOutcome,
 } from "../chat/chat-context.js";
-import { verifyRuntimeCommandSeal } from "../directives/command-seal.js";
-import type { CommandSealState } from "../directives/command-seal.js";
+import type { CustomAssetTransformSpec } from "../media/custom-asset-transform.js";
+import { transformCustomAssetMedia } from "../media/custom-asset-transform.js";
+import {
+  sealRuntimeStagedCommand,
+  verifyRuntimeCommandSeal,
+} from "../directives/command-seal.js";
+import type {
+  CommandSealState,
+  SealVerifyError,
+} from "../directives/command-seal.js";
 import { parseGrantCandidatesFromPermissionState } from "../grants/grant-state.js";
 import { computeCommandSignature } from "../lib/crypto.js";
 import {
@@ -540,6 +548,19 @@ type GeneratedDraft = {
 };
 
 type GeneratedAssetType = "image" | "gif" | "pdf" | "csv" | "code" | "file" | "txt" | "md";
+type GeneratedCustomAssetKind = "emote" | "sticker" | "gif";
+type GeneratedCustomAssetScope = "mine" | "group" | "server";
+type GeneratedCustomAssetSaveIntent = {
+  kind: GeneratedCustomAssetKind;
+  scope: GeneratedCustomAssetScope;
+  nameHint: string | null;
+};
+type GeneratedCustomAssetSaveResult = {
+  kind: GeneratedCustomAssetKind;
+  scope: GeneratedCustomAssetScope;
+  name: string;
+  id: number | null;
+};
 type MediaGeneratorStreamFrame = {
   sourceFileName: string | null;
   isStreamPart: boolean;
@@ -710,7 +731,7 @@ export class CommandExecutor {
       return true;
     }
 
-    const command = parseCommand(read.value);
+    let command = parseCommand(read.value);
     if (!command) {
       await this.writeOutcome({
         at: nowIso(),
@@ -725,6 +746,7 @@ export class CommandExecutor {
       return true;
     }
 
+    let commandSigVerified = false;
     if (this.ctx.controlKey) {
       const expected = computeCommandSignature(this.ctx.controlKey, command);
       if (!command.sig || command.sig !== expected) {
@@ -746,6 +768,7 @@ export class CommandExecutor {
         await this.markQueueItemCompletedByInbox(inboxFile, "failed", "invalid command signature");
         return true;
       }
+      commandSigVerified = true;
     }
 
     let sealError = verifyRuntimeCommandSeal(this.ctx.commandSeal, command);
@@ -764,6 +787,19 @@ export class CommandExecutor {
         })
         .catch(() => undefined);
       sealError = verifyRuntimeCommandSeal(this.ctx.commandSeal, command);
+    }
+    if (sealError) {
+      const resealedCommand = await this.tryResealTrustedCommandForActiveSession({
+        command,
+        sealError,
+        commandSigVerified,
+        filePath,
+        inboxFile,
+      });
+      if (resealedCommand) {
+        command = resealedCommand;
+        sealError = verifyRuntimeCommandSeal(this.ctx.commandSeal, command);
+      }
     }
     if (sealError) {
       const outcome: CommandOutcome = {
@@ -916,6 +952,61 @@ export class CommandExecutor {
       kind: command.kind,
     }).catch(() => undefined);
     return { processed: true, outcome };
+  }
+
+  private async tryResealTrustedCommandForActiveSession(input: {
+    command: Command;
+    sealError: SealVerifyError;
+    commandSigVerified: boolean;
+    filePath: string;
+    inboxFile: string;
+  }): Promise<Command | null> {
+    const recoverableSealErrors = new Set<SealVerifyError>([
+      "missing_runtime_session",
+      "runtime_session_mismatch",
+      "missing_runtime_origin",
+      "missing_runtime_sig",
+      "invalid_runtime_sig",
+    ]);
+    if (!recoverableSealErrors.has(input.sealError)) return null;
+
+    const commandId = asNonEmptyString(input.command.id);
+    if (!commandId) return null;
+    const sourceDirectiveId = asNonEmptyString(input.command.sourceDirectiveId);
+    const pendingDirectiveId = asNonEmptyString(input.command.pendingDirectiveId);
+    const runtimeOrigin = asNonEmptyString(input.command.runtimeOrigin)?.toLowerCase() ?? "";
+    const trustedDirectiveOrigin =
+      runtimeOrigin === "director_directive" || runtimeOrigin === "pending_promotion";
+    const directiveLinked = sourceDirectiveId === commandId || pendingDirectiveId === commandId;
+
+    if (!input.commandSigVerified && !(trustedDirectiveOrigin && directiveLinked)) {
+      return null;
+    }
+
+    const resealed = sealRuntimeStagedCommand(
+      this.ctx.commandSeal,
+      {
+        ...input.command,
+      },
+      runtimeOrigin || "runtime_resealed",
+    );
+    await writeJsonFile(input.filePath, resealed).catch(() => undefined);
+    await this.ctx.memory
+      .recordWrite({
+        type: "inbox_command_resealed",
+        at: nowIso(),
+        inboxFile: input.inboxFile,
+        commandId,
+        kind: input.command.kind,
+        reason: input.sealError,
+        trustSource: input.commandSigVerified ? "command_sig" : "directive_origin",
+        priorRuntimeSessionId: input.command.runtimeSessionId ?? null,
+        priorRuntimeOrigin: input.command.runtimeOrigin ?? null,
+        resealedRuntimeSessionId: resealed.runtimeSessionId,
+        resealedRuntimeOrigin: resealed.runtimeOrigin,
+      })
+      .catch(() => undefined);
+    return resealed;
   }
 
   private tryRehydrateRuntimeIssuedSeal(command: Command): boolean {
@@ -1196,7 +1287,7 @@ export class CommandExecutor {
     expectedTargetHash: string;
   }): ActionContract | null {
     const parseFromRecord = (record: Record<string, unknown>): ActionContract | null => {
-      const action = asNonEmptyString(record.action)?.toLowerCase();
+      const action = asNonEmptyString(record.action)?.toLowerCase() ?? input.action;
       if (action !== input.action) return null;
       if (typeof record.shouldExecute !== "boolean") return null;
       const target = isRecord(record.target) ? record.target : null;
@@ -1206,8 +1297,14 @@ export class CommandExecutor {
       const commentId =
         target.commentId === null ? null : asPositiveInt(target.commentId);
       if (commentId !== (input.expectedCommentId ?? null)) return null;
-      const targetHash = asNonEmptyString(target.targetHash);
-      if (!targetHash || targetHash !== input.expectedTargetHash) return null;
+      const targetHashCandidate = asNonEmptyString(target.targetHash);
+      if (
+        targetHashCandidate !== null &&
+        targetHashCandidate !== input.expectedTargetHash
+      ) {
+        return null;
+      }
+      const targetHash = targetHashCandidate ?? input.expectedTargetHash;
       const targetLockMatch = isTargetLockMatch({
         payload: {
           targetPostId: postId,
@@ -3117,9 +3214,12 @@ export class CommandExecutor {
           .catch(() => undefined);
         if (!decision.shouldExecute) {
           const explicitRequested =
+            command.forceNow === true ||
             payload.explicitPublishRequested === true ||
             payload.forceNow === true ||
-            payload.userExplicitRequest === true;
+            payload.userExplicitRequest === true ||
+            command.runtimeOrigin === "director_directive" ||
+            command.runtimeOrigin === "pending_promotion";
           if (explicitRequested) {
             await this.ctx.memory
               .recordWrite({
@@ -3310,9 +3410,12 @@ export class CommandExecutor {
           .catch(() => undefined);
         if (!decision.shouldExecute) {
           const explicitRequested =
+            command.forceNow === true ||
             payload.explicitPublishRequested === true ||
             payload.forceNow === true ||
-            payload.userExplicitRequest === true;
+            payload.userExplicitRequest === true ||
+            command.runtimeOrigin === "director_directive" ||
+            command.runtimeOrigin === "pending_promotion";
           if (explicitRequested) {
             await this.ctx.memory
               .recordWrite({
@@ -3475,16 +3578,14 @@ export class CommandExecutor {
 
     const requireExplicitPublishVerb = payload.requireExplicitPublishVerb === true;
     const explicitPublishRequested = payload.explicitPublishRequested === true;
-    if (requireExplicitPublishVerb && !explicitPublishRequested) {
+    if (
+      requireExplicitPublishVerb &&
+      !explicitPublishRequested &&
+      this.shouldEnforceExplicitPublishGate(payload)
+    ) {
       const blockedDraftCount = drafts.filter((draft) => {
         const action = draft.action.trim().toLowerCase();
-        return (
-          action === "post" ||
-          action === "comment" ||
-          action === "story" ||
-          action === "like" ||
-          action === "repost"
-        );
+        return action === "post" || action === "story";
       }).length;
       if (blockedDraftCount > 0) {
         await this.ctx.memory.recordWrite({
@@ -3497,7 +3598,7 @@ export class CommandExecutor {
         }).catch(() => undefined);
         return this.failedOutcome(
           command,
-          "Publish action blocked: explicit post/publish/share/comment/story/repost request required.",
+          "Publish action blocked: explicit post/publish/share/story request required.",
           "publish_verb_required",
         );
       }
@@ -3538,6 +3639,390 @@ export class CommandExecutor {
         ok: entry.ok,
       })),
     });
+  }
+
+  private shouldEnforceExplicitPublishGate(payload: Record<string, unknown>): boolean {
+    if (payload.chatLiteralGenerate === true) return false;
+    const goal = asNonEmptyString(payload.goal)?.toLowerCase() ?? "";
+    if (goal === "chat" || goal === "settings" || goal === "moderation") {
+      return false;
+    }
+
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    const commandName = asNonEmptyString(chatContext?.commandName)?.toLowerCase() ?? "";
+    if (
+      commandName === "follow" ||
+      commandName === "follow-engagers" ||
+      commandName === "followengagers" ||
+      commandName === "follow-accept" ||
+      commandName === "followaccept" ||
+      commandName === "agent-status" ||
+      commandName === "chat-status" ||
+      commandName === "settings"
+    ) {
+      return false;
+    }
+
+    const serverIntentHint = isRecord(chatContext?.serverIntentHint)
+      ? chatContext.serverIntentHint
+      : null;
+    const actionFamily =
+      asNonEmptyString(serverIntentHint?.actionFamily)?.toLowerCase() ?? "";
+    if (
+      actionFamily === "conversation" ||
+      actionFamily === "settings" ||
+      actionFamily === "assist" ||
+      actionFamily === "research"
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private parseGeneratedCustomAssetKind(
+    value: unknown,
+  ): GeneratedCustomAssetKind | null {
+    const normalized = asNonEmptyString(value)?.toLowerCase() ?? "";
+    if (normalized === "emote") return "emote";
+    if (normalized === "sticker") return "sticker";
+    if (normalized === "gif") return "gif";
+    return null;
+  }
+
+  private parseGeneratedCustomAssetScope(
+    value: unknown,
+  ): GeneratedCustomAssetScope | null {
+    const normalized = asNonEmptyString(value)?.toLowerCase() ?? "";
+    if (normalized === "mine") return "mine";
+    if (normalized === "group") return "group";
+    if (normalized === "server") return "server";
+    return null;
+  }
+
+  private parseGeneratedCustomAssetTransformSpec(
+    payload: Record<string, unknown>,
+  ): CustomAssetTransformSpec | undefined {
+    const explicitRoot = isRecord(payload.generatedCustomAssetSave)
+      ? payload.generatedCustomAssetSave
+      : null;
+    const explicitTransform = isRecord(explicitRoot?.transform)
+      ? explicitRoot.transform
+      : isRecord(payload.generatedCustomAssetTransform)
+        ? payload.generatedCustomAssetTransform
+        : null;
+    if (!explicitTransform) return undefined;
+    const parseNumeric = (
+      value: unknown,
+      clampMin: number,
+      clampMax: number,
+    ): number | undefined => {
+      if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+      return Math.max(clampMin, Math.min(clampMax, value));
+    };
+    const parseIntNumeric = (
+      value: unknown,
+      clampMin: number,
+      clampMax: number,
+    ): number | undefined => {
+      const parsed = parseNumeric(value, clampMin, clampMax);
+      return typeof parsed === "number" ? Math.floor(parsed) : undefined;
+    };
+    const fitRaw = asNonEmptyString(explicitTransform.fit)?.toLowerCase();
+    const fit =
+      fitRaw === "cover" || fitRaw === "contain" || fitRaw === "inside"
+        ? fitRaw
+        : undefined;
+    const formatRaw = asNonEmptyString(explicitTransform.format)?.toLowerCase();
+    const format =
+      formatRaw === "gif" ||
+      formatRaw === "webp" ||
+      formatRaw === "png" ||
+      formatRaw === "jpeg"
+        ? formatRaw
+        : undefined;
+    const width = parseIntNumeric(explicitTransform.width, 16, 2048);
+    const height = parseIntNumeric(explicitTransform.height, 16, 2048);
+    const rotateDeg = parseNumeric(explicitTransform.rotateDeg, -360, 360);
+    const brightness = parseNumeric(explicitTransform.brightness, 0.1, 3);
+    const contrast = parseNumeric(explicitTransform.contrast, 0.2, 3);
+    const saturation = parseNumeric(explicitTransform.saturation, 0, 3);
+    const blur = parseNumeric(explicitTransform.blur, 0, 20);
+    const sharpen = parseNumeric(explicitTransform.sharpen, 0, 10);
+    const quality = parseIntNumeric(explicitTransform.quality, 30, 100);
+    const spec: CustomAssetTransformSpec = {
+      ...(width !== undefined ? { width } : {}),
+      ...(height !== undefined ? { height } : {}),
+      ...(fit ? { fit } : {}),
+      ...(rotateDeg !== undefined ? { rotateDeg } : {}),
+      ...(brightness !== undefined ? { brightness } : {}),
+      ...(contrast !== undefined ? { contrast } : {}),
+      ...(saturation !== undefined ? { saturation } : {}),
+      ...(blur !== undefined ? { blur } : {}),
+      ...(sharpen !== undefined ? { sharpen } : {}),
+      ...(quality !== undefined ? { quality } : {}),
+      ...(format ? { format } : {}),
+    };
+    if (Object.keys(spec).length === 0) return undefined;
+    return spec;
+  }
+
+  private async prepareGeneratedCustomAssetForSave(input: {
+    command: Command;
+    payload: Record<string, unknown>;
+    sourcePrompt: string;
+    sourceUrl: string;
+    sourceMimeType: string;
+    intent: GeneratedCustomAssetSaveIntent;
+  }): Promise<{
+    mediaUrl: string;
+    mimeType: string;
+    width: number | undefined;
+    height: number | undefined;
+    isAnimated: boolean | undefined;
+    transformNotes: string[];
+  }> {
+    const fallbackMimeType = input.sourceMimeType;
+    const transformSpec = this.parseGeneratedCustomAssetTransformSpec(input.payload);
+    try {
+      const transformed = await transformCustomAssetMedia({
+        sourceUrl: input.sourceUrl,
+        sourceMimeType: input.sourceMimeType,
+        kind: input.intent.kind,
+        ...(transformSpec ? { spec: transformSpec } : {}),
+      });
+      if (!transformed?.bytes?.byteLength) {
+        return {
+          mediaUrl: input.sourceUrl,
+          mimeType: fallbackMimeType,
+          width: undefined,
+          height: undefined,
+          isAnimated:
+            input.intent.kind === "gif" || fallbackMimeType.trim().toLowerCase() === "image/gif"
+              ? true
+              : undefined,
+          transformNotes: ["transform_skipped_empty_output"],
+        };
+      }
+
+      const fileExt = mimeToExt(transformed.mimeType);
+      const uploadFilename = `${input.intent.kind}-${Date.now()}.${fileExt}`;
+      const chunkUploaded = await this.uploadBytesViaChunkRoute({
+        bytes: transformed.bytes,
+        mimeType: transformed.mimeType,
+        filename: uploadFilename,
+      });
+      const uploaded =
+        chunkUploaded ??
+        this.mapUploadResult(
+          await this.agent().uploadDataUri.mutate({
+            dataUri: `data:${transformed.mimeType};base64,${transformed.bytes.toString("base64")}`,
+          }),
+        );
+      const transformedMime = transformed.mimeType.trim().toLowerCase();
+      return {
+        mediaUrl: uploaded.mediaUrl,
+        mimeType: transformedMime || fallbackMimeType,
+        width:
+          typeof transformed.width === "number" && Number.isFinite(transformed.width)
+            ? transformed.width
+            : undefined,
+        height:
+          typeof transformed.height === "number" && Number.isFinite(transformed.height)
+            ? transformed.height
+            : undefined,
+        isAnimated:
+          input.intent.kind === "gif" || transformedMime === "image/gif" ? true : undefined,
+        transformNotes: transformed.notes,
+      };
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "generated_custom_asset_transform_failed",
+          at: nowIso(),
+          commandId: input.command.id,
+          kind: input.intent.kind,
+          sourcePrompt: truncateText(input.sourcePrompt, 220),
+          sourceUrl: input.sourceUrl,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return {
+        mediaUrl: input.sourceUrl,
+        mimeType: fallbackMimeType,
+        width: undefined,
+        height: undefined,
+        isAnimated:
+          input.intent.kind === "gif" || fallbackMimeType.trim().toLowerCase() === "image/gif"
+            ? true
+            : undefined,
+        transformNotes: ["transform_failed_fallback_source"],
+      };
+    }
+  }
+
+  private resolveGeneratedCustomAssetSaveIntent(
+    payload: Record<string, unknown>,
+    sourcePrompt: string,
+  ): GeneratedCustomAssetSaveIntent | null {
+    const explicit = isRecord(payload.generatedCustomAssetSave)
+      ? payload.generatedCustomAssetSave
+      : null;
+    if (explicit) {
+      const explicitKind = this.parseGeneratedCustomAssetKind(explicit.kind);
+      const explicitScope =
+        this.parseGeneratedCustomAssetScope(explicit.scope) ?? "mine";
+      if (explicitKind) {
+        return {
+          kind: explicitKind,
+          scope: explicitScope,
+          nameHint: asNonEmptyString(explicit.nameHint),
+        };
+      }
+    }
+
+    const normalized = sourcePrompt.trim().toLowerCase();
+    if (!normalized.length) return null;
+    const hasSaveVerb = /\b(?:attach|add|save|store|put|set)\b/iu.test(normalized);
+    const hasTargetHint = /\b(?:to|as|in|into|for)\b/iu.test(normalized);
+    if (!hasSaveVerb || !hasTargetHint) return null;
+
+    const kindCandidates: Array<{
+      kind: GeneratedCustomAssetKind;
+      index: number;
+    }> = [
+      { kind: "emote" as const, index: normalized.indexOf("emote") },
+      { kind: "sticker" as const, index: normalized.indexOf("sticker") },
+      { kind: "gif" as const, index: normalized.indexOf("gif") },
+    ].filter((entry) => entry.index >= 0);
+    if (!kindCandidates.length) return null;
+    kindCandidates.sort((a, b) => a.index - b.index);
+    const kind = kindCandidates[0]?.kind ?? null;
+    if (!kind) return null;
+
+    const scope =
+      /\b(?:group|conversation|this group)\b/iu.test(normalized)
+        ? "group"
+        : /\b(?:server|guild|channel|this server)\b/iu.test(normalized)
+          ? "server"
+          : "mine";
+
+    return { kind, scope, nameHint: null };
+  }
+
+  private buildGeneratedCustomAssetName(input: {
+    kind: GeneratedCustomAssetKind;
+    sourcePrompt: string;
+    nameHint: string | null;
+  }): string {
+    const maxLen = input.kind === "gif" ? 64 : 32;
+    const normalized = (input.nameHint ?? input.sourcePrompt)
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9\s_-]+/gu, " ")
+      .replace(/[\s-]+/gu, "_")
+      .replace(/_+/gu, "_")
+      .replace(/^_+|_+$/gu, "")
+      .slice(0, maxLen);
+    if (normalized.length >= 2) return normalized;
+    return `${input.kind}_${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}`;
+  }
+
+  private resolveGeneratedAssetServerId(payload: Record<string, unknown>): string | null {
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    return (
+      asNonEmptyString(payload.serverId) ??
+      asNonEmptyString(payload.chatServerId) ??
+      asNonEmptyString(payload.targetServerId) ??
+      asNonEmptyString(chatContext?.serverId)
+    );
+  }
+
+  private async saveGeneratedCustomAsset(input: {
+    command: Command;
+    payload: Record<string, unknown>;
+    intent: GeneratedCustomAssetSaveIntent;
+    sourcePrompt: string;
+    mediaUrl: string;
+    mimeType: string;
+    chatTarget: { conversationId?: string; channelId?: string };
+  }): Promise<GeneratedCustomAssetSaveResult> {
+    if (!this.ctx.callAgentChatBridge) {
+      throw new Error("chat_bridge_unavailable");
+    }
+
+    if (input.intent.scope === "group" && !input.chatTarget.conversationId) {
+      throw new Error("group_custom_asset_requires_conversation_context");
+    }
+
+    const serverId = this.resolveGeneratedAssetServerId(input.payload);
+    if (input.intent.scope === "server" && !serverId) {
+      throw new Error("server_custom_asset_requires_server_id");
+    }
+
+    const name = this.buildGeneratedCustomAssetName({
+      kind: input.intent.kind,
+      sourcePrompt: input.sourcePrompt,
+      nameHint: input.intent.nameHint,
+    });
+
+    const prepared = await this.prepareGeneratedCustomAssetForSave({
+      command: input.command,
+      payload: input.payload,
+      sourcePrompt: input.sourcePrompt,
+      sourceUrl: input.mediaUrl,
+      sourceMimeType: input.mimeType,
+      intent: input.intent,
+    });
+
+    const result = await this.ctx.callAgentChatBridge({
+      action: "save_custom_asset",
+      kind: input.intent.kind,
+      scope: input.intent.scope,
+      name,
+      url: prepared.mediaUrl,
+      ...(input.intent.kind === "gif" ? { previewUrl: prepared.mediaUrl } : {}),
+      mimeType: prepared.mimeType,
+      ...(prepared.width !== undefined ? { width: prepared.width } : {}),
+      ...(prepared.height !== undefined ? { height: prepared.height } : {}),
+      ...(prepared.isAnimated !== undefined
+        ? { isAnimated: prepared.isAnimated }
+        : {}),
+      ...(input.chatTarget.conversationId
+        ? { conversationId: input.chatTarget.conversationId }
+        : {}),
+      ...(serverId ? { serverId } : {}),
+    });
+
+    if (prepared.transformNotes.length > 0) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "generated_custom_asset_saved",
+          at: nowIso(),
+          commandId: input.command.id,
+          kind: input.intent.kind,
+          scope: input.intent.scope,
+          sourceUrl: input.mediaUrl,
+          savedUrl: prepared.mediaUrl,
+          transformNotes: prepared.transformNotes,
+        })
+        .catch(() => undefined);
+    }
+
+    const resultRecord = isRecord(result) ? result : null;
+    const savedRecord = resultRecord && isRecord(resultRecord.saved)
+      ? resultRecord.saved
+      : null;
+    const id =
+      savedRecord && typeof savedRecord.id === "number" && Number.isFinite(savedRecord.id)
+        ? Math.floor(savedRecord.id)
+        : null;
+    return {
+      kind: input.intent.kind,
+      scope: input.intent.scope,
+      name,
+      id,
+    };
   }
 
   private resolveGeneratedAssetType(value: unknown): GeneratedAssetType {
@@ -3687,6 +4172,10 @@ export class CommandExecutor {
         : generatedAssetType === "gif"
           ? "GIF"
           : "image";
+    const generatedCustomAssetSaveIntent =
+      !avatarRequest && !bannerRequest
+        ? this.resolveGeneratedCustomAssetSaveIntent(payload, basePrompt)
+        : null;
     const summary = truncateText(basePrompt, 220);
     const chatRoute = chatTarget.conversationId
       ? { conversationId: chatTarget.conversationId }
@@ -3709,9 +4198,16 @@ export class CommandExecutor {
           ? "Working on your banner now..."
           : `Generating ${generatedLabel} for "${summary}".`;
     let previewMessageId: string | null = null;
+    let previewMessageCreateAttempted = false;
     let previewProgressFingerprint = "";
     let previewProgressUpdatedAtMs = 0;
     let latestMediaProgress: MediaGenerationProgress | null = null;
+    const snapshotStreamFrames = (): MediaGeneratorStreamFrame[] => {
+      const progress = latestMediaProgress;
+      return progress && Array.isArray(progress.streamFrames)
+        ? progress.streamFrames
+        : [];
+    };
     const buildProcessingActionPreview = (progress?: MediaGenerationProgress) => ({
       type: previewType,
       status: "processing",
@@ -3729,6 +4225,150 @@ export class CommandExecutor {
         : {}),
     });
     const previewClientMessageId = `runtime_generate_${command.id}`;
+    let previewLookupBackoffUntilMs = 0;
+    const maybeResolvePreviewMessageId = async (force: boolean): Promise<string | null> => {
+      if (previewMessageId) return previewMessageId;
+      const callAgentChatBridge = this.ctx.callAgentChatBridge;
+      if (!callAgentChatBridge) return null;
+      const nowMs = Date.now();
+      if (!force && nowMs < previewLookupBackoffUntilMs) {
+        return null;
+      }
+      previewLookupBackoffUntilMs = nowMs + 800;
+      try {
+        const listed = await callAgentChatBridge({
+          action: "list_messages",
+          ...chatRoute,
+          limit: 120,
+        });
+        const data = isRecord(listed) ? listed : null;
+        const items = data ? toUnknownArray(data.items) : [];
+        for (const rawItem of items) {
+          if (!isRecord(rawItem)) continue;
+          const message = isRecord(rawItem.message) ? rawItem.message : null;
+          if (!message) continue;
+          const messageId = asNonEmptyString(message.id);
+          const clientMessageId = asNonEmptyString(message.clientMessageId);
+          if (!messageId || !clientMessageId) continue;
+          if (
+            clientMessageId === previewClientMessageId ||
+            clientMessageId.startsWith(`${previewClientMessageId}_`)
+          ) {
+            previewMessageId = messageId;
+            return previewMessageId;
+          }
+        }
+      } catch {
+        return null;
+      }
+      return null;
+    };
+    const tryEditPreviewMessage = async (input: {
+      body: string;
+      attachments?: Array<{
+        url: string;
+        mimeType: string;
+        sizeBytes: number;
+        metadata?: Record<string, unknown>;
+      }>;
+      metadata: Record<string, unknown>;
+      kind: "processing" | "success" | "failed";
+    }): Promise<boolean> => {
+      const callAgentChatBridge = this.ctx.callAgentChatBridge;
+      if (!callAgentChatBridge) return false;
+      const runEdit = async (
+        messageId: string,
+        dropAttachments: boolean,
+      ): Promise<void> => {
+        await callAgentChatBridge({
+          action: "edit_message",
+          messageId,
+          body: input.body,
+          ...(!dropAttachments && input.attachments
+            ? { attachments: input.attachments }
+            : {}),
+          metadata: input.metadata,
+        });
+      };
+      let messageId = previewMessageId ?? (await maybeResolvePreviewMessageId(true));
+      if (!messageId) return false;
+      try {
+        await runEdit(messageId, false);
+        previewMessageId = messageId;
+        return true;
+      } catch (firstError: unknown) {
+        if (
+          input.kind !== "processing" &&
+          Array.isArray(input.attachments) &&
+          input.attachments.length > 0
+        ) {
+          try {
+            await runEdit(messageId, true);
+            previewMessageId = messageId;
+            await this.ctx.memory
+              .recordWrite({
+                type: "chat_literal_generate_preview_edit_without_attachment",
+                at: nowIso(),
+                commandId: command.id,
+                kind: input.kind,
+                message:
+                  firstError instanceof Error
+                    ? firstError.message
+                    : String(firstError),
+              })
+              .catch(() => undefined);
+            return true;
+          } catch {
+            // Continue to recovery path below.
+          }
+        }
+        previewMessageId = null;
+        messageId = await maybeResolvePreviewMessageId(true);
+        if (!messageId) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "chat_literal_generate_preview_edit_failed",
+              at: nowIso(),
+              commandId: command.id,
+              kind: input.kind,
+              message:
+                firstError instanceof Error ? firstError.message : String(firstError),
+            })
+            .catch(() => undefined);
+          return false;
+        }
+        try {
+          await runEdit(messageId, false);
+          previewMessageId = messageId;
+          return true;
+        } catch (retryError: unknown) {
+          if (
+            input.kind !== "processing" &&
+            Array.isArray(input.attachments) &&
+            input.attachments.length > 0
+          ) {
+            try {
+              await runEdit(messageId, true);
+              previewMessageId = messageId;
+              return true;
+            } catch {
+              // fall through to logging below
+            }
+          }
+          await this.ctx.memory
+            .recordWrite({
+              type: "chat_literal_generate_preview_edit_failed",
+              at: nowIso(),
+              commandId: command.id,
+              kind: input.kind,
+              message:
+                retryError instanceof Error ? retryError.message : String(retryError),
+            })
+            .catch(() => undefined);
+          return false;
+        }
+      }
+    };
     const sendOrEditPreviewMessage = async (input: {
       body: string;
       attachments?: Array<{
@@ -3747,89 +4387,53 @@ export class CommandExecutor {
         mimeType: string;
         sizeBytes: number;
         metadata?: Record<string, unknown>;
-      }>): Promise<void> => {
-        const created = await callAgentChatBridge({
-          action: "send_message",
-          clientMessageId:
-            input.kind === "processing"
-              ? previewClientMessageId
-              : `${previewClientMessageId}_${input.kind}_${Date.now()}`,
-          ...chatRoute,
-          body: input.body,
-          format: "markdown",
-          ...(attachments ? { attachments } : {}),
-          metadata: input.metadata,
-        });
-        previewMessageId ??= extractBridgeMessageId(created);
-      };
-      if (previewMessageId) {
+      }>): Promise<boolean> => {
+        if (previewMessageCreateAttempted) return false;
+        previewMessageCreateAttempted = true;
         try {
-          await callAgentChatBridge({
-            action: "edit_message",
-            messageId: previewMessageId,
+          const created = await callAgentChatBridge({
+            action: "send_message",
+            clientMessageId: previewClientMessageId,
+            ...chatRoute,
             body: input.body,
-            ...(input.attachments ? { attachments: input.attachments } : {}),
+            format: "markdown",
+            ...(attachments ? { attachments } : {}),
             metadata: input.metadata,
           });
-          return;
+          previewMessageId ??= extractBridgeMessageId(created);
+          if (!previewMessageId) {
+            await maybeResolvePreviewMessageId(true);
+          }
+          return true;
         } catch (error: unknown) {
-          await this.ctx.memory
-            .recordWrite({
-              type: "chat_literal_generate_preview_edit_failed",
-              at: nowIso(),
-              commandId: command.id,
-              kind: input.kind,
-              message:
-                error instanceof Error ? error.message : String(error),
-            })
-            .catch(() => undefined);
-          // Keep a single preview message thread. Do not spawn a duplicate box.
-          if (input.kind === "processing") {
-            return;
-          }
-          try {
-            await sendFreshPreviewMessage(input.attachments);
-            return;
-          } catch (fallbackError: unknown) {
-            await this.ctx.memory
-              .recordWrite({
-                type: "chat_literal_generate_preview_terminal_send_failed",
-                at: nowIso(),
-                commandId: command.id,
-                kind: input.kind,
-                message:
-                  fallbackError instanceof Error
-                    ? fallbackError.message
-                    : String(fallbackError),
-              })
-              .catch(() => undefined);
-            if (input.attachments && input.attachments.length > 0) {
-              try {
-                await sendFreshPreviewMessage(undefined);
-                return;
-              } catch (fallbackWithoutAttachmentError: unknown) {
-                await this.ctx.memory
-                  .recordWrite({
-                    type: "chat_literal_generate_preview_terminal_send_without_attachment_failed",
-                    at: nowIso(),
-                    commandId: command.id,
-                    kind: input.kind,
-                    message:
-                      fallbackWithoutAttachmentError instanceof Error
-                        ? fallbackWithoutAttachmentError.message
-                        : String(fallbackWithoutAttachmentError),
-                  })
-                  .catch(() => undefined);
-              }
-            }
-            return;
-          }
+          previewMessageCreateAttempted = false;
+          throw error;
+        }
+      };
+      if (
+        previewMessageId ||
+        previewMessageCreateAttempted ||
+        input.kind !== "processing"
+      ) {
+        const edited = await tryEditPreviewMessage(input);
+        if (edited) {
+          return;
+        }
+        // Keep a single preview box. Do not create secondary terminal boxes.
+        if (input.kind !== "processing") {
+          return;
         }
       }
-      await sendFreshPreviewMessage(input.attachments);
+      const sent = await sendFreshPreviewMessage(input.attachments);
+      if (!sent) {
+        await maybeResolvePreviewMessageId(true);
+      }
     };
     const emitStreamProgress = async (progress: MediaGenerationProgress): Promise<void> => {
       latestMediaProgress = progress;
+      if (!previewMessageId) {
+        await maybeResolvePreviewMessageId(true);
+      }
       if (!previewMessageId) return;
       const nowMs = Date.now();
       if (nowMs - previewProgressUpdatedAtMs < 120) return;
@@ -3846,16 +4450,16 @@ export class CommandExecutor {
       if (fingerprint === previewProgressFingerprint) return;
       previewProgressFingerprint = fingerprint;
       previewProgressUpdatedAtMs = nowMs;
-      await this.ctx.callAgentChatBridge?.({
-        action: "edit_message",
-        messageId: previewMessageId,
+      const edited = await tryEditPreviewMessage({
+        kind: "processing",
         body: processingBody,
         metadata: {
           automated: true,
           sourceContext: "CHAT",
           actionPreview: buildProcessingActionPreview(progress),
         },
-      }).catch(() => undefined);
+      });
+      if (!edited) return;
     };
     try {
       await sendOrEditPreviewMessage({
@@ -3914,7 +4518,7 @@ export class CommandExecutor {
         const avatarProfileHref = avatarTarget === "owner" && avatarHandle
           ? `/u/${avatarHandle.replace(/^@+/u, "")}?edit=avatar&crop=1`
           : null;
-        const streamedFrames = latestMediaProgress?.streamFrames ?? [];
+        const streamedFrames = snapshotStreamFrames();
         const needsExplicitFinalFrame =
           streamedFrames.length === 0 ||
           streamedFrames[streamedFrames.length - 1]?.previewUrl !== media.mediaUrl;
@@ -4035,7 +4639,7 @@ export class CommandExecutor {
         const bannerProfileHref = bannerTarget === "owner" && bannerHandle
           ? `/u/${bannerHandle.replace(/^@+/u, "")}?edit=banner&crop=1`
           : null;
-        const streamedFrames = latestMediaProgress?.streamFrames ?? [];
+        const streamedFrames = snapshotStreamFrames();
         const needsExplicitFinalFrame =
           streamedFrames.length === 0 ||
           streamedFrames[streamedFrames.length - 1]?.previewUrl !== media.mediaUrl;
@@ -4129,7 +4733,7 @@ export class CommandExecutor {
         });
       }
 
-      const streamedFrames = latestMediaProgress?.streamFrames ?? [];
+      const streamedFrames = snapshotStreamFrames();
       const needsExplicitFinalFrame =
         streamedFrames.length === 0 ||
         streamedFrames[streamedFrames.length - 1]?.previewUrl !== media.mediaUrl;
@@ -4148,9 +4752,39 @@ export class CommandExecutor {
             },
           ]
         : streamedFrames;
+      let generatedCustomAssetSaveResult: GeneratedCustomAssetSaveResult | null = null;
+      let generatedCustomAssetSaveError: string | null = null;
+      if (generatedCustomAssetSaveIntent) {
+        try {
+          generatedCustomAssetSaveResult = await this.saveGeneratedCustomAsset({
+            command,
+            payload,
+            intent: generatedCustomAssetSaveIntent,
+            sourcePrompt: basePrompt,
+            mediaUrl: media.mediaUrl,
+            mimeType,
+            chatTarget,
+          });
+        } catch (error: unknown) {
+          generatedCustomAssetSaveError =
+            error instanceof Error ? error.message : String(error);
+        }
+      }
+      const customAssetScopeLabel =
+        generatedCustomAssetSaveResult?.scope === "group"
+          ? "this group"
+          : generatedCustomAssetSaveResult?.scope === "server"
+            ? "this server"
+            : "your library";
+      const successBody =
+        generatedCustomAssetSaveResult
+          ? `Generated ${generatedLabel} for "${summary}". Saved as ${generatedCustomAssetSaveResult.kind} \`${generatedCustomAssetSaveResult.name}\` in ${customAssetScopeLabel}.`
+          : generatedCustomAssetSaveError && generatedCustomAssetSaveIntent
+            ? `Generated ${generatedLabel} for "${summary}". Could not save to ${generatedCustomAssetSaveIntent.scope} ${generatedCustomAssetSaveIntent.kind}s (${truncateText(generatedCustomAssetSaveError, 120)}).`
+            : `Generated ${generatedLabel} for "${summary}".`;
       await sendOrEditPreviewMessage({
         kind: "success",
-        body: `Generated ${generatedLabel} for "${summary}".`,
+        body: successBody,
         attachments: [
           {
             url: media.mediaUrl,
@@ -4173,6 +4807,23 @@ export class CommandExecutor {
             previewUrl: media.mediaUrl,
             href: media.mediaUrl,
             hrefLabel: `Open ${generatedLabel}`,
+            ...(generatedCustomAssetSaveResult
+              ? {
+                  customAsset: {
+                    kind: generatedCustomAssetSaveResult.kind,
+                    scope: generatedCustomAssetSaveResult.scope,
+                    name: generatedCustomAssetSaveResult.name,
+                    id: generatedCustomAssetSaveResult.id,
+                  },
+                }
+              : generatedCustomAssetSaveError && generatedCustomAssetSaveIntent
+                ? {
+                    customAssetSaveError: truncateText(
+                      generatedCustomAssetSaveError,
+                      180,
+                    ),
+                  }
+                : {}),
             ...(streamFramesForSuccess.length > 0
               ? {
                   streamFrames: streamFramesForSuccess,
@@ -4192,6 +4843,11 @@ export class CommandExecutor {
         generatedAssetType,
         mediaUrl: media.mediaUrl,
         prompt: summary,
+        customAssetKind: generatedCustomAssetSaveResult?.kind ?? null,
+        customAssetScope: generatedCustomAssetSaveResult?.scope ?? null,
+        customAssetName: generatedCustomAssetSaveResult?.name ?? null,
+        customAssetId: generatedCustomAssetSaveResult?.id ?? null,
+        customAssetSaveError: generatedCustomAssetSaveError,
         targetConversationId: chatTarget.conversationId ?? null,
         targetChannelId: chatTarget.channelId ?? null,
       });
@@ -4199,6 +4855,12 @@ export class CommandExecutor {
         generatedAssetType,
         mediaUrl: media.mediaUrl,
         prompt: summary,
+        ...(generatedCustomAssetSaveResult
+          ? { customAsset: generatedCustomAssetSaveResult }
+          : {}),
+        ...(generatedCustomAssetSaveError && generatedCustomAssetSaveIntent
+          ? { customAssetSaveError: generatedCustomAssetSaveError }
+          : {}),
         mode: "chat_literal_generate",
       });
     } catch (error: unknown) {
@@ -4284,7 +4946,14 @@ export class CommandExecutor {
       "story";
     const mappedKind = this.mapGoalToGenerateKind(goal);
     const requestedKinds = this.resolveRequestedGenerateKinds(payload, mappedKind);
-    const primaryKind = requestedKinds[0] ?? mappedKind;
+    const scopedKinds = this.resolveDirectiveScopeGenerateKinds(payload);
+    const mergedKinds = [...requestedKinds];
+    for (const scopedKind of scopedKinds) {
+      if (!mergedKinds.includes(scopedKind)) {
+        mergedKinds.push(scopedKind);
+      }
+    }
+    const primaryKind = mergedKinds[0] ?? mappedKind;
     const scope = isRecord(payload.directiveScope) ? payload.directiveScope : null;
     const scopedTarget = scope && isRecord(scope.target) ? scope.target : null;
     const postId =
@@ -4324,7 +4993,7 @@ export class CommandExecutor {
       command.actionNonce;
     return {
       kind: primaryKind,
-      ...(requestedKinds.length > 0 ? { kinds: requestedKinds } : {}),
+      ...(mergedKinds.length > 0 ? { kinds: mergedKinds } : {}),
       ...(count ? { count } : {}),
       ...(topic ? { topic } : {}),
       ...(mood ? { mood } : {}),
@@ -4336,6 +5005,31 @@ export class CommandExecutor {
       ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       ...(command.grantId ? { grantId: command.grantId } : {}),
     };
+  }
+
+  private mapAllowedWriteKindToGenerateKind(commandKind: string): string | null {
+    const normalized = commandKind.trim().toLowerCase();
+    if (normalized === "write.commentpost") return "comment";
+    if (normalized === "write.votepost") return "like";
+    if (normalized === "write.repostpost") return "repost";
+    if (normalized === "write.createstory") return "story";
+    if (normalized === "write.createpost") return "thread";
+    return null;
+  }
+
+  private resolveDirectiveScopeGenerateKinds(payload: Record<string, unknown>): string[] {
+    const scope = isRecord(payload.directiveScope) ? payload.directiveScope : null;
+    if (!scope || !Array.isArray(scope.allowedCommandKinds)) return [];
+    const resolved: string[] = [];
+    const seen = new Set<string>();
+    for (const value of scope.allowedCommandKinds) {
+      if (typeof value !== "string") continue;
+      const mapped = this.mapAllowedWriteKindToGenerateKind(value);
+      if (!mapped || seen.has(mapped)) continue;
+      seen.add(mapped);
+      resolved.push(mapped);
+    }
+    return resolved;
   }
 
   private async buildGenerateInputWithRuntimeContext(
@@ -4609,8 +5303,41 @@ export class CommandExecutor {
               : null;
     if (!mappedKind) return null;
 
+    const sourcePayload = isRecord(input.command.payload) ? input.command.payload : null;
+    const sourcePostId = sourcePayload
+      ? asPositiveInt(sourcePayload.postId) ??
+        asPositiveInt(sourcePayload.targetPostId)
+      : null;
+    const sourceCommentId = sourcePayload
+      ? asPositiveInt(sourcePayload.parentId) ??
+        asPositiveInt(sourcePayload.commentId) ??
+        asPositiveInt(sourcePayload.targetCommentId)
+      : null;
+
     if (mappedKind === "write.votePost") {
       basePayload.vote = 1;
+    }
+    if (
+      mappedKind === "write.commentPost" ||
+      mappedKind === "write.votePost" ||
+      mappedKind === "write.repostPost"
+    ) {
+      const lockedPostId = sourcePostId ?? asPositiveInt(basePayload.postId);
+      const lockedCommentId =
+        mappedKind === "write.commentPost"
+          ? sourceCommentId ?? asPositiveInt(basePayload.parentId)
+          : null;
+      if (lockedPostId) {
+        basePayload.postId = lockedPostId;
+        if (mappedKind === "write.commentPost" && lockedCommentId) {
+          basePayload.parentId = lockedCommentId;
+          basePayload.commentId = lockedCommentId;
+        }
+        applyTargetLock(basePayload, {
+          postId: lockedPostId,
+          commentId: lockedCommentId ?? null,
+        });
+      }
     }
     if (mappedKind === "write.createPost") {
       const postTypeRaw = asNonEmptyString(basePayload.postType)?.toLowerCase();

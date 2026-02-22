@@ -22,14 +22,19 @@ import type {
   LongTermArchiveCapsule,
   LongTermArchiveIndex,
   ArchiveCompressFn,
-  ArchiveCompressionRequest,
 } from "~/types/memory.js";
 import type { KthxRetentionConfig } from "~/types/config.js";
 import type { StateSqliteStore } from "~/state/sqlite-state.js";
 import { isRecord } from "~/lib/guards.js";
 import { ensureDir, readJsonFile, writeJsonFile, appendJsonLine, readLastJsonLines } from "~/lib/fs-helpers.js";
 import { nowIso, normalizeIso, toShortLine, unique } from "~/lib/time.js";
-import { extractKeysFromPayload, extractActorHintFromPayload, extractTextHintFromPayload, parseMemoryEnvelope } from "./extract.js";
+import {
+  extractKeysFromPayload,
+  extractActorHintFromPayload,
+  extractTextHintFromPayload,
+  extractParticipantsFromPayload,
+  parseMemoryEnvelope,
+} from "./extract.js";
 import { archiveJsonl, createArchiveBasename, listArchiveIndexes, findArchiveGzPath, readEventsFromGzArchive, pickWeightedArchiveBasenames } from "./archive.js";
 import { defaultMoodState, computeMoodDelta, applyMoodSignal } from "./mood.js";
 import { defaultTemporalContext, uniqueEventsBySignature, summarizeEventsForTier, summarizeTargetFocus, eventSignature } from "./temporal.js";
@@ -150,6 +155,7 @@ type KeywordIndexDoc = {
   postId: number | null;
   commentId: number | null;
   actor: string | null;
+  participants: string[];
   summary: string;
   keywords: string[];
 };
@@ -302,6 +308,14 @@ const normalizeKeywordDoc = (
     postId: asFinitePositiveInt(value.postId) ?? null,
     commentId: asFinitePositiveInt(value.commentId) ?? null,
     actor: asNullableString(value.actor),
+    participants: Array.isArray(value.participants)
+      ? unique(
+          value.participants
+            .filter((entry): entry is string => typeof entry === "string")
+            .map((entry) => entry.trim())
+            .filter((entry) => entry.length > 0),
+        ).slice(0, 16)
+      : [],
     summary: toShortLine(summary, 220),
     keywords,
   };
@@ -1097,6 +1111,7 @@ export class MemoryStore {
       return null;
     }
     const actor = extractActorHintFromPayload(envelope.payload) || null;
+    const participants = extractParticipantsFromPayload(envelope.payload);
     const textHint = extractTextHintFromPayload(envelope.payload);
     const fallbackSummaryParts = [
       sourceType,
@@ -1134,6 +1149,7 @@ export class MemoryStore {
       postId: typeof keys.postId === "number" ? keys.postId : null,
       commentId: typeof keys.commentId === "number" ? keys.commentId : null,
       actor,
+      participants,
       summary,
       keywords,
     };

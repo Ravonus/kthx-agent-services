@@ -6,6 +6,7 @@ export type RetrievalPresetDoc = {
   postId: number | null;
   commentId: number | null;
   actor: string | null;
+  participants?: string[];
   summary: string;
 };
 
@@ -48,6 +49,28 @@ export type RetrievalPresetMostEngagedComment = {
   summary: string | null;
 };
 
+export type RetrievalPresetTopParticipantMetric =
+  | "combined"
+  | "comments"
+  | "likes"
+  | "reposts"
+  | "views"
+  | "notifications"
+  | "presence";
+
+export type RetrievalPresetTopParticipant = {
+  participant: string;
+  display: string;
+  score: number;
+  comments: number;
+  likes: number;
+  reposts: number;
+  views: number;
+  notifications: number;
+  presence: number;
+  lastAt: string;
+};
+
 export type RetrievalPresetSummary = {
   requested: {
     mostRecentPost: boolean;
@@ -56,6 +79,7 @@ export type RetrievalPresetSummary = {
     lastComments: boolean;
     lastLikes: boolean;
     lastViews: boolean;
+    topParticipants: boolean;
   };
   range: {
     label: string;
@@ -75,6 +99,12 @@ export type RetrievalPresetSummary = {
   lastComments: RetrievalPresetEvent[];
   lastLikes: RetrievalPresetEvent[];
   lastViews: RetrievalPresetEvent[];
+  topParticipants: {
+    rangeLabel: string;
+    rangeMaxAgeMs: number;
+    metric: RetrievalPresetTopParticipantMetric;
+    participants: RetrievalPresetTopParticipant[];
+  } | null;
   lines: string[];
 };
 
@@ -88,6 +118,7 @@ type RetrievalPresetInput = {
   maxMostEngagedPosts?: number;
   maxMostEngagedComments?: number;
   maxEventsPerType?: number;
+  maxTopParticipants?: number;
   nowMs?: number;
 };
 
@@ -99,6 +130,8 @@ type TimeRange = {
 type NormalizedDoc = {
   atMs: number;
   doc: RetrievalPresetDoc;
+  participantTokens: string[];
+  primaryParticipant: string | null;
 };
 
 const ENGAGEMENT_WEIGHTS: Record<string, number> = {
@@ -112,6 +145,14 @@ const COMMENT_ENGAGEMENT_WEIGHTS: Record<string, number> = {
   post_comment: 4,
   post_like: 3,
   post_repost: 2,
+  post_view: 1,
+  notification_created: 1,
+};
+
+const PARTICIPANT_ENGAGEMENT_WEIGHTS: Record<string, number> = {
+  post_comment: 5,
+  post_repost: 4,
+  post_like: 2,
   post_view: 1,
   notification_created: 1,
 };
@@ -218,6 +259,47 @@ const parseRangeFromQuery = (
   };
 };
 
+const normalizeParticipantToken = (value: string | null): string | null => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed.length) return null;
+  if (/^id:[a-zA-Z0-9_.:-]{6,120}$/u.test(trimmed)) return trimmed;
+  const handle = trimmed.replace(/^@+/u, "").toLowerCase();
+  if (!/^[a-z0-9_.-]{2,64}$/u.test(handle)) return null;
+  return `@${handle}`;
+};
+
+const participantDisplay = (value: string): string =>
+  value.startsWith("id:") ? value.slice(3) : value;
+
+const parseTopParticipantMetric = (
+  query: string,
+): RetrievalPresetTopParticipantMetric => {
+  const lowered = query.toLowerCase();
+  if (/\b(memory\s+most|most\s+in\s+memory|memory\s+presence)\b/iu.test(lowered)) {
+    return "presence";
+  }
+  const hasComments = /\bcomments?\b/iu.test(lowered);
+  const hasLikes = /\blikes?\b/iu.test(lowered);
+  const hasReposts = /\b(reposts?|quotes?)\b/iu.test(lowered);
+  const hasViews = /\bviews?\b/iu.test(lowered);
+  const hasNotifications = /\bnotifications?\b/iu.test(lowered);
+  const metricsRequested = [
+    hasComments,
+    hasLikes,
+    hasReposts,
+    hasViews,
+    hasNotifications,
+  ].filter(Boolean).length;
+  if (metricsRequested > 1) return "combined";
+  if (hasComments) return "comments";
+  if (hasLikes) return "likes";
+  if (hasReposts) return "reposts";
+  if (hasViews) return "views";
+  if (hasNotifications) return "notifications";
+  return "combined";
+};
+
 const buildPresetRequestFlags = (query: string): {
   mostRecentPost: boolean;
   mostEngaged: boolean;
@@ -225,6 +307,7 @@ const buildPresetRequestFlags = (query: string): {
   lastComments: boolean;
   lastLikes: boolean;
   lastViews: boolean;
+  topParticipants: boolean;
 } => {
   const lowered = query.toLowerCase();
   const hasRecentLead = /\b(last|latest|recent)\b/iu.test(lowered);
@@ -245,6 +328,13 @@ const buildPresetRequestFlags = (query: string): {
       lowered,
     ) || (/\bmost\b/iu.test(lowered) && /\bengagement\b/iu.test(lowered))) &&
     !mostEngagedComments;
+  const topParticipants =
+    /\b(biggest|top|most)\s+(engagers?|engagement|users|people|accounts)\b/iu.test(
+      lowered,
+    ) ||
+    /\bwho\s+(?:engaged|engages|is\s+in\s+memory)\b/iu.test(lowered) ||
+    /\bmemory\s+most\b/iu.test(lowered) ||
+    /\bmost\s+active\s+(users|people|accounts)\b/iu.test(lowered);
 
   return {
     mostRecentPost:
@@ -260,6 +350,7 @@ const buildPresetRequestFlags = (query: string): {
     lastViews:
       /\b(last|latest|recent)\s+views?\b/iu.test(lowered) ||
       (groupedRecentList && hasViewsWord),
+    topParticipants,
   };
 };
 
@@ -268,6 +359,19 @@ const normalizeDocs = (docs: RetrievalPresetDoc[]): NormalizedDoc[] =>
     .map((doc) => ({
       doc,
       atMs: Date.parse(doc.receivedAt),
+      participantTokens: [
+        normalizeParticipantToken(doc.actor),
+        ...(Array.isArray(doc.participants) ? doc.participants : []).map(
+          (entry) => normalizeParticipantToken(entry),
+        ),
+      ].filter((entry): entry is string => typeof entry === "string"),
+      primaryParticipant:
+        normalizeParticipantToken(doc.actor) ??
+        (Array.isArray(doc.participants)
+          ? doc.participants
+              .map((entry) => normalizeParticipantToken(entry))
+              .find((entry): entry is string => typeof entry === "string") ?? null
+          : null),
     }))
     .filter((entry) => Number.isFinite(entry.atMs))
     .sort((a, b) => b.atMs - a.atMs);
@@ -328,7 +432,8 @@ export const buildRetrievalPresets = (
     requested.mostEngagedComments ||
     requested.lastComments ||
     requested.lastLikes ||
-    requested.lastViews;
+    requested.lastViews ||
+    requested.topParticipants;
 
   if (!shouldRunAnyPreset) {
     return {
@@ -340,6 +445,7 @@ export const buildRetrievalPresets = (
       lastComments: [],
       lastLikes: [],
       lastViews: [],
+      topParticipants: null,
       lines: [],
     };
   }
@@ -369,6 +475,11 @@ export const buildRetrievalPresets = (
     1,
     Math.min(6, Math.floor(input.maxEventsPerType ?? 3)),
   );
+  const maxTopParticipants = Math.max(
+    1,
+    Math.min(12, Math.floor(input.maxTopParticipants ?? 6)),
+  );
+  const topParticipantMetric = parseTopParticipantMetric(query);
 
   let mostRecentPost: RetrievalPresetMostRecentPost | null = null;
   if (requested.mostRecentPost) {
@@ -569,6 +680,135 @@ export const buildRetrievalPresets = (
       )
     : [];
 
+  let topParticipants: RetrievalPresetSummary["topParticipants"] = null;
+  if (requested.topParticipants) {
+    const aggregate = new Map<
+      string,
+      {
+        participant: string;
+        score: number;
+        comments: number;
+        likes: number;
+        reposts: number;
+        views: number;
+        notifications: number;
+        presence: number;
+        lastAt: string;
+      }
+    >();
+
+    for (const entry of docs) {
+      if (!isInRange(entry.atMs, nowMs, range.maxAgeMs)) continue;
+      if (typeof scopePostId === "number" && entry.doc.postId !== scopePostId) continue;
+      if (
+        typeof scopeCommentId === "number" &&
+        entry.doc.commentId !== scopeCommentId
+      ) {
+        continue;
+      }
+
+      const seenInDoc = new Set<string>();
+      for (const participant of entry.participantTokens) {
+        if (seenInDoc.has(participant)) continue;
+        seenInDoc.add(participant);
+        const existing = aggregate.get(participant) ?? {
+          participant,
+          score: 0,
+          comments: 0,
+          likes: 0,
+          reposts: 0,
+          views: 0,
+          notifications: 0,
+          presence: 0,
+          lastAt: entry.doc.receivedAt,
+        };
+        existing.presence += 1;
+        if (Date.parse(entry.doc.receivedAt) > Date.parse(existing.lastAt)) {
+          existing.lastAt = entry.doc.receivedAt;
+        }
+        aggregate.set(participant, existing);
+      }
+
+      const engager = entry.primaryParticipant;
+      if (!engager) continue;
+      const existing = aggregate.get(engager) ?? {
+        participant: engager,
+        score: 0,
+        comments: 0,
+        likes: 0,
+        reposts: 0,
+        views: 0,
+        notifications: 0,
+        presence: 0,
+        lastAt: entry.doc.receivedAt,
+      };
+      const sourceType = entry.doc.sourceType ?? "";
+      const weight = PARTICIPANT_ENGAGEMENT_WEIGHTS[sourceType] ?? 0;
+      existing.score += weight;
+      if (sourceType === "post_comment") existing.comments += 1;
+      else if (sourceType === "post_like") existing.likes += 1;
+      else if (sourceType === "post_repost") existing.reposts += 1;
+      else if (sourceType === "post_view") existing.views += 1;
+      else if (sourceType === "notification_created") existing.notifications += 1;
+      if (Date.parse(entry.doc.receivedAt) > Date.parse(existing.lastAt)) {
+        existing.lastAt = entry.doc.receivedAt;
+      }
+      aggregate.set(engager, existing);
+    }
+
+    const metricSelector = (
+      entry: {
+        score: number;
+        comments: number;
+        likes: number;
+        reposts: number;
+        views: number;
+        notifications: number;
+        presence: number;
+      },
+    ): number => {
+      if (topParticipantMetric === "comments") return entry.comments;
+      if (topParticipantMetric === "likes") return entry.likes;
+      if (topParticipantMetric === "reposts") return entry.reposts;
+      if (topParticipantMetric === "views") return entry.views;
+      if (topParticipantMetric === "notifications") return entry.notifications;
+      if (topParticipantMetric === "presence") return entry.presence;
+      return (
+        entry.score +
+        entry.presence * 0.35 +
+        entry.notifications * 0.4
+      );
+    };
+
+    const participants = [...aggregate.values()]
+      .sort((a, b) => {
+        const bScore = metricSelector(b);
+        const aScore = metricSelector(a);
+        if (bScore !== aScore) return bScore - aScore;
+        return Date.parse(b.lastAt) - Date.parse(a.lastAt);
+      })
+      .slice(0, maxTopParticipants)
+      .map((entry) => ({
+        participant: entry.participant,
+        display: participantDisplay(entry.participant),
+        score: Number.parseFloat(metricSelector(entry).toFixed(2)),
+        comments: entry.comments,
+        likes: entry.likes,
+        reposts: entry.reposts,
+        views: entry.views,
+        notifications: entry.notifications,
+        presence: entry.presence,
+        lastAt: entry.lastAt,
+      }));
+
+    topParticipants = {
+      rangeLabel: range.label,
+      rangeMaxAgeMs: range.maxAgeMs,
+      metric: topParticipantMetric,
+      participants,
+    };
+  }
+
   const lines: string[] = [];
   if (requested.mostRecentPost) {
     if (mostRecentPost) {
@@ -630,6 +870,19 @@ export const buildRetrievalPresets = (
   if (requested.lastComments) appendEventLines("comments", lastComments);
   if (requested.lastLikes) appendEventLines("likes", lastLikes);
   if (requested.lastViews) appendEventLines("views", lastViews);
+  if (requested.topParticipants) {
+    const count = topParticipants?.participants.length ?? 0;
+    lines.push(
+      `preset:top_participants range=${range.label} metric=${topParticipantMetric} users=${count}`,
+    );
+    if (topParticipants) {
+      for (const entry of topParticipants.participants) {
+        lines.push(
+          `participant ${entry.participant} score=${entry.score.toFixed(2)} presence=${entry.presence} comments=${entry.comments} likes=${entry.likes} reposts=${entry.reposts} views=${entry.views} notifications=${entry.notifications} last=${entry.lastAt}`,
+        );
+      }
+    }
+  }
 
   return {
     requested,
@@ -640,6 +893,7 @@ export const buildRetrievalPresets = (
     lastComments,
     lastLikes,
     lastViews,
+    topParticipants,
     lines,
   };
 };

@@ -209,6 +209,7 @@ export const parseChatOpenClawReply = (
 export interface ChatInboxEntry {
   messageId: string;
   body: string;
+  replyToMessageId: string | null;
   topic: string | null;
   eventType: string;
   conversationId: string | null;
@@ -327,7 +328,11 @@ export const buildIntentAndReplyDrilldownPrompt = ({
     "Retrieval policy (drill-down):",
     "1) conversation history for exact wording and recent asks",
     "2) memory snapshot for indexed recent activity + target references",
-    "3) if still ambiguous, ask one compact follow-up",
+    "3) capability map to check whether runtime has a route/tool for the request",
+    "4) if still ambiguous, ask one compact follow-up",
+    "",
+    "If command conversion is uncertain, use the provided capability map and memory snapshot to infer whether this can be resolved without asking another question.",
+    "Prioritize doing the work directly when a route exists (lookup, retrieval, posting, profile updates, gif lookup, etc.).",
     "",
     "Never disclose internal runtime details, logs, tokens, bridge status, permissions internals, queue state, directives, or infrastructure.",
     "Never output slash commands, usage templates, JSON blocks, or system diagnostics in the reply.",

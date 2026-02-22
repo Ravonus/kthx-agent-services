@@ -8,6 +8,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import path from "node:path";
 
 import { isRecord } from "../lib/guards.js";
 import { nowIso, toAnswerPreview } from "../lib/text.js";
@@ -107,7 +108,58 @@ interface StaleReplyDecision {
   reason: "fresh" | "stale_not_important" | "stale_important_expired" | "stale_important_allowed" | "invalid_timestamp";
 }
 
+interface ReplyTargetContext {
+  messageId: string;
+  authorDisplay: string | null;
+  authorHandle: string | null;
+  bodyPreview: string | null;
+  attachmentSummary: string | null;
+  hintPostId: number | null;
+  hintCommentId: number | null;
+  retrievalQueryFragment: string;
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+const DOC_CONTEXT_RELEVANT_LINE_PATTERN =
+  /\b(socket|ws|route|api|action|memory|retriev|directive|chat|dm|channel|post|comment|repost|like|follow|view|gif|image|avatar|banner|retention|profile|draft)\b/iu;
+
+const DOC_CONTEXT_PATH_CANDIDATES = [
+  path.resolve(process.cwd(), "public", "chat-system.md"),
+  path.resolve(process.cwd(), "public", "AGENT-KTHX-v2.md"),
+  path.resolve(process.cwd(), "..", "public", "chat-system.md"),
+  path.resolve(process.cwd(), "..", "public", "AGENT-KTHX-v2.md"),
+] as const;
+
+const buildSystemDocExcerpt = (sourceName: string, raw: string): string => {
+  const lines = raw.split(/\r?\n/u);
+  const picked: string[] = [];
+  let activeHeading = "";
+  let lastHeadingWritten = "";
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line.length || line.startsWith("```")) continue;
+    if (/^#{1,6}\s+/u.test(line)) {
+      activeHeading = line.replace(/^#{1,6}\s+/u, "").trim();
+      continue;
+    }
+    const isRelevant = DOC_CONTEXT_RELEVANT_LINE_PATTERN.test(line);
+    const isStructured =
+      /^[-*]\s+/u.test(line) ||
+      /^\d+[.)]\s+/u.test(line) ||
+      /^(GET|POST|PUT|PATCH|DELETE)\s+/u.test(line) ||
+      /^`[^`]+`$/u.test(line);
+    if (!isRelevant || (!isStructured && line.length > 140)) continue;
+    if (activeHeading.length > 0 && activeHeading !== lastHeadingWritten) {
+      picked.push(`section: ${activeHeading}`);
+      lastHeadingWritten = activeHeading;
+    }
+    picked.push(line.replace(/^`|`$/gu, ""));
+    if (picked.length >= 42) break;
+  }
+  if (picked.length === 0) return "";
+  return [`source: ${sourceName}`, ...picked].join("\n");
+};
 
 const extractSentMessageId = (response: unknown): string | null => {
   if (!isRecord(response)) return null;
@@ -138,6 +190,129 @@ const parsePostAndCommentHints = (text: string): {
     ...(Number.isFinite(postId) && postId > 0 ? { postId } : {}),
     ...(Number.isFinite(commentId) && commentId > 0 ? { commentId } : {}),
   };
+};
+
+const extractHintFromRecordByKeys = (
+  record: Record<string, unknown>,
+  keys: readonly string[],
+): number | null => {
+  for (const key of keys) {
+    const value = record[key];
+    const numeric =
+      typeof value === "number" && Number.isFinite(value) && value > 0
+        ? Math.floor(value)
+        : typeof value === "string"
+          ? (() => {
+              const parsed = Number.parseInt(value.trim(), 10);
+              return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+            })()
+          : null;
+    if (numeric !== null) return numeric;
+  }
+  return null;
+};
+
+const extractPostAndCommentHintsFromRecord = (
+  value: Record<string, unknown>,
+): { postId: number | null; commentId: number | null } => {
+  const postKeys = [
+    "postId",
+    "post_id",
+    "targetPostId",
+    "target_post_id",
+  ] as const;
+  const commentKeys = [
+    "commentId",
+    "comment_id",
+    "targetCommentId",
+    "target_comment_id",
+  ] as const;
+  const directPostId = extractHintFromRecordByKeys(value, postKeys);
+  const directCommentId = extractHintFromRecordByKeys(value, commentKeys);
+  if (directPostId !== null || directCommentId !== null) {
+    return {
+      postId: directPostId,
+      commentId: directCommentId,
+    };
+  }
+
+  for (const nestedKey of ["target", "context", "metadata", "directive", "reply"] as const) {
+    const nested = value[nestedKey];
+    if (!isRecord(nested)) continue;
+    const nestedPostId = extractHintFromRecordByKeys(nested, postKeys);
+    const nestedCommentId = extractHintFromRecordByKeys(nested, commentKeys);
+    if (nestedPostId !== null || nestedCommentId !== null) {
+      return {
+        postId: nestedPostId,
+        commentId: nestedCommentId,
+      };
+    }
+  }
+
+  return {
+    postId: null,
+    commentId: null,
+  };
+};
+
+const summarizeReplyTargetAttachments = (value: unknown): string | null => {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const mimeTypeCounts = new Map<string, number>();
+  for (const item of value) {
+    if (!isRecord(item)) continue;
+    const mimeRaw = typeof item.mimeType === "string" ? item.mimeType.trim().toLowerCase() : "";
+    if (!mimeRaw.length) continue;
+    mimeTypeCounts.set(mimeRaw, (mimeTypeCounts.get(mimeRaw) ?? 0) + 1);
+  }
+  const total = Array.from(mimeTypeCounts.values()).reduce((sum, count) => sum + count, 0);
+  if (total <= 0) return null;
+  const topMimes = Array.from(mimeTypeCounts.entries())
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 3)
+    .map(([mime, count]) => `${mime}:${count}`);
+  const noun = total === 1 ? "attachment" : "attachments";
+  return `${total} ${noun} (${topMimes.join(", ")})`;
+};
+
+const mergePostAndCommentHints = (
+  primary: { postId?: number; commentId?: number },
+  secondary: { postId?: number; commentId?: number },
+): { postId?: number; commentId?: number } => {
+  const mergedPostId = primary.postId ?? secondary.postId;
+  const mergedCommentId = primary.commentId ?? secondary.commentId;
+  return {
+    ...(typeof mergedPostId === "number" ? { postId: mergedPostId } : {}),
+    ...(typeof mergedCommentId === "number" ? { commentId: mergedCommentId } : {}),
+  };
+};
+
+const buildReplyTargetSummaryLines = (
+  replyTargetContext: ReplyTargetContext | null,
+): string[] => {
+  if (!replyTargetContext) return [];
+  const lines = [
+    `- messageId=${replyTargetContext.messageId}`,
+  ];
+  if (replyTargetContext.authorDisplay || replyTargetContext.authorHandle) {
+    lines.push(
+      `- author=${replyTargetContext.authorDisplay ?? "unknown"}${
+        replyTargetContext.authorHandle ? ` (@${replyTargetContext.authorHandle})` : ""
+      }`,
+    );
+  }
+  if (replyTargetContext.bodyPreview) {
+    lines.push(`- body=${replyTargetContext.bodyPreview}`);
+  }
+  if (replyTargetContext.attachmentSummary) {
+    lines.push(`- attachments=${replyTargetContext.attachmentSummary}`);
+  }
+  if (typeof replyTargetContext.hintPostId === "number") {
+    lines.push(`- hintedPostId=${replyTargetContext.hintPostId}`);
+  }
+  if (typeof replyTargetContext.hintCommentId === "number") {
+    lines.push(`- hintedCommentId=${replyTargetContext.hintCommentId}`);
+  }
+  return lines;
 };
 
 const VIEW_CONTEXT_PATTERN =
@@ -172,9 +347,11 @@ const shouldIncludeViewStateContext = ({
 const buildRetrievalQuery = ({
   entry,
   conversationHistory,
+  replyTargetContext,
 }: {
   entry: ChatInboxEntry;
   conversationHistory: unknown[];
+  replyTargetContext: ReplyTargetContext | null;
 }): string => {
   const historySnippets = conversationHistory
     .map((item) => {
@@ -185,18 +362,22 @@ const buildRetrievalQuery = ({
     .filter((line) => line.length > 0)
     .slice(-6)
     .join(" ");
-  const combined = [entry.body.trim(), historySnippets]
+  const combined = [
+    entry.body.trim(),
+    replyTargetContext?.retrievalQueryFragment ?? "",
+    historySnippets,
+  ]
     .filter((line) => line.length > 0)
     .join(" ")
     .trim();
-  return combined.slice(0, 700);
+  return combined.slice(0, 900);
 };
 
 const ENGAGEMENT_RETRIEVAL_PATTERN =
   /\b(like|likes|comment|comments|reply|replies|repost|reposts|quote|follow|follows|engage|engagement|interact|interaction|views?|impressions?|timeline|feed|trending|viral)\b/iu;
 
 const SITE_LOOKUP_TRIGGER_PATTERN =
-  /\b(post|posts|comment|comments|likes?|views?|reposts?|engagement|followers?|following|draft|directive|timeline|feed|recent|latest|newest|last|who viewed|who liked|gif|gifs|meme|reaction)\b/iu;
+  /\b(post|posts|comment|comments|likes?|views?|reposts?|engagement|followers?|following|draft|directive|timeline|feed|recent|latest|newest|last|who viewed|who liked|gif|gifs|meme|reaction|emote|emotes|sticker|stickers|emoji|asset|assets|account|accounts|users?|agents?|discover|recommend|suggest|browse|explore|trending)\b/iu;
 
 const LOOKUP_FORCE_PATTERN =
   /\b(not found|never found|can't find|cant find|where (?:is|did)|show me|what happened to|pull it|fetch it)\b/iu;
@@ -206,7 +387,13 @@ const LATEST_POST_LOOKUP_PATTERN =
 
 const COMMENT_LOOKUP_PATTERN = /\bcomments?\b/iu;
 const FOLLOW_LOOKUP_PATTERN = /\bfollow(?:er|ers|ing)?\b/iu;
+const SUGGESTED_FOLLOW_LOOKUP_PATTERN =
+  /\b(suggest|recommended?|recommend|discover|find)\b[\s\S]*\b(follow|accounts?|people|users?|agents?|creators?|vibe)\b|\bwho\s+should\s+(?:i|we|you)\s+follow\b/iu;
+const BROWSE_POST_LOOKUP_PATTERN =
+  /\b(browse|explore|discover|trending|doom\s*scroll|look\s+around)\b[\s\S]*\b(feed|posts?|timeline|platform|around)\b|\bwhat(?:'s| is)\s+trending\b/iu;
 const GIF_LOOKUP_PATTERN = /\b(gif|gifs|meme|reaction)\b/iu;
+const CUSTOM_ASSET_LOOKUP_PATTERN =
+  /\b(emote|emotes|sticker|stickers|gif|gifs|reaction|reactions|emoji|asset|assets)\b/iu;
 
 const toFinitePositiveInt = (value: unknown): number | null => {
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
@@ -248,6 +435,28 @@ const extractGifSearchQuery = (value: string): string | null => {
   return toAnswerPreview(compact, 120);
 };
 
+const extractCustomAssetSearchQuery = (value: string): string | null => {
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  if (!normalized.length) return null;
+  const directMatch =
+    /\b(?:emote|sticker|gif|reaction|emoji|asset)s?\b(?:\s+(?:named|called|for|of|about|with))?\s+(.+)/iu.exec(
+      normalized,
+    );
+  if (directMatch?.[1]) {
+    return toAnswerPreview(directMatch[1], 140);
+  }
+  const softened = normalized.replace(
+    /\b(?:show|find|search|lookup|look|pull|fetch|get|give|send|share|use|drop|react|with|my)\b/giu,
+    " ",
+  );
+  const compact = softened
+    .replace(/\b(?:emote|emotes|sticker|stickers|gif|gifs|reaction|reactions|emoji|asset|assets)\b/giu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (!compact.length) return null;
+  return toAnswerPreview(compact, 140);
+};
+
 const parseRetrievalHitCount = (bundle: ContextBundle): number => {
   if (
     !isRecord(bundle.retrieval) ||
@@ -276,6 +485,24 @@ const pickPostRecordFromLookup = (
     if (isRecord(first)) return first;
   }
   return value;
+};
+
+const pickPostRecordsFromLookup = (
+  value: unknown,
+): Array<Record<string, unknown>> => {
+  if (Array.isArray(value)) {
+    return value.filter((entry): entry is Record<string, unknown> =>
+      isRecord(entry),
+    );
+  }
+  if (!isRecord(value)) return [];
+  if (Array.isArray(value.items)) {
+    return value.items.filter((entry): entry is Record<string, unknown> =>
+      isRecord(entry),
+    );
+  }
+  if (isRecord(value.post)) return [value.post];
+  return [value];
 };
 
 const pickCommentRecordsFromLookup = (
@@ -373,6 +600,73 @@ const summarizeCommentRecord = (
   return { line, postId, commentId, bodyPreview };
 };
 
+const pickUserRecordsFromLookup = (
+  value: unknown,
+): Array<Record<string, unknown>> => {
+  if (Array.isArray(value)) {
+    return value.filter((entry): entry is Record<string, unknown> =>
+      isRecord(entry),
+    );
+  }
+  if (!isRecord(value)) return [];
+  if (isRecord(value.user)) return [value.user];
+  if (Array.isArray(value.items)) {
+    return value.items.filter((entry): entry is Record<string, unknown> =>
+      isRecord(entry),
+    );
+  }
+  return [value];
+};
+
+const summarizeUserRecord = (
+  value: Record<string, unknown>,
+): {
+  line: string;
+  handle: string | null;
+  userId: string | null;
+  reason: string | null;
+} => {
+  const userId =
+    typeof value.id === "string" && value.id.trim().length > 0
+      ? value.id.trim()
+      : null;
+  const handleRaw =
+    typeof value.handle === "string" && value.handle.trim().length > 0
+      ? value.handle.trim()
+      : "";
+  const handle = handleRaw.replace(/^@+/u, "");
+  const name =
+    typeof value.name === "string" && value.name.trim().length > 0
+      ? toAnswerPreview(value.name.trim(), 42)
+      : null;
+  const reason =
+    typeof value.reason === "string" && value.reason.trim().length > 0
+      ? toAnswerPreview(value.reason.trim(), 68)
+      : null;
+  const mutualCount = toFinitePositiveInt(value.mutualCount);
+  const score =
+    typeof value.score === "number" && Number.isFinite(value.score)
+      ? value.score.toFixed(2)
+      : null;
+  const isAgent = value.isAgent === true;
+  const line = [
+    `user:@${handle.length > 0 ? handle : "unknown"}`,
+    name ? `name=${name}` : "",
+    reason ? `reason=${reason}` : "",
+    typeof mutualCount === "number" ? `mutuals=${mutualCount}` : "",
+    score ? `score=${score}` : "",
+    `type=${isAgent ? "agent" : "human"}`,
+  ]
+    .filter((part) => part.length > 0)
+    .join(" · ");
+  return {
+    line,
+    handle: handle.length > 0 ? handle : null,
+    userId,
+    reason,
+  };
+};
+
 const pickGifRecordsFromLookup = (
   value: unknown,
 ): Array<Record<string, unknown>> => {
@@ -412,6 +706,75 @@ const summarizeGifRecord = (
     .filter((part) => part.length > 0)
     .join(" · ");
   return { line, id, url: url ?? previewUrl, title };
+};
+
+const pickCustomAssetRecordsFromLookup = (
+  value: unknown,
+): Array<Record<string, unknown>> => {
+  if (Array.isArray(value)) {
+    return value.filter((entry): entry is Record<string, unknown> =>
+      isRecord(entry),
+    );
+  }
+  if (!isRecord(value)) return [];
+  if (Array.isArray(value.items)) {
+    return value.items.filter((entry): entry is Record<string, unknown> =>
+      isRecord(entry),
+    );
+  }
+  return [value];
+};
+
+const summarizeCustomAssetRecord = (value: Record<string, unknown>): {
+  line: string;
+  kind: string | null;
+  name: string | null;
+  owner: string | null;
+  source: string | null;
+  url: string | null;
+} => {
+  const kindRaw =
+    typeof value.kind === "string" && value.kind.trim().length > 0
+      ? value.kind.trim().toLowerCase()
+      : null;
+  const kind =
+    kindRaw === "emote" || kindRaw === "sticker" || kindRaw === "gif"
+      ? kindRaw
+      : null;
+  const name =
+    typeof value.name === "string" && value.name.trim().length > 0
+      ? toAnswerPreview(value.name.trim(), 42)
+      : null;
+  const ownerRaw =
+    typeof value.owner === "string" && value.owner.trim().length > 0
+      ? value.owner.trim().toLowerCase()
+      : null;
+  const owner = ownerRaw === "agent" || ownerRaw === "owner" ? ownerRaw : null;
+  const source =
+    typeof value.source === "string" && value.source.trim().length > 0
+      ? value.source.trim().toLowerCase()
+      : null;
+  const urlRaw =
+    (typeof value.previewUrl === "string" && value.previewUrl.trim().length > 0
+      ? value.previewUrl
+      : typeof value.url === "string" && value.url.trim().length > 0
+        ? value.url
+        : null) ?? null;
+  const url = urlRaw ? urlRaw.trim() : null;
+  const score =
+    typeof value.score === "number" && Number.isFinite(value.score)
+      ? value.score.toFixed(0)
+      : null;
+  const line = [
+    `${kind ?? "asset"}:${name ?? "unnamed"}`,
+    owner ? `owner=${owner}` : "",
+    source ? `source=${source}` : "",
+    score ? `score=${score}` : "",
+    url ? `url=${url}` : "",
+  ]
+    .filter((part) => part.length > 0)
+    .join(" · ");
+  return { line, kind, name, owner, source, url };
 };
 
 const resolveRetrievalIntentForEntry = ({
@@ -780,6 +1143,9 @@ const buildDrilldownMemorySummary = (bundle: ContextBundle): string => {
 export class ChatManager implements ChatManagerLike {
   private readonly ctx: ChatManagerContext;
   private readonly retentionDialogs = new Map<string, RetentionDialogState>();
+  private systemDocContextCached: string | null = null;
+  private systemDocContextCachedAtMs = 0;
+  private systemDocContextInFlight: Promise<string | null> | null = null;
   constructor(ctx: ChatManagerContext) { this.ctx = ctx; }
 
   async pollInbox(): Promise<void> {
@@ -1231,15 +1597,102 @@ export class ChatManager implements ChatManagerLike {
     return tokens;
   }
 
+  private resolveReplyTargetContext(
+    entry: ChatInboxEntry,
+    conversationHistory: unknown[],
+  ): ReplyTargetContext | null {
+    const replyToMessageId = entry.replyToMessageId?.trim() ?? "";
+    if (!replyToMessageId.length) return null;
+
+    const matched = conversationHistory.find((item) => {
+      if (!isRecord(item)) return false;
+      const message = isRecord(item.message) ? item.message : null;
+      return (
+        message &&
+        typeof message.id === "string" &&
+        message.id.trim() === replyToMessageId
+      );
+    });
+
+    if (!isRecord(matched)) {
+      return {
+        messageId: replyToMessageId,
+        authorDisplay: null,
+        authorHandle: null,
+        bodyPreview: null,
+        attachmentSummary: null,
+        hintPostId: null,
+        hintCommentId: null,
+        retrievalQueryFragment: `reply_to_message_id ${replyToMessageId}`,
+      };
+    }
+
+    const message = isRecord(matched.message) ? matched.message : null;
+    const author = isRecord(matched.author) ? matched.author : null;
+    const body =
+      message && typeof message.body === "string" ? message.body.trim() : "";
+    const bodyPreview = body.length > 0 ? toAnswerPreview(body, 220) : null;
+    const authorDisplay =
+      author && typeof author.displayCache === "string" && author.displayCache.trim().length > 0
+        ? author.displayCache.trim()
+        : null;
+    const authorHandleRaw =
+      author && typeof author.handleCache === "string" && author.handleCache.trim().length > 0
+        ? author.handleCache.trim()
+        : "";
+    const authorHandle = authorHandleRaw.replace(/^@+/u, "");
+    const attachmentSummary = summarizeReplyTargetAttachments(matched.attachments);
+
+    const bodyHints = body.length > 0 ? parsePostAndCommentHints(body) : {};
+    const messageHints = message ? extractPostAndCommentHintsFromRecord(message) : { postId: null, commentId: null };
+    const metadataHints =
+      message && isRecord(message.metadata)
+        ? extractPostAndCommentHintsFromRecord(message.metadata)
+        : { postId: null, commentId: null };
+    const hintPostId =
+      bodyHints.postId ??
+      messageHints.postId ??
+      metadataHints.postId ??
+      null;
+    const hintCommentId =
+      bodyHints.commentId ??
+      messageHints.commentId ??
+      metadataHints.commentId ??
+      null;
+
+    const retrievalParts = [
+      `reply_to_message_id ${replyToMessageId}`,
+      authorHandle.length > 0 ? `reply_to_author @${authorHandle}` : "",
+      bodyPreview ? `reply_to_body ${bodyPreview}` : "",
+      typeof hintPostId === "number" ? `reply_to_post ${hintPostId}` : "",
+      typeof hintCommentId === "number" ? `reply_to_comment ${hintCommentId}` : "",
+      attachmentSummary ? `reply_to_attachments ${attachmentSummary}` : "",
+    ].filter((part) => part.length > 0);
+
+    return {
+      messageId: replyToMessageId,
+      authorDisplay,
+      authorHandle: authorHandle.length > 0 ? authorHandle : null,
+      bodyPreview,
+      attachmentSummary,
+      hintPostId,
+      hintCommentId,
+      retrievalQueryFragment: toAnswerPreview(retrievalParts.join(" "), 420),
+    };
+  }
+
   private async fetchConversationHistory(entry: ChatInboxEntry): Promise<unknown[]> {
     try {
+      const limit = entry.replyToMessageId ? 40 : 10;
       const payload = {
         action: "list_messages",
         ...(entry.conversationId ? { conversationId: entry.conversationId } : { channelId: entry.channelId }),
-        limit: 10,
+        limit,
       };
       const result = await this.ctx.callAgentChatBridge(payload);
-      if (isRecord(result) && Array.isArray(result.items)) return (result.items as unknown[]).slice(0, 10).reverse();
+      if (isRecord(result) && Array.isArray(result.items)) {
+        return (result.items as unknown[]).slice(0, limit).reverse();
+      }
       return [];
     } catch { return []; }
   }
@@ -1585,7 +2038,23 @@ export class ChatManager implements ChatManagerLike {
   ): Promise<string | null> {
     if (typeof this.ctx.memory.buildContext !== "function") return null;
     try {
-      const hints = parsePostAndCommentHints(entry.body);
+      const messageHints = parsePostAndCommentHints(entry.body);
+      const replyTargetContext = this.resolveReplyTargetContext(
+        entry,
+        conversationHistory,
+      );
+      const replyHints =
+        replyTargetContext
+          ? {
+              ...(typeof replyTargetContext.hintPostId === "number"
+                ? { postId: replyTargetContext.hintPostId }
+                : {}),
+              ...(typeof replyTargetContext.hintCommentId === "number"
+                ? { commentId: replyTargetContext.hintCommentId }
+                : {}),
+            }
+          : {};
+      const hints = mergePostAndCommentHints(messageHints, replyHints);
       const includeViewState = shouldIncludeViewStateContext({
         entry,
         conversationHistory,
@@ -1594,6 +2063,7 @@ export class ChatManager implements ChatManagerLike {
       const retrievalQuery = buildRetrievalQuery({
         entry,
         conversationHistory,
+        replyTargetContext,
       });
       const retrievalIntent = resolveRetrievalIntentForEntry({
         entry,
@@ -1631,6 +2101,8 @@ export class ChatManager implements ChatManagerLike {
         hints,
         bundle,
       });
+      const systemDocContext = await this.loadSystemDocContext();
+      const replyTargetLines = buildReplyTargetSummaryLines(replyTargetContext);
 
       const historyLines = conversationHistory
         .map((item) => {
@@ -1659,12 +2131,28 @@ export class ChatManager implements ChatManagerLike {
         "- prefer natural conversation; do not force command syntax",
         "- when asked about drafts/directives/posts/comments/likes, infer from recent memory first",
         "- when asked for gifs or reactions, use live gif lookup results when available",
+        "- for emotes/stickers/gifs in chats, prefer agent-owned custom assets first, then owner-selected assets",
+        "- memory retrieval supports: most recent post, most engaged posts/comments, last comments/likes/views, and top participants by engagement or memory presence",
         "- if memory misses, use live site lookup results below before asking for clarification",
         "- if exact target unclear, ask one concise clarifying question",
         "",
+        "## Runtime Capability Map",
+        "- list_messages: fetch DM/channel history and reply target content",
+        "- find_post / find_comment / find_user / find_gif / find_custom_assets / suggest_followers / browse_posts: live site lookups",
+        "- send_message / edit_message / typing: conversational response + status updates",
+        "- memory context: keyword retrieval, long-term archive retrieval, view state, engagement presets",
+        "- retention control (DM-only): guided retention policy updates",
+        "- when conversion is ambiguous, use these capabilities first; ask follow-up only when no route can resolve the request",
+        "",
+        ...(systemDocContext
+          ? ["## System Docs Capability Context", systemDocContext, ""]
+          : []),
         "## Recent Chat History",
         ...(historyLines.length > 0 ? historyLines : ["(none)"]),
         "",
+        ...(replyTargetLines.length > 0
+          ? ["## Reply Target", ...replyTargetLines, ""]
+          : []),
         ...(liveLookupLines.length > 0
           ? ["## Live Site Lookup", ...liveLookupLines, ""]
           : []),
@@ -1678,6 +2166,44 @@ export class ChatManager implements ChatManagerLike {
       return combined.slice(0, maxChars);
     } catch {
       return null;
+    }
+  }
+
+  private async loadSystemDocContext(): Promise<string | null> {
+    const nowMs = Date.now();
+    if (
+      this.systemDocContextCached &&
+      nowMs - this.systemDocContextCachedAtMs < 5 * 60_000
+    ) {
+      return this.systemDocContextCached;
+    }
+    if (this.systemDocContextInFlight) {
+      return this.systemDocContextInFlight;
+    }
+    this.systemDocContextInFlight = (async () => {
+      const excerpts: string[] = [];
+      for (const candidate of DOC_CONTEXT_PATH_CANDIDATES) {
+        try {
+          const raw = await fs.readFile(candidate, "utf8");
+          const excerpt = buildSystemDocExcerpt(path.basename(candidate), raw);
+          if (excerpt.length > 0) excerpts.push(excerpt);
+        } catch {
+          continue;
+        }
+      }
+      const combined = excerpts.join("\n\n").trim();
+      const capped =
+        combined.length > 0
+          ? combined.slice(0, 2600)
+          : null;
+      this.systemDocContextCached = capped;
+      this.systemDocContextCachedAtMs = Date.now();
+      return capped;
+    })();
+    try {
+      return await this.systemDocContextInFlight;
+    } finally {
+      this.systemDocContextInFlight = null;
     }
   }
 
@@ -1695,6 +2221,8 @@ export class ChatManager implements ChatManagerLike {
     }
     const query = input.retrievalQuery.trim();
     if (!query.length) return false;
+    if (SUGGESTED_FOLLOW_LOOKUP_PATTERN.test(query)) return true;
+    if (BROWSE_POST_LOOKUP_PATTERN.test(query)) return true;
     if (GIF_LOOKUP_PATTERN.test(query)) return true;
     if (!SITE_LOOKUP_TRIGGER_PATTERN.test(query)) return false;
     if (LOOKUP_FORCE_PATTERN.test(query)) return true;
@@ -1928,6 +2456,152 @@ export class ChatManager implements ChatManagerLike {
             error: toAnswerPreview(message, 180),
           });
         }
+      }
+    }
+
+    if (SUGGESTED_FOLLOW_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const response = await lookupCall({
+          action: "suggest_followers",
+          limit: 8,
+          includeAgents: true,
+        });
+        const users = pickUserRecordsFromLookup(response)
+          .map((entry) => summarizeUserRecord(entry))
+          .slice(0, 4);
+        if (users.length === 0) {
+          lines.push("lookup: no follow suggestions available right now");
+          await remember({
+            lookupKind: "suggest_followers",
+            found: false,
+            summary: "no follow suggestions available",
+          });
+        } else {
+          for (const user of users) {
+            lines.push(`lookup: ${user.line}`);
+            await remember({
+              lookupKind: "suggest_followers",
+              found: true,
+              handle: user.handle,
+              userId: user.userId,
+              summary: user.reason ?? user.line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: suggest_followers failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "suggest_followers",
+          found: false,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (BROWSE_POST_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      try {
+        const response = await lookupCall({
+          action: "browse_posts",
+          limit: 8,
+        });
+        const posts = pickPostRecordsFromLookup(response)
+          .map((entry) => summarizePostRecord(entry))
+          .slice(0, 4);
+        if (posts.length === 0) {
+          lines.push("lookup: browse posts returned no items");
+          await remember({
+            lookupKind: "browse_posts",
+            found: false,
+            summary: "browse posts returned no items",
+          });
+        } else {
+          for (const post of posts) {
+            lines.push(`lookup: browse -> ${post.line}`);
+            await remember({
+              lookupKind: "browse_posts",
+              found: true,
+              postId: post.postId,
+              summary: post.bodyPreview ?? post.line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: browse_posts failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "browse_posts",
+          found: false,
+          error: toAnswerPreview(message, 180),
+        });
+      }
+    }
+
+    if (CUSTOM_ASSET_LOOKUP_PATTERN.test(input.retrievalQuery)) {
+      const assetQuery = extractCustomAssetSearchQuery(input.retrievalQuery);
+      const assetLookupPayload: Record<string, unknown> = {
+        action: "find_custom_assets",
+        limit: 8,
+        includeOwnerSelections: true,
+      };
+      if (assetQuery) {
+        assetLookupPayload.query = assetQuery;
+      }
+      if (input.entry.conversationId) {
+        assetLookupPayload.conversationId = input.entry.conversationId;
+      } else if (input.entry.channelId) {
+        assetLookupPayload.channelId = input.entry.channelId;
+      }
+      try {
+        const response = await lookupCall(assetLookupPayload);
+        const assets = pickCustomAssetRecordsFromLookup(response)
+          .map((entry) => summarizeCustomAssetRecord(entry))
+          .slice(0, 4);
+        if (assets.length === 0) {
+          lines.push(
+            assetQuery
+              ? `lookup: custom assets for "${assetQuery}" not found`
+              : "lookup: no preferred custom assets available",
+          );
+          await remember({
+            lookupKind: "custom_asset_search",
+            found: false,
+            query: assetQuery,
+            summary: assetQuery
+              ? `custom assets for "${assetQuery}" not found`
+              : "no preferred custom assets available",
+          });
+        } else {
+          for (const asset of assets) {
+            lines.push(`lookup: ${asset.line}`);
+            await remember({
+              lookupKind: "custom_asset_search",
+              found: true,
+              query: assetQuery,
+              kind: asset.kind,
+              name: asset.name,
+              owner: asset.owner,
+              source: asset.source,
+              url: asset.url,
+              summary: asset.line,
+            });
+          }
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(
+          `lookup: custom asset fetch failed (${toAnswerPreview(message, 120)})`,
+        );
+        await remember({
+          lookupKind: "custom_asset_search",
+          found: false,
+          query: assetQuery,
+          error: toAnswerPreview(message, 180),
+        });
       }
     }
 

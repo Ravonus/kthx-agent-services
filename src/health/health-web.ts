@@ -25,7 +25,10 @@ import {
   createStateSqliteStoreFromEnv,
   type StateSqliteStore,
 } from "../state/sqlite-state.js";
-import { buildRetrievalPresets } from "../memory/retrieval-presets.js";
+import {
+  buildRetrievalPresets,
+  type RetrievalPresetTopParticipantMetric,
+} from "../memory/retrieval-presets.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -92,6 +95,7 @@ type KeywordIndexDoc = {
   postId: number | null;
   commentId: number | null;
   actor: string | null;
+  participants: string[];
   summary: string;
   keywords: string[];
 };
@@ -255,6 +259,52 @@ const parseRetrievalIntent = (value: string | null): RetrievalIntent => {
   return "chat";
 };
 
+const parseTopParticipantMetric = (
+  value: string | null,
+): RetrievalPresetTopParticipantMetric => {
+  const normalized = (value ?? "").trim().toLowerCase();
+  if (
+    normalized === "combined" ||
+    normalized === "comments" ||
+    normalized === "likes" ||
+    normalized === "reposts" ||
+    normalized === "views" ||
+    normalized === "notifications" ||
+    normalized === "presence"
+  ) {
+    return normalized;
+  }
+  return "combined";
+};
+
+const normalizeParticipantToken = (value: string): string | null => {
+  const trimmed = value.trim();
+  if (!trimmed.length) return null;
+  if (/^id:[a-zA-Z0-9_.:-]{6,120}$/u.test(trimmed)) return trimmed;
+  const handle = trimmed.replace(/^@+/u, "").toLowerCase();
+  if (!/^[a-z0-9_.-]{2,64}$/u.test(handle)) return null;
+  return `@${handle}`;
+};
+
+const resolveRangeMsFromQuery = (query: URLSearchParams): number => {
+  const direct = parseBoundedIntQuery(query.get("rangeMs"), 60_000, 366 * 86_400_000);
+  if (direct !== null) return direct;
+  const range = (query.get("range") ?? "").trim().toLowerCase();
+  if (range === "24h") return 24 * 3_600_000;
+  if (range === "7d") return 7 * 24 * 3_600_000;
+  if (range === "30d") return 30 * 24 * 3_600_000;
+  if (range === "90d") return 90 * 24 * 3_600_000;
+  if (range === "365d") return 365 * 24 * 3_600_000;
+  return 30 * 24 * 3_600_000;
+};
+
+const formatRangeLabelFromMs = (rangeMs: number): string => {
+  const totalHours = Math.max(1, Math.round(rangeMs / 3_600_000));
+  if (totalHours % (24 * 30) === 0) return `${totalHours / (24 * 30)}mo`;
+  if (totalHours % 24 === 0) return `${totalHours / 24}d`;
+  return `${totalHours}h`;
+};
+
 const normalizeKeywordDoc = (docId: string, raw: unknown): KeywordIndexDoc | null => {
   if (!isRecord(raw)) return null;
   const summary = str(raw.summary);
@@ -277,6 +327,16 @@ const normalizeKeywordDoc = (docId: string, raw: unknown): KeywordIndexDoc | nul
     postId: intFromUnknown(raw.postId),
     commentId: intFromUnknown(raw.commentId),
     actor: str(raw.actor),
+    participants: Array.isArray(raw.participants)
+      ? [
+          ...new Set(
+            raw.participants
+              .filter((item): item is string => typeof item === "string")
+              .map((item) => item.trim())
+              .filter((item) => item.length > 0),
+          ),
+        ].slice(0, 16)
+      : [],
     summary,
     keywords,
   };
@@ -738,6 +798,165 @@ const buildRetrievalDiagnostics = (input: {
   };
 };
 
+const buildMemoryEngagementDiagnostics = (input: {
+  index: KeywordIndexSnapshot;
+  rangeMs: number;
+  metric: RetrievalPresetTopParticipantMetric;
+  limit: number;
+  postId: number | null;
+  commentId: number | null;
+  intent: RetrievalIntent;
+}): Record<string, unknown> => {
+  const nowMs = Date.now();
+  const safeRangeMs = Math.max(60_000, Math.min(366 * 86_400_000, input.rangeMs));
+  const rangeLabel = formatRangeLabelFromMs(safeRangeMs);
+  const sinceMs = nowMs - safeRangeMs;
+  const scopePostId = input.postId;
+  const scopeCommentId = input.commentId;
+  const docs = Object.values(input.index.docs)
+    .map((doc) => ({
+      doc,
+      atMs: Date.parse(doc.receivedAt),
+    }))
+    .filter((entry) => Number.isFinite(entry.atMs) && entry.atMs >= sinceMs && entry.atMs <= nowMs)
+    .filter((entry) => {
+      if (scopePostId !== null && entry.doc.postId !== scopePostId) return false;
+      if (scopeCommentId !== null && entry.doc.commentId !== scopeCommentId) return false;
+      return true;
+    });
+
+  const metricHint =
+    input.metric === "presence"
+      ? "in memory most"
+      : `by ${input.metric}`;
+  const presetQuery = `top engagers ${metricHint} last ${Math.max(
+    1,
+    Math.round(safeRangeMs / 3_600_000),
+  )}h`;
+  const presetSummary = buildRetrievalPresets({
+    docs: Object.values(input.index.docs),
+    query: presetQuery,
+    intent: input.intent,
+    postId: scopePostId,
+    commentId: scopeCommentId,
+    defaultRangeMs: safeRangeMs,
+    maxTopParticipants: Math.max(1, Math.min(25, input.limit)),
+  });
+
+  const totals = {
+    comments: 0,
+    likes: 0,
+    reposts: 0,
+    views: 0,
+    notifications: 0,
+    presence: 0,
+  };
+  const presenceByParticipant = new Map<string, number>();
+  const timelineByDay = new Map<
+    string,
+    {
+      day: string;
+      comments: number;
+      likes: number;
+      reposts: number;
+      views: number;
+      notifications: number;
+      presence: number;
+    }
+  >();
+
+  for (const entry of docs) {
+    const sourceType = entry.doc.sourceType ?? "";
+    const day = new Date(entry.atMs).toISOString().slice(0, 10);
+    const timeline = timelineByDay.get(day) ?? {
+      day,
+      comments: 0,
+      likes: 0,
+      reposts: 0,
+      views: 0,
+      notifications: 0,
+      presence: 0,
+    };
+    if (sourceType === "post_comment") {
+      totals.comments += 1;
+      timeline.comments += 1;
+    } else if (sourceType === "post_like") {
+      totals.likes += 1;
+      timeline.likes += 1;
+    } else if (sourceType === "post_repost") {
+      totals.reposts += 1;
+      timeline.reposts += 1;
+    } else if (sourceType === "post_view") {
+      totals.views += 1;
+      timeline.views += 1;
+    } else if (sourceType === "notification_created") {
+      totals.notifications += 1;
+      timeline.notifications += 1;
+    }
+
+    const participantSet = new Set<string>();
+    if (typeof entry.doc.actor === "string") {
+      const normalizedActor = normalizeParticipantToken(entry.doc.actor);
+      if (normalizedActor) participantSet.add(normalizedActor);
+    }
+    for (const rawParticipant of entry.doc.participants) {
+      const normalized = normalizeParticipantToken(rawParticipant);
+      if (normalized) participantSet.add(normalized);
+    }
+    timeline.presence += participantSet.size;
+    totals.presence += participantSet.size;
+    for (const participant of participantSet) {
+      presenceByParticipant.set(
+        participant,
+        (presenceByParticipant.get(participant) ?? 0) + 1,
+      );
+    }
+    timelineByDay.set(day, timeline);
+  }
+
+  const topPresenceParticipants = [...presenceByParticipant.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, Math.max(1, Math.min(20, input.limit)))
+    .map(([participant, count]) => ({
+      participant,
+      display: participant.startsWith("id:") ? participant.slice(3) : participant,
+      presence: count,
+    }));
+
+  const timeline = [...timelineByDay.values()].sort((a, b) =>
+    a.day < b.day ? -1 : a.day > b.day ? 1 : 0,
+  );
+  const totalEngagement =
+    totals.comments +
+    totals.likes +
+    totals.reposts +
+    totals.views +
+    totals.notifications;
+
+  return {
+    range: {
+      label: rangeLabel,
+      maxAgeMs: safeRangeMs,
+      from: new Date(sinceMs).toISOString(),
+      to: new Date(nowMs).toISOString(),
+    },
+    scope: {
+      postId: scopePostId,
+      commentId: scopeCommentId,
+    },
+    metric: input.metric,
+    totals: {
+      ...totals,
+      totalEngagement,
+    },
+    docsConsidered: docs.length,
+    topParticipants: presetSummary.topParticipants,
+    topPresenceParticipants,
+    timeline,
+    presetLines: presetSummary.lines,
+  };
+};
+
 const resolveStateDir = (): string => {
   const configured = trimEnv("MG_AGENT_STATE_DIR");
   if (configured) return path.resolve(configured);
@@ -1165,7 +1384,7 @@ button:hover{background:#f1f5f9}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 </style></head><body>
 <div class="wrap">
-<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Read-Only Health</div></div><div class="muted" id="ts">refreshing...</div></div>
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Read-Only Health</div></div><div class="row"><a href="/graphs" class="badge neutral" style="text-decoration:none">Open Graphs</a><div class="muted" id="ts">refreshing...</div></div></div>
 <div class="grid">
 <div class="card"><div class="muted">Runtime</div><div id="rt"></div></div>
 <div class="card"><div class="muted">Chat Bridge</div><div id="cb"></div></div>
@@ -1229,6 +1448,10 @@ if(presets.mostEngagedComments&&typeof presets.mostEngagedComments==='object'&&A
 const cards=presets.mostEngagedComments.comments.slice(0,4).map(c=>'<div class="muted">comment '+esc(c.commentId)+' (post '+esc(c.postId??'n/a')+') score='+esc(c.score)+' · c='+esc(c.comments)+' l='+esc(c.likes)+' r='+esc(c.reposts)+' v='+esc(c.views)+' n='+esc(c.notifications)+' · '+esc(fmt(c.lastAt))+'</div>');
 rows.push('<div class="evt"><strong>Preset: Most Engaged Comments</strong><br/><span class="muted">range='+esc(presets.mostEngagedComments.rangeLabel??'n/a')+'</span>'+(cards.join('')||'<div class="muted">none</div>')+'</div>');
 }
+if(presets.topParticipants&&typeof presets.topParticipants==='object'&&Array.isArray(presets.topParticipants.participants)){
+const cards=presets.topParticipants.participants.slice(0,8).map(p=>'<div class="muted">'+esc(p.display??p.participant)+' · score='+esc(p.score)+' · presence='+esc(p.presence)+' · c='+esc(p.comments)+' l='+esc(p.likes)+' r='+esc(p.reposts)+' v='+esc(p.views)+' n='+esc(p.notifications)+' · '+esc(fmt(p.lastAt))+'</div>');
+rows.push('<div class="evt"><strong>Preset: Top Participants</strong><br/><span class="muted">range='+esc(presets.topParticipants.rangeLabel??'n/a')+' · metric='+esc(presets.topParticipants.metric??'combined')+'</span>'+(cards.join('')||'<div class="muted">none</div>')+'</div>');
+}
 const renderPresetEvents=(label,key)=>{
 const list=Array.isArray(presets[key])?presets[key]:[];
 if(!list.length)return;
@@ -1255,6 +1478,75 @@ const runRetrieval=async()=>{const q=(document.getElementById('rq').value??'').t
 const tick=async()=>{try{const r=await fetch(healthUrl,{cache:'no-store'});render(await r.json())}catch(e){document.getElementById('ts').textContent='refresh failed: '+e}};
 void tick();setInterval(tick,3000);
 document.getElementById('rrun').addEventListener('click',()=>{void runRetrieval()});
+</script></body></html>`;
+
+const GRAPH_PAGE = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Agent Memory Graphs</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--ink:#0f172a;--muted:#475569;--line:#dbe3ef;--accent:#2563eb;--accent2:#0f766e}
+*{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,sans-serif;background:linear-gradient(145deg,#eef3ff,#f8fafc);color:var(--ink)}
+.wrap{max-width:1200px;margin:24px auto;padding:0 16px;display:grid;gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 8px 22px rgba(15,23,42,.06)}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.h1{font-size:22px;font-weight:700;margin:2px 0}.muted{color:var(--muted);font-size:13px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+input,select,button{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px;background:#fff;color:var(--ink)}
+button{cursor:pointer}button:hover{background:#f1f5f9}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.bars{display:grid;gap:8px}
+.bar{display:grid;grid-template-columns:140px 1fr auto;gap:8px;align-items:center}
+.track{height:12px;background:#e2e8f0;border-radius:999px;overflow:hidden}
+.fill{height:100%;background:linear-gradient(90deg,var(--accent),#60a5fa)}
+.fill2{background:linear-gradient(90deg,var(--accent2),#2dd4bf)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;font-size:13px}.k{color:var(--muted)}
+a{color:#2563eb;text-decoration:none}
+</style></head><body>
+<div class="wrap">
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Memory Engagement Graphs</div></div><div class="row"><a href="/" class="muted">Back to health</a><div class="muted" id="ts">loading...</div></div></div>
+<div class="card">
+<div class="row">
+<select id="range"><option value="24h">24h</option><option value="7d">7d</option><option value="30d" selected>30d</option><option value="90d">90d</option><option value="365d">365d</option></select>
+<select id="metric"><option value="combined">combined</option><option value="comments">comments</option><option value="likes">likes</option><option value="reposts">reposts</option><option value="views">views</option><option value="notifications">notifications</option><option value="presence">presence</option></select>
+<input id="limit" type="number" min="3" max="20" value="10" style="width:90px"/>
+<input id="postId" type="number" min="1" placeholder="postId (optional)" style="width:140px"/>
+<input id="commentId" type="number" min="1" placeholder="commentId (optional)" style="width:160px"/>
+<button id="run" type="button">Refresh</button>
+</div>
+<div class="muted" id="meta" style="margin-top:8px">ready</div>
+</div>
+<div class="grid">
+<div class="card"><div class="muted">Totals</div><div id="totals" class="kv"></div></div>
+<div class="card"><div class="muted">Top Participants</div><div id="top" class="bars"></div></div>
+<div class="card"><div class="muted">Presence Leaders</div><div id="presence" class="bars"></div></div>
+</div>
+<div class="card"><div class="muted">Timeline (daily)</div><div id="timeline" class="bars"></div></div>
+</div>
+<script>
+const esc=v=>String(v??'n/a').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const fmt=iso=>{if(!iso)return'n/a';const ms=Date.parse(iso);return Number.isFinite(ms)?new Date(ms).toLocaleString():'n/a'};
+const kv=obj=>Object.entries(obj).map(([k,v])=>'<div class="k">'+esc(k)+'</div><div>'+esc(v??'n/a')+'</div>').join('');
+const barRow=(label,value,max,useAlt)=>{const width=max>0?Math.max(2,Math.round((value/max)*100)):0;return '<div class="bar"><div>'+esc(label)+'</div><div class="track"><div class="fill'+(useAlt?' fill2':'')+'" style="width:'+width+'%"></div></div><div>'+esc(value)+'</div></div>'};
+const render=(payload)=>{if(!payload||payload.ok!==true){document.getElementById('meta').textContent='data unavailable';return;}
+document.getElementById('ts').textContent='updated '+fmt(payload.generatedAt);
+const totals=payload.totals&&typeof payload.totals==='object'?payload.totals:{};
+document.getElementById('totals').innerHTML=kv({range:payload.range?.label,metric:payload.metric,docsConsidered:payload.docsConsidered,totalEngagement:totals.totalEngagement,comments:totals.comments,likes:totals.likes,reposts:totals.reposts,views:totals.views,notifications:totals.notifications,presence:totals.presence,from:fmt(payload.range?.from),to:fmt(payload.range?.to)});
+const tp=payload.topParticipants&&typeof payload.topParticipants==='object'?payload.topParticipants:null;
+const topRows=Array.isArray(tp?.participants)?tp.participants:[];
+const topMax=topRows.reduce((m,r)=>Math.max(m,Number(r.score)||0),0);
+document.getElementById('top').innerHTML=topRows.length?topRows.map((row)=>barRow((row.display??row.participant??'unknown')+' ('+(row.lastAt?new Date(row.lastAt).toLocaleDateString():'n/a')+')',Number(row.score)||0,topMax,false)).join(''):'<div class="muted">No participant data.</div>';
+const pp=Array.isArray(payload.topPresenceParticipants)?payload.topPresenceParticipants:[];
+const ppMax=pp.reduce((m,r)=>Math.max(m,Number(r.presence)||0),0);
+document.getElementById('presence').innerHTML=pp.length?pp.map((row)=>barRow(row.display??row.participant??'unknown',Number(row.presence)||0,ppMax,true)).join(''):'<div class="muted">No presence data.</div>';
+const tl=Array.isArray(payload.timeline)?payload.timeline:[];
+const tlRows=tl.slice(-20);
+const tlMax=tlRows.reduce((m,row)=>Math.max(m,(Number(row.comments)||0)+(Number(row.likes)||0)+(Number(row.reposts)||0)+(Number(row.views)||0)+(Number(row.notifications)||0)),0);
+document.getElementById('timeline').innerHTML=tlRows.length?tlRows.map((row)=>{const total=(Number(row.comments)||0)+(Number(row.likes)||0)+(Number(row.reposts)||0)+(Number(row.views)||0)+(Number(row.notifications)||0);return barRow(row.day+' · c'+(row.comments||0)+' l'+(row.likes||0)+' r'+(row.reposts||0)+' v'+(row.views||0)+' n'+(row.notifications||0),total,tlMax,false)}).join(''):'<div class="muted">No timeline data.</div>';
+document.getElementById('meta').textContent='range '+esc(payload.range?.label)+' · metric '+esc(payload.metric)+' · participants '+esc(topRows.length);
+};
+const run=async()=>{const sp=new URLSearchParams();sp.set('range',String(document.getElementById('range').value||'30d'));sp.set('metric',String(document.getElementById('metric').value||'combined'));sp.set('limit',String(document.getElementById('limit').value||'10'));const postId=String(document.getElementById('postId').value||'').trim();const commentId=String(document.getElementById('commentId').value||'').trim();if(postId)sp.set('postId',postId);if(commentId)sp.set('commentId',commentId);document.getElementById('meta').textContent='loading...';try{const res=await fetch('/api/health/memory-engagement?'+sp.toString(),{cache:'no-store'});render(await res.json())}catch(err){document.getElementById('meta').textContent='failed: '+err}};
+document.getElementById('run').addEventListener('click',()=>{void run()});
+void run();
 </script></body></html>`;
 
 // ---------------------------------------------------------------------------
@@ -1527,6 +1819,51 @@ const main = async (): Promise<void> => {
         return;
       }
     }
+    if (url.pathname === "/api/health/memory-engagement") {
+      if (!hasPrivateAccess(req)) {
+        json(res, 403, {
+          ok: false,
+          error: "forbidden",
+          message: "Missing or invalid health private key.",
+        });
+        return;
+      }
+      try {
+        const snapshot = await buildSnapshot();
+        const files = isRecord(snapshot.files) ? snapshot.files : {};
+        const keywordPath =
+          str(files.keywordIndex) ??
+          path.join(resolveStateDir(), "memory", "context", "keyword-index.json");
+        const keywordIndex = normalizeKeywordIndex(
+          await readJsonRecord(keywordPath),
+        );
+        const diagnostics = buildMemoryEngagementDiagnostics({
+          index: keywordIndex,
+          rangeMs: resolveRangeMsFromQuery(url.searchParams),
+          metric: parseTopParticipantMetric(url.searchParams.get("metric")),
+          limit: intFromUnknown(url.searchParams.get("limit")) ?? 10,
+          postId: intFromUnknown(url.searchParams.get("postId")),
+          commentId: intFromUnknown(url.searchParams.get("commentId")),
+          intent: parseRetrievalIntent(url.searchParams.get("intent")),
+        });
+        json(res, 200, {
+          ok: true,
+          generatedAt: new Date().toISOString(),
+          stateDir: resolveStateDir(),
+          keywordIndexPath: keywordPath,
+          keywordIndexUpdatedAt: keywordIndex.updatedAt,
+          ...diagnostics,
+        });
+        return;
+      } catch (error: unknown) {
+        json(res, 500, {
+          ok: false,
+          error: "memory_engagement_unavailable",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+    }
     if (url.pathname === "/api/health/directive-lifecycle") {
       if (!hasPrivateAccess(req)) {
         json(res, 403, {
@@ -1605,6 +1942,12 @@ const main = async (): Promise<void> => {
         });
         return;
       }
+    }
+    if (url.pathname === "/graphs") {
+      res.statusCode = 200;
+      res.setHeader("content-type", "text/html; charset=utf-8");
+      res.end(GRAPH_PAGE);
+      return;
     }
     if (url.pathname !== "/") { res.statusCode = 404; res.end("Not Found"); return; }
     res.statusCode = 200;
