@@ -300,18 +300,30 @@ const toUnknownArray = (value: unknown): unknown[] =>
   Array.isArray(value) ? value : [];
 
 const extractBridgeMessageId = (value: unknown): string | null => {
-  const fromRecord = (record: Record<string, unknown>): string | null => {
-    const direct = asNonEmptyString(record.id);
-    if (direct) return direct;
+  const fromRecord = (
+    record: Record<string, unknown>,
+    depth: number,
+  ): string | null => {
+    if (depth > 8) return null;
+    const directId = asNonEmptyString(record.id);
+    if (directId) return directId;
+    const directMessageId = asNonEmptyString(record.messageId);
+    if (directMessageId) return directMessageId;
     const message = isRecord(record.message) ? record.message : null;
-    const messageId = message ? asNonEmptyString(message.id) : null;
-    if (messageId) return messageId;
-    const nestedData = isRecord(record.data) ? record.data : null;
-    if (!nestedData) return null;
-    return fromRecord(nestedData);
+    const nestedMessageId = message
+      ? asNonEmptyString(message.id) ?? asNonEmptyString(message.messageId)
+      : null;
+    if (nestedMessageId) return nestedMessageId;
+    for (const key of ["primary", "data", "result", "payload", "response"] as const) {
+      const nested = isRecord(record[key]) ? record[key] : null;
+      if (!nested) continue;
+      const resolved = fromRecord(nested, depth + 1);
+      if (resolved) return resolved;
+    }
+    return null;
   };
   if (!isRecord(value)) return null;
-  return fromRecord(value);
+  return fromRecord(value, 0);
 };
 
 const isMissingFileError = (error: unknown): boolean => {
@@ -5946,7 +5958,12 @@ export class CommandExecutor {
           });
           previewMessageId ??= extractBridgeMessageId(created);
           if (!previewMessageId) {
-            await maybeResolvePreviewMessageId(true);
+            for (let attempt = 0; attempt < 5 && !previewMessageId; attempt += 1) {
+              if (attempt > 0) {
+                await sleep(90 + attempt * 70);
+              }
+              previewMessageId ??= await maybeResolvePreviewMessageId(true);
+            }
           }
           return true;
         } catch (error: unknown) {
@@ -5964,7 +5981,10 @@ export class CommandExecutor {
           return;
         }
         if (input.kind !== "processing") {
-          if (!previewMessageId && !previewMessageCreateAttempted) {
+          if (!previewMessageId) {
+            // Terminal delivery is more important than preserving a single-card flow.
+            // If we still cannot resolve the preview message id, retry one fresh send.
+            previewMessageCreateAttempted = false;
             try {
               await sendFreshPreviewMessage(input.attachments);
             } catch {
