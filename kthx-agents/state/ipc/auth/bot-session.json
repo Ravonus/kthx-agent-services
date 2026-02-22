@@ -1,0 +1,9 @@
+{
+  "updatedAt": "2026-02-22T06:50:07.021Z",
+  "source": "agent-ws-supervisor",
+  "token": null,
+  "expiresAt": null,
+  "connectionId": "agent-supervisor-1771743006973-3pcyax6b",
+  "state": "cleared",
+  "reason": "supervisor_exit"
+}

@@ -1,0 +1,61 @@
+{
+  "updatedAt": "2026-02-22T06:50:07.023Z",
+  "reason": "shutdown",
+  "pid": 56225,
+  "connectionId": "agent-supervisor-1771743006973-3pcyax6b",
+  "botToken": {
+    "present": false,
+    "expiresAt": null
+  },
+  "updates": {
+    "enabled": true,
+    "autoUpdateOnStart": true,
+    "restartAfterUpdate": true,
+    "inProgress": false,
+    "requested": false,
+    "lastUpdateAt": "2026-02-22T06:50:07.020Z",
+    "lastUpdateStatus": "failed",
+    "lastUpdateError": "working tree is dirty; set updates.allowDirtyWorkingTree=true to force update"
+  },
+  "processes": [
+    {
+      "name": "runtime",
+      "script": "/Users/ravonus/Documents/moltgram/agent-service/dist/main.js",
+      "pid": null,
+      "desiredState": "running",
+      "running": false,
+      "restartCount": 0,
+      "lastStartAt": null,
+      "lastExit": null,
+      "lastError": "[supervisor] missing MG_AGENT_KEY_BOX (set MG_OWNER_INVITE_TOKEN for first-time registration)",
+      "disabledReason": null,
+      "stopRequested": false
+    },
+    {
+      "name": "bridge",
+      "script": "/Users/ravonus/Documents/moltgram/agent-service/kthx-agents/scripts/agent-chat-bridge.mjs",
+      "pid": null,
+      "desiredState": "stopped",
+      "running": false,
+      "restartCount": 0,
+      "lastStartAt": null,
+      "lastExit": null,
+      "lastError": "script_missing",
+      "disabledReason": "script_missing",
+      "stopRequested": false
+    },
+    {
+      "name": "health",
+      "script": "/Users/ravonus/Documents/moltgram/agent-service/kthx-agents/scripts/agent-health-web.mjs",
+      "pid": null,
+      "desiredState": "stopped",
+      "running": false,
+      "restartCount": 0,
+      "lastStartAt": null,
+      "lastExit": null,
+      "lastError": "script_missing",
+      "disabledReason": "script_missing",
+      "stopRequested": false
+    }
+  ]
+}

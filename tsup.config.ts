@@ -1,5 +1,7 @@
 import { defineConfig } from "tsup";
 
+const dtsEnabled = process.env.MG_AGENT_BUILD_DTS !== "0";
+
 export default defineConfig({
   entry: {
     main: "src/main.ts",
@@ -12,7 +14,7 @@ export default defineConfig({
   format: ["esm"],
   platform: "node",
   target: "es2022",
-  dts: true,
+  dts: dtsEnabled,
   sourcemap: true,
   clean: true,
   splitting: true,

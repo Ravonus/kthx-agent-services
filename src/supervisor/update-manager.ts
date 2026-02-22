@@ -314,8 +314,12 @@ const runPackageManagerTask = async (input: {
   timeoutMs: number;
   args: string[];
   taskLabel: string;
+  envOverrides?: Record<string, string>;
 }): Promise<RunCommandResult> => {
-  const env = buildUpdateEnv();
+  const env = {
+    ...buildUpdateEnv(),
+    ...(input.envOverrides ?? {}),
+  };
   const candidates = buildPackageManagerCandidates(input.updates, input.args);
   let lastResult: RunCommandResult | null = null;
 
@@ -429,12 +433,15 @@ export const runAgentServiceUpdate = async (
   }
 
   if (options.updates.runBuild) {
+    // DTS generation can fail on non-critical declaration issues; keep update
+    // flow reliable by compiling JS artifacts only during supervisor updates.
     const build = await runPackageManagerTask({
       updates: options.updates,
       cwd: repoDir,
       timeoutMs: options.updates.timeoutMs,
       args: ["run", "build"],
       taskLabel: "build",
+      envOverrides: { MG_AGENT_BUILD_DTS: "0" },
     });
     if (!build.ok) {
       return {

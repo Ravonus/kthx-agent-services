@@ -58,6 +58,9 @@ const COMMENT_PROMPT_WRAPPER_PATTERN =
 const ACTION_IDEMPOTENCY_IN_FLIGHT_WINDOW_MS = 45_000;
 const ACTION_REQUEUE_BACKOFF_MS = 15_000;
 const OWNER_CAPABILITY_COOLDOWN_MS = 60_000;
+const BRIDGE_LOOKUP_CACHE_TTL_MS = 12_000;
+const ENGAGEMENT_TARGET_CACHE_TTL_MS = 90_000;
+const ENGAGEMENT_TARGET_CACHE_MAX_ENTRIES = 240;
 const POST_NOVELTY_HISTORY_WINDOW_MS = 1000 * 60 * 60 * 24 * 7;
 const POST_NOVELTY_HISTORY_MAX_ITEMS = 80;
 const POST_NOVELTY_MAX_AVOID_REFERENCES = 8;
@@ -640,6 +643,28 @@ type PostDraftContext = {
   memorySummary: string | null;
 };
 
+type EngagementTargetCandidate = {
+  postId: number;
+  commentId: number | null;
+  authorId: string | null;
+  source: string;
+};
+
+type EngagementLookupHints = {
+  rawQuery: string;
+  postId: number | null;
+  commentId: number | null;
+  handles: string[];
+};
+
+type EngagementResolutionTrace = {
+  step: string;
+  queryCount: number;
+  cacheHits: number;
+  addedCandidates: number;
+  totalCandidates: number;
+};
+
 type RecentPostNoveltyEntry = {
   atMs: number;
   postType: "text" | "media";
@@ -678,6 +703,11 @@ export class CommandExecutor {
   private readonly inFlight = new Set<string>();
   private readonly ownerCapabilityDeniedByTarget = new Map<string, OwnerCapabilityCooldown>();
   private readonly recentPostNoveltyHistory: RecentPostNoveltyEntry[] = [];
+  private readonly bridgeLookupCache = new Map<string, { expiresAtMs: number; value: unknown }>();
+  private readonly engagementTargetCache = new Map<
+    string,
+    { expiresAtMs: number; candidate: EngagementTargetCandidate }
+  >();
 
   constructor(ctx: CommandExecutorContext) {
     this.ctx = ctx;
@@ -687,6 +717,140 @@ export class CommandExecutor {
     const normalizedCommandId = commandId.trim();
     if (!normalizedCommandId.length) return;
     this.ctx.commandSeal.runtimeConsumedCommandIds.delete(normalizedCommandId);
+  }
+
+  private pruneBridgeLookupCache(nowMs: number): void {
+    for (const [key, cached] of this.bridgeLookupCache) {
+      if (cached.expiresAtMs > nowMs) continue;
+      this.bridgeLookupCache.delete(key);
+    }
+    if (this.bridgeLookupCache.size <= ENGAGEMENT_TARGET_CACHE_MAX_ENTRIES) return;
+    const overflow = this.bridgeLookupCache.size - ENGAGEMENT_TARGET_CACHE_MAX_ENTRIES;
+    let removed = 0;
+    for (const key of this.bridgeLookupCache.keys()) {
+      this.bridgeLookupCache.delete(key);
+      removed += 1;
+      if (removed >= overflow) break;
+    }
+  }
+
+  private pruneEngagementTargetCache(nowMs: number): void {
+    for (const [key, cached] of this.engagementTargetCache) {
+      if (cached.expiresAtMs > nowMs) continue;
+      this.engagementTargetCache.delete(key);
+    }
+    if (this.engagementTargetCache.size <= ENGAGEMENT_TARGET_CACHE_MAX_ENTRIES) return;
+    const overflow = this.engagementTargetCache.size - ENGAGEMENT_TARGET_CACHE_MAX_ENTRIES;
+    let removed = 0;
+    for (const key of this.engagementTargetCache.keys()) {
+      this.engagementTargetCache.delete(key);
+      removed += 1;
+      if (removed >= overflow) break;
+    }
+  }
+
+  private buildEngagementTargetCacheKey(input: {
+    action: "comment" | "like" | "repost";
+    payload: Record<string, unknown>;
+    hints: EngagementLookupHints;
+  }): string {
+    const scope = isRecord(input.payload.directiveScope) ? input.payload.directiveScope : null;
+    const scopeTarget = scope && isRecord(scope.target) ? scope.target : null;
+    const channelId = asNonEmptyString(input.payload.channelId) ??
+      asNonEmptyString(scope?.channelId) ??
+      asNonEmptyString(scopeTarget?.channelId) ??
+      "";
+    const conversationId = asNonEmptyString(input.payload.conversationId) ??
+      asNonEmptyString(scope?.conversationId) ??
+      asNonEmptyString(scopeTarget?.conversationId) ??
+      "";
+    return [
+      input.action,
+      input.hints.postId ? `p:${input.hints.postId}` : "p:none",
+      input.hints.commentId ? `c:${input.hints.commentId}` : "c:none",
+      input.hints.handles.slice(0, 3).join(","),
+      truncateText(input.hints.rawQuery, 120).toLowerCase(),
+      channelId,
+      conversationId,
+    ].join("|");
+  }
+
+  private async callAgentBridgeLookupCached(
+    payload: Record<string, unknown>,
+    ttlMs: number = BRIDGE_LOOKUP_CACHE_TTL_MS,
+  ): Promise<{ value: unknown; cacheHit: boolean }> {
+    if (!this.ctx.callAgentChatBridge) return { value: null, cacheHit: false };
+    const nowMs = Date.now();
+    this.pruneBridgeLookupCache(nowMs);
+    const key = JSON.stringify(payload);
+    const cached = this.bridgeLookupCache.get(key);
+    if (cached && cached.expiresAtMs > nowMs) {
+      return { value: cached.value, cacheHit: true };
+    }
+    const value = await this.ctx.callAgentChatBridge(payload);
+    this.bridgeLookupCache.set(key, {
+      expiresAtMs: nowMs + Math.max(1000, ttlMs),
+      value,
+    });
+    return { value, cacheHit: false };
+  }
+
+  private extractEngagementLookupHints(payload: Record<string, unknown>): EngagementLookupHints {
+    const fields = [
+      asNonEmptyString(payload.requestText),
+      asNonEmptyString(payload.topic),
+      asNonEmptyString(payload.prompt),
+      asNonEmptyString(payload.body),
+      asNonEmptyString(payload.caption),
+      asNonEmptyString(payload.textBody),
+    ].filter((value): value is string => Boolean(value));
+    const rawQuery = truncateText(fields.join(" · "), 420);
+    const postIdFromText = (() => {
+      for (const match of rawQuery.matchAll(/\bpost(?:\s*id)?\s*[:#]?\s*(\d{1,12})\b/giu)) {
+        const parsed = Number.parseInt(match[1] ?? "", 10);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+      }
+      return null;
+    })();
+    const commentIdFromText = (() => {
+      for (const match of rawQuery.matchAll(
+        /\bcomment(?:\s*id)?\s*[:#]?\s*(\d{1,12})\b/giu,
+      )) {
+        const parsed = Number.parseInt(match[1] ?? "", 10);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+      }
+      return null;
+    })();
+    const handles = [...rawQuery.matchAll(/@([a-z0-9_.-]{2,64})/giu)]
+      .map((match) => (match[1] ?? "").trim().toLowerCase())
+      .filter((value) => value.length > 0)
+      .slice(0, 8);
+    return {
+      rawQuery,
+      postId: postIdFromText,
+      commentId: commentIdFromText,
+      handles,
+    };
+  }
+
+  private parseTargetIdsFromTextLine(text: string): {
+    postId: number | null;
+    commentId: number | null;
+  } {
+    const normalized = text.trim();
+    if (!normalized.length) {
+      return { postId: null, commentId: null };
+    }
+    const parse = (pattern: RegExp): number | null => {
+      const match = normalized.match(pattern);
+      if (!match) return null;
+      const parsed = Number.parseInt(match[1] ?? "", 10);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    };
+    return {
+      postId: parse(/\bpost(?:\s*id)?\s*[:#]?\s*(\d{1,12})\b/iu),
+      commentId: parse(/\bcomment(?:\s*id)?\s*[:#]?\s*(\d{1,12})\b/iu),
+    };
   }
 
   async processCommandFile(
@@ -2480,16 +2644,34 @@ export class CommandExecutor {
     if (!payload) {
       return this.failedOutcome(command, "Invalid payload for write.commentPost.");
     }
-    const postId = asPositiveInt(payload.postId);
     const body =
       asNonEmptyString(payload.body) ??
       asNonEmptyString(payload.requestText) ??
       asNonEmptyString(payload.prompt) ??
       "Write a concise, relevant reply to the target post.";
-    if (!postId) {
-      return this.failedOutcome(command, "postId is required for comments.");
+    const resolvedTarget =
+      (await this.resolveEngagementTargetForDirective({
+        payload,
+        action: "comment",
+        commandId: command.id,
+      })) ?? null;
+    if (!resolvedTarget) {
+      throw new RequeueCommandError("comment_target_resolution_waiting_for_context:no_target");
     }
-    const parentId = asPositiveInt(payload.parentId);
+    const postId = resolvedTarget.postId;
+    const parentId =
+      asPositiveInt(payload.parentId) ??
+      asPositiveInt(payload.commentId) ??
+      asPositiveInt(payload.targetCommentId) ??
+      resolvedTarget.commentId ??
+      null;
+    payload.postId = postId;
+    payload.targetPostId = postId;
+    if (parentId) {
+      payload.parentId = parentId;
+      payload.commentId = parentId;
+      payload.targetCommentId = parentId;
+    }
     const expectedTarget = {
       postId,
       commentId: parentId ?? null,
@@ -2562,8 +2744,8 @@ export class CommandExecutor {
       const curatedBody = await this.curateCommentBodyWithOpenClaw({
         command,
         payload,
-        postId,
-        parentId,
+        postId: target.postId,
+        parentId: target.commentId,
         body,
         targetHash: target.targetHash,
         lifecycleIdempotencyKey: idempotencyKey,
@@ -2577,9 +2759,9 @@ export class CommandExecutor {
       });
       const finalBody = curatedBody.body;
       const result = await this.agent().commentPost.mutate({
-        postId,
+        postId: target.postId,
         body: finalBody,
-        ...(parentId ? { parentId } : {}),
+        ...(target.commentId ? { parentId: target.commentId } : {}),
         ...(provenance ? { provenance } : {}),
         ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
         ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
@@ -2590,8 +2772,8 @@ export class CommandExecutor {
           type: "comment_body_curated",
           at: nowIso(),
           commandId: command.id,
-          postId,
-          parentId,
+          postId: target.postId,
+          parentId: target.commentId,
           source: curatedBody.source,
           reason: curatedBody.reason,
           draftBody: truncateText(body, 200),
@@ -3582,8 +3764,18 @@ export class CommandExecutor {
   private async executeWriteVote(command: Command): Promise<CommandOutcome> {
     const payload = isRecord(command.payload) ? command.payload : null;
     if (!payload) return this.failedOutcome(command, "Invalid payload for write.votePost.");
-    const postId = asPositiveInt(payload.postId);
-    if (!postId) return this.failedOutcome(command, "postId is required for write.votePost.");
+    const resolvedTarget =
+      (await this.resolveEngagementTargetForDirective({
+        payload,
+        action: "like",
+        commandId: command.id,
+      })) ?? null;
+    if (!resolvedTarget) {
+      throw new RequeueCommandError("like_target_resolution_waiting_for_context:no_target");
+    }
+    const postId = resolvedTarget.postId;
+    payload.postId = postId;
+    payload.targetPostId = postId;
     const expectedTarget = {
       postId,
       commentId: null,
@@ -3782,8 +3974,18 @@ export class CommandExecutor {
   private async executeWriteRepost(command: Command): Promise<CommandOutcome> {
     const payload = isRecord(command.payload) ? command.payload : null;
     if (!payload) return this.failedOutcome(command, "Invalid payload for write.repostPost.");
-    const postId = asPositiveInt(payload.postId);
-    if (!postId) return this.failedOutcome(command, "postId is required for write.repostPost.");
+    const resolvedTarget =
+      (await this.resolveEngagementTargetForDirective({
+        payload,
+        action: "repost",
+        commandId: command.id,
+      })) ?? null;
+    if (!resolvedTarget) {
+      throw new RequeueCommandError("repost_target_resolution_waiting_for_context:no_target");
+    }
+    const postId = resolvedTarget.postId;
+    payload.postId = postId;
+    payload.targetPostId = postId;
     const expectedTarget = {
       postId,
       commentId: null,
@@ -3994,6 +4196,52 @@ export class CommandExecutor {
       command.actionNonce ??
       null;
     const provenance = asNonEmptyString(payload.provenance);
+    const enforcedDraftAction = this.resolveEnforcedDraftAction(payload);
+    if (enforcedDraftAction) {
+      const scopedDirective = isRecord(payload.directiveScope) ? payload.directiveScope : null;
+      const scopedTarget = scopedDirective && isRecord(scopedDirective.target) ? scopedDirective.target : null;
+      const hasTargetPostId =
+        asPositiveInt(payload.postId) ??
+        asPositiveInt(payload.targetPostId) ??
+        (scopedDirective
+          ? asPositiveInt(scopedDirective.targetPostId) ??
+            (scopedTarget ? asPositiveInt(scopedTarget.postId) : null)
+          : null);
+      if (!hasTargetPostId) {
+        const resolvedTarget = await this.resolveEngagementTargetForDirective({
+          payload,
+          action: enforcedDraftAction,
+          commandId: command.id,
+        });
+        if (!resolvedTarget) {
+          throw new RequeueCommandError(
+            `engagement_target_resolution_waiting_for_context:${enforcedDraftAction}:no_target`,
+          );
+        }
+        payload.postId = resolvedTarget.postId;
+        payload.targetPostId = resolvedTarget.postId;
+        if (enforcedDraftAction === "comment" && resolvedTarget.commentId) {
+          payload.commentId = resolvedTarget.commentId;
+          payload.parentId = resolvedTarget.commentId;
+          payload.targetCommentId = resolvedTarget.commentId;
+        }
+        const nextScope = isRecord(payload.directiveScope)
+          ? { ...payload.directiveScope }
+          : ({} as Record<string, unknown>);
+        nextScope.targetPostId = resolvedTarget.postId;
+        if (enforcedDraftAction === "comment" && resolvedTarget.commentId) {
+          nextScope.targetCommentId = resolvedTarget.commentId;
+        }
+        const nextScopeTarget = isRecord(nextScope.target)
+          ? { ...nextScope.target }
+          : ({} as Record<string, unknown>);
+        nextScopeTarget.postId = resolvedTarget.postId;
+        nextScopeTarget.commentId =
+          enforcedDraftAction === "comment" ? (resolvedTarget.commentId ?? null) : null;
+        nextScope.target = nextScopeTarget;
+        payload.directiveScope = nextScope;
+      }
+    }
 
     const inlineDrafts = this.extractInlineDrafts(payload);
     const generateInput =
@@ -4008,7 +4256,6 @@ export class CommandExecutor {
       inlineDrafts.length > 0
         ? inlineDrafts
         : this.extractGeneratedDrafts(generatedResult);
-    const enforcedDraftAction = this.resolveEnforcedDraftAction(payload);
     const executableDrafts =
       enforcedDraftAction === null
         ? drafts
@@ -5506,6 +5753,629 @@ export class CommandExecutor {
       ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       ...(command.grantId ? { grantId: command.grantId } : {}),
     };
+  }
+
+  private collectBridgeRecordItems(value: unknown): Record<string, unknown>[] {
+    const collected: Record<string, unknown>[] = [];
+    const seen = new Set<Record<string, unknown>>();
+    const push = (entry: unknown): void => {
+      if (!isRecord(entry) || seen.has(entry)) return;
+      seen.add(entry);
+      collected.push(entry);
+    };
+    if (Array.isArray(value)) {
+      for (const entry of value) push(entry);
+      return collected;
+    }
+    if (!isRecord(value)) return collected;
+    for (const key of ["items", "results", "posts", "comments", "data"] as const) {
+      const nested = value[key];
+      if (Array.isArray(nested)) {
+        for (const entry of nested) push(entry);
+      } else {
+        push(nested);
+      }
+    }
+    push(value.post);
+    push(value.comment);
+    if (collected.length === 0) push(value);
+    return collected;
+  }
+
+  private extractEngagementTargetCandidateFromRecord(
+    record: Record<string, unknown>,
+    source: string,
+  ): EngagementTargetCandidate | null {
+    const parseFrom = (entry: Record<string, unknown>): EngagementTargetCandidate | null => {
+      const looksLikeCommentRecord =
+        asPositiveInt(entry.commentId) !== null ||
+        asPositiveInt(entry.parentId) !== null ||
+        (asPositiveInt(entry.postId) !== null &&
+          (asNonEmptyString(entry.body) !== null ||
+            asNonEmptyString(entry.textBody) !== null));
+      const postId =
+        asPositiveInt(entry.postId) ??
+        asPositiveInt(entry.targetPostId) ??
+        (looksLikeCommentRecord ? null : asPositiveInt(entry.id));
+      if (!postId) return null;
+      const commentId =
+        asPositiveInt(entry.commentId) ??
+        asPositiveInt(entry.parentId) ??
+        asPositiveInt(entry.targetCommentId) ??
+        null;
+      const author = isRecord(entry.author) ? entry.author : null;
+      const authorId =
+        asNonEmptyString(entry.authorId) ??
+        asNonEmptyString(author?.id) ??
+        null;
+      return {
+        postId,
+        commentId,
+        authorId,
+        source,
+      };
+    };
+    const direct = parseFrom(record);
+    if (direct) return direct;
+    for (const key of ["target", "post", "comment", "data"] as const) {
+      const nested = isRecord(record[key]) ? record[key] : null;
+      if (!nested) continue;
+      const parsed = parseFrom(nested);
+      if (parsed) return parsed;
+    }
+    return null;
+  }
+
+  private async resolveEngagementTargetForDirective(input: {
+    payload: Record<string, unknown>;
+    action: "comment" | "like" | "repost";
+    commandId: string;
+  }): Promise<EngagementTargetCandidate | null> {
+    const scopedDirective = isRecord(input.payload.directiveScope)
+      ? input.payload.directiveScope
+      : null;
+    const scopedTarget = scopedDirective && isRecord(scopedDirective.target)
+      ? scopedDirective.target
+      : null;
+    const explicitPostId =
+      asPositiveInt(input.payload.postId) ??
+      asPositiveInt(input.payload.targetPostId) ??
+      (scopedDirective
+        ? asPositiveInt(scopedDirective.targetPostId) ??
+          (scopedTarget ? asPositiveInt(scopedTarget.postId) : null)
+        : null);
+    const explicitCommentId =
+      asPositiveInt(input.payload.parentId) ??
+      asPositiveInt(input.payload.commentId) ??
+      asPositiveInt(input.payload.targetCommentId) ??
+      (scopedDirective
+        ? asPositiveInt(scopedDirective.targetCommentId) ??
+          (scopedTarget ? asPositiveInt(scopedTarget.commentId) : null)
+        : null);
+    if (explicitPostId) {
+      return {
+        postId: explicitPostId,
+        commentId: input.action === "comment" ? (explicitCommentId ?? null) : null,
+        authorId: null,
+        source: "directive_payload",
+      };
+    }
+
+    const hints = this.extractEngagementLookupHints(input.payload);
+    const hintedPostId = hints.postId;
+    const hintedCommentId = hints.commentId;
+    if (hintedPostId) {
+      return {
+        postId: hintedPostId,
+        commentId: input.action === "comment" ? hintedCommentId : null,
+        authorId: null,
+        source: "payload_hint",
+      };
+    }
+
+    if (!this.ctx.callAgentChatBridge) return null;
+
+    const cacheKey = this.buildEngagementTargetCacheKey({
+      action: input.action,
+      payload: input.payload,
+      hints,
+    });
+    const nowMs = Date.now();
+    this.pruneEngagementTargetCache(nowMs);
+    const cachedResolution = this.engagementTargetCache.get(cacheKey);
+    if (cachedResolution && cachedResolution.expiresAtMs > nowMs) {
+      return {
+        ...cachedResolution.candidate,
+        commentId:
+          input.action === "comment"
+            ? (cachedResolution.candidate.commentId ?? null)
+            : null,
+      };
+    }
+
+    type LookupPlan = {
+      source: string;
+      request: Record<string, unknown>;
+      parser?: (value: unknown) => EngagementTargetCandidate[];
+    };
+    const trace: EngagementResolutionTrace[] = [];
+    const candidates: EngagementTargetCandidate[] = [];
+    const seenTargetKeys = new Set<string>();
+    const pushCandidate = (candidate: EngagementTargetCandidate | null): void => {
+      if (!candidate) return;
+      const key = `${candidate.postId}:${candidate.commentId ?? 0}`;
+      if (seenTargetKeys.has(key)) return;
+      seenTargetKeys.add(key);
+      candidates.push(candidate);
+    };
+    const addCandidatesFrom = (value: unknown, source: string): number => {
+      let added = 0;
+      for (const item of this.collectBridgeRecordItems(value)) {
+        const parsed = this.extractEngagementTargetCandidateFromRecord(item, source);
+        if (!parsed) continue;
+        const before = candidates.length;
+        pushCandidate(parsed);
+        if (candidates.length > before) added += 1;
+      }
+      return added;
+    };
+    const runLookupStep = async (
+      step: string,
+      plans: LookupPlan[],
+    ): Promise<void> => {
+      if (plans.length === 0) return;
+      let queryCount = 0;
+      let cacheHits = 0;
+      let addedCandidates = 0;
+      for (const plan of plans) {
+        try {
+          const result = await this.callAgentBridgeLookupCached(plan.request);
+          queryCount += 1;
+          if (result.cacheHit) cacheHits += 1;
+          if (typeof plan.parser === "function") {
+            for (const candidate of plan.parser(result.value)) {
+              const before = candidates.length;
+              pushCandidate(candidate);
+              if (candidates.length > before) addedCandidates += 1;
+            }
+          } else {
+            addedCandidates += addCandidatesFrom(result.value, plan.source);
+          }
+        } catch (error: unknown) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "engagement_target_lookup_failed",
+              at: nowIso(),
+              commandId: input.commandId,
+              action: input.action,
+              step,
+              source: plan.source,
+              lookupAction: asNonEmptyString(plan.request.action) ?? "unknown",
+              error: error instanceof Error ? error.message : String(error),
+            })
+            .catch(() => undefined);
+        }
+      }
+      trace.push({
+        step,
+        queryCount,
+        cacheHits,
+        addedCandidates,
+        totalCandidates: candidates.length,
+      });
+    };
+
+    let agentMainUserId: string | null = null;
+    let agentHandle: string | null = null;
+    const profileResult = await this.callAgentBridgeLookupCached({
+      action: "agent_profile",
+    }).catch(() => ({ value: null, cacheHit: false }));
+    if (isRecord(profileResult.value) && isRecord(profileResult.value.agent)) {
+      const agentRecord = profileResult.value.agent;
+      agentMainUserId = asNonEmptyString(agentRecord.mainUserId) ?? null;
+      agentHandle = asNonEmptyString(agentRecord.handle)?.replace(/^@+/u, "").toLowerCase() ?? null;
+    }
+    trace.push({
+      step: "agent_profile",
+      queryCount: 1,
+      cacheHits: profileResult.cacheHit ? 1 : 0,
+      addedCandidates: 0,
+      totalCandidates: 0,
+    });
+
+    if (typeof this.ctx.memory.buildContext === "function") {
+      try {
+        const request: ContextRequest = {
+          mode: "engagement",
+          audience: "runtime_write",
+          maxRecentEvents: 80,
+          maxArchiveEvents: 40,
+          includeKeywordRetrieval: true,
+          retrievalIntent: "engagement",
+          retrievalMaxItems: 12,
+          retrievalQuery: [
+            input.action,
+            hints.rawQuery,
+            "target resolution",
+          ]
+            .filter((entry) => entry.trim().length > 0)
+            .join(" · "),
+        };
+        const bundle = await this.ctx.memory.buildContext(request);
+        const before = candidates.length;
+        const envelopes = [
+          ...(Array.isArray(bundle.target?.events) ? bundle.target.events : []),
+          ...(Array.isArray(bundle.recent) ? bundle.recent : []),
+          ...(Array.isArray(bundle.archive) ? bundle.archive : []),
+        ];
+        for (const envelope of envelopes) {
+          if (!isRecord(envelope) || !isRecord(envelope.payload)) continue;
+          pushCandidate(
+            this.extractEngagementTargetCandidateFromRecord(
+              envelope.payload,
+              "memory_event",
+            ),
+          );
+        }
+        if (isRecord(bundle.retrieval) && Array.isArray(bundle.retrieval.lines)) {
+          for (const line of bundle.retrieval.lines) {
+            if (typeof line !== "string") continue;
+            const parsedIds = this.parseTargetIdsFromTextLine(line);
+            if (!parsedIds.postId) continue;
+            pushCandidate({
+              postId: parsedIds.postId,
+              commentId: input.action === "comment" ? (parsedIds.commentId ?? null) : null,
+              authorId: null,
+              source: "memory_retrieval",
+            });
+          }
+        }
+        trace.push({
+          step: "memory_context",
+          queryCount: 1,
+          cacheHits: 0,
+          addedCandidates: candidates.length - before,
+          totalCandidates: candidates.length,
+        });
+      } catch (error: unknown) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "engagement_target_lookup_failed",
+            at: nowIso(),
+            commandId: input.commandId,
+            action: input.action,
+            step: "memory_context",
+            source: "memory",
+            lookupAction: "buildContext",
+            error: error instanceof Error ? error.message : String(error),
+          })
+          .catch(() => undefined);
+      }
+    }
+
+    const hintPlans: LookupPlan[] = [];
+    if (hintedPostId) {
+      hintPlans.push({
+        source: "hint_post_lookup",
+        request: { action: "find_post", postId: hintedPostId },
+      });
+    }
+    for (const handle of hints.handles.slice(0, 4)) {
+      hintPlans.push({
+        source: "hint_handle_latest",
+        request: {
+          action: "find_post",
+          authorHandle: `@${handle}`,
+          latest: true,
+        },
+      });
+    }
+    await runLookupStep("payload_hints", hintPlans);
+
+    const mentionParser = (value: unknown): EngagementTargetCandidate[] => {
+      const resolved: EngagementTargetCandidate[] = [];
+      for (const row of this.collectBridgeRecordItems(value)) {
+        const targetType = asNonEmptyString(row.targetType)?.toLowerCase() ?? "";
+        if (targetType !== "post") continue;
+        const targetId = asPositiveInt(row.targetId);
+        if (!targetId) continue;
+        const targetCommentId = asPositiveInt(row.targetCommentId) ?? null;
+        resolved.push({
+          postId: targetId,
+          commentId: input.action === "comment" ? targetCommentId : null,
+          authorId: null,
+          source: "unanswered_mention",
+        });
+      }
+      return resolved;
+    };
+    const ownCommentPlans: LookupPlan[] = [];
+    if (input.action === "comment" && agentHandle) {
+      ownCommentPlans.push({
+        source: "own_latest",
+        request: {
+          action: "find_post",
+          authorHandle: `@${agentHandle}`,
+          latest: true,
+        },
+      });
+    }
+    ownCommentPlans.push({
+      source: "unanswered_mention",
+      request: {
+        action: "browse_unanswered_mentions",
+        limit: 24,
+        sinceHours: 24 * 14,
+      },
+      parser: mentionParser,
+    });
+    await runLookupStep("high_signal", ownCommentPlans);
+
+    const topEngagerResult = await this.callAgentBridgeLookupCached({
+      action: "browse_top_engagers",
+      limit: 10,
+      windowHours: 24 * 14,
+    }).catch(() => ({ value: null, cacheHit: false }));
+    const topEngagerHandles = this.collectBridgeRecordItems(topEngagerResult.value)
+      .map((row) => {
+        const user = isRecord(row.user) ? row.user : null;
+        return (
+          asNonEmptyString(user?.handle) ??
+          asNonEmptyString(row.handle) ??
+          null
+        );
+      })
+      .filter((entry): entry is string => Boolean(entry))
+      .map((entry) => entry.replace(/^@+/u, "").toLowerCase())
+      .slice(0, 4);
+    trace.push({
+      step: "browse_top_engagers",
+      queryCount: 1,
+      cacheHits: topEngagerResult.cacheHit ? 1 : 0,
+      addedCandidates: 0,
+      totalCandidates: candidates.length,
+    });
+    const topEngagerPlans: LookupPlan[] = topEngagerHandles.map((handle) => ({
+      source: "top_engager_latest",
+      request: {
+        action: "find_post",
+        authorHandle: `@${handle}`,
+        latest: true,
+      },
+    }));
+    topEngagerPlans.push({
+      source: "recent_actions",
+      request: {
+        action: "browse_recent_actions",
+        limit: 18,
+      },
+    });
+    await runLookupStep("engagement_network", topEngagerPlans);
+
+    const hasConfidentCandidate = (): boolean =>
+      candidates.some((candidate) => {
+        if (input.action === "comment") {
+          return candidate.source === "own_latest" || candidate.source === "unanswered_mention";
+        }
+        return (
+          candidate.source === "unanswered_mention" ||
+          candidate.source === "top_engager_latest" ||
+          candidate.source === "recent_actions"
+        );
+      });
+
+    if (!hasConfidentCandidate()) {
+      await runLookupStep("broad_feed", [
+        {
+          source: "home_feed",
+          request: { action: "browse_home_feed", limit: 24 },
+        },
+        {
+          source: "trending",
+          request: { action: "browse_trending", limit: 24 },
+        },
+        {
+          source: "explore",
+          request: { action: "browse_posts", limit: 24 },
+        },
+      ]);
+    }
+
+    if (!hasConfidentCandidate() && hints.rawQuery.trim().length > 2) {
+      await runLookupStep("search_global", [
+        {
+          source: "search_global",
+          request: {
+            action: "search_global",
+            query: truncateText(hints.rawQuery, 220),
+            limit: 24,
+          },
+        },
+      ]);
+    }
+
+    if (candidates.length === 0) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "engagement_target_resolution_failed",
+          at: nowIso(),
+          commandId: input.commandId,
+          action: input.action,
+          reason: "no_candidates",
+          query: hints.rawQuery,
+          trace,
+        })
+        .catch(() => undefined);
+      return null;
+    }
+
+    const byTargetKey = new Map<string, EngagementTargetCandidate>();
+    for (const candidate of candidates) {
+      const key = `${candidate.postId}:${candidate.commentId ?? 0}`;
+      byTargetKey.set(key, candidate);
+    }
+    const hydrationPool = [...byTargetKey.values()].slice(0, 10);
+    await runLookupStep(
+      "candidate_hydration",
+      hydrationPool.map((candidate) => ({
+        source: "hydrate_find_post",
+        request: {
+          action: "find_post",
+          postId: candidate.postId,
+        },
+        parser: (value: unknown): EngagementTargetCandidate[] => {
+          const postRecord = this.extractPostRecordForCommentCuration(value, candidate.postId);
+          if (!postRecord) return [];
+          const author = isRecord(postRecord.author) ? postRecord.author : null;
+          const authorId =
+            asNonEmptyString(author?.mainUserId) ??
+            asNonEmptyString(author?.id) ??
+            asNonEmptyString(postRecord.authorId) ??
+            candidate.authorId;
+          return [
+            {
+              ...candidate,
+              authorId,
+              source: candidate.source,
+            },
+          ];
+        },
+      })),
+    );
+
+    const preferredSourceOrderComment = new Map<string, number>([
+      ["payload_hint", 0],
+      ["memory_retrieval", 1],
+      ["own_latest", 2],
+      ["unanswered_mention", 3],
+      ["top_engager_latest", 4],
+      ["recent_actions", 5],
+      ["home_feed", 6],
+      ["trending", 7],
+      ["search_global", 8],
+      ["explore", 9],
+      ["memory_event", 10],
+      ["directive_payload", 11],
+    ]);
+    const preferredSourceOrderEngagement = new Map<string, number>([
+      ["payload_hint", 0],
+      ["unanswered_mention", 1],
+      ["top_engager_latest", 2],
+      ["recent_actions", 3],
+      ["home_feed", 4],
+      ["trending", 5],
+      ["search_global", 6],
+      ["explore", 7],
+      ["memory_retrieval", 8],
+      ["memory_event", 9],
+      ["own_latest", 10],
+      ["directive_payload", 11],
+    ]);
+
+    const rankTable =
+      input.action === "comment"
+        ? preferredSourceOrderComment
+        : preferredSourceOrderEngagement;
+    const scoreCandidate = (candidate: EngagementTargetCandidate): number => {
+      const sourceRank = rankTable.get(candidate.source) ?? 999;
+      const isOwn =
+        Boolean(agentMainUserId) && candidate.authorId === agentMainUserId;
+      const ownBias =
+        input.action === "comment"
+          ? isOwn
+            ? 80
+            : 15
+          : isOwn
+            ? -140
+            : 40;
+      const commentBias =
+        input.action === "comment" && candidate.commentId ? 26 : 0;
+      return 10_000 - sourceRank * 120 + ownBias + commentBias + (candidate.postId % 17);
+    };
+    candidates.sort((a, b) => {
+      const delta = scoreCandidate(b) - scoreCandidate(a);
+      if (delta !== 0) return delta;
+      if (a.postId !== b.postId) return b.postId - a.postId;
+      const aComment = a.commentId ?? 0;
+      const bComment = b.commentId ?? 0;
+      return bComment - aComment;
+    });
+    let selected = candidates[0] ?? null;
+    if (!selected) return null;
+
+    if (input.action === "comment" && !selected.commentId) {
+      const selectedPostId = selected.postId;
+      try {
+        const commentLookup = await this.callAgentBridgeLookupCached({
+          action: "browse_comments",
+          postId: selectedPostId,
+          limit: 12,
+        });
+        const commentRecords = this.collectBridgeRecordItems(commentLookup.value)
+          .map((entry) => {
+            const postId = asPositiveInt(entry.postId);
+            const commentId = asPositiveInt(entry.commentId) ?? asPositiveInt(entry.id);
+            if (!postId || postId !== selectedPostId || !commentId) return null;
+            const author = isRecord(entry.author) ? entry.author : null;
+            const authorId =
+              asNonEmptyString(author?.mainUserId) ??
+              asNonEmptyString(author?.id) ??
+              asNonEmptyString(entry.authorId) ??
+              null;
+            const createdAtRaw =
+              asNonEmptyString(entry.createdAt) ??
+              asNonEmptyString(entry.created_at);
+            const createdAtMs = createdAtRaw ? Date.parse(createdAtRaw) : NaN;
+            return {
+              commentId,
+              authorId,
+              createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : -1,
+            };
+          })
+          .filter(
+            (
+              value,
+            ): value is { commentId: number; authorId: string | null; createdAtMs: number } =>
+              Boolean(value),
+          )
+          .filter((value) => !agentMainUserId || value.authorId !== agentMainUserId)
+          .sort((a, b) => b.createdAtMs - a.createdAtMs);
+        if (commentRecords.length > 0) {
+          selected = {
+            ...selected,
+            commentId: commentRecords[0]?.commentId ?? null,
+            source: `${selected.source}+comment_thread`,
+          };
+        }
+      } catch {
+        // best-effort parent comment enrichment only
+      }
+    }
+
+    const resolved = {
+      ...selected,
+      commentId: input.action === "comment" ? (selected.commentId ?? null) : null,
+    };
+    this.engagementTargetCache.set(cacheKey, {
+      expiresAtMs: Date.now() + ENGAGEMENT_TARGET_CACHE_TTL_MS,
+      candidate: resolved,
+    });
+    this.pruneEngagementTargetCache(Date.now());
+    await this.ctx.memory
+      .recordWrite({
+        type: "engagement_target_resolved",
+        at: nowIso(),
+        commandId: input.commandId,
+        action: input.action,
+        postId: resolved.postId,
+        commentId: resolved.commentId,
+        source: resolved.source,
+        query: hints.rawQuery,
+        candidatesConsidered: candidates.length,
+        trace,
+      })
+      .catch(() => undefined);
+    return resolved;
   }
 
   private mapAllowedWriteKindToGenerateKind(commandKind: string): string | null {

@@ -1,0 +1,197 @@
+{
+  "version": 1,
+  "paths": {
+    "homeDir": "/Users/ravonus/Documents/moltgram/agent-service/kthx-agents",
+    "stateDir": "/Users/ravonus/Documents/moltgram/agent-service/kthx-agents/state",
+    "generatedDir": "/Users/ravonus/Documents/moltgram/agent-service/kthx-agents/state/ipc/generated"
+  },
+  "openclaw": {
+    "enabled": true,
+    "binPath": "",
+    "agentName": "",
+    "autoCreateResponseAgent": true,
+    "responseAgentName": "util-agent",
+    "responseAgentModel": "anthropic/claude-haiku-4-5",
+    "listAgentsCommand": "openclaw agents",
+    "promptCommand": "openclaw agent --agent \"{agent}\" --json --thinking medium -m \"{prompt}\"",
+    "scheduleCommand": "openclaw agent --agent \"{agent}\" --json --thinking medium -m \"{prompt}\"",
+    "wakeUrl": "",
+    "wakeToken": "",
+    "wakeReasons": [
+      "director_directive",
+      "mention_directive",
+      "director_grant",
+      "socket_challenge_required",
+      "terminal_prompt_required",
+      "socket_subscription_error",
+      "terminal_run_required",
+      "directive_completed"
+    ],
+    "allowCreateAgent": true,
+    "createAgentCommand": "openclaw agents add {new_agent} --non-interactive --workspace {workspace_root}/{new_agent} --model {response_agent_model} --json",
+    "timeoutMs": 120000
+  },
+  "queue": {
+    "llmScheduleMinItems": 2,
+    "minSpacingSeconds": 120,
+    "maxSpacingSeconds": 1800,
+    "runnerTickMs": 1000,
+    "autoRun": true
+  },
+  "memory": {
+    "checkpointMinutes": 30,
+    "agentCompressionCooldownMinutes": 30,
+    "notificationBufferMax": 4000,
+    "retention": {
+      "enabled": true,
+      "intervalMinutes": 180,
+      "commands": {
+        "days": 365
+      },
+      "moods": {
+        "days": 365
+      },
+      "posts": {
+        "days": 365
+      },
+      "interactions": {
+        "days": 365
+      },
+      "notifications": {
+        "days": 365
+      },
+      "system": {
+        "days": 365
+      },
+      "longTerm": {
+        "enabled": true,
+        "maxCapsules": 200000,
+        "maxCompactionsPerRun": 10,
+        "maxEventsPerArchive": 180,
+        "maxSnippetsPerArchive": 8,
+        "useAgentCompression": true
+      }
+    }
+  },
+  "image": {
+    "commandTemplate": "generateImage --sync --dir \"{dir}\" --files \"{files}\" \"{prompt}\"",
+    "fileCommandTemplate": "generateFile --sync --type \"{type}\" --dir \"{dir}\" --output \"{output}\" --files \"{files}\" \"{prompt}\"",
+    "defaultPersona": "default",
+    "mediaIndexMaxEntries": 800,
+    "referenceLookback": 3,
+    "personas": [
+      {
+        "name": "default",
+        "aliases": [
+          "general",
+          "main"
+        ],
+        "labels": [
+          "general"
+        ],
+        "styleHint": ""
+      },
+      {
+        "name": "real_me",
+        "aliases": [
+          "selfie",
+          "irl",
+          "real_me",
+          "my_face"
+        ],
+        "labels": [
+          "selfie",
+          "real_me"
+        ],
+        "styleHint": ""
+      },
+      {
+        "name": "virtual_me",
+        "aliases": [
+          "avatar",
+          "digital_me",
+          "virtual_me"
+        ],
+        "labels": [
+          "virtual_me",
+          "avatar"
+        ],
+        "styleHint": ""
+      },
+      {
+        "name": "anime_persona",
+        "aliases": [
+          "anime",
+          "anime_me",
+          "manga",
+          "chibi",
+          "anime_style"
+        ],
+        "labels": [
+          "anime_persona",
+          "stylized_character",
+          "creative_image"
+        ],
+        "styleHint": ""
+      },
+      {
+        "name": "creative_image",
+        "aliases": [
+          "creative",
+          "imaginative",
+          "concept"
+        ],
+        "labels": [
+          "creative_image",
+          "stylized"
+        ],
+        "styleHint": ""
+      },
+      {
+        "name": "group_photo",
+        "aliases": [
+          "group",
+          "friends",
+          "group_photo",
+          "team_shot"
+        ],
+        "labels": [
+          "group_photo",
+          "group",
+          "social"
+        ],
+        "styleHint": ""
+      },
+      {
+        "name": "activities",
+        "aliases": [
+          "activity",
+          "action",
+          "outdoor",
+          "lifestyle"
+        ],
+        "labels": [
+          "activities",
+          "activity",
+          "lifestyle"
+        ],
+        "styleHint": ""
+      }
+    ]
+  },
+  "updates": {
+    "enabled": true,
+    "autoUpdateOnStart": true,
+    "restartAfterUpdate": true,
+    "haltOnFailure": false,
+    "repoDir": "",
+    "remote": "origin",
+    "branch": "main",
+    "allowDirtyWorkingTree": false,
+    "runInstall": true,
+    "runBuild": true,
+    "packageManagerExecutable": "pnpm",
+    "packageManagerUseNpmExecFallback": true,
+    "timeoutMs": 300000
+  }
+}
