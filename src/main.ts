@@ -130,6 +130,19 @@ const parseRetryAfterMs = (input: {
   return Math.max(1000, input.fallbackMs);
 };
 
+const summarizeBridgeIssues = (body: unknown): string | null => {
+  if (!isRecord(body) || body.issues === undefined) return null;
+  try {
+    const serialized = JSON.stringify(body.issues);
+    if (!serialized || serialized.length === 0) return null;
+    const truncated =
+      serialized.length > 700 ? `${serialized.slice(0, 700)}…` : serialized;
+    return ` issues=${truncated}`;
+  } catch {
+    return " issues=unserializable";
+  }
+};
+
 const isEnabledEnvFlag = (value: string | null): boolean => {
   if (!value) return false;
   const normalized = value.trim().toLowerCase();
@@ -1260,6 +1273,7 @@ const main = async (): Promise<void> => {
         isRecord(body) && typeof body.error === "string"
           ? body.error
           : `HTTP ${response.status}`;
+      const bridgeIssuesSummary = summarizeBridgeIssues(body);
       const isTokenAuthFailure =
         response.status === 401 && isBotTokenAuthFailureMessage(errorMessage);
       if (isTokenAuthFailure && !attemptedTokenRecovery) {
@@ -1270,7 +1284,9 @@ const main = async (): Promise<void> => {
         );
         continue;
       }
-      throw new Error(`agent chat bridge request failed: ${errorMessage}`);
+      throw new Error(
+        `agent chat bridge request failed: ${errorMessage}${bridgeIssuesSummary ?? ""}`,
+      );
     }
   };
 

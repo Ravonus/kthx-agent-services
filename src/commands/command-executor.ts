@@ -296,6 +296,149 @@ const stripEmDashCharacters = (value: string): string =>
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 
+const BRIDGE_RATE_LIMIT_MESSAGE_RE =
+  /\b(?:rate[_\s-]?limit|too many requests|http\s*429|status\s*429|429)\b/iu;
+const RETRY_AFTER_MS_RE = /retry[_\s-]?after(?:_ms|ms)?\D{0,6}(\d{1,7})/iu;
+const RETRY_REMAINING_MS_RE = /(\d{1,7})\s*ms\s*remaining/iu;
+
+const normalizeDelayMs = (value: unknown): number | null => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.max(0, Math.floor(value));
+};
+
+const parseRetryDelayFromMessage = (value: string): number | null => {
+  const retryAfterMatch = RETRY_AFTER_MS_RE.exec(value);
+  if (retryAfterMatch?.[1]) {
+    const parsed = Number.parseInt(retryAfterMatch[1], 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+  const remainingMatch = RETRY_REMAINING_MS_RE.exec(value);
+  if (remainingMatch?.[1]) {
+    const parsed = Number.parseInt(remainingMatch[1], 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+  return null;
+};
+
+const extractStatusCode = (
+  value: Record<string, unknown> | null,
+  depth = 0,
+): number | null => {
+  if (!value || depth > 4) return null;
+  const directStatus = normalizeDelayMs(value.status);
+  if (directStatus !== null) return directStatus;
+  const directStatusCode = normalizeDelayMs(value.statusCode);
+  if (directStatusCode !== null) return directStatusCode;
+  const directHttpStatus = normalizeDelayMs(value.httpStatus);
+  if (directHttpStatus !== null) return directHttpStatus;
+  const nestedCause = isRecord(value.cause) ? value.cause : null;
+  if (nestedCause) {
+    const nestedStatus = extractStatusCode(nestedCause, depth + 1);
+    if (nestedStatus !== null) return nestedStatus;
+  }
+  return null;
+};
+
+const extractRetryAfterMs = (
+  value: Record<string, unknown> | null,
+  depth = 0,
+): number | null => {
+  if (!value || depth > 4) return null;
+  const direct =
+    normalizeDelayMs(value.retryAfterMs) ??
+    normalizeDelayMs(value.retry_after_ms) ??
+    normalizeDelayMs(value.retryAfter);
+  if (direct !== null) return direct;
+  if (typeof value.message === "string") {
+    const fromMessage = parseRetryDelayFromMessage(value.message);
+    if (fromMessage !== null) return fromMessage;
+  }
+  const nestedCause = isRecord(value.cause) ? value.cause : null;
+  if (nestedCause) {
+    const nested = extractRetryAfterMs(nestedCause, depth + 1);
+    if (nested !== null) return nested;
+  }
+  return null;
+};
+
+const isBridgeRateLimitedError = (error: unknown): boolean => {
+  if (error instanceof Error) {
+    const record = error as Error & { status?: unknown; cause?: unknown };
+    if (normalizeDelayMs(record.status) === 429) return true;
+    const nestedStatus = extractStatusCode(
+      isRecord(record.cause) ? record.cause : null,
+    );
+    if (nestedStatus === 429) return true;
+    return BRIDGE_RATE_LIMIT_MESSAGE_RE.test(error.message);
+  }
+  if (isRecord(error)) {
+    const status = extractStatusCode(error);
+    if (status === 429) return true;
+    const message =
+      typeof error.message === "string"
+        ? error.message
+        : typeof error.error === "string"
+          ? error.error
+          : null;
+    return message ? BRIDGE_RATE_LIMIT_MESSAGE_RE.test(message) : false;
+  }
+  if (typeof error === "string") {
+    return BRIDGE_RATE_LIMIT_MESSAGE_RE.test(error);
+  }
+  return false;
+};
+
+const resolveBridgeRetryDelayMs = (
+  error: unknown,
+  fallbackMs: number,
+  attempt: number,
+): number => {
+  const maxDelayMs = 20_000;
+  const fromError = extractRetryAfterMs(isRecord(error) ? error : null);
+  if (fromError !== null) {
+    return Math.min(maxDelayMs, Math.max(120, fromError + attempt * 50));
+  }
+  if (error instanceof Error) {
+    const fromMessage = parseRetryDelayFromMessage(error.message);
+    if (fromMessage !== null) {
+      return Math.min(maxDelayMs, Math.max(120, fromMessage + attempt * 50));
+    }
+  }
+  return Math.min(maxDelayMs, Math.max(120, fallbackMs + attempt * 120));
+};
+
+const callBridgeWithRateLimitRetry = async <T>(input: {
+  call: () => Promise<T>;
+  maxAttempts: number;
+  fallbackDelayMs: number;
+}): Promise<T> => {
+  const maxAttempts = Math.max(1, Math.floor(input.maxAttempts));
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await input.call();
+    } catch (error: unknown) {
+      lastError = error;
+      if (attempt >= maxAttempts - 1 || !isBridgeRateLimitedError(error)) {
+        throw error;
+      }
+      const delayMs = resolveBridgeRetryDelayMs(
+        error,
+        input.fallbackDelayMs,
+        attempt,
+      );
+      await sleep(delayMs);
+    }
+  }
+  throw (lastError instanceof Error
+    ? lastError
+    : new Error("bridge_retry_exhausted"));
+};
+
 const toUnknownArray = (value: unknown): unknown[] =>
   Array.isArray(value) ? value : [];
 
@@ -6626,30 +6769,212 @@ export class CommandExecutor {
     let latestMediaProgress: MediaGenerationProgress | null = null;
     let generationCompleted = false;
     let uploadCompleted = false;
+    const previewClientMessageId = `runtime_generate_${command.id}`;
+    let previewStreamFrameCursor = 0;
     const snapshotStreamFrames = (): MediaGeneratorStreamFrame[] => {
       const progress = latestMediaProgress;
       return progress && Array.isArray(progress.streamFrames)
         ? progress.streamFrames
         : [];
     };
-    const buildProcessingActionPreview = (progress?: MediaGenerationProgress) => ({
+    const MAX_PROCESSING_STREAM_FRAME_DELTA = 3;
+    const MAX_FINALIZE_STREAM_FRAMES = 1;
+    const MAX_PREVIEW_HTTP_URL_LENGTH = 2048;
+    const MAX_PREVIEW_DATA_URI_LENGTH = 12_000;
+    const sanitizePreviewUrlForChat = (value: string | null | undefined): string | null => {
+      const normalized = asNonEmptyString(value);
+      if (!normalized) return null;
+      if (isHttpUrl(normalized)) {
+        return normalized.length <= MAX_PREVIEW_HTTP_URL_LENGTH ? normalized : null;
+      }
+      if (isDataUri(normalized)) {
+        return normalized.length <= MAX_PREVIEW_DATA_URI_LENGTH ? normalized : null;
+      }
+      return null;
+    };
+    const resolveChatDeliveryUrl = (
+      ...values: Array<string | null | undefined>
+    ): string | null => {
+      for (const value of values) {
+        const normalized = sanitizePreviewUrlForChat(value);
+        if (normalized) return normalized;
+      }
+      return null;
+    };
+    const compactStreamFramesForChat = (
+      frames: MediaGeneratorStreamFrame[],
+      maxFrames: number,
+    ): MediaGeneratorStreamFrame[] => {
+      const boundedMax = Math.max(1, Math.floor(maxFrames));
+      const compacted: MediaGeneratorStreamFrame[] = [];
+      for (const rawFrame of frames.slice(-boundedMax)) {
+        const previewUrl = sanitizePreviewUrlForChat(rawFrame.previewUrl);
+        if (
+          !previewUrl &&
+          rawFrame.isFinalStreamFrame !== true &&
+          rawFrame.isStreamPart !== true
+        ) {
+          continue;
+        }
+        compacted.push({
+          sourceFileName: rawFrame.sourceFileName,
+          isStreamPart: rawFrame.isStreamPart === true,
+          streamPartIndex:
+            typeof rawFrame.streamPartIndex === "number" &&
+            Number.isFinite(rawFrame.streamPartIndex)
+              ? Math.max(0, Math.floor(rawFrame.streamPartIndex))
+              : null,
+          isFinalStreamFrame: rawFrame.isFinalStreamFrame === true,
+          previewUrl,
+          outputPath: null,
+          metadataId: null,
+          source: rawFrame.source,
+        });
+      }
+      return compacted;
+    };
+    const buildStreamPreviewMetadata = (input: {
+      frames: MediaGeneratorStreamFrame[];
+      maxFrames: number;
+      finalPreviewUrl?: string | null;
+    }): {
+      streamFrames: MediaGeneratorStreamFrame[];
+      streamFrameCount: number;
+      latestStreamFrameIndex: number;
+      hasFinalStreamFrame: boolean;
+      streamRevealProgress: number;
+    } | null => {
+      const compacted = compactStreamFramesForChat(input.frames, input.maxFrames);
+      const normalizedFinalPreviewUrl = sanitizePreviewUrlForChat(input.finalPreviewUrl);
+      const hasExplicitFinalPreviewFrame =
+        normalizedFinalPreviewUrl !== null &&
+        compacted.some(
+          (entry) =>
+            entry.isFinalStreamFrame &&
+            typeof entry.previewUrl === "string" &&
+            entry.previewUrl === normalizedFinalPreviewUrl,
+        );
+      if (normalizedFinalPreviewUrl && !hasExplicitFinalPreviewFrame) {
+        compacted.push({
+          sourceFileName: null,
+          isStreamPart: false,
+          streamPartIndex: null,
+          isFinalStreamFrame: true,
+          previewUrl: normalizedFinalPreviewUrl,
+          outputPath: null,
+          metadataId: null,
+          source: "runtime.final",
+        });
+      }
+      if (compacted.length === 0) return null;
+      const hasFinalStreamFrame = compacted.some((entry) => entry.isFinalStreamFrame);
+      const streamFrameCount = compacted.length;
+      return {
+        streamFrames: compacted,
+        streamFrameCount,
+        latestStreamFrameIndex: streamFrameCount - 1,
+        hasFinalStreamFrame,
+        streamRevealProgress: hasFinalStreamFrame
+          ? 1
+          : Math.min(0.92, Number((1 - Math.exp(-streamFrameCount * 0.45)).toFixed(3))),
+      };
+    };
+    type StreamPreviewDeltaMetadata = {
+      streamFrameDelta: MediaGeneratorStreamFrame[];
+      streamFrameDeltaBaseCount: number;
+      streamFrameCount: number;
+      latestStreamFrameIndex: number;
+      hasFinalStreamFrame: boolean;
+      streamRevealProgress: number;
+    };
+    const buildStreamPreviewDeltaMetadata = (input: {
+      frames: MediaGeneratorStreamFrame[];
+      deltaBaseCount: number;
+      maxDeltaFrames: number;
+      finalPreviewUrl?: string | null;
+    }): {
+      metadata: StreamPreviewDeltaMetadata;
+      nextFrameCursor: number;
+    } | null => {
+      const boundedBaseCount = Math.max(0, Math.floor(input.deltaBaseCount));
+      const normalizedFinalPreviewUrl = sanitizePreviewUrlForChat(input.finalPreviewUrl);
+      const sourceFrames = input.frames;
+      const sourceFrameCount = sourceFrames.length;
+      const deltaBaseCount = Math.max(0, Math.min(sourceFrameCount, boundedBaseCount));
+      const compactedDeltaFrames = compactStreamFramesForChat(
+        sourceFrames.slice(deltaBaseCount),
+        input.maxDeltaFrames,
+      );
+      const hasFinalFrameInSource = sourceFrames.some((entry) => entry.isFinalStreamFrame);
+      const hasExplicitFinalPreviewFrameInSource =
+        normalizedFinalPreviewUrl !== null &&
+        sourceFrames.some(
+          (entry) =>
+            entry.isFinalStreamFrame &&
+            typeof entry.previewUrl === "string" &&
+            entry.previewUrl === normalizedFinalPreviewUrl,
+        );
+      if (
+        normalizedFinalPreviewUrl &&
+        !compactedDeltaFrames.some(
+          (entry) =>
+            entry.isFinalStreamFrame &&
+            typeof entry.previewUrl === "string" &&
+            entry.previewUrl === normalizedFinalPreviewUrl,
+        )
+      ) {
+        compactedDeltaFrames.push({
+          sourceFileName: null,
+          isStreamPart: false,
+          streamPartIndex: null,
+          isFinalStreamFrame: true,
+          previewUrl: normalizedFinalPreviewUrl,
+          outputPath: null,
+          metadataId: null,
+          source: "runtime.final",
+        });
+      }
+      const streamFrameCount =
+        normalizedFinalPreviewUrl && !hasExplicitFinalPreviewFrameInSource
+          ? sourceFrameCount + 1
+          : sourceFrameCount;
+      if (compactedDeltaFrames.length === 0 && streamFrameCount === 0) {
+        return null;
+      }
+      const hasFinalStreamFrame = hasFinalFrameInSource || normalizedFinalPreviewUrl !== null;
+      const revealBase = 1 - Math.exp(-streamFrameCount * 0.45);
+      return {
+        metadata: {
+          streamFrameDelta: compactedDeltaFrames,
+          streamFrameDeltaBaseCount: deltaBaseCount,
+          streamFrameCount,
+          latestStreamFrameIndex: Math.max(0, streamFrameCount - 1),
+          hasFinalStreamFrame,
+          streamRevealProgress: hasFinalStreamFrame
+            ? 1
+            : Math.min(0.92, Number(revealBase.toFixed(3))),
+        },
+        nextFrameCursor: sourceFrameCount,
+      };
+    };
+    const buildProcessingActionPreview = (input?: {
+      progress?: MediaGenerationProgress;
+      streamDeltaMetadata?: StreamPreviewDeltaMetadata | null;
+    }) => ({
       type: previewType,
       status: "processing",
       title: processingTitle,
       summary,
-      ...(progress?.latestPreviewUrl ? { previewUrl: progress.latestPreviewUrl } : {}),
-      ...(progress
+      streamSessionId: previewClientMessageId,
+      ...(input?.progress?.latestPreviewUrl
         ? {
-            streamFrames: progress.streamFrames,
-            streamFrameCount: progress.streamFrameCount,
-            latestStreamFrameIndex: progress.latestStreamFrameIndex,
-            hasFinalStreamFrame: progress.hasFinalStreamFrame,
-            streamRevealProgress: progress.streamRevealProgress,
+            previewUrl: sanitizePreviewUrlForChat(input.progress.latestPreviewUrl),
           }
         : {}),
+      ...(input?.streamDeltaMetadata ?? {}),
     });
-    const previewClientMessageId = `runtime_generate_${command.id}`;
     let previewLookupBackoffUntilMs = 0;
+    let previewLastEditError: string | null = null;
     const maybeResolvePreviewMessageId = async (force: boolean): Promise<string | null> => {
       if (previewMessageId) return previewMessageId;
       const callAgentChatBridge = this.ctx.callAgentChatBridge;
@@ -6660,10 +6985,15 @@ export class CommandExecutor {
       }
       previewLookupBackoffUntilMs = nowMs + 800;
       try {
-        const listed = await callAgentChatBridge({
-          action: "list_messages",
-          ...chatRoute,
-          limit: 80,
+        const listed = await callBridgeWithRateLimitRetry({
+          call: () =>
+            callAgentChatBridge({
+              action: "list_messages",
+              ...chatRoute,
+              limit: 80,
+            }),
+          maxAttempts: force ? 4 : 2,
+          fallbackDelayMs: 220,
         });
         const data = isRecord(listed) ? listed : null;
         const items = data ? toUnknownArray(data.items) : [];
@@ -6700,37 +7030,63 @@ export class CommandExecutor {
     }): Promise<boolean> => {
       const callAgentChatBridge = this.ctx.callAgentChatBridge;
       if (!callAgentChatBridge) return false;
-      const runEdit = async (messageId: string | null): Promise<string | null> => {
-        const edited = await callAgentChatBridge({
+      const runEdit = async (): Promise<string | null> => {
+        const resolvedPreviewMessageId =
+          previewMessageId ??
+          (input.kind === "processing"
+            ? await maybeResolvePreviewMessageId(false)
+            : await maybeResolvePreviewMessageId(true));
+        const callEdit = async (payload: Record<string, unknown>) =>
+          callBridgeWithRateLimitRetry({
+            call: () => callAgentChatBridge(payload),
+            maxAttempts: input.kind === "processing" ? 4 : 8,
+            fallbackDelayMs: input.kind === "processing" ? 220 : 420,
+          });
+        if (resolvedPreviewMessageId) {
+          const editedByMessageId = await callEdit({
+            action: "edit_message",
+            messageId: resolvedPreviewMessageId,
+            ...chatRoute,
+            body: input.body,
+            ...(input.attachments ? { attachments: input.attachments } : {}),
+            metadata: input.metadata,
+          });
+          return extractBridgeMessageId(editedByMessageId) ?? resolvedPreviewMessageId;
+        }
+        const editedByClientMessageId = await callEdit({
           action: "edit_message",
-          ...(messageId ? { messageId } : {}),
           clientMessageId: previewClientMessageId,
           ...chatRoute,
           body: input.body,
           ...(input.attachments ? { attachments: input.attachments } : {}),
           metadata: input.metadata,
         });
-        return extractBridgeMessageId(edited);
+        return extractBridgeMessageId(editedByClientMessageId);
       };
-      let messageId = previewMessageId ?? (await maybeResolvePreviewMessageId(true));
       try {
-        const editedMessageId = await runEdit(messageId);
-        previewMessageId = messageId ?? editedMessageId ?? previewMessageId;
+        const editedMessageId = await runEdit();
+        previewLastEditError = null;
+        previewMessageId = editedMessageId ?? previewMessageId;
         if (!previewMessageId) {
           previewMessageId = await maybeResolvePreviewMessageId(true);
         }
         return true;
       } catch (firstError: unknown) {
+        previewLastEditError =
+          firstError instanceof Error ? firstError.message : String(firstError);
         previewMessageId = null;
-        messageId = await maybeResolvePreviewMessageId(true);
+        await maybeResolvePreviewMessageId(true);
         try {
-          const editedMessageId = await runEdit(messageId);
-          previewMessageId = messageId ?? editedMessageId ?? previewMessageId;
+          const editedMessageId = await runEdit();
+          previewLastEditError = null;
+          previewMessageId = editedMessageId ?? previewMessageId;
           if (!previewMessageId) {
             previewMessageId = await maybeResolvePreviewMessageId(true);
           }
           return true;
         } catch (retryError: unknown) {
+          previewLastEditError =
+            retryError instanceof Error ? retryError.message : String(retryError);
           await this.ctx.memory
             .recordWrite({
               type: "chat_literal_generate_preview_edit_failed",
@@ -6743,6 +7099,50 @@ export class CommandExecutor {
             .catch(() => undefined);
           return false;
         }
+      }
+    };
+    const rebindPreviewMessageId = async (): Promise<boolean> => {
+      const callAgentChatBridge = this.ctx.callAgentChatBridge;
+      if (!callAgentChatBridge) return false;
+      try {
+        const rebound = await callBridgeWithRateLimitRetry({
+          call: () =>
+            callAgentChatBridge({
+              action: "send_message",
+              clientMessageId: previewClientMessageId,
+              ...chatRoute,
+              body: processingBody,
+              format: "markdown",
+              metadata: {
+                automated: true,
+                sourceContext: "CHAT",
+                actionPreview: latestMediaProgress
+                  ? buildProcessingActionPreview({
+                      progress: latestMediaProgress,
+                    })
+                  : buildProcessingActionPreview(),
+              },
+            }),
+          maxAttempts: 8,
+          fallbackDelayMs: 420,
+        });
+        previewMessageCreateAttempted = true;
+        previewMessageId = extractBridgeMessageId(rebound) ?? previewMessageId;
+        if (!previewMessageId) {
+          previewMessageId = await maybeResolvePreviewMessageId(true);
+        }
+        return Boolean(previewMessageId);
+      } catch (error: unknown) {
+        previewLastEditError = error instanceof Error ? error.message : String(error);
+        await this.ctx.memory
+          .recordWrite({
+            type: "chat_literal_generate_preview_rebind_failed",
+            at: nowIso(),
+            commandId: command.id,
+            message: previewLastEditError,
+          })
+          .catch(() => undefined);
+        return false;
       }
     };
     const sendOrEditPreviewMessage = async (input: {
@@ -6767,14 +7167,19 @@ export class CommandExecutor {
         if (previewMessageCreateAttempted) return false;
         previewMessageCreateAttempted = true;
         try {
-          const created = await callAgentChatBridge({
-            action: "send_message",
-            clientMessageId: previewClientMessageId,
-            ...chatRoute,
-            body: input.body,
-            format: "markdown",
-            ...(attachments ? { attachments } : {}),
-            metadata: input.metadata,
+          const created = await callBridgeWithRateLimitRetry({
+            call: () =>
+              callAgentChatBridge({
+                action: "send_message",
+                clientMessageId: previewClientMessageId,
+                ...chatRoute,
+                body: input.body,
+                format: "markdown",
+                ...(attachments ? { attachments } : {}),
+                metadata: input.metadata,
+              }),
+            maxAttempts: input.kind === "processing" ? 4 : 8,
+            fallbackDelayMs: input.kind === "processing" ? 220 : 420,
           });
           previewMessageId ??= extractBridgeMessageId(created);
           if (!previewMessageId) {
@@ -6801,6 +7206,13 @@ export class CommandExecutor {
           return true;
         }
         if (input.kind !== "processing") {
+          const rebound = await rebindPreviewMessageId();
+          if (rebound) {
+            const editedAfterRebind = await tryEditPreviewMessage(input);
+            if (editedAfterRebind) {
+              return true;
+            }
+          }
           if (!previewMessageCreateAttempted) {
             return sendFreshPreviewMessage(input.attachments);
           }
@@ -6815,12 +7227,12 @@ export class CommandExecutor {
     };
     const emitStreamProgress = async (progress: MediaGenerationProgress): Promise<void> => {
       latestMediaProgress = progress;
+      if (!previewMessageCreateAttempted) return;
       if (!previewMessageId) {
-        await maybeResolvePreviewMessageId(true);
+        await maybeResolvePreviewMessageId(false);
       }
-      if (!previewMessageId) return;
       const nowMs = Date.now();
-      if (nowMs - previewProgressUpdatedAtMs < 120) return;
+      if (nowMs - previewProgressUpdatedAtMs < 260) return;
       const fingerprint = [
         progress.contextId ?? "",
         progress.contextStatus ?? "",
@@ -6834,16 +7246,30 @@ export class CommandExecutor {
       if (fingerprint === previewProgressFingerprint) return;
       previewProgressFingerprint = fingerprint;
       previewProgressUpdatedAtMs = nowMs;
+      const streamDelta = buildStreamPreviewDeltaMetadata({
+        frames: progress.streamFrames,
+        deltaBaseCount: previewStreamFrameCursor,
+        maxDeltaFrames: MAX_PROCESSING_STREAM_FRAME_DELTA,
+      });
       const edited = await tryEditPreviewMessage({
         kind: "processing",
         body: processingBody,
         metadata: {
           automated: true,
           sourceContext: "CHAT",
-          actionPreview: buildProcessingActionPreview(progress),
+          actionPreview: buildProcessingActionPreview({
+            progress,
+            streamDeltaMetadata: streamDelta?.metadata ?? null,
+          }),
         },
       });
       if (!edited) return;
+      if (streamDelta) {
+        previewStreamFrameCursor = Math.max(
+          previewStreamFrameCursor,
+          streamDelta.nextFrameCursor,
+        );
+      }
     };
     try {
       await sendOrEditPreviewMessage({
@@ -6906,6 +7332,14 @@ export class CommandExecutor {
         },
       });
       uploadCompleted = true;
+      const chatDeliveryUrl = resolveChatDeliveryUrl(
+        media.mediaUrl,
+        media.mediaOptimizedUrl,
+        media.mediaOriginalUrl,
+      );
+      if (!chatDeliveryUrl) {
+        throw new Error("chat_delivery_media_url_invalid");
+      }
       if (avatarRequest) {
         const avatarCropSpec =
           profileCropSpec?.target === "avatar"
@@ -6932,25 +7366,17 @@ export class CommandExecutor {
         const avatarProfileHref = avatarTarget === "owner" && avatarHandle
           ? `/u/${avatarHandle.replace(/^@+/u, "")}?edit=avatar&crop=1`
           : null;
-        const streamedFrames = snapshotStreamFrames();
-        const needsExplicitFinalFrame =
-          streamedFrames.length === 0 ||
-          streamedFrames[streamedFrames.length - 1]?.previewUrl !== media.mediaUrl;
-        const streamFramesForSuccess = needsExplicitFinalFrame
-          ? [
-              ...streamedFrames,
-              {
-                sourceFileName: null,
-                isStreamPart: false,
-                streamPartIndex: null,
-                isFinalStreamFrame: true,
-                previewUrl: media.mediaUrl,
-                outputPath: null,
-                metadataId: null,
-                source: "runtime.final",
-              },
-            ]
-          : streamedFrames;
+        const streamPreviewForSuccess = buildStreamPreviewMetadata({
+          frames: snapshotStreamFrames(),
+          maxFrames: MAX_FINALIZE_STREAM_FRAMES,
+          finalPreviewUrl: chatDeliveryUrl,
+        });
+        const streamPreviewDeltaForSuccess = buildStreamPreviewDeltaMetadata({
+          frames: snapshotStreamFrames(),
+          deltaBaseCount: previewStreamFrameCursor,
+          maxDeltaFrames: MAX_FINALIZE_STREAM_FRAMES,
+          finalPreviewUrl: chatDeliveryUrl,
+        });
         const completionText =
           avatarTarget === "owner"
             ? "Done. Here is your new avatar. If framing looks off, tap Crop avatar and keep your face in the center safe zone."
@@ -6960,7 +7386,7 @@ export class CommandExecutor {
           body: completionText,
           attachments: [
             {
-              url: media.mediaUrl,
+              url: chatDeliveryUrl,
               mimeType,
               sizeBytes,
               metadata: {
@@ -6979,18 +7405,12 @@ export class CommandExecutor {
               status: "success",
               title: "Persona avatar updated",
               summary,
-              previewUrl: media.mediaUrl,
-              href: media.mediaUrl,
+              streamSessionId: previewClientMessageId,
+              previewUrl: chatDeliveryUrl,
+              href: chatDeliveryUrl,
               hrefLabel: "Open avatar image",
-              ...(streamFramesForSuccess.length > 0
-                ? {
-                    streamFrames: streamFramesForSuccess,
-                    streamFrameCount: streamFramesForSuccess.length,
-                    latestStreamFrameIndex: streamFramesForSuccess.length - 1,
-                    hasFinalStreamFrame: true,
-                    streamRevealProgress: 1,
-                  }
-                : {}),
+              ...(streamPreviewForSuccess ?? {}),
+              ...(streamPreviewDeltaForSuccess?.metadata ?? {}),
               cropHint: avatarCropSpec.guidance,
               cropZones: avatarCropSpec,
               ...(avatarProfileHref
@@ -7006,7 +7426,10 @@ export class CommandExecutor {
           },
         });
         if (!chatDeliveryHandled) {
-          throw new Error("chat_preview_finalize_failed:chat_avatar_update");
+          previewLastEditError ??= "preview_delivery_unresolved";
+          throw new Error(
+            `chat_preview_finalize_failed:chat_avatar_update:${previewLastEditError ?? "unknown"}`,
+          );
         }
         await this.ctx.memory.recordWrite({
             type: "chat_avatar_updated",
@@ -7057,25 +7480,17 @@ export class CommandExecutor {
         const bannerProfileHref = bannerTarget === "owner" && bannerHandle
           ? `/u/${bannerHandle.replace(/^@+/u, "")}?edit=banner&crop=1`
           : null;
-        const streamedFrames = snapshotStreamFrames();
-        const needsExplicitFinalFrame =
-          streamedFrames.length === 0 ||
-          streamedFrames[streamedFrames.length - 1]?.previewUrl !== media.mediaUrl;
-        const streamFramesForSuccess = needsExplicitFinalFrame
-          ? [
-              ...streamedFrames,
-              {
-                sourceFileName: null,
-                isStreamPart: false,
-                streamPartIndex: null,
-                isFinalStreamFrame: true,
-                previewUrl: media.mediaUrl,
-                outputPath: null,
-                metadataId: null,
-                source: "runtime.final",
-              },
-            ]
-          : streamedFrames;
+        const streamPreviewForSuccess = buildStreamPreviewMetadata({
+          frames: snapshotStreamFrames(),
+          maxFrames: MAX_FINALIZE_STREAM_FRAMES,
+          finalPreviewUrl: chatDeliveryUrl,
+        });
+        const streamPreviewDeltaForSuccess = buildStreamPreviewDeltaMetadata({
+          frames: snapshotStreamFrames(),
+          deltaBaseCount: previewStreamFrameCursor,
+          maxDeltaFrames: MAX_FINALIZE_STREAM_FRAMES,
+          finalPreviewUrl: chatDeliveryUrl,
+        });
         const completionText =
           bannerTarget === "owner"
             ? "Done. Here is your new banner. If framing looks off, tap Crop banner and keep key details in the center safe zone."
@@ -7085,7 +7500,7 @@ export class CommandExecutor {
           body: completionText,
           attachments: [
             {
-              url: media.mediaUrl,
+              url: chatDeliveryUrl,
               mimeType,
               sizeBytes,
               metadata: {
@@ -7103,18 +7518,12 @@ export class CommandExecutor {
               status: "success",
               title: "Profile banner updated",
               summary,
-              previewUrl: media.mediaUrl,
-              href: media.mediaUrl,
+              streamSessionId: previewClientMessageId,
+              previewUrl: chatDeliveryUrl,
+              href: chatDeliveryUrl,
               hrefLabel: "Open banner image",
-              ...(streamFramesForSuccess.length > 0
-                ? {
-                    streamFrames: streamFramesForSuccess,
-                    streamFrameCount: streamFramesForSuccess.length,
-                    latestStreamFrameIndex: streamFramesForSuccess.length - 1,
-                    hasFinalStreamFrame: true,
-                    streamRevealProgress: 1,
-                  }
-                : {}),
+              ...(streamPreviewForSuccess ?? {}),
+              ...(streamPreviewDeltaForSuccess?.metadata ?? {}),
               cropHint: bannerCropSpec.guidance,
               cropZones: bannerCropSpec,
               ...(bannerProfileHref
@@ -7130,7 +7539,10 @@ export class CommandExecutor {
           },
         });
         if (!chatDeliveryHandled) {
-          throw new Error("chat_preview_finalize_failed:chat_banner_update");
+          previewLastEditError ??= "preview_delivery_unresolved";
+          throw new Error(
+            `chat_preview_finalize_failed:chat_banner_update:${previewLastEditError ?? "unknown"}`,
+          );
         }
         await this.ctx.memory.recordWrite({
           type: "chat_banner_updated",
@@ -7155,25 +7567,17 @@ export class CommandExecutor {
         });
       }
 
-      const streamedFrames = snapshotStreamFrames();
-      const needsExplicitFinalFrame =
-        streamedFrames.length === 0 ||
-        streamedFrames[streamedFrames.length - 1]?.previewUrl !== media.mediaUrl;
-      const streamFramesForSuccess = needsExplicitFinalFrame
-        ? [
-            ...streamedFrames,
-            {
-              sourceFileName: null,
-              isStreamPart: false,
-              streamPartIndex: null,
-              isFinalStreamFrame: true,
-              previewUrl: media.mediaUrl,
-              outputPath: null,
-              metadataId: null,
-              source: "runtime.final",
-            },
-          ]
-        : streamedFrames;
+      const streamPreviewForSuccess = buildStreamPreviewMetadata({
+        frames: snapshotStreamFrames(),
+        maxFrames: MAX_FINALIZE_STREAM_FRAMES,
+        finalPreviewUrl: chatDeliveryUrl,
+      });
+      const streamPreviewDeltaForSuccess = buildStreamPreviewDeltaMetadata({
+        frames: snapshotStreamFrames(),
+        deltaBaseCount: previewStreamFrameCursor,
+        maxDeltaFrames: MAX_FINALIZE_STREAM_FRAMES,
+        finalPreviewUrl: chatDeliveryUrl,
+      });
       let generatedCustomAssetSaveResult: GeneratedCustomAssetSaveResult | null = null;
       let generatedCustomAssetSaveError: string | null = null;
       if (generatedCustomAssetSaveIntent) {
@@ -7209,7 +7613,7 @@ export class CommandExecutor {
         body: successBody,
         attachments: [
           {
-            url: media.mediaUrl,
+            url: chatDeliveryUrl,
             mimeType,
             sizeBytes,
             metadata: {
@@ -7226,8 +7630,9 @@ export class CommandExecutor {
             status: "success",
             title: `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generated`,
             summary,
-            previewUrl: media.mediaUrl,
-            href: media.mediaUrl,
+            streamSessionId: previewClientMessageId,
+            previewUrl: chatDeliveryUrl,
+            href: chatDeliveryUrl,
             hrefLabel: `Open ${generatedLabel}`,
             ...(generatedCustomAssetSaveResult
               ? {
@@ -7246,20 +7651,16 @@ export class CommandExecutor {
                     ),
                   }
                 : {}),
-            ...(streamFramesForSuccess.length > 0
-              ? {
-                  streamFrames: streamFramesForSuccess,
-                  streamFrameCount: streamFramesForSuccess.length,
-                  latestStreamFrameIndex: streamFramesForSuccess.length - 1,
-                  hasFinalStreamFrame: true,
-                  streamRevealProgress: 1,
-                }
-              : {}),
+            ...(streamPreviewForSuccess ?? {}),
+            ...(streamPreviewDeltaForSuccess?.metadata ?? {}),
           },
         },
       });
       if (!chatDeliveryHandled) {
-        throw new Error("chat_preview_finalize_failed:chat_literal_generate");
+        previewLastEditError ??= "preview_delivery_unresolved";
+        throw new Error(
+          `chat_preview_finalize_failed:chat_literal_generate:${previewLastEditError ?? "unknown"}`,
+        );
       }
       await this.ctx.memory.recordWrite({
         type: "chat_literal_generate_sent",
@@ -7293,6 +7694,14 @@ export class CommandExecutor {
       const message = error instanceof Error ? error.message : String(error);
       const isPromptCurationFailure = /prompt_curation_/iu.test(message);
       const isChatDeliveryFailure = /chat_preview_finalize_failed:/iu.test(message);
+      const failureStreamFrames = snapshotStreamFrames();
+      const streamPreviewForFailure = failureStreamFrames.length > 0
+        ? buildStreamPreviewDeltaMetadata({
+            frames: failureStreamFrames,
+            deltaBaseCount: previewStreamFrameCursor,
+            maxDeltaFrames: MAX_FINALIZE_STREAM_FRAMES,
+          })
+        : null;
       const failureStage: CommandLifecycleCheckpointStage = isChatDeliveryFailure
         ? "chat_delivery"
         : uploadCompleted
@@ -7317,6 +7726,7 @@ export class CommandExecutor {
           actionPreview: {
             type: avatarRequest ? "persona" : bannerRequest ? "banner" : generatedAssetType,
             status: "failed",
+            streamSessionId: previewClientMessageId,
             title:
               avatarRequest
                 ? "Avatar update failed"
@@ -7328,6 +7738,7 @@ export class CommandExecutor {
                     ? "Prompt curation failed"
                     : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
             error: truncateText(message, 240),
+            ...(streamPreviewForFailure?.metadata ?? {}),
           },
         },
       }).catch(() => false);
@@ -7384,6 +7795,7 @@ export class CommandExecutor {
           generatedAssetType,
           chatDeliveryHandled: previewFailureDelivered,
           chatDeliveryCheckpointRecorded: failureStage === "chat_delivery",
+          chatPreviewDeliveryError: previewLastEditError,
         },
       };
     }
@@ -10507,11 +10919,32 @@ export class CommandExecutor {
     }
     const outcomeData = isRecord(outcome.data) ? outcome.data : null;
     const chatDeliveryHandled = outcomeData?.chatDeliveryHandled === true;
+    const outcomeMode = asNonEmptyString(outcomeData?.mode)?.toLowerCase() ?? "";
+    const outcomeErrorMessage = asNonEmptyString(outcome.error?.message) ?? "";
+    const literalGenerateDeliveryOwned =
+      payload?.chatLiteralGenerate === true ||
+      payload?.chatLiteralGenerate === "true" ||
+      outcomeMode === "chat_literal_generate" ||
+      /literal generate delivery failed:/iu.test(outcomeErrorMessage);
 
-    if (
-      (payload?.chatLiteralGenerate === true || payload?.requireDraftOnly === true) &&
-      chatDeliveryHandled
-    ) {
+    if (literalGenerateDeliveryOwned) {
+      if (outcomeData?.chatDeliveryCheckpointRecorded === true) {
+        return chatDeliveryHandled;
+      }
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "chat_delivery",
+        status: chatDeliveryHandled ? "ok" : "failed",
+        message: chatDeliveryHandled ? null : "chat_preview_delivery_failed",
+        metadata: {
+          mode: "chat_literal_generate_preview",
+          outcomeOk: outcome.ok,
+        },
+      });
+      return chatDeliveryHandled;
+    }
+
+    if (payload?.requireDraftOnly === true && chatDeliveryHandled) {
       if (outcomeData?.chatDeliveryCheckpointRecorded === true) {
         return true;
       }
@@ -10520,7 +10953,7 @@ export class CommandExecutor {
         stage: "chat_delivery",
         status: "ok",
         metadata: {
-          mode: payload.chatLiteralGenerate === true ? "chat_literal_generate_preview" : "draft_preview",
+          mode: "draft_preview",
           outcomeOk: outcome.ok,
         },
       });
@@ -10530,12 +10963,17 @@ export class CommandExecutor {
     const kind = command.kind.trim().toLowerCase();
     if (kind.startsWith("write.")) {
       let fallbackUsed = false;
+      const callAgentChatBridge = this.ctx.callAgentChatBridge;
       let delivered = await sendChatResultMessageFromOutcome({
         command,
         outcome,
         chatTarget,
         deps: {
-          callAgentChatBridge: this.ctx.callAgentChatBridge,
+          callAgentChatBridge:
+            callAgentChatBridge ??
+            (async () => {
+              throw new Error("chat_bridge_unavailable");
+            }),
           memory: this.ctx.memory,
         },
       });

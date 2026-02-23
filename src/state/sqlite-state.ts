@@ -97,6 +97,39 @@ const safeJsonParse = (raw: string): unknown => {
   }
 };
 
+const listSqliteTableColumns = (db: DatabaseSync, tableName: string): Set<string> => {
+  const normalizedTable = tableName.trim();
+  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/u.test(normalizedTable)) return new Set();
+  const stmt = db.prepare(`PRAGMA table_info(${normalizedTable})`);
+  const rows = stmt.all() as unknown[];
+  const columns = new Set<string>();
+  for (const row of rows) {
+    if (!isRecord(row)) continue;
+    const name = typeof row.name === "string" ? row.name.trim() : "";
+    if (name.length > 0) {
+      columns.add(name);
+    }
+  }
+  return columns;
+};
+
+const ensureRuntimeCommandLifecycleSchema = (db: DatabaseSync): void => {
+  const tableName = "runtime_command_lifecycle";
+  const columns = listSqliteTableColumns(db, tableName);
+  const requiredColumns: Array<{ name: string; sqlType: string }> = [
+    { name: "source_kind", sqlType: "TEXT" },
+    { name: "grant_id", sqlType: "TEXT" },
+    { name: "payload_json", sqlType: "TEXT" },
+  ];
+  for (const column of requiredColumns) {
+    if (columns.has(column.name)) continue;
+    db.exec(
+      `ALTER TABLE ${tableName} ADD COLUMN ${column.name} ${column.sqlType};`,
+    );
+    columns.add(column.name);
+  }
+};
+
 export class StateSqliteStore {
   readonly enabled: boolean;
   readonly dbPath: string;
@@ -195,6 +228,7 @@ export class StateSqliteStore {
       CREATE INDEX IF NOT EXISTS idx_runtime_command_lifecycle_state
         ON runtime_command_lifecycle(state, updated_at DESC);
     `);
+    ensureRuntimeCommandLifecycleSchema(db);
     this.db = db;
     this.upsertSnapshotStmt = db.prepare(`
       INSERT INTO state_snapshots (scope, visibility, updated_at, json)

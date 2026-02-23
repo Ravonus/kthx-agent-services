@@ -2465,22 +2465,25 @@ export class ChatManager implements ChatManagerLike {
               .catch(() => undefined);
             continue;
           }
-          const deterministicRouteReply =
-            await this.handleDeterministicRouteAction(entry);
-          if (deterministicRouteReply) {
-            await this.sendReply(entry, deterministicRouteReply).catch(() => undefined);
-            this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
-            await this.ctx.memory
-              .recordWrite({
-                type: "chat_runtime_route_action_reply_sent",
-                at: nowIso(),
-                messageId: entry.messageId,
-                conversationId: entry.conversationId,
-                channelId: entry.channelId,
-                replyPreview: toAnswerPreview(deterministicRouteReply, 220),
-              })
-              .catch(() => undefined);
-            continue;
+          const deterministicRouteEnabled = false;
+          if (deterministicRouteEnabled) {
+            const deterministicRouteReply =
+              await this.handleDeterministicRouteAction(entry);
+            if (deterministicRouteReply) {
+              await this.sendReply(entry, deterministicRouteReply).catch(() => undefined);
+              this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
+              await this.ctx.memory
+                .recordWrite({
+                  type: "chat_runtime_route_action_reply_sent",
+                  at: nowIso(),
+                  messageId: entry.messageId,
+                  conversationId: entry.conversationId,
+                  channelId: entry.channelId,
+                  replyPreview: toAnswerPreview(deterministicRouteReply, 220),
+                })
+                .catch(() => undefined);
+              continue;
+            }
           }
           const shouldStream = this.ctx.config.chatRuntimeTextStreamEnabled && this.ctx.config.chatRuntimeUseOpenClaw;
           const streamState = shouldStream ? this.createStreamState(entry) : null;
