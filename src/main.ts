@@ -1936,6 +1936,29 @@ const main = async (): Promise<void> => {
     runOpenClawPrompt: async (input: { prompt: string; purpose: string }) => {
       return openClawManager.prompt(input.prompt, { purpose: input.purpose });
     },
+    promotePendingDirectives: async (input) => {
+      if (!ctx.directiveManager) {
+        return {
+          scanned: 0,
+          promoted: 0,
+          skippedPermissionDenied: 0,
+          skippedTerminal: 0,
+          skippedAlreadySeen: 0,
+          skippedQueued: 0,
+          limit: Math.max(1, Math.min(100, input.limit)),
+        };
+      }
+      return ctx.directiveManager.promoteFromPending({
+        limit: input.limit,
+        retryPermissionDenied: input.retryPermissionDenied,
+        ...(typeof input.bypassCooldown === "boolean"
+          ? { bypassCooldown: input.bypassCooldown }
+          : {}),
+        ...(typeof input.source === "string" && input.source.trim().length > 0
+          ? { source: input.source.trim() }
+          : {}),
+      });
+    },
   });
 
   // -- QueueManager

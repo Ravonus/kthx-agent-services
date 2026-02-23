@@ -53,9 +53,28 @@ export interface SubscriptionManagerLike {
   dispose(): void;
 }
 
+export type PendingDirectivePromotionInput = {
+  limit?: number;
+  retryPermissionDenied?: boolean;
+  bypassCooldown?: boolean;
+  source?: string;
+};
+
+export type PendingDirectivePromotionResult = {
+  scanned: number;
+  promoted: number;
+  skippedPermissionDenied: number;
+  skippedTerminal: number;
+  skippedAlreadySeen: number;
+  skippedQueued: number;
+  limit: number;
+};
+
 export interface DirectiveManagerLike {
   intake(payload: unknown): Promise<void>;
-  promoteFromPending(): Promise<void>;
+  promoteFromPending(
+    input?: PendingDirectivePromotionInput,
+  ): Promise<PendingDirectivePromotionResult>;
   handleDirective: ((payload: unknown) => Promise<void>) | null;
   dispose(): void;
 }
@@ -159,7 +178,7 @@ export interface MintTrackingState {
 
 export interface DirectiveTrackingState {
   pendingDirectives: unknown[];
-  pendingPromotionPromise: Promise<void> | null;
+  pendingPromotionPromise: Promise<PendingDirectivePromotionResult> | null;
   lastPendingPromotionAtMs: number;
   autoEnqueueMutation: Promise<void>;
   seenDirectiveNoncesById: Map<string, Set<string>>;

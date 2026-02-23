@@ -55,8 +55,10 @@ const MAX_COLLECTED_REFERENCE_INPUTS = 12;
 const COMMENT_ECHO_PREFIX_PATTERN = /^frame\s*\d+\s*[:.-]/iu;
 const COMMENT_PROMPT_WRAPPER_PATTERN =
   /^(?:generate|create|make|draw|render)\s+(?:an?\s+)?(?:image|gif|avatar|banner|file)\b/iu;
-const STREAM_PART_ARTIFACT_PATTERN = /(?:^|[./_-])part[_-]?\d+(?:\D|$)/iu;
+const STREAM_PART_ARTIFACT_PATTERN = /(?:^|[./_-])part(?:[_-]?(?:\d+|x))(?:\D|$)/iu;
 const STREAM_PART_INDEX_PATTERN = /(?:^|[._-])part[_-]?(\d+)(?:\D|$)/iu;
+const TRANSIENT_MEDIA_ARTIFACT_FILENAME_PATTERN =
+  /(?:^|[._-])(?:tmp|temp|temporary|intermediate|working|partial|draft|frame[_-]?\d+|chunk[_-]?\d+)(?:[._-]|\d|$)|\.tmp$/iu;
 const ACTION_IDEMPOTENCY_IN_FLIGHT_WINDOW_MS = 45_000;
 const ACTION_REQUEUE_BACKOFF_MS = 15_000;
 const OWNER_CAPABILITY_COOLDOWN_MS = 60_000;
@@ -737,6 +739,22 @@ type CommandExecutorContext = {
   runOpenClawPrompt:
     | ((input: { prompt: string; purpose: string }) => Promise<OpenClawPromptExecutionResult | null>)
     | null;
+  promotePendingDirectives?:
+    | ((input: {
+        limit: number;
+        retryPermissionDenied: boolean;
+        bypassCooldown?: boolean;
+        source?: string;
+      }) => Promise<{
+        scanned: number;
+        promoted: number;
+        skippedPermissionDenied: number;
+        skippedTerminal: number;
+        skippedAlreadySeen: number;
+        skippedQueued: number;
+        limit: number;
+      }>)
+    | null;
 };
 
 type ExecuteResult = {
@@ -830,7 +848,7 @@ type CommentCurationContext = {
 
 type CuratedCommentBody = {
   body: string;
-  source: "openclaw";
+  source: "openclaw" | "draft_fallback";
   reason: string;
 };
 
@@ -898,7 +916,7 @@ type RecentPostNoveltyEntry = {
 type EngagementDecision = {
   shouldExecute: boolean;
   reason: string;
-  source: "openclaw";
+  source: "openclaw" | "agent_runtime";
   contract: ActionContract | null;
 };
 
@@ -1849,10 +1867,13 @@ export class CommandExecutor {
       const outcome = await this.executeWriteRepost(command);
       return { processed: true, outcome };
     }
+    if (kind === "brain.retrypending") {
+      const outcome = await this.executeRetryPending(command);
+      return { processed: true, outcome };
+    }
     if (
       kind === "brain.generateandqueue" ||
       kind === "brain.plan" ||
-      kind === "brain.retrypending" ||
       kind === "agent.task" ||
       kind === "agent_task"
     ) {
@@ -2024,12 +2045,24 @@ export class CommandExecutor {
     action: "comment" | "like" | "repost";
     postId: number;
     commentId: number | null;
+    commentBody?: string | null;
   }): string {
     const directiveId = input.command.sourceDirectiveId ?? input.command.id;
     const targetHash = buildTargetHash({
       postId: input.postId,
       commentId: input.commentId,
     });
+    const normalizedCommentBody =
+      input.action === "comment" && typeof input.commentBody === "string"
+        ? normalizeCommentText(input.commentBody)
+        : "";
+    const commentBodyHash =
+      normalizedCommentBody.length > 0
+        ? crypto
+            .createHash("sha256")
+            .update(normalizedCommentBody)
+            .digest("hex")
+        : null;
     return crypto
       .createHash("sha256")
       .update(
@@ -2038,6 +2071,11 @@ export class CommandExecutor {
           actionNonce: input.command.actionNonce ?? "",
           action: input.action,
           targetHash,
+          ...(input.action === "comment"
+            ? {
+                commentBodyHash,
+              }
+            : {}),
         }),
       )
       .digest("hex");
@@ -2180,19 +2218,43 @@ export class CommandExecutor {
     );
   }
 
+  private isRecoverableDraftGrantErrorMessage(message: string): boolean {
+    const normalized = message.trim().toLowerCase();
+    if (!normalized.length) return false;
+    return (
+      normalized.includes("owner capability denied: no_grant") ||
+      normalized.includes("owner capability denied: missing_grant_id_with_active_window") ||
+      normalized.includes("permission denied for requested write") ||
+      normalized.includes("forbidden:no_grant") ||
+      normalized.includes("forbidden:exhausted") ||
+      normalized.includes("forbidden:not_ready")
+    );
+  }
+
+  private isRecoverableDraftExecutionError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    if (error instanceof RequeueCommandError) return false;
+    return this.isRecoverableDraftGrantErrorMessage(error.message);
+  }
+
+  private isRecoverableDraftSkipDecision(decision: string | null): boolean {
+    if (!decision) return false;
+    return this.isRecoverableDraftGrantErrorMessage(decision);
+  }
+
   private async preflightGrantForAction(input: {
     command: Command;
     payload: Record<string, unknown>;
     action: "comment" | "like" | "repost";
     lifecycle: {
       idempotencyKey: string;
-      target: {
-        postId: number;
-        commentId: number | null;
-        targetHash: string;
+        target: {
+          postId: number;
+          commentId: number | null;
+          targetHash: string;
+        };
       };
-    };
-  }): Promise<string> {
+  }): Promise<string | null> {
     const ownerCooldown = this.resolveOwnerCapabilityCooldown({
       action: input.action,
       targetHash: input.lifecycle.target.targetHash,
@@ -2234,6 +2296,20 @@ export class CommandExecutor {
       return inferredGrantId;
     }
 
+    if (this.isDirectiveContextLinkedCommand(input.command)) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "directive_preflight_grant_bypassed",
+          at: nowIso(),
+          commandId: input.command.id,
+          directiveId: input.command.sourceDirectiveId ?? input.command.id,
+          action: input.action,
+          reason: "directive_context",
+        })
+        .catch(() => undefined);
+      return null;
+    }
+
     const hasUsableWindow = this.hasUsablePermissionWindowForAction(
       input.payload.permissionState,
       input.action,
@@ -2262,6 +2338,18 @@ export class CommandExecutor {
       })
       .catch(() => undefined);
     throw new Error(errorMessage);
+  }
+
+  private isDirectiveContextLinkedCommand(command: Command): boolean {
+    if (asNonEmptyString(command.sourceDirectiveId)) return true;
+    if (asNonEmptyString(command.pendingDirectiveId)) return true;
+    const runtimeOrigin =
+      asNonEmptyString(command.runtimeOrigin)?.toLowerCase() ?? "";
+    return (
+      runtimeOrigin === "director_directive" ||
+      runtimeOrigin === "pending_promotion" ||
+      runtimeOrigin === "runtime_resealed"
+    );
   }
 
   private extractActionContractFromUnknown(input: {
@@ -4091,6 +4179,7 @@ export class CommandExecutor {
       action: "comment",
       postId: target.postId,
       commentId: target.commentId,
+      commentBody: body,
     });
     const dedupe = this.beginActionLifecycle({
       command,
@@ -4156,7 +4245,7 @@ export class CommandExecutor {
         ...(provenance ? { provenance } : {}),
         ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
         ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
-        grantId,
+        ...(grantId ? { grantId } : {}),
       });
       await this.ctx.memory
         .recordWrite({
@@ -4230,9 +4319,31 @@ export class CommandExecutor {
     if (!draftBody.length) {
       throw new Error("Comment blocked: empty draft body.");
     }
+    const attemptDraftFallback = async (reason: string): Promise<CuratedCommentBody | null> => {
+      const fallback = this.buildDraftCommentFallback({
+        draftBody,
+        context,
+      });
+      if (!fallback) return null;
+      await this.ctx.memory
+        .recordWrite({
+          type: "comment_body_curation_fallback",
+          at: nowIso(),
+          commandId: input.command.id,
+          postId: input.postId,
+          parentId: input.parentId,
+          reason,
+          draftBody: truncateText(draftBody, 200),
+          fallbackBody: truncateText(fallback.body, 200),
+        })
+        .catch(() => undefined);
+      return fallback;
+    };
 
     const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
     if (!runOpenClawPrompt) {
+      const fallback = await attemptDraftFallback("openclaw_required_unavailable");
+      if (fallback) return fallback;
       throw new RequeueCommandError(
         "comment_curation_waiting_for_openclaw:openclaw_required_unavailable",
       );
@@ -4248,6 +4359,8 @@ export class CommandExecutor {
           reason: "missing_target_post_context",
         })
         .catch(() => undefined);
+      const fallback = await attemptDraftFallback("missing_target_post_context");
+      if (fallback) return fallback;
       throw new RequeueCommandError(
         "comment_curation_waiting_for_target_context:missing_target_post_context",
       );
@@ -4314,33 +4427,32 @@ export class CommandExecutor {
               draftBody: truncateText(draftBody, 200),
             })
             .catch(() => undefined);
-          throw new RequeueCommandError(
-            "comment_curation_waiting_for_openclaw:openclaw_declined_or_missing_body",
-          );
         }
-        const validation = this.validateCuratedCommentCandidate({
-          candidate: contract.body,
-          draftBody,
-          context,
-        });
-        if (validation.ok) {
-          return {
-            body: contract.body,
-            source: "openclaw",
-            reason: "openclaw_curated",
-          };
+        if (contract.shouldExecute && contract.body) {
+          const validation = this.validateCuratedCommentCandidate({
+            candidate: contract.body,
+            draftBody,
+            context,
+          });
+          if (validation.ok) {
+            return {
+              body: contract.body,
+              source: "openclaw",
+              reason: "openclaw_curated",
+            };
+          }
+          await this.ctx.memory
+            .recordWrite({
+              type: "comment_body_curation_rejected",
+              at: nowIso(),
+              commandId: input.command.id,
+              postId: input.postId,
+              reason: validation.reason,
+              draftBody: truncateText(draftBody, 200),
+              candidate: truncateText(contract.body, 200),
+            })
+            .catch(() => undefined);
         }
-        await this.ctx.memory
-          .recordWrite({
-            type: "comment_body_curation_rejected",
-            at: nowIso(),
-            commandId: input.command.id,
-            postId: input.postId,
-            reason: validation.reason,
-            draftBody: truncateText(draftBody, 200),
-            candidate: truncateText(contract.body, 200),
-          })
-          .catch(() => undefined);
       } else {
         await this.ctx.memory
           .recordWrite({
@@ -4365,10 +4477,18 @@ export class CommandExecutor {
     }
 
     if (openClawCurationErrored) {
+      const fallback = await attemptDraftFallback("openclaw_curation_failed");
+      if (fallback) return fallback;
       throw new RequeueCommandError(
         "comment_curation_waiting_for_openclaw:openclaw_curation_failed",
       );
     }
+    const fallback = await attemptDraftFallback(
+      attemptedOpenClawCuration
+        ? "target_specific_llm_curation_required"
+        : "missing_llm_curation",
+    );
+    if (fallback) return fallback;
     await this.ctx.memory
       .recordWrite({
         type: "comment_body_curation_blocked",
@@ -4955,6 +5075,24 @@ export class CommandExecutor {
     return false;
   }
 
+  private buildDraftCommentFallback(input: {
+    draftBody: string;
+    context: CommentCurationContext;
+  }): CuratedCommentBody | null {
+    const fallbackBody = this.normalizeCuratedCommentBody(input.draftBody);
+    if (fallbackBody.length === 0 || fallbackBody.length > 280) {
+      return null;
+    }
+    const echoLike = this.isDraftCommentEchoLike(fallbackBody, input.context);
+    return {
+      body: fallbackBody,
+      source: "draft_fallback",
+      reason: echoLike
+        ? "generated_draft_fallback_echo_like"
+        : "generated_draft_fallback",
+    };
+  }
+
   private async loadEngagementDecisionContext(input: {
     action: "like" | "repost";
     postId: number;
@@ -5055,14 +5193,31 @@ export class CommandExecutor {
       postId: input.postId,
       payload: input.payload,
     });
-    const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
-    if (!runOpenClawPrompt) {
+    const fallbackExecute = async (
+      reason: string,
+      errorMessage?: string,
+    ): Promise<EngagementDecision> => {
+      await this.ctx.memory
+        .recordWrite({
+          type: "engagement_action_decision_fallback",
+          at: nowIso(),
+          commandId: input.command.id,
+          action: input.action,
+          postId: input.postId,
+          reason,
+          ...(errorMessage ? { error: errorMessage } : {}),
+        })
+        .catch(() => undefined);
       return {
-        shouldExecute: false,
-        reason: "openclaw_required_unavailable",
-        source: "openclaw",
+        shouldExecute: true,
+        reason,
+        source: "agent_runtime",
         contract: null,
       };
+    };
+    const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
+    if (!runOpenClawPrompt) {
+      return fallbackExecute("agent_runtime_without_openclaw");
     }
     try {
       this.updateActionLifecycle({
@@ -5120,12 +5275,7 @@ export class CommandExecutor {
             postId: input.postId,
           })
           .catch(() => undefined);
-        return {
-          shouldExecute: false,
-          reason: "openclaw_contract_invalid",
-          source: "openclaw",
-          contract: null,
-        };
+        return fallbackExecute("agent_runtime_openclaw_contract_invalid");
       }
       return {
         shouldExecute: contract.shouldExecute,
@@ -5144,12 +5294,8 @@ export class CommandExecutor {
           error: error instanceof Error ? error.message : String(error),
         })
         .catch(() => undefined);
-      return {
-        shouldExecute: false,
-        reason: "openclaw_decision_failed",
-        source: "openclaw",
-        contract: null,
-      };
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return fallbackExecute("agent_runtime_openclaw_error", errorMessage);
     }
   }
 
@@ -5330,7 +5476,7 @@ export class CommandExecutor {
       const result = await this.agent().votePost.mutate({
         postId,
         vote,
-        grantId,
+        ...(grantId ? { grantId } : {}),
         ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
         ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       });
@@ -5548,7 +5694,7 @@ export class CommandExecutor {
       const result = await this.agent().repostPost.mutate({
         postId,
         repost,
-        grantId,
+        ...(grantId ? { grantId } : {}),
         ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
         ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       });
@@ -6128,6 +6274,91 @@ export class CommandExecutor {
     });
   }
 
+  private async executeRetryPending(command: Command): Promise<CommandOutcome> {
+    const payload = isRecord(command.payload)
+      ? command.payload
+      : ({} as Record<string, unknown>);
+    const requestedLimit = asPositiveInt(payload.limit);
+    const limit = Math.max(1, Math.min(100, requestedLimit ?? 20));
+    const retryPermissionDenied =
+      payload.force === true ||
+      payload.forceNow === true ||
+      payload.retryPermissionDenied === true ||
+      payload.retryBlocked === true;
+    if (!this.ctx.promotePendingDirectives) {
+      return this.failedOutcome(
+        command,
+        "Retry pending is unavailable: pending promotion handler is not wired.",
+        "pending_retry_handler_missing",
+      );
+    }
+
+    let summary: {
+      scanned: number;
+      promoted: number;
+      skippedPermissionDenied: number;
+      skippedTerminal: number;
+      skippedAlreadySeen: number;
+      skippedQueued: number;
+      limit: number;
+    };
+    try {
+      summary = await this.ctx.promotePendingDirectives({
+        limit,
+        retryPermissionDenied,
+        bypassCooldown: true,
+        source: "brain_retry_pending",
+      });
+    } catch (error: unknown) {
+      return this.failedOutcome(
+        command,
+        error instanceof Error ? error.message : "retry pending failed",
+        "pending_retry_failed",
+      );
+    }
+
+    const summaryParts = [
+      `scanned ${summary.scanned}`,
+      `queued ${summary.promoted}`,
+      `seen-skip ${summary.skippedAlreadySeen}`,
+      `queued-skip ${summary.skippedQueued}`,
+      `terminal-skip ${summary.skippedTerminal}`,
+      `permission-skip ${summary.skippedPermissionDenied}`,
+    ];
+    const completionBody =
+      summary.promoted > 0
+        ? `Queued ${summary.promoted} pending directive${summary.promoted === 1 ? "" : "s"} (${summaryParts.join(", ")}).`
+        : `No pending directives were queued (${summaryParts.join(", ")}).`;
+
+    await this.ctx.memory
+      .recordWrite({
+        type: "retry_pending_command_completed",
+        at: nowIso(),
+        commandId: command.id,
+        sourceDirectiveId: command.sourceDirectiveId ?? null,
+        retryPermissionDenied,
+        ...summary,
+      })
+      .catch(() => undefined);
+
+    return this.successOutcome(command, {
+      retryPending: summary,
+      chatCompletion: {
+        body: completionBody,
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: "retry_pending",
+            status: summary.promoted > 0 ? "success" : "noop",
+            title: "Pending queue retry",
+            summary: completionBody,
+          },
+        },
+      },
+    });
+  }
+
   private async executeGenerateAndQueue(command: Command): Promise<CommandOutcome> {
     const payload = isRecord(command.payload) ? command.payload : null;
     if (!payload) {
@@ -6431,6 +6662,9 @@ export class CommandExecutor {
     }
 
     const executedOutcomes: CommandOutcome[] = [];
+    const skippedDrafts: Array<{ kind: string; reason: string }> = [];
+    const failedDrafts: Array<{ kind: string; reason: string; code: string | null }> = [];
+    const blockedWriteKinds = new Set<string>();
     for (const draft of permissionFilteredDrafts) {
       if (!draft) continue;
       const draftCommand = this.mapDraftToWriteCommand({
@@ -6441,39 +6675,152 @@ export class CommandExecutor {
         provenance,
       });
       if (!draftCommand) continue;
-      const outcome = await this.executeCommandFromMappedDraft(draftCommand);
-      executedOutcomes.push(outcome);
-      if (!outcome.ok) {
-        break;
+      const normalizedDraftKind = draftCommand.kind.trim().toLowerCase();
+      if (blockedWriteKinds.has(normalizedDraftKind)) {
+        skippedDrafts.push({
+          kind: normalizedDraftKind,
+          reason: "skipped_after_recoverable_grant_denial",
+        });
+        continue;
+      }
+      try {
+        const outcome = await this.executeCommandFromMappedDraft(draftCommand);
+        executedOutcomes.push(outcome);
+        if (!outcome.ok) {
+          const failureReason = asNonEmptyString(outcome.error?.message) ??
+            "generated draft execution failed.";
+          failedDrafts.push({
+            kind: normalizedDraftKind,
+            reason: failureReason,
+            code: asNonEmptyString(outcome.error?.code) ?? null,
+          });
+          await this.ctx.memory
+            .recordWrite({
+              type: "generate_draft_execution_failed",
+              at: nowIso(),
+              commandId: command.id,
+              draftKind: normalizedDraftKind,
+              reason: failureReason,
+              code: asNonEmptyString(outcome.error?.code) ?? null,
+              sourceDirectiveId: command.sourceDirectiveId ?? null,
+            })
+            .catch(() => undefined);
+          if (this.isRecoverableDraftGrantErrorMessage(failureReason)) {
+            blockedWriteKinds.add(normalizedDraftKind);
+          }
+          continue;
+        }
+        const outcomeData = isRecord(outcome.data) ? outcome.data : null;
+        const skipped = outcomeData?.skipped === true;
+        const decision = asNonEmptyString(outcomeData?.decision);
+        if (skipped) {
+          const reason = decision ?? "skipped";
+          skippedDrafts.push({
+            kind: normalizedDraftKind,
+            reason,
+          });
+          if (this.isRecoverableDraftSkipDecision(reason)) {
+            blockedWriteKinds.add(normalizedDraftKind);
+          }
+        }
+      } catch (error: unknown) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (this.isRecoverableDraftExecutionError(error)) {
+          blockedWriteKinds.add(normalizedDraftKind);
+          skippedDrafts.push({
+            kind: normalizedDraftKind,
+            reason,
+          });
+          await this.ctx.memory
+            .recordWrite({
+              type: "generate_draft_execution_skipped",
+              at: nowIso(),
+              commandId: command.id,
+              draftKind: normalizedDraftKind,
+              reason,
+              sourceDirectiveId: command.sourceDirectiveId ?? null,
+            })
+            .catch(() => undefined);
+          continue;
+        }
+        failedDrafts.push({
+          kind: normalizedDraftKind,
+          reason,
+          code: null,
+        });
+        await this.ctx.memory
+          .recordWrite({
+            type: "generate_draft_execution_failed",
+            at: nowIso(),
+            commandId: command.id,
+            draftKind: normalizedDraftKind,
+            reason,
+            sourceDirectiveId: command.sourceDirectiveId ?? null,
+          })
+          .catch(() => undefined);
+        if (this.isRecoverableDraftGrantErrorMessage(reason)) {
+          blockedWriteKinds.add(normalizedDraftKind);
+        }
+        continue;
       }
     }
 
-    const firstFailure = executedOutcomes.find((entry) => !entry.ok);
-    if (firstFailure) {
+    const firstFailure = failedDrafts[0] ?? null;
+    if (firstFailure && executedOutcomes.filter((entry) => entry.ok).length === 0) {
       await this.recordCommandLifecycleCheckpoint({
         command,
         stage: "write_mutation",
         status: "failed",
-        message: firstFailure.error?.message ?? null,
+        message: firstFailure.reason,
         metadata: {
           executedCount: executedOutcomes.length,
+          failedCount: failedDrafts.length,
         },
       });
       return this.failedOutcome(
         command,
-        firstFailure.error?.message ?? "generated draft execution failed.",
-        firstFailure.error?.code,
+        firstFailure.reason,
+        firstFailure.code ?? undefined,
       );
     }
 
-    if (executedOutcomes.length > 0) {
+    const appliedOutcomeCount = executedOutcomes.filter((entry) => {
+      if (!entry.ok) return false;
+      const entryData = isRecord(entry.data) ? entry.data : null;
+      return entryData?.skipped !== true;
+    }).length;
+    if (appliedOutcomeCount === 0 && skippedDrafts.length > 0 && failedDrafts.length === 0) {
+      const firstSkipReason = skippedDrafts[0]?.reason ?? "no_executable_draft";
       await this.recordCommandLifecycleCheckpoint({
         command,
         stage: "write_mutation",
-        status: "ok",
+        status: "failed",
+        message: firstSkipReason,
         metadata: {
           executedCount: executedOutcomes.length,
+          skippedCount: skippedDrafts.length,
+          failedCount: failedDrafts.length,
+        },
+      });
+      return this.failedOutcome(
+        command,
+        `Generated drafts were skipped: ${truncateText(firstSkipReason, 220)}.`,
+        "no_executable_draft",
+      );
+    }
+
+    if (executedOutcomes.length > 0 || skippedDrafts.length > 0 || failedDrafts.length > 0) {
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "write_mutation",
+        status: failedDrafts.length > 0 && appliedOutcomeCount === 0 ? "failed" : "ok",
+        message: failedDrafts.length > 0 ? failedDrafts[0]?.reason ?? null : null,
+        metadata: {
+          executedCount: executedOutcomes.length,
+          appliedCount: appliedOutcomeCount,
           executedKinds: executedOutcomes.map((entry) => entry.kind),
+          skippedCount: skippedDrafts.length,
+          failedCount: failedDrafts.length,
         },
       });
     }
@@ -6484,7 +6831,21 @@ export class CommandExecutor {
         commandId: entry.commandId,
         kind: entry.kind,
         ok: entry.ok,
+        skipped: isRecord(entry.data) ? entry.data.skipped === true : false,
+        ...(isRecord(entry.data) && asNonEmptyString(entry.data.decision)
+          ? { decision: asNonEmptyString(entry.data.decision) }
+          : {}),
       })),
+      ...(skippedDrafts.length > 0
+        ? {
+            skippedDrafts: skippedDrafts.slice(0, 24),
+          }
+        : {}),
+      ...(failedDrafts.length > 0
+        ? {
+            failedDrafts: failedDrafts.slice(0, 24),
+          }
+        : {}),
     });
   }
 
@@ -7087,11 +7448,16 @@ export class CommandExecutor {
     const resolveChatDeliveryUrl = (
       ...values: Array<string | null | undefined>
     ): string | null => {
+      let fallback: string | null = null;
       for (const value of values) {
         const normalized = sanitizePreviewUrlForChat(value);
-        if (normalized) return normalized;
+        if (!normalized) continue;
+        fallback ??= normalized;
+        if (!this.isStreamPartArtifactReference(normalized)) {
+          return normalized;
+        }
       }
-      return null;
+      return fallback;
     };
     const compactStreamFramesForChat = (
       frames: MediaGeneratorStreamFrame[],
@@ -7631,9 +7997,9 @@ export class CommandExecutor {
       });
       uploadCompleted = true;
       const chatDeliveryUrl = resolveChatDeliveryUrl(
+        media.mediaOriginalUrl,
         media.mediaUrl,
         media.mediaOptimizedUrl,
-        media.mediaOriginalUrl,
       );
       if (!chatDeliveryUrl) {
         throw new Error("chat_delivery_media_url_invalid");
@@ -7895,7 +8261,16 @@ export class CommandExecutor {
           : generatedCustomAssetSaveError && generatedCustomAssetSaveIntent
             ? `Generated ${generatedLabel} for "${summary}". Could not save to ${generatedCustomAssetSaveIntent.scope} ${generatedCustomAssetSaveIntent.kind}s (${truncateText(generatedCustomAssetSaveError, 120)}).`
             : `Generated ${generatedLabel} for "${summary}".`;
-      const finalChatDeliveryUrl = generatedCustomAssetSaveResult?.url ?? chatDeliveryUrl;
+      const finalChatDeliveryUrl = resolveChatDeliveryUrl(
+        generatedCustomAssetSaveResult?.url,
+        chatDeliveryUrl,
+        media.mediaOriginalUrl,
+        media.mediaUrl,
+        media.mediaOptimizedUrl,
+      );
+      if (!finalChatDeliveryUrl) {
+        throw new Error("chat_delivery_media_url_invalid");
+      }
       const finalMimeType = generatedCustomAssetSaveResult?.mimeType ?? mimeType;
       const streamPreviewForSuccess = buildStreamPreviewMetadata({
         frames: snapshotStreamFrames(),
@@ -8123,6 +8498,7 @@ export class CommandExecutor {
     payload: Record<string, unknown>,
     command: Command,
   ): Record<string, unknown> {
+    const context = isRecord(payload.context) ? payload.context : null;
     const goal =
       asNonEmptyString(payload.goal)?.toLowerCase() ??
       asNonEmptyString(payload.kind)?.toLowerCase() ??
@@ -8156,16 +8532,105 @@ export class CommandExecutor {
     const count = asPositiveInt(payload.count);
     const topic =
       asNonEmptyString(payload.topic) ??
+      asNonEmptyString(context?.topic) ??
       asNonEmptyString(payload.requestText) ??
       asNonEmptyString(payload.prompt) ??
       null;
-    const mood = asNonEmptyString(payload.mood);
-    const tags = Array.isArray(payload.tags)
-      ? payload.tags
-          .map((entry) => asNonEmptyString(entry))
-          .filter((entry): entry is string => Boolean(entry))
-          .slice(0, 8)
-      : [];
+    const mood =
+      asNonEmptyString(payload.mood) ??
+      asNonEmptyString(context?.mood);
+    const collectStringArray = (
+      value: unknown,
+      max: number,
+    ): string[] => {
+      if (!Array.isArray(value)) return [];
+      const out: string[] = [];
+      for (const entry of value) {
+        const normalized = asNonEmptyString(entry);
+        if (!normalized) continue;
+        out.push(normalized);
+        if (out.length >= max) break;
+      }
+      return out;
+    };
+    const collectHandleArray = (
+      value: unknown,
+      max: number,
+    ): string[] => {
+      if (!Array.isArray(value)) return [];
+      const out: string[] = [];
+      for (const entry of value) {
+        if (typeof entry === "string") {
+          const normalized = entry.trim().replace(/^@+/u, "").toLowerCase();
+          if (!normalized.length) continue;
+          out.push(normalized);
+          if (out.length >= max) break;
+          continue;
+        }
+        if (!isRecord(entry)) continue;
+        const handle = asNonEmptyString(entry.handle);
+        if (!handle) continue;
+        out.push(handle.replace(/^@+/u, "").toLowerCase());
+        if (out.length >= max) break;
+      }
+      return out;
+    };
+    const tags = Array.from(
+      new Set(
+        [
+          ...collectStringArray(payload.tags, 24),
+          ...collectStringArray(payload.mediaLabels, 24),
+          ...collectStringArray(payload.labels, 24),
+          ...collectStringArray(context?.tags, 24),
+          ...collectStringArray(context?.mediaLabels, 24),
+          ...collectStringArray(context?.labels, 24),
+        ].map((entry) => entry.trim()),
+      ),
+    )
+      .filter((entry) => entry.length > 0)
+      .slice(0, 24);
+    const taggedHandles = Array.from(
+      new Set(
+        [
+          ...collectHandleArray(payload.taggedHandles, 24),
+          ...collectHandleArray(payload.taggedUsers, 24),
+          ...collectHandleArray(context?.taggedHandles, 24),
+          ...collectHandleArray(context?.taggedUsers, 24),
+        ],
+      ),
+    ).slice(0, 24);
+    const mediaReferenceUrls = this.collectMediaReferenceInputs(payload).slice(0, 12);
+    const mediaMode =
+      asNonEmptyString(payload.mediaMode)?.toLowerCase() ??
+      asNonEmptyString(context?.mediaMode)?.toLowerCase() ??
+      null;
+    const mediaPersona =
+      asNonEmptyString(payload.mediaPersona) ??
+      asNonEmptyString(payload.persona) ??
+      asNonEmptyString(payload.personaName) ??
+      asNonEmptyString(context?.mediaPersona) ??
+      asNonEmptyString(context?.persona) ??
+      asNonEmptyString(context?.personaName) ??
+      null;
+    const mediaPersonaStyleHint =
+      asNonEmptyString(payload.mediaPersonaStyleHint) ??
+      asNonEmptyString(payload.personaStyleHint) ??
+      asNonEmptyString(context?.mediaPersonaStyleHint) ??
+      asNonEmptyString(context?.personaStyleHint) ??
+      null;
+    const explicitVariationSeed = asNonEmptyString(payload.variationSeed);
+    const directiveActionNonceSeed =
+      asNonEmptyString(payload.sourceDirectiveActionNonce) ??
+      command.actionNonce ??
+      null;
+    const variationSeed =
+      explicitVariationSeed ??
+      (directiveActionNonceSeed
+        ? `${directiveActionNonceSeed}:${Date.now().toString(36)}:${crypto
+            .randomUUID()
+            .replaceAll("-", "")
+            .slice(0, 8)}`
+        : `${Date.now().toString(36)}_${crypto.randomUUID().replaceAll("-", "").slice(0, 10)}`);
     const provenance = asNonEmptyString(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
@@ -8181,6 +8646,12 @@ export class CommandExecutor {
       ...(topic ? { topic } : {}),
       ...(mood ? { mood } : {}),
       ...(tags.length > 0 ? { tags } : {}),
+      ...(mediaMode ? { mediaMode } : {}),
+      ...(mediaPersona ? { mediaPersona } : {}),
+      ...(mediaPersonaStyleHint ? { mediaPersonaStyleHint } : {}),
+      ...(taggedHandles.length > 0 ? { taggedHandles } : {}),
+      ...(mediaReferenceUrls.length > 0 ? { mediaReferenceUrls } : {}),
+      ...(variationSeed ? { variationSeed } : {}),
       ...(postId ? { postId } : {}),
       ...(commentId ? { commentId } : {}),
       ...(provenance ? { provenance } : {}),
@@ -9338,10 +9809,17 @@ export class CommandExecutor {
   private resolveEnforcedDraftAction(
     payload: Record<string, unknown>,
   ): "comment" | "like" | "repost" | null {
-    const goal = asNonEmptyString(payload.goal)?.toLowerCase() ?? "";
-    if (goal === "comment" || goal === "like" || goal === "repost") return goal;
-
     const normalizedKinds = this.resolveRequestedGenerateKinds(payload, "story");
+    const goal = asNonEmptyString(payload.goal)?.toLowerCase() ?? "";
+    if (goal === "comment" || goal === "like" || goal === "repost") {
+      if (
+        normalizedKinds.length <= 1 ||
+        normalizedKinds.every((kind) => kind === goal)
+      ) {
+        return goal;
+      }
+    }
+
     if (normalizedKinds.length === 1) {
       const onlyKind = normalizedKinds[0];
       if (onlyKind === "comment" || onlyKind === "like" || onlyKind === "repost") {
@@ -9855,12 +10333,70 @@ export class CommandExecutor {
     }
   }
 
+  private isTransientMediaArtifactFileName(value: string | null | undefined): boolean {
+    const normalized = asNonEmptyString(value);
+    if (!normalized) return false;
+    const fileName = path.basename(normalized.trim());
+    if (!fileName.length) return false;
+    return (
+      STREAM_PART_ARTIFACT_PATTERN.test(fileName) ||
+      TRANSIENT_MEDIA_ARTIFACT_FILENAME_PATTERN.test(fileName)
+    );
+  }
+
+  private isStreamPartArtifactReference(value: string | null | undefined): boolean {
+    const normalized = asNonEmptyString(value);
+    if (!normalized) return false;
+    if (this.isTransientMediaArtifactFileName(normalized)) return true;
+    if (!isHttpUrl(normalized)) {
+      return STREAM_PART_ARTIFACT_PATTERN.test(normalized);
+    }
+    try {
+      const parsed = new URL(normalized);
+      const decodedPath = decodeURIComponent(parsed.pathname);
+      if (this.isTransientMediaArtifactFileName(path.posix.basename(decodedPath))) {
+        return true;
+      }
+      for (const [key, rawValue] of parsed.searchParams.entries()) {
+        if (/^(?:part|frame|chunk|tmp|temp|temporary|intermediate)$/iu.test(key)) {
+          return true;
+        }
+        if (
+          this.isTransientMediaArtifactFileName(rawValue) ||
+          STREAM_PART_ARTIFACT_PATTERN.test(rawValue)
+        ) {
+          return true;
+        }
+      }
+      return false;
+    } catch {
+      return this.isTransientMediaArtifactFileName(normalized);
+    }
+  }
+
+  private resolvePreferredMediaUrl(
+    ...values: Array<string | null | undefined>
+  ): string | null {
+    let fallback: string | null = null;
+    for (const value of values) {
+      const normalized = asNonEmptyString(value);
+      if (!normalized) continue;
+      fallback ??= normalized;
+      if (!this.isStreamPartArtifactReference(normalized)) {
+        return normalized;
+      }
+    }
+    return fallback;
+  }
+
   private mapUploadResult(uploaded: unknown): ResolvedMediaUpload {
     const data = isRecord(uploaded) ? uploaded : null;
-    const mediaUrl =
-      asNonEmptyString(data?.optimizedUrl) ??
-      asNonEmptyString(data?.url) ??
-      asNonEmptyString(data?.mediaUrl);
+    const mediaUrl = this.resolvePreferredMediaUrl(
+      asNonEmptyString(data?.url),
+      asNonEmptyString(data?.mediaUrl),
+      asNonEmptyString(data?.originalUrl),
+      asNonEmptyString(data?.optimizedUrl),
+    );
     if (!mediaUrl) {
       throw new Error("no_media_url");
     }
@@ -9871,8 +10407,20 @@ export class CommandExecutor {
         : mediaTypeRaw === "image"
           ? ("image" as const)
           : undefined;
-    const originalUrl = asNonEmptyString(data?.originalUrl) ?? mediaUrl;
-    const optimizedUrl = asNonEmptyString(data?.optimizedUrl) ?? mediaUrl;
+    const originalUrl =
+      this.resolvePreferredMediaUrl(
+        asNonEmptyString(data?.originalUrl),
+        asNonEmptyString(data?.url),
+        asNonEmptyString(data?.mediaUrl),
+        asNonEmptyString(data?.optimizedUrl),
+      ) ?? mediaUrl;
+    const optimizedUrl =
+      this.resolvePreferredMediaUrl(
+        asNonEmptyString(data?.optimizedUrl),
+        asNonEmptyString(data?.url),
+        asNonEmptyString(data?.mediaUrl),
+        asNonEmptyString(data?.originalUrl),
+      ) ?? mediaUrl;
     const result: ResolvedMediaUpload = {
       mediaUrl,
       mediaOriginalUrl: originalUrl,
@@ -10120,7 +10668,7 @@ export class CommandExecutor {
             ? Math.max(0, Math.floor(streamPartIndexFromName))
             : null;
       const isStreamPartFromName =
-        sourceFileName !== null && STREAM_PART_ARTIFACT_PATTERN.test(sourceFileName);
+        sourceFileName !== null && this.isStreamPartArtifactReference(sourceFileName);
       const isStreamPart =
         rawEntry.isStreamPart === true ||
         (typeof streamPartIndexRaw === "number" && Number.isFinite(streamPartIndexRaw)) ||
@@ -10267,7 +10815,7 @@ export class CommandExecutor {
               asNonEmptyString(item.url)
             : null);
         if (!direct) continue;
-        if (!STREAM_PART_ARTIFACT_PATTERN.test(direct)) return true;
+        if (!this.isStreamPartArtifactReference(direct)) return true;
       }
       return false;
     };
@@ -10611,7 +11159,7 @@ export class CommandExecutor {
     requireFinalStreamFrame?: boolean;
   }): Promise<string | null> {
     const deadlineMs = Date.now() + Math.max(0, Math.floor(input.maxWaitMs));
-    let lastCandidate: string | null = null;
+    let lastMissingStableCandidate: string | null = null;
     do {
       const candidate = await this.resolveGeneratedMediaSource({
         requestDir: input.requestDir,
@@ -10621,22 +11169,27 @@ export class CommandExecutor {
       });
       if (candidate) {
         if (isHttpUrl(candidate) || isDataUri(candidate)) {
-          return candidate;
+          if (!this.isStreamPartArtifactReference(candidate)) {
+            return candidate;
+          }
+        } else {
+          const absolute = path.isAbsolute(candidate)
+            ? candidate
+            : path.resolve(input.requestDir, candidate);
+          if (!this.isStreamPartArtifactReference(absolute)) {
+            const exists = await fs
+              .access(absolute)
+              .then(() => true)
+              .catch(() => false);
+            if (exists) {
+              return absolute;
+            }
+            lastMissingStableCandidate = absolute;
+          }
         }
-        const absolute = path.isAbsolute(candidate)
-          ? candidate
-          : path.resolve(input.requestDir, candidate);
-        const exists = await fs
-          .access(absolute)
-          .then(() => true)
-          .catch(() => false);
-        if (exists) {
-          return absolute;
-        }
-        lastCandidate = absolute;
       }
       if (Date.now() >= deadlineMs) {
-        return lastCandidate;
+        return lastMissingStableCandidate;
       }
       await sleep(300);
     } while (true);
@@ -10674,8 +11227,7 @@ export class CommandExecutor {
       asNonEmptyString(entry.sourceFileName) ??
       asNonEmptyString(entry.file_name);
     const isStreamPartFromName =
-      sourceFileName !== null &&
-      STREAM_PART_ARTIFACT_PATTERN.test(sourceFileName);
+      sourceFileName !== null && this.isStreamPartArtifactReference(sourceFileName);
     return (
       entry.isFinalStreamFrame === true ||
       entry.streamIsFinalFrame === true ||
@@ -10719,12 +11271,12 @@ export class CommandExecutor {
     const resolveCandidate = (value: unknown): string | null => {
       const candidate = asNonEmptyString(value);
       if (!candidate) return null;
-      if (STREAM_PART_ARTIFACT_PATTERN.test(candidate)) return null;
+      if (this.isStreamPartArtifactReference(candidate)) return null;
       if (isHttpUrl(candidate) || isDataUri(candidate)) return candidate;
       const absolute = path.isAbsolute(candidate)
         ? candidate
         : path.resolve(requestDir, candidate);
-      if (STREAM_PART_ARTIFACT_PATTERN.test(absolute)) return null;
+      if (this.isStreamPartArtifactReference(absolute)) return null;
       return absolute;
     };
 
@@ -10754,8 +11306,7 @@ export class CommandExecutor {
           asNonEmptyString(entry.sourceFileName) ??
           asNonEmptyString(entry.file_name);
         const isStreamPartFromName =
-          sourceFileName !== null &&
-          STREAM_PART_ARTIFACT_PATTERN.test(sourceFileName);
+          sourceFileName !== null && this.isStreamPartArtifactReference(sourceFileName);
         const isFinalStreamFrame =
           entry.isFinalStreamFrame === true ||
           entry.streamIsFinalFrame === true ||
@@ -10856,6 +11407,10 @@ export class CommandExecutor {
     if (!isRecord(parsed)) return null;
     const streamResolved = resolveFromStreamEvents(parsed.streamEvents);
     if (streamResolved.resolved) return streamResolved.resolved;
+    const allowTopLevelFallback =
+      !requireFinalStreamFrame ||
+      !streamResolved.hasEvents ||
+      streamResolved.hasFinalStreamFrame;
     const urlKeys = [
       "lastOutputPath",
       "latestOutputPath",
@@ -10904,33 +11459,44 @@ export class CommandExecutor {
       "files",
       "outputFiles",
     ];
-    for (const key of arrayKeys) {
-      const resolved = scanArtifactArray(parsed[key]);
-      if (resolved) return resolved;
-    }
-    for (const key of urlKeys) {
-      const resolved = resolveCandidate(parsed[key]);
-      if (resolved) return resolved;
+    if (allowTopLevelFallback) {
+      for (const key of arrayKeys) {
+        const resolved = scanArtifactArray(parsed[key]);
+        if (resolved) return resolved;
+      }
+      for (const key of urlKeys) {
+        const resolved = resolveCandidate(parsed[key]);
+        if (resolved) return resolved;
+      }
     }
 
     const context = isRecord(parsed.context) ? parsed.context : null;
     if (context) {
       const contextStreamResolved = resolveFromStreamEvents(context.streamEvents);
       if (contextStreamResolved.resolved) return contextStreamResolved.resolved;
-      for (const key of arrayKeys) {
-        const resolved = scanArtifactArray(context[key]);
-        if (resolved) return resolved;
+      const allowContextFallback =
+        !requireFinalStreamFrame ||
+        !contextStreamResolved.hasEvents ||
+        contextStreamResolved.hasFinalStreamFrame;
+      if (allowContextFallback) {
+        for (const key of arrayKeys) {
+          const resolved = scanArtifactArray(context[key]);
+          if (resolved) return resolved;
+        }
       }
-      const keepAlive = isRecord(context.keepAlive) ? context.keepAlive : null;
-      if (keepAlive) {
+      const keepAlive =
+        allowContextFallback && isRecord(context.keepAlive) ? context.keepAlive : null;
+      if (allowContextFallback && keepAlive) {
         for (const key of urlKeys) {
           const resolved = resolveCandidate(keepAlive[key]);
           if (resolved) return resolved;
         }
       }
-      for (const key of urlKeys) {
-        const resolved = resolveCandidate(context[key]);
-        if (resolved) return resolved;
+      if (allowContextFallback) {
+        for (const key of urlKeys) {
+          const resolved = resolveCandidate(context[key]);
+          if (resolved) return resolved;
+        }
       }
     }
 
@@ -10939,34 +11505,48 @@ export class CommandExecutor {
         if (!isRecord(run)) continue;
         const runStreamResolved = resolveFromStreamEvents(run.streamEvents);
         if (runStreamResolved.resolved) return runStreamResolved.resolved;
-        for (const key of arrayKeys) {
-          const resolved = scanArtifactArray(run[key]);
-          if (resolved) return resolved;
-        }
-        for (const key of urlKeys) {
-          const resolved = resolveCandidate(run[key]);
-          if (resolved) return resolved;
+        const allowRunFallback =
+          !requireFinalStreamFrame ||
+          !runStreamResolved.hasEvents ||
+          runStreamResolved.hasFinalStreamFrame;
+        if (allowRunFallback) {
+          for (const key of arrayKeys) {
+            const resolved = scanArtifactArray(run[key]);
+            if (resolved) return resolved;
+          }
+          for (const key of urlKeys) {
+            const resolved = resolveCandidate(run[key]);
+            if (resolved) return resolved;
+          }
         }
         const runContext = isRecord(run.context) ? run.context : null;
         if (runContext) {
           const runContextStreamResolved = resolveFromStreamEvents(runContext.streamEvents);
           if (runContextStreamResolved.resolved) return runContextStreamResolved.resolved;
-          for (const key of arrayKeys) {
-            const resolved = scanArtifactArray(runContext[key]);
-            if (resolved) return resolved;
+          const allowRunContextFallback =
+            !requireFinalStreamFrame ||
+            !runContextStreamResolved.hasEvents ||
+            runContextStreamResolved.hasFinalStreamFrame;
+          if (allowRunContextFallback) {
+            for (const key of arrayKeys) {
+              const resolved = scanArtifactArray(runContext[key]);
+              if (resolved) return resolved;
+            }
           }
           const runKeepAlive = isRecord(runContext.keepAlive)
             ? runContext.keepAlive
             : null;
-          if (runKeepAlive) {
+          if (allowRunContextFallback && runKeepAlive) {
             for (const key of urlKeys) {
               const resolved = resolveCandidate(runKeepAlive[key]);
               if (resolved) return resolved;
             }
           }
-          for (const key of urlKeys) {
-            const resolved = resolveCandidate(runContext[key]);
-            if (resolved) return resolved;
+          if (allowRunContextFallback) {
+            for (const key of urlKeys) {
+              const resolved = resolveCandidate(runContext[key]);
+              if (resolved) return resolved;
+            }
           }
         }
       }
@@ -10982,7 +11562,7 @@ export class CommandExecutor {
         (entry) => entry.isFile() && MEDIA_FILE_RE.test(entry.name),
       );
       const stableCandidates = fileEntries.filter(
-        (entry) => !STREAM_PART_ARTIFACT_PATTERN.test(entry.name),
+        (entry) => !this.isStreamPartArtifactReference(entry.name),
       );
       const pickNewestPath = async (candidates: typeof fileEntries): Promise<string | null> => {
         if (candidates.length === 0) return null;
@@ -11252,8 +11832,23 @@ export class CommandExecutor {
       };
     }
 
-    const executed = Array.isArray(data?.executed) ? data.executed : [];
-    const executedCount = executed.length;
+    const executedAll = Array.isArray(data?.executed) ? data.executed : [];
+    const executedApplied = executedAll.filter((entry) => {
+      if (!isRecord(entry)) return true;
+      return entry.skipped !== true;
+    });
+    const skippedExecutionEntries = executedAll.filter(
+      (entry) => isRecord(entry) && entry.skipped === true,
+    );
+    const skippedDraftEntries = Array.isArray(data?.skippedDrafts)
+      ? data.skippedDrafts.filter((entry): entry is Record<string, unknown> => isRecord(entry))
+      : [];
+    const failedDraftEntries = Array.isArray(data?.failedDrafts)
+      ? data.failedDrafts.filter((entry): entry is Record<string, unknown> => isRecord(entry))
+      : [];
+    const executedCount = executedApplied.length;
+    const skippedCount = skippedExecutionEntries.length + skippedDraftEntries.length;
+    const failedCount = failedDraftEntries.length;
     const readHandleList = (value: unknown): string[] =>
       Array.from(
         new Set(
@@ -11281,7 +11876,7 @@ export class CommandExecutor {
     };
     const executedKinds = Array.from(
       new Set(
-        executed
+        executedApplied
           .map((entry) =>
             isRecord(entry) ? asNonEmptyString(entry.kind) : null,
           )
@@ -11324,8 +11919,29 @@ export class CommandExecutor {
     } else if (executedCount > 0 && executedKinds.length > 0) {
       summary =
         `Done. Executed ${executedCount} action${executedCount === 1 ? "" : "s"}: ${executedKinds.slice(0, 4).join(", ")}${executedKinds.length > 4 ? ` (+${executedKinds.length - 4} more)` : ""}.`;
+      if (skippedCount > 0) {
+        summary += ` Skipped ${skippedCount} due to unavailable grant budget or action constraints.`;
+      }
+      if (failedCount > 0) {
+        summary += ` Failed ${failedCount} action${failedCount === 1 ? "" : "s"} during execution.`;
+      }
     } else if (executedCount > 0) {
       summary = `Done. Executed ${executedCount} action${executedCount === 1 ? "" : "s"}.`;
+      if (skippedCount > 0) {
+        summary += ` Skipped ${skippedCount} due to unavailable grant budget or action constraints.`;
+      }
+      if (failedCount > 0) {
+        summary += ` Failed ${failedCount} action${failedCount === 1 ? "" : "s"} during execution.`;
+      }
+    } else if (skippedCount > 0 && failedCount > 0) {
+      summary =
+        `No actions were executed. Skipped ${skippedCount} and failed ${failedCount} during execution.`;
+    } else if (skippedCount > 0) {
+      summary =
+        `No actions were executed. Skipped ${skippedCount} due to unavailable grant budget or action constraints.`;
+    } else if (failedCount > 0) {
+      summary =
+        `No actions were executed. Failed ${failedCount} action${failedCount === 1 ? "" : "s"} during execution.`;
     }
     return {
       body: summary,
@@ -11339,12 +11955,32 @@ export class CommandExecutor {
           summary: commandName,
           detail: summary,
           executedCount,
+          skippedCount,
+          failedCount,
           ...(executedKinds.length > 0 ? { executedKinds } : {}),
           ...(followedHandles.length > 0 ? { followedHandles } : {}),
           ...(alreadyFollowedHandles.length > 0
             ? { alreadyFollowedHandles }
             : {}),
           ...(failedHandles.length > 0 ? { failedHandles } : {}),
+          ...(failedDraftEntries.length > 0
+            ? {
+                failedDrafts: failedDraftEntries
+                  .map((entry) => ({
+                    kind: asNonEmptyString(entry.kind),
+                    reason: asNonEmptyString(entry.reason),
+                    code: asNonEmptyString(entry.code),
+                  }))
+                  .filter(
+                    (entry): entry is {
+                      kind: string | null;
+                      reason: string | null;
+                      code: string | null;
+                    } => entry.reason !== null,
+                  )
+                  .slice(0, 12),
+              }
+            : {}),
         },
       },
     };

@@ -17,7 +17,11 @@ import { writeJsonFile, readJsonFile, readJsonMaybeIncomplete } from "../lib/fs.
 import { computeCommandSignature } from "../lib/crypto.js";
 import { applyTargetLock } from "../lib/command-target.js";
 import type { Command } from "../types/ipc.js";
-import type { DirectiveManagerLike } from "../runtime-context.js";
+import type {
+  DirectiveManagerLike,
+  PendingDirectivePromotionInput,
+  PendingDirectivePromotionResult,
+} from "../runtime-context.js";
 import {
   resolveForceNowFromPayload,
   resolveQueueClass,
@@ -67,7 +71,7 @@ export interface DirectiveManagerContext {
 
 export interface DirectiveTrackingState {
   pendingDirectives: unknown[];
-  pendingPromotionPromise: Promise<unknown> | null;
+  pendingPromotionPromise: Promise<PendingDirectivePromotionResult> | null;
   lastPendingPromotionAtMs: number;
   autoEnqueueMutation: Promise<void>;
   seenDirectiveNoncesById: Map<string, Set<string>>;
@@ -123,6 +127,24 @@ const asPositiveInt = (value: unknown): number | null => {
     }
   }
   return null;
+};
+
+const QUEUED_PENDING_STATUSES = new Set([
+  "queued_for_execution",
+  "draft_waiting_execution",
+]);
+
+const TERMINAL_PENDING_STATUSES = new Set([
+  "completed",
+  "permission_denied",
+  "no_executable_draft",
+  "max_retry_exceeded",
+]);
+
+const normalizePendingPromotionLimit = (value: unknown): number => {
+  const parsed = asPositiveInt(value);
+  if (!parsed) return 25;
+  return Math.max(1, Math.min(100, parsed));
 };
 
 const resolveDirectiveTarget = (input: {
@@ -364,12 +386,31 @@ export class DirectiveManager implements DirectiveManagerLike {
     );
   }
 
-  async promoteFromPending(): Promise<void> {
-    if (this.ctx.directive.pendingPromotionPromise) { await this.ctx.directive.pendingPromotionPromise; return; }
-    if (Date.now() - this.ctx.directive.lastPendingPromotionAtMs < 3_000) return;
-    this.ctx.directive.pendingPromotionPromise = this.doPromoteFromPending()
-      .finally(() => { this.ctx.directive.pendingPromotionPromise = null; });
-    await this.ctx.directive.pendingPromotionPromise;
+  async promoteFromPending(
+    input?: PendingDirectivePromotionInput,
+  ): Promise<PendingDirectivePromotionResult> {
+    if (this.ctx.directive.pendingPromotionPromise) {
+      return this.ctx.directive.pendingPromotionPromise;
+    }
+    const limit = normalizePendingPromotionLimit(input?.limit);
+    if (
+      input?.bypassCooldown !== true &&
+      Date.now() - this.ctx.directive.lastPendingPromotionAtMs < 3_000
+    ) {
+      return {
+        scanned: 0,
+        promoted: 0,
+        skippedPermissionDenied: 0,
+        skippedTerminal: 0,
+        skippedAlreadySeen: 0,
+        skippedQueued: 0,
+        limit,
+      };
+    }
+    this.ctx.directive.pendingPromotionPromise = this.doPromoteFromPending(input).finally(() => {
+      this.ctx.directive.pendingPromotionPromise = null;
+    });
+    return this.ctx.directive.pendingPromotionPromise;
   }
 
   dispose(): void { /* No timers to clear. */ }
@@ -392,14 +433,30 @@ export class DirectiveManager implements DirectiveManagerLike {
     } catch { /* Non-fatal: best-effort ACK. */ }
   }
 
-  private async doPromoteFromPending(): Promise<void> {
+  private async doPromoteFromPending(
+    input?: PendingDirectivePromotionInput,
+  ): Promise<PendingDirectivePromotionResult> {
     const entries = await fs.readdir(this.ctx.ipcPaths.pendingDir).catch(() => []);
     const jsonEntries = entries.filter((e) => e.endsWith(".json")).sort();
-    if (!jsonEntries.length) return;
-    const TERMINAL_STATUSES = new Set(["completed", "permission_denied", "no_executable_draft", "max_retry_exceeded"]);
-    const limit = 25;
+    const limit = normalizePendingPromotionLimit(input?.limit);
+    if (!jsonEntries.length) {
+      return {
+        scanned: 0,
+        promoted: 0,
+        skippedPermissionDenied: 0,
+        skippedTerminal: 0,
+        skippedAlreadySeen: 0,
+        skippedQueued: 0,
+        limit,
+      };
+    }
+    const retryPermissionDenied = input?.retryPermissionDenied === true;
     let examined = 0;
     let promoted = 0;
+    let skippedPermissionDenied = 0;
+    let skippedTerminal = 0;
+    let skippedAlreadySeen = 0;
+    let skippedQueued = 0;
     for (const entry of jsonEntries) {
       if (examined >= limit) break;
       const pendingPath = path.join(this.ctx.ipcPaths.pendingDir, entry);
@@ -410,9 +467,30 @@ export class DirectiveManager implements DirectiveManagerLike {
         ? pendingDoc.id.trim() : path.basename(entry, ".json");
       if (!pendingId.length) continue;
       examined += 1;
-      const pendingStatus = typeof pendingDoc.status === "string" ? pendingDoc.status.trim() : "";
-      if (TERMINAL_STATUSES.has(pendingStatus)) continue;
-      if (this.hasSeenDirective(pendingId, null)) continue;
+      const pendingStatus =
+        typeof pendingDoc.status === "string"
+          ? pendingDoc.status.trim().toLowerCase()
+          : "";
+      if (pendingStatus === "permission_denied" && !retryPermissionDenied) {
+        skippedPermissionDenied += 1;
+        continue;
+      }
+      if (pendingStatus.length > 0 && QUEUED_PENDING_STATUSES.has(pendingStatus)) {
+        skippedQueued += 1;
+        continue;
+      }
+      if (
+        pendingStatus.length > 0 &&
+        TERMINAL_PENDING_STATUSES.has(pendingStatus) &&
+        !(pendingStatus === "permission_denied" && retryPermissionDenied)
+      ) {
+        skippedTerminal += 1;
+        continue;
+      }
+      if (this.hasSeenDirective(pendingId, null)) {
+        skippedAlreadySeen += 1;
+        continue;
+      }
       this.markDirectiveSeen(pendingId, null);
       const sourceKind = typeof pendingDoc.sourceKind === "string" && pendingDoc.sourceKind.trim().length > 0
         ? pendingDoc.sourceKind.trim() : "brain.retryPending";
@@ -447,16 +525,35 @@ export class DirectiveManager implements DirectiveManagerLike {
         rec.status = "queued_for_execution";
         rec.updatedAt = nowIso();
         rec.lastAutoEnqueueReason = "pending_promoted_to_queue";
+        if (retryPermissionDenied && "permissionDenied" in rec) {
+          delete rec.permissionDenied;
+        }
         await writeJsonFile(pendingPath, latestPending).catch(() => {});
       }
       promoted += 1;
     }
     this.ctx.directive.lastPendingPromotionAtMs = Date.now();
-    if (promoted > 0) {
-      await this.ctx.memory.recordWrite({
-        type: "pending_promoted_to_queue", at: nowIso(),
-        source: "promote_from_pending", promoted, examined,
-      });
-    }
+    await this.ctx.memory.recordWrite({
+      type: "pending_promoted_to_queue",
+      at: nowIso(),
+      source: input?.source ?? "promote_from_pending",
+      promoted,
+      examined,
+      limit,
+      retryPermissionDenied,
+      skippedPermissionDenied,
+      skippedTerminal,
+      skippedAlreadySeen,
+      skippedQueued,
+    });
+    return {
+      scanned: examined,
+      promoted,
+      skippedPermissionDenied,
+      skippedTerminal,
+      skippedAlreadySeen,
+      skippedQueued,
+      limit,
+    };
   }
 }
