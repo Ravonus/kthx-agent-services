@@ -377,6 +377,122 @@ export const buildChatResultMessageFromOutcome = ({
     };
   }
 
+  if (kind === "write.votePost") {
+    const data = isRecord(outcome?.data) ? (outcome!.data as Record<string, unknown>) : null;
+    const skipped = data?.skipped === true;
+    const decision =
+      typeof data?.decision === "string" && data.decision.trim().length > 0
+        ? data.decision.trim()
+        : null;
+    const payload = isRecord(command?.payload) ? (command!.payload as Record<string, unknown>) : null;
+    const postId =
+      toFinitePositiveInt(payload?.postId) ??
+      toFinitePositiveInt(payload?.targetPostId);
+    if (ok && skipped) {
+      const summary = decision ? `Skipped: ${decision}` : "Skipped by policy";
+      return {
+        body: `Like skipped${decision ? ` (${decision})` : "."}`,
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: "like",
+            status: "success",
+            title: "Like skipped",
+            summary,
+            ...(postId ? { href: `/p/${postId}`, hrefLabel: "Open post", postId } : {}),
+          },
+        },
+      };
+    }
+    if (ok) {
+      return {
+        body: "Done. I liked that post.",
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: "like",
+            status: "success",
+            title: "Post liked",
+            ...(postId ? { href: `/p/${postId}`, hrefLabel: "Open post", postId } : {}),
+          },
+        },
+      };
+    }
+    return {
+      body: `I couldn't complete that like request${errorMessage ? `: ${errorMessage}` : "."}`,
+      metadata: {
+        automated: true,
+        sourceContext: "CHAT",
+        actionPreview: {
+          type: "like",
+          status: "failed",
+          title: "Like failed",
+          error: errorMessage || null,
+        },
+      },
+    };
+  }
+
+  if (kind === "write.repostPost") {
+    const data = isRecord(outcome?.data) ? (outcome!.data as Record<string, unknown>) : null;
+    const skipped = data?.skipped === true;
+    const decision =
+      typeof data?.decision === "string" && data.decision.trim().length > 0
+        ? data.decision.trim()
+        : null;
+    const payload = isRecord(command?.payload) ? (command!.payload as Record<string, unknown>) : null;
+    const postId =
+      toFinitePositiveInt(payload?.postId) ??
+      toFinitePositiveInt(payload?.targetPostId);
+    if (ok && skipped) {
+      const summary = decision ? `Skipped: ${decision}` : "Skipped by policy";
+      return {
+        body: `Repost skipped${decision ? ` (${decision})` : "."}`,
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: "repost",
+            status: "success",
+            title: "Repost skipped",
+            summary,
+            ...(postId ? { href: `/p/${postId}`, hrefLabel: "Open post", postId } : {}),
+          },
+        },
+      };
+    }
+    if (ok) {
+      return {
+        body: "Done. I reposted it.",
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: "repost",
+            status: "success",
+            title: "Post reposted",
+            ...(postId ? { href: `/p/${postId}`, hrefLabel: "Open post", postId } : {}),
+          },
+        },
+      };
+    }
+    return {
+      body: `I couldn't complete that repost request${errorMessage ? `: ${errorMessage}` : "."}`,
+      metadata: {
+        automated: true,
+        sourceContext: "CHAT",
+        actionPreview: {
+          type: "repost",
+          status: "failed",
+          title: "Repost failed",
+          error: errorMessage || null,
+        },
+      },
+    };
+  }
+
   return null;
 };
 
@@ -403,12 +519,12 @@ export const sendChatResultMessageFromOutcome = async ({
   outcome: Record<string, unknown> | null;
   chatTarget?: ChatTarget | null;
   deps: ChatResultSenderDeps;
-}): Promise<void> => {
+}): Promise<boolean> => {
   const resolvedTarget =
     chatTarget ?? resolveChatTargetFromPayload(command?.payload ?? null);
-  if (!resolvedTarget) return;
+  if (!resolvedTarget) return false;
   const result = buildChatResultMessageFromOutcome({ command, outcome });
-  if (!result) return;
+  if (!result) return false;
   try {
     await deps.callAgentChatBridge({
       action: "send_message",
@@ -440,6 +556,7 @@ export const sendChatResultMessageFromOutcome = async ({
           ? resolvedTarget.channelId
           : null,
     });
+    return true;
   } catch (error: unknown) {
     await deps.memory.recordWrite({
       type: "chat_command_result_send_failed",
@@ -450,6 +567,7 @@ export const sendChatResultMessageFromOutcome = async ({
         typeof command?.kind === "string" ? command.kind : null,
       error: error instanceof Error ? error.message : String(error),
     });
+    return false;
   }
 };
 

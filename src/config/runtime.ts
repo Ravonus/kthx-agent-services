@@ -98,8 +98,6 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     (trimEnv("MG_AGENT_REJECT_MULTIPLE_CHOICE_CHALLENGE") ?? "0") === "1";
   const mintChallengeAutoRetryEnabled =
     (trimEnv("MG_AGENT_MINT_CHALLENGE_AUTO_RETRY") ?? "1") !== "0";
-  const allowSyntheticMediaFallback =
-    (trimEnv("MG_AGENT_ALLOW_SYNTHETIC_MEDIA_FALLBACK") ?? "1") !== "0";
   const backendSerializeRequests =
     (trimEnv("MG_AGENT_BACKEND_SERIALIZE") ?? "1") !== "0";
   const backendRequestDebug =
@@ -359,7 +357,6 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     mintChallengeAutoRetryMaxAttempts,
     challengeAnswerMaxChars,
     wsUploadDataUriMaxBytes,
-    allowSyntheticMediaFallback,
     httpUploadChunkBytes,
     openClawWakeDebounceMs,
     openClawWakeBatchMs,

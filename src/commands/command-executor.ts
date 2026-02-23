@@ -305,15 +305,18 @@ const extractBridgeMessageId = (value: unknown): string | null => {
     depth: number,
   ): string | null => {
     if (depth > 8) return null;
-    const directId = asNonEmptyString(record.id);
-    if (directId) return directId;
-    const directMessageId = asNonEmptyString(record.messageId);
-    if (directMessageId) return directMessageId;
     const message = isRecord(record.message) ? record.message : null;
     const nestedMessageId = message
-      ? asNonEmptyString(message.id) ?? asNonEmptyString(message.messageId)
+      ? asNonEmptyString(message.id) ??
+        asNonEmptyString(message.messageId) ??
+        asNonEmptyString(message.message_id)
       : null;
     if (nestedMessageId) return nestedMessageId;
+    const directMessageId =
+      asNonEmptyString(record.messageId) ?? asNonEmptyString(record.message_id);
+    if (directMessageId) return directMessageId;
+    const directId = asNonEmptyString(record.id);
+    if (directId) return directId;
     for (const key of ["primary", "data", "result", "payload", "response"] as const) {
       const nested = isRecord(record[key]) ? record[key] : null;
       if (!nested) continue;
@@ -771,6 +774,18 @@ type OwnerCapabilityCooldown = {
   reason: string;
 };
 
+type CommandLifecycleCheckpointStage =
+  | "received"
+  | "queued"
+  | "executing"
+  | "generated"
+  | "uploaded"
+  | "write_mutation"
+  | "chat_delivery"
+  | "ack";
+
+type FollowTargetMode = "owner" | "agent";
+
 export class CommandExecutor {
   private readonly ctx: CommandExecutorContext;
   private readonly inFlight = new Set<string>();
@@ -784,6 +799,32 @@ export class CommandExecutor {
 
   constructor(ctx: CommandExecutorContext) {
     this.ctx = ctx;
+  }
+
+  private async recordCommandLifecycleCheckpoint(input: {
+    command: Command;
+    stage: CommandLifecycleCheckpointStage;
+    status?: "ok" | "failed";
+    message?: string | null;
+    metadata?: Record<string, unknown>;
+  }): Promise<void> {
+    await this.ctx.memory
+      .recordWrite({
+        type: "command_execution_checkpoint",
+        at: nowIso(),
+        commandId: input.command.id,
+        commandKind: input.command.kind,
+        sourceDirectiveId: input.command.sourceDirectiveId ?? null,
+        pendingDirectiveId: input.command.pendingDirectiveId ?? null,
+        actionNonce: input.command.actionNonce ?? null,
+        stage: input.stage,
+        status: input.status ?? "ok",
+        ...(input.message && input.message.trim().length > 0
+          ? { message: truncateText(input.message, 320) }
+          : {}),
+        ...(input.metadata ? { metadata: input.metadata } : {}),
+      })
+      .catch(() => undefined);
   }
 
   private releaseReplayConsumedForRetry(commandId: string): void {
@@ -926,6 +967,329 @@ export class CommandExecutor {
     };
   }
 
+  private normalizeFollowHandleCandidate(value: string): string | null {
+    const cleaned = value
+      .trim()
+      .replace(/^[`"'“”‘’([{<@]+/gu, "")
+      .replace(/[`"'“”‘’)\]}>.,!?;:]+$/gu, "");
+    const normalized = cleaned.replace(/^@+/u, "").toLowerCase();
+    if (!normalized.length) return null;
+    return /^[a-z0-9_.-]{2,64}$/u.test(normalized) ? normalized : null;
+  }
+
+  private resolveChatCommandName(payload: Record<string, unknown>): string | null {
+    const explicit = asNonEmptyString(payload.chatCommandName)?.toLowerCase();
+    if (explicit) return explicit;
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    return asNonEmptyString(chatContext?.commandName)?.toLowerCase() ?? null;
+  }
+
+  private resolveDelegatedFollowAction(
+    payload: Record<string, unknown>,
+  ): "follow" | "follow_engagers" | "follow_accept" | null {
+    const explicitAction = asNonEmptyString(payload.followAction)?.toLowerCase() ?? "";
+    if (explicitAction === "follow") return "follow";
+    if (
+      explicitAction === "follow_engagers" ||
+      explicitAction === "follow-engagers" ||
+      explicitAction === "followengagers"
+    ) {
+      return "follow_engagers";
+    }
+    if (
+      explicitAction === "follow_accept" ||
+      explicitAction === "follow-accept" ||
+      explicitAction === "followaccept"
+    ) {
+      return "follow_accept";
+    }
+    const chatCommandName = this.resolveChatCommandName(payload);
+    if (chatCommandName === "follow") return "follow";
+    if (
+      chatCommandName === "follow-engagers" ||
+      chatCommandName === "followengagers"
+    ) {
+      return "follow_engagers";
+    }
+    if (
+      chatCommandName === "follow-accept" ||
+      chatCommandName === "followaccept"
+    ) {
+      return "follow_accept";
+    }
+    return null;
+  }
+
+  private resolveFollowTargetMode(payload: Record<string, unknown>): FollowTargetMode {
+    const parseTarget = (value: string | null): FollowTargetMode | null => {
+      if (!value) return null;
+      const normalized = value.trim().toLowerCase();
+      if (
+        normalized === "owner" ||
+        normalized === "for-me" ||
+        normalized === "for_owner" ||
+        normalized === "me"
+      ) {
+        return "owner";
+      }
+      if (normalized === "agent" || normalized === "as-agent" || normalized === "as_agent") {
+        return "agent";
+      }
+      return null;
+    };
+
+    const directTarget =
+      parseTarget(asNonEmptyString(payload.followTargetMode)) ??
+      parseTarget(asNonEmptyString(payload.followMode)) ??
+      parseTarget(asNonEmptyString(payload.requestedActingAs));
+    if (directTarget) return directTarget;
+
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    const commandArgs = Array.isArray(chatContext?.commandArgs) ? chatContext.commandArgs : [];
+    const firstArg = commandArgs.length > 0 ? asNonEmptyString(commandArgs[0]) : null;
+    const argTarget = parseTarget(firstArg);
+    if (argTarget) return argTarget;
+
+    const commandOrigin = asNonEmptyString(chatContext?.commandOrigin)?.toLowerCase();
+    if (commandOrigin === "natural" || commandOrigin === "followup") {
+      return "agent";
+    }
+    return "owner";
+  }
+
+  private collectFollowHandlesFromPayload(payload: Record<string, unknown>): string[] {
+    const handles: string[] = [];
+    const pushHandle = (value: unknown): void => {
+      if (typeof value !== "string") return;
+      const normalized = this.normalizeFollowHandleCandidate(value);
+      if (!normalized) return;
+      if (
+        normalized === "for" ||
+        normalized === "me" ||
+        normalized === "all" ||
+        normalized === "more" ||
+        normalized === "as-agent" ||
+        normalized === "as_agent"
+      ) {
+        return;
+      }
+      handles.push(normalized);
+    };
+    const pushHandlesFromUnknown = (value: unknown): void => {
+      if (typeof value === "string") {
+        for (const match of value.matchAll(/@([a-z0-9_.-]{2,64})/giu)) {
+          pushHandle(match[1] ?? "");
+        }
+        for (const token of value.split(/\s+/u)) {
+          pushHandle(token);
+        }
+        return;
+      }
+      if (!Array.isArray(value)) return;
+      for (const entry of value) {
+        if (typeof entry === "string") {
+          pushHandle(entry);
+        }
+      }
+    };
+
+    pushHandlesFromUnknown(payload.followHandles);
+    pushHandle(payload.handle);
+    pushHandle(payload.followHandle);
+    pushHandlesFromUnknown(payload.followSelections);
+
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    pushHandlesFromUnknown(chatContext?.commandArgs);
+    pushHandlesFromUnknown(chatContext?.commandRawArgs);
+    pushHandlesFromUnknown(chatContext?.originalMessage);
+
+    pushHandlesFromUnknown(payload.prompt);
+    pushHandlesFromUnknown(payload.topic);
+    pushHandlesFromUnknown(payload.requestText);
+
+    return Array.from(new Set(handles)).slice(0, 24);
+  }
+
+  private collectFollowSelectionsFromPayload(payload: Record<string, unknown>): string[] {
+    const selections: string[] = [];
+    const pushSelection = (value: unknown): void => {
+      if (typeof value !== "string") return;
+      const normalized = value.trim().toLowerCase();
+      if (!normalized.length) return;
+      selections.push(normalized);
+    };
+    const pushSelectionFromUnknown = (value: unknown): void => {
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          pushSelection(entry);
+        }
+        return;
+      }
+      pushSelection(value);
+    };
+
+    pushSelectionFromUnknown(payload.followSelections);
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    pushSelectionFromUnknown(chatContext?.commandArgs);
+    return Array.from(new Set(selections)).slice(0, 16);
+  }
+
+  private resolveFollowEngagersCount(payload: Record<string, unknown>): number {
+    const fromPayload = asPositiveInt(payload.followCount);
+    if (fromPayload) return Math.max(1, Math.min(12, fromPayload));
+    const selections = this.collectFollowSelectionsFromPayload(payload);
+    if (selections.includes("all")) return 12;
+    const numeric = selections
+      .map((entry) => Number.parseInt(entry, 10))
+      .find((value) => Number.isFinite(value) && value > 0);
+    if (numeric) return Math.max(1, Math.min(12, Math.floor(numeric)));
+    return 8;
+  }
+
+  private extractTopEngagerHandlesFromLookup(value: unknown, limit: number): string[] {
+    const handles: string[] = [];
+    for (const row of this.collectBridgeRecordItems(value)) {
+      const user = isRecord(row.user) ? row.user : null;
+      const candidate =
+        asNonEmptyString(user?.handle) ??
+        asNonEmptyString(user?.username) ??
+        asNonEmptyString(row.handle) ??
+        asNonEmptyString(row.username);
+      if (!candidate) continue;
+      const normalized = this.normalizeFollowHandleCandidate(candidate);
+      if (!normalized) continue;
+      handles.push(normalized);
+      if (handles.length >= limit) break;
+    }
+    return Array.from(new Set(handles)).slice(0, limit);
+  }
+
+  private async attemptFollowHandle(input: {
+    target: FollowTargetMode;
+    handle: string;
+    action: "follow_user" | "unfollow_user";
+  }): Promise<{
+    handle: string;
+    status:
+      | "followed"
+      | "already_followed"
+      | "unfollowed"
+      | "already_unfollowed"
+      | "not_found"
+      | "self"
+      | "blocked"
+      | "failed";
+    error: string | null;
+  }> {
+    const callAgentChatBridge = this.ctx.callAgentChatBridge;
+    if (!callAgentChatBridge) {
+      return {
+        handle: input.handle,
+        status: "failed",
+        error: "chat_bridge_unavailable",
+      };
+    }
+    try {
+      const result = await callAgentChatBridge({
+        action: input.action,
+        target: input.target,
+        handle: input.handle,
+      });
+      const data = isRecord(result) ? result : null;
+      const user = isRecord(data?.user) ? data.user : null;
+      const resolvedHandle =
+        this.normalizeFollowHandleCandidate(asNonEmptyString(user?.handle) ?? input.handle) ??
+        input.handle;
+      if (input.action === "follow_user") {
+        const created = data?.created === true;
+        const followed = data?.followed === true;
+        if (followed && created) {
+          return { handle: resolvedHandle, status: "followed", error: null };
+        }
+        if (followed && !created) {
+          return { handle: resolvedHandle, status: "already_followed", error: null };
+        }
+        return {
+          handle: resolvedHandle,
+          status: "failed",
+          error: "follow_action_returned_unexpected_shape",
+        };
+      }
+      const removed = data?.removed === true;
+      if (removed) {
+        return { handle: resolvedHandle, status: "unfollowed", error: null };
+      }
+      return { handle: resolvedHandle, status: "already_unfollowed", error: null };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      const lowered = message.toLowerCase();
+      if (lowered.includes("not found")) {
+        return { handle: input.handle, status: "not_found", error: message };
+      }
+      if (lowered.includes("own account") || lowered.includes("your own")) {
+        return { handle: input.handle, status: "self", error: message };
+      }
+      if (lowered.includes("blocked")) {
+        return { handle: input.handle, status: "blocked", error: message };
+      }
+      return { handle: input.handle, status: "failed", error: message };
+    }
+  }
+
+  private buildFollowSummaryText(input: {
+    target: FollowTargetMode;
+    followed: string[];
+    alreadyFollowed: string[];
+    notFound: string[];
+    self: string[];
+    blocked: string[];
+    failed: string[];
+    remainingCount?: number;
+    followEngagers?: boolean;
+  }): string {
+    const accountLabel = input.target === "agent" ? "agent account" : "your account";
+    const segments: string[] = [];
+    if (input.followed.length > 0) {
+      if (input.followEngagers) {
+        segments.push(
+          `On the ${accountLabel}, now following ${input.followed.length} top engager${input.followed.length === 1 ? "" : "s"}: ${input.followed.map((entry) => `@${entry}`).join(", ")}.`,
+        );
+      } else {
+        segments.push(
+          `On the ${accountLabel}, now following: ${input.followed.map((entry) => `@${entry}`).join(", ")}.`,
+        );
+      }
+    }
+    if (input.alreadyFollowed.length > 0) {
+      segments.push(
+        `Already followed on the ${accountLabel}: ${input.alreadyFollowed.map((entry) => `@${entry}`).join(", ")}.`,
+      );
+    }
+    if (input.notFound.length > 0) {
+      segments.push(`Not found: ${input.notFound.map((entry) => `@${entry}`).join(", ")}.`);
+    }
+    if (input.self.length > 0) {
+      segments.push(`Skipped your own account: ${input.self.map((entry) => `@${entry}`).join(", ")}.`);
+    }
+    if (input.blocked.length > 0) {
+      segments.push(
+        `Blocked follow relationship: ${input.blocked.map((entry) => `@${entry}`).join(", ")}.`,
+      );
+    }
+    if (input.failed.length > 0) {
+      segments.push(`Could not follow right now: ${input.failed.map((entry) => `@${entry}`).join(", ")}.`);
+    }
+    if (segments.length === 0) {
+      segments.push("No follow changes were applied.");
+    }
+    if (typeof input.remainingCount === "number" && input.remainingCount > 0) {
+      segments.push(
+        `${input.remainingCount} more high-signal engagers are available. Say "follow more engagers" to continue.`,
+      );
+    }
+    return segments.join(" ");
+  }
+
   async processCommandFile(
     fileName: string,
     _opts?: { interactiveRl?: unknown },
@@ -1006,6 +1370,14 @@ export class CommandExecutor {
       await this.markQueueItemCompletedByInbox(inboxFile, "failed", "command parse failed");
       return true;
     }
+    await this.recordCommandLifecycleCheckpoint({
+      command,
+      stage: "received",
+      status: "ok",
+      metadata: {
+        inboxFile,
+      },
+    });
 
     let commandSigVerified = false;
     if (this.ctx.controlKey) {
@@ -1100,6 +1472,20 @@ export class CommandExecutor {
       return true;
     }
 
+    await this.recordCommandLifecycleCheckpoint({
+      command,
+      stage: "queued",
+      status: "ok",
+      metadata: {
+        inboxFile,
+      },
+    });
+    await this.recordCommandLifecycleCheckpoint({
+      command,
+      stage: "executing",
+      status: "ok",
+    });
+
     const result = await this.executeCommand(command).catch(async (error: unknown) => {
       if (error instanceof RequeueCommandError) {
         this.releaseReplayConsumedForRetry(command.id);
@@ -1148,6 +1534,15 @@ export class CommandExecutor {
       await this.moveInboxFileToProcessed(filePath, "done");
       await this.markQueueItemCompletedByInbox(inboxFile, "done", null);
       return true;
+    }
+
+    if (command.kind.trim().toLowerCase().startsWith("write.")) {
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "write_mutation",
+        status: outcome.ok ? "ok" : "failed",
+        message: outcome.ok ? null : outcome.error?.message ?? null,
+      });
     }
 
     await this.writeOutcome(outcome);
@@ -1870,6 +2265,7 @@ export class CommandExecutor {
             },
             keepOriginal: true,
             promptFallbacks: [slidePrompt],
+            command,
           });
           slideItems.push({
             mediaUrl: slideMedia.mediaUrl,
@@ -1968,6 +2364,7 @@ export class CommandExecutor {
             },
             keepOriginal: true,
             promptFallbacks: [visualBackgroundPrompt],
+            command,
           });
           const imageTextItem: Record<string, unknown> = {
             mediaUrl: backgroundMedia.mediaUrl,
@@ -2233,6 +2630,7 @@ export class CommandExecutor {
         mediaPromptForWrite,
         asNonEmptyString(payload.prompt),
       ],
+      command,
     });
     const mediaCandidate = noveltyValidation.candidateText;
     const result = await this.agent().createPost.mutate({
@@ -3221,6 +3619,7 @@ export class CommandExecutor {
         asNonEmptyString(payload.mediaPrompt),
         asNonEmptyString(payload.imagePrompt),
       ],
+      command,
     });
 
     const result = await this.agent().createStory.mutate({
@@ -3272,6 +3671,7 @@ export class CommandExecutor {
         asNonEmptyString(payload.imagePrompt),
         asNonEmptyString(payload.prompt),
       ],
+      command,
     });
     const result = await this.updateAvatar({
       target,
@@ -3316,6 +3716,7 @@ export class CommandExecutor {
         asNonEmptyString(payload.imagePrompt),
         asNonEmptyString(payload.prompt),
       ],
+      command,
     });
     const result = await this.updateBanner({
       target,
@@ -4907,10 +5308,413 @@ export class CommandExecutor {
     }
   }
 
+  private async executeDelegatedFollowAction(input: {
+    command: Command;
+    payload: Record<string, unknown>;
+    action: "follow" | "follow_engagers" | "follow_accept";
+  }): Promise<CommandOutcome> {
+    const target = this.resolveFollowTargetMode(input.payload);
+    const actionLabel = input.action === "follow_engagers"
+      ? "follow-engagers"
+      : input.action === "follow_accept"
+        ? "follow-accept"
+        : "follow";
+    const applyFollowForHandles = async (handles: string[]) => {
+      const followed: string[] = [];
+      const alreadyFollowed: string[] = [];
+      const notFound: string[] = [];
+      const self: string[] = [];
+      const blocked: string[] = [];
+      const failed: string[] = [];
+      const errors: Array<{ handle: string; error: string }> = [];
+      for (const handle of handles) {
+        const attempt = await this.attemptFollowHandle({
+          target,
+          handle,
+          action: "follow_user",
+        });
+        if (attempt.status === "followed") {
+          followed.push(attempt.handle);
+          continue;
+        }
+        if (attempt.status === "already_followed") {
+          alreadyFollowed.push(attempt.handle);
+          continue;
+        }
+        if (attempt.status === "not_found") {
+          notFound.push(attempt.handle);
+          if (attempt.error) {
+            errors.push({ handle: attempt.handle, error: attempt.error });
+          }
+          continue;
+        }
+        if (attempt.status === "self") {
+          self.push(attempt.handle);
+          if (attempt.error) {
+            errors.push({ handle: attempt.handle, error: attempt.error });
+          }
+          continue;
+        }
+        if (attempt.status === "blocked") {
+          blocked.push(attempt.handle);
+          if (attempt.error) {
+            errors.push({ handle: attempt.handle, error: attempt.error });
+          }
+          continue;
+        }
+        failed.push(attempt.handle);
+        if (attempt.error) {
+          errors.push({ handle: attempt.handle, error: attempt.error });
+        }
+      }
+      return {
+        followed,
+        alreadyFollowed,
+        notFound,
+        self,
+        blocked,
+        failed,
+        errors,
+      };
+    };
+
+    if (input.action === "follow") {
+      const handles = this.collectFollowHandlesFromPayload(input.payload);
+      if (handles.length === 0) {
+        return this.successOutcome(input.command, {
+          followAction: actionLabel,
+          followInputMissing: true,
+          chatCompletion: {
+            body: "Usage: /follow [for-me|as-agent] @handle (you can include multiple handles).",
+            metadata: {
+              automated: true,
+              sourceContext: "CHAT",
+              actionPreview: {
+                type: "follow",
+                status: "failed",
+                title: "Follow input missing",
+              },
+            },
+          },
+        });
+      }
+      const applied = await applyFollowForHandles(handles);
+      const summaryText = this.buildFollowSummaryText({
+        target,
+        followed: applied.followed,
+        alreadyFollowed: applied.alreadyFollowed,
+        notFound: applied.notFound,
+        self: applied.self,
+        blocked: applied.blocked,
+        failed: applied.failed,
+      });
+      await this.recordCommandLifecycleCheckpoint({
+        command: input.command,
+        stage: "write_mutation",
+        status:
+          applied.followed.length > 0 || applied.alreadyFollowed.length > 0
+            ? "ok"
+            : "failed",
+        metadata: {
+          action: actionLabel,
+          target,
+          requestedCount: handles.length,
+          followedCount: applied.followed.length,
+          alreadyFollowedCount: applied.alreadyFollowed.length,
+          notFoundCount: applied.notFound.length,
+          selfCount: applied.self.length,
+          blockedCount: applied.blocked.length,
+          failedCount: applied.failed.length,
+        },
+      });
+      return this.successOutcome(input.command, {
+        followAction: actionLabel,
+        target,
+        requestedHandles: handles,
+        followedHandles: applied.followed,
+        alreadyFollowedHandles: applied.alreadyFollowed,
+        notFoundHandles: applied.notFound,
+        selfHandles: applied.self,
+        blockedHandles: applied.blocked,
+        failedHandles: applied.failed,
+        errors: applied.errors,
+        chatCompletion: {
+          body: summaryText,
+          metadata: {
+            automated: true,
+            sourceContext: "CHAT",
+            actionPreview: {
+              type: "follow",
+              status:
+                applied.followed.length > 0 || applied.alreadyFollowed.length > 0
+                  ? "success"
+                  : "failed",
+              title: "Follow update",
+              summary: summaryText,
+            },
+          },
+        },
+      });
+    }
+
+    if (input.action === "follow_engagers") {
+      const requestedCount = this.resolveFollowEngagersCount(input.payload);
+      const lookbackDays = asPositiveInt(input.payload.followLookbackDays) ?? 120;
+      let candidateHandles: string[] = [];
+      try {
+        const lookup = await this.callAgentBridgeLookupCached(
+          {
+            action: "browse_top_engagers",
+            limit: Math.min(60, Math.max(24, requestedCount * 4)),
+            windowHours: lookbackDays * 24,
+          },
+          4_000,
+        );
+        candidateHandles = this.extractTopEngagerHandlesFromLookup(lookup.value, 60);
+      } catch (error: unknown) {
+        return this.failedOutcome(
+          input.command,
+          `Follow-engagers lookup failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          "follow_engagers_lookup_failed",
+        );
+      }
+      if (candidateHandles.length === 0) {
+        const body =
+          target === "agent"
+            ? `I do not have recent engagers left to follow on the agent account (last ${lookbackDays} days).`
+            : `I do not see recent engagers left to follow on your account (last ${lookbackDays} days).`;
+        return this.successOutcome(input.command, {
+          followAction: actionLabel,
+          target,
+          requestedCount,
+          lookbackDays,
+          candidatesFound: 0,
+          chatCompletion: {
+            body,
+            metadata: {
+              automated: true,
+              sourceContext: "CHAT",
+              actionPreview: {
+                type: "follow",
+                status: "success",
+                title: "No follow candidates",
+                summary: body,
+              },
+            },
+          },
+        });
+      }
+      const selectedHandles = candidateHandles.slice(0, requestedCount);
+      const applied = await applyFollowForHandles(selectedHandles);
+      const remainingCount = Math.max(0, candidateHandles.length - selectedHandles.length);
+      const summaryText = this.buildFollowSummaryText({
+        target,
+        followed: applied.followed,
+        alreadyFollowed: applied.alreadyFollowed,
+        notFound: applied.notFound,
+        self: applied.self,
+        blocked: applied.blocked,
+        failed: applied.failed,
+        remainingCount,
+        followEngagers: true,
+      });
+      await this.recordCommandLifecycleCheckpoint({
+        command: input.command,
+        stage: "write_mutation",
+        status:
+          applied.followed.length > 0 || applied.alreadyFollowed.length > 0
+            ? "ok"
+            : "failed",
+        metadata: {
+          action: actionLabel,
+          target,
+          requestedCount,
+          candidatesFound: candidateHandles.length,
+          followedCount: applied.followed.length,
+          alreadyFollowedCount: applied.alreadyFollowed.length,
+          failedCount:
+            applied.failed.length +
+            applied.notFound.length +
+            applied.self.length +
+            applied.blocked.length,
+          remainingCount,
+        },
+      });
+      return this.successOutcome(input.command, {
+        followAction: actionLabel,
+        target,
+        requestedCount,
+        lookbackDays,
+        candidateHandles,
+        selectedHandles,
+        followedHandles: applied.followed,
+        alreadyFollowedHandles: applied.alreadyFollowed,
+        notFoundHandles: applied.notFound,
+        selfHandles: applied.self,
+        blockedHandles: applied.blocked,
+        failedHandles: applied.failed,
+        errors: applied.errors,
+        remainingCount,
+        chatCompletion: {
+          body: summaryText,
+          metadata: {
+            automated: true,
+            sourceContext: "CHAT",
+            actionPreview: {
+              type: "follow",
+              status:
+                applied.followed.length > 0 || applied.alreadyFollowed.length > 0
+                  ? "success"
+                  : "failed",
+              title: "Follow-engagers update",
+              summary: summaryText,
+            },
+          },
+        },
+      });
+    }
+
+    const followSelections = this.collectFollowSelectionsFromPayload(input.payload)
+      .flatMap((entry) => entry.split(","))
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry.length > 0);
+    const explicitHandles = this.collectFollowHandlesFromPayload(input.payload);
+    let mappedHandles = [...explicitHandles];
+    const wantsAll = followSelections.includes("all");
+    const indexSelections = followSelections
+      .map((entry) => Number.parseInt(entry, 10))
+      .filter((entry) => Number.isFinite(entry) && entry > 0)
+      .map((entry) => Math.floor(entry));
+    if (wantsAll || indexSelections.length > 0) {
+      try {
+        const followCount = this.resolveFollowEngagersCount(input.payload);
+        const lookup = await this.callAgentBridgeLookupCached(
+          {
+            action: "browse_top_engagers",
+            limit: Math.min(60, Math.max(24, followCount * 4)),
+            windowHours: (asPositiveInt(input.payload.followLookbackDays) ?? 120) * 24,
+          },
+          4_000,
+        );
+        const rankedHandles = this.extractTopEngagerHandlesFromLookup(lookup.value, 60);
+        if (wantsAll) {
+          mappedHandles = [...mappedHandles, ...rankedHandles.slice(0, followCount)];
+        } else {
+          mappedHandles = [
+            ...mappedHandles,
+            ...indexSelections
+              .map((value) => rankedHandles[value - 1] ?? null)
+              .filter((value): value is string => Boolean(value)),
+          ];
+        }
+      } catch (error: unknown) {
+        return this.failedOutcome(
+          input.command,
+          `Follow-accept lookup failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          "follow_accept_lookup_failed",
+        );
+      }
+    }
+    const targetHandles = Array.from(new Set(mappedHandles)).slice(0, 24);
+    if (targetHandles.length === 0) {
+      return this.successOutcome(input.command, {
+        followAction: actionLabel,
+        target,
+        followInputMissing: true,
+        chatCompletion: {
+          body:
+            "I do not have a pending follow suggestion list for this request. Ask for suggestions first, then confirm with handles or indexes.",
+          metadata: {
+            automated: true,
+            sourceContext: "CHAT",
+            actionPreview: {
+              type: "follow",
+              status: "failed",
+              title: "Follow accept pending list missing",
+            },
+          },
+        },
+      });
+    }
+
+    const applied = await applyFollowForHandles(targetHandles);
+    const summaryText = this.buildFollowSummaryText({
+      target,
+      followed: applied.followed,
+      alreadyFollowed: applied.alreadyFollowed,
+      notFound: applied.notFound,
+      self: applied.self,
+      blocked: applied.blocked,
+      failed: applied.failed,
+    });
+    await this.recordCommandLifecycleCheckpoint({
+      command: input.command,
+      stage: "write_mutation",
+      status:
+        applied.followed.length > 0 || applied.alreadyFollowed.length > 0
+          ? "ok"
+          : "failed",
+      metadata: {
+        action: actionLabel,
+        target,
+        requestedCount: targetHandles.length,
+        followedCount: applied.followed.length,
+        alreadyFollowedCount: applied.alreadyFollowed.length,
+        failedCount:
+          applied.failed.length +
+          applied.notFound.length +
+          applied.self.length +
+          applied.blocked.length,
+      },
+    });
+    return this.successOutcome(input.command, {
+      followAction: actionLabel,
+      target,
+      followSelections,
+      selectedHandles: targetHandles,
+      followedHandles: applied.followed,
+      alreadyFollowedHandles: applied.alreadyFollowed,
+      notFoundHandles: applied.notFound,
+      selfHandles: applied.self,
+      blockedHandles: applied.blocked,
+      failedHandles: applied.failed,
+      errors: applied.errors,
+      chatCompletion: {
+        body: summaryText,
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: "follow",
+            status:
+              applied.followed.length > 0 || applied.alreadyFollowed.length > 0
+                ? "success"
+                : "failed",
+            title: "Follow-accept update",
+            summary: summaryText,
+          },
+        },
+      },
+    });
+  }
+
   private async executeGenerateAndQueue(command: Command): Promise<CommandOutcome> {
     const payload = isRecord(command.payload) ? command.payload : null;
     if (!payload) {
       return this.failedOutcome(command, "Invalid payload for generate-and-queue command.");
+    }
+
+    const delegatedFollowAction = this.resolveDelegatedFollowAction(payload);
+    if (delegatedFollowAction) {
+      return this.executeDelegatedFollowAction({
+        command,
+        payload,
+        action: delegatedFollowAction,
+      });
     }
 
     if (payload.chatLiteralGenerate === true) {
@@ -5019,12 +5823,30 @@ export class CommandExecutor {
         })
         .catch(() => undefined);
     }
-    const generatedResult =
-      inlineDrafts.length > 0
-        ? null
-        : await this.agent().generate.mutate(
-            generateInput ?? this.buildGenerateInput(payload, command),
-          );
+    let generatedResult: unknown = null;
+    if (!inlineDrafts.length) {
+      try {
+        generatedResult = await this.agent().generate.mutate(
+          generateInput ?? this.buildGenerateInput(payload, command),
+        );
+        await this.recordCommandLifecycleCheckpoint({
+          command,
+          stage: "generated",
+          status: "ok",
+          metadata: {
+            hasGeneratedResult: Boolean(generatedResult),
+          },
+        });
+      } catch (error: unknown) {
+        await this.recordCommandLifecycleCheckpoint({
+          command,
+          stage: "generated",
+          status: "failed",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+    }
     const drafts =
       inlineDrafts.length > 0
         ? inlineDrafts
@@ -5110,14 +5932,22 @@ export class CommandExecutor {
           "draft_preview_missing",
         );
       }
-      await this.sendDraftPreviewMessage({
+      const previewDelivered = await this.sendDraftPreviewMessage({
         payload,
         preview: draftPreview,
-      }).catch(() => undefined);
+      }).catch(() => false);
+      if (!previewDelivered) {
+        return this.failedOutcome(
+          command,
+          "Draft generated, but preview delivery to chat failed.",
+          "draft_preview_delivery_failed",
+        );
+      }
       return this.successOutcome(command, {
         generated: generatedResult,
         draftOnly: true,
         draftCount: permissionFilteredDrafts.length,
+        chatDeliveryHandled: previewDelivered,
         preview: {
           summary: draftPreview.summary,
           postKind: draftPreview.draftPostKind,
@@ -5175,11 +6005,32 @@ export class CommandExecutor {
 
     const firstFailure = executedOutcomes.find((entry) => !entry.ok);
     if (firstFailure) {
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "write_mutation",
+        status: "failed",
+        message: firstFailure.error?.message ?? null,
+        metadata: {
+          executedCount: executedOutcomes.length,
+        },
+      });
       return this.failedOutcome(
         command,
         firstFailure.error?.message ?? "generated draft execution failed.",
         firstFailure.error?.code,
       );
+    }
+
+    if (executedOutcomes.length > 0) {
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "write_mutation",
+        status: "ok",
+        metadata: {
+          executedCount: executedOutcomes.length,
+          executedKinds: executedOutcomes.map((entry) => entry.kind),
+        },
+      });
     }
 
     return this.successOutcome(command, {
@@ -5832,52 +6683,22 @@ export class CommandExecutor {
     }): Promise<boolean> => {
       const callAgentChatBridge = this.ctx.callAgentChatBridge;
       if (!callAgentChatBridge) return false;
-      const runEdit = async (
-        messageId: string,
-        dropAttachments: boolean,
-      ): Promise<void> => {
+      const runEdit = async (messageId: string): Promise<void> => {
         await callAgentChatBridge({
           action: "edit_message",
           messageId,
           body: input.body,
-          ...(!dropAttachments && input.attachments
-            ? { attachments: input.attachments }
-            : {}),
+          ...(input.attachments ? { attachments: input.attachments } : {}),
           metadata: input.metadata,
         });
       };
       let messageId = previewMessageId ?? (await maybeResolvePreviewMessageId(true));
       if (!messageId) return false;
       try {
-        await runEdit(messageId, false);
+        await runEdit(messageId);
         previewMessageId = messageId;
         return true;
       } catch (firstError: unknown) {
-        if (
-          input.kind !== "processing" &&
-          Array.isArray(input.attachments) &&
-          input.attachments.length > 0
-        ) {
-          try {
-            await runEdit(messageId, true);
-            previewMessageId = messageId;
-            await this.ctx.memory
-              .recordWrite({
-                type: "chat_literal_generate_preview_edit_without_attachment",
-                at: nowIso(),
-                commandId: command.id,
-                kind: input.kind,
-                message:
-                  firstError instanceof Error
-                    ? firstError.message
-                    : String(firstError),
-              })
-              .catch(() => undefined);
-            return true;
-          } catch {
-            // Continue to recovery path below.
-          }
-        }
         previewMessageId = null;
         messageId = await maybeResolvePreviewMessageId(true);
         if (!messageId) {
@@ -5894,23 +6715,10 @@ export class CommandExecutor {
           return false;
         }
         try {
-          await runEdit(messageId, false);
+          await runEdit(messageId);
           previewMessageId = messageId;
           return true;
         } catch (retryError: unknown) {
-          if (
-            input.kind !== "processing" &&
-            Array.isArray(input.attachments) &&
-            input.attachments.length > 0
-          ) {
-            try {
-              await runEdit(messageId, true);
-              previewMessageId = messageId;
-              return true;
-            } catch {
-              // fall through to logging below
-            }
-          }
           await this.ctx.memory
             .recordWrite({
               type: "chat_literal_generate_preview_edit_failed",
@@ -5935,9 +6743,9 @@ export class CommandExecutor {
       }>;
       metadata: Record<string, unknown>;
       kind: "processing" | "success" | "failed";
-    }): Promise<void> => {
+    }): Promise<boolean> => {
       const callAgentChatBridge = this.ctx.callAgentChatBridge;
-      if (!callAgentChatBridge) return;
+      if (!callAgentChatBridge) return false;
       const sendFreshPreviewMessage = async (attachments?: Array<{
         url: string;
         mimeType: string;
@@ -5978,27 +6786,20 @@ export class CommandExecutor {
       ) {
         const edited = await tryEditPreviewMessage(input);
         if (edited) {
-          return;
+          return true;
         }
         if (input.kind !== "processing") {
-          if (!previewMessageId) {
-            // Terminal delivery is more important than preserving a single-card flow.
-            // If we still cannot resolve the preview message id, retry one fresh send.
-            previewMessageCreateAttempted = false;
-            try {
-              await sendFreshPreviewMessage(input.attachments);
-            } catch {
-              // Non-fatal: avoid dropping generation result on preview message failures.
-            }
+          if (!previewMessageCreateAttempted) {
+            return sendFreshPreviewMessage(input.attachments);
           }
-          // Keep a single preview box. Do not create secondary terminal boxes.
-          return;
+          return false;
         }
       }
       const sent = await sendFreshPreviewMessage(input.attachments);
       if (!sent) {
         await maybeResolvePreviewMessageId(true);
       }
+      return sent;
     };
     const emitStreamProgress = async (progress: MediaGenerationProgress): Promise<void> => {
       latestMediaProgress = progress;
@@ -6063,6 +6864,21 @@ export class CommandExecutor {
         media.mediaSizeBytes > 0
           ? Math.max(1, Math.floor(media.mediaSizeBytes))
           : 1;
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "uploaded",
+        status: "ok",
+        metadata: {
+          generatedAssetType,
+          mediaUrl: media.mediaUrl,
+          mimeType,
+          mode: avatarRequest
+            ? "chat_avatar_update"
+            : bannerRequest
+              ? "chat_banner_update"
+              : "chat_literal_generate",
+        },
+      });
       if (avatarRequest) {
         const avatarCropSpec =
           profileCropSpec?.target === "avatar"
@@ -6112,7 +6928,7 @@ export class CommandExecutor {
           avatarTarget === "owner"
             ? "Done. Here is your new avatar. If framing looks off, tap Crop avatar and keep your face in the center safe zone."
             : "Done. Here is my new avatar. If framing looks off, tap Crop avatar and keep the face in the center safe zone.";
-        await sendOrEditPreviewMessage({
+        const chatDeliveryHandled = await sendOrEditPreviewMessage({
           kind: "success",
           body: completionText,
           attachments: [
@@ -6162,6 +6978,9 @@ export class CommandExecutor {
             },
           },
         });
+        if (!chatDeliveryHandled) {
+          throw new Error("chat_preview_finalize_failed:chat_avatar_update");
+        }
         await this.ctx.memory.recordWrite({
             type: "chat_avatar_updated",
             at: nowIso(),
@@ -6182,6 +7001,7 @@ export class CommandExecutor {
           mediaUrl: media.mediaUrl,
           prompt: summary,
           updateResult: avatarResult,
+          chatDeliveryHandled,
         });
       }
       if (bannerRequest) {
@@ -6233,7 +7053,7 @@ export class CommandExecutor {
           bannerTarget === "owner"
             ? "Done. Here is your new banner. If framing looks off, tap Crop banner and keep key details in the center safe zone."
             : "Done. Here is my new banner. If framing looks off, keep key details in the center safe zone.";
-        await sendOrEditPreviewMessage({
+        const chatDeliveryHandled = await sendOrEditPreviewMessage({
           kind: "success",
           body: completionText,
           attachments: [
@@ -6282,6 +7102,9 @@ export class CommandExecutor {
             },
           },
         });
+        if (!chatDeliveryHandled) {
+          throw new Error("chat_preview_finalize_failed:chat_banner_update");
+        }
         await this.ctx.memory.recordWrite({
           type: "chat_banner_updated",
           at: nowIso(),
@@ -6301,6 +7124,7 @@ export class CommandExecutor {
           mediaUrl: media.mediaUrl,
           prompt: summary,
           updateResult: bannerResult,
+          chatDeliveryHandled,
         });
       }
 
@@ -6353,7 +7177,7 @@ export class CommandExecutor {
           : generatedCustomAssetSaveError && generatedCustomAssetSaveIntent
             ? `Generated ${generatedLabel} for "${summary}". Could not save to ${generatedCustomAssetSaveIntent.scope} ${generatedCustomAssetSaveIntent.kind}s (${truncateText(generatedCustomAssetSaveError, 120)}).`
             : `Generated ${generatedLabel} for "${summary}".`;
-      await sendOrEditPreviewMessage({
+      const chatDeliveryHandled = await sendOrEditPreviewMessage({
         kind: "success",
         body: successBody,
         attachments: [
@@ -6407,6 +7231,9 @@ export class CommandExecutor {
           },
         },
       });
+      if (!chatDeliveryHandled) {
+        throw new Error("chat_preview_finalize_failed:chat_literal_generate");
+      }
       await this.ctx.memory.recordWrite({
         type: "chat_literal_generate_sent",
         at: nowIso(),
@@ -6433,16 +7260,31 @@ export class CommandExecutor {
           ? { customAssetSaveError: generatedCustomAssetSaveError }
           : {}),
         mode: "chat_literal_generate",
+        chatDeliveryHandled,
       });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       const isPromptCurationFailure = /prompt_curation_/iu.test(message);
+      const isChatDeliveryFailure = /chat_preview_finalize_failed:/iu.test(message);
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: isChatDeliveryFailure ? "chat_delivery" : "uploaded",
+        status: "failed",
+        message,
+        metadata: {
+          generatedAssetType,
+          avatarRequest,
+          bannerRequest,
+        },
+      });
       await sendOrEditPreviewMessage({
         kind: "failed",
         body: avatarRequest
           ? "I could not update that avatar right now. Please retry in a moment."
           : bannerRequest
             ? "I could not update that banner right now. Please retry in a moment."
+            : isChatDeliveryFailure
+              ? `I generated that ${generatedLabel}, but failed to finalize delivery in chat. Please retry.`
             : isPromptCurationFailure
               ? `I could not prepare a generation prompt for that ${generatedLabel} right now. Please retry in a moment.`
               : `I could not generate that ${generatedLabel} right now. Please retry in a moment.`,
@@ -6457,6 +7299,8 @@ export class CommandExecutor {
                 ? "Avatar update failed"
                 : bannerRequest
                   ? "Banner update failed"
+                  : isChatDeliveryFailure
+                    ? "Delivery failed"
                   : isPromptCurationFailure
                     ? "Prompt curation failed"
                     : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
@@ -6479,11 +7323,15 @@ export class CommandExecutor {
           ? `Avatar update failed: ${message}`
           : bannerRequest
             ? `Banner update failed: ${message}`
+          : isChatDeliveryFailure
+            ? `Literal generate delivery failed: ${message}`
           : `Literal generate failed: ${message}`,
         avatarRequest
           ? "avatar_update_failed"
           : bannerRequest
             ? "banner_update_failed"
+            : isChatDeliveryFailure
+              ? "chat_delivery_failed"
             : "literal_generate_failed",
       );
     }
@@ -8063,12 +8911,32 @@ export class CommandExecutor {
     payload: Record<string, unknown>;
     keepOriginal?: boolean;
     promptFallbacks: Array<string | null>;
+    command?: Command;
   }): Promise<ResolvedMediaUpload> {
     const payload = input.payload;
     const keepOriginal = input.keepOriginal === true;
+    const markUploaded = async (
+      result: ResolvedMediaUpload,
+      source: string,
+    ): Promise<ResolvedMediaUpload> => {
+      if (input.command) {
+        await this.recordCommandLifecycleCheckpoint({
+          command: input.command,
+          stage: "uploaded",
+          status: "ok",
+          metadata: {
+            source,
+            mediaUrl: result.mediaUrl,
+            mediaType: result.mediaType ?? null,
+          },
+        });
+      }
+      return result;
+    };
     const existingMediaUrl = asNonEmptyString(payload.mediaUrl);
     if (existingMediaUrl) {
-      return this.uploadResolvedMediaSource(existingMediaUrl, { keepOriginal });
+      const resolved = await this.uploadResolvedMediaSource(existingMediaUrl, { keepOriginal });
+      return markUploaded(resolved, "payload.mediaUrl");
     }
 
     const mediaItems = Array.isArray(payload.mediaItems) ? payload.mediaItems : [];
@@ -8076,7 +8944,8 @@ export class CommandExecutor {
       if (!isRecord(mediaItem)) continue;
       const mediaUrl = asNonEmptyString(mediaItem.mediaUrl);
       if (mediaUrl) {
-        return this.uploadResolvedMediaSource(mediaUrl, { keepOriginal });
+        const resolved = await this.uploadResolvedMediaSource(mediaUrl, { keepOriginal });
+        return markUploaded(resolved, "payload.mediaItems");
       }
     }
 
@@ -8086,12 +8955,13 @@ export class CommandExecutor {
     if (!prompt) {
       throw new Error("no_media_url");
     }
-    return this.generateAndUploadMediaFromPrompt(prompt, {
+    const generated = await this.generateAndUploadMediaFromPrompt(prompt, {
       generatedAssetType: this.resolveGeneratedAssetType(payload.generatedAssetType),
       mode: "write_media_generate",
       referenceInputs: this.collectMediaReferenceInputs(payload),
       keepOriginal,
     });
+    return markUploaded(generated, "generated_prompt");
   }
 
   private async uploadResolvedMediaSource(
@@ -9448,16 +10318,182 @@ export class CommandExecutor {
     });
   }
 
+  private buildNonWriteChatCompletion(input: {
+    command: Command;
+    outcome: CommandOutcome;
+  }): { body: string; metadata: Record<string, unknown> } | null {
+    const data = isRecord(input.outcome.data) ? input.outcome.data : null;
+    const explicitCompletion = data && isRecord(data.chatCompletion)
+      ? data.chatCompletion
+      : null;
+    const explicitBody = asNonEmptyString(explicitCompletion?.body);
+    if (explicitBody) {
+      const explicitMetadata = isRecord(explicitCompletion?.metadata)
+        ? explicitCompletion.metadata
+        : null;
+      return {
+        body: explicitBody,
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          ...(explicitMetadata ?? {}),
+        },
+      };
+    }
+
+    const payload = isRecord(input.command.payload) ? input.command.payload : null;
+    if (!payload) return null;
+    const commandName = this.resolveChatCommandName(payload) ?? input.command.kind;
+    const errorMessage = input.outcome.error?.message?.trim() ?? "";
+    if (!input.outcome.ok) {
+      return {
+        body: errorMessage.length > 0
+          ? `I couldn't complete that ${commandName} request: ${errorMessage}`
+          : `I couldn't complete that ${commandName} request.`,
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: "command",
+            status: "failed",
+            title: "Command failed",
+            summary: commandName,
+            ...(errorMessage.length > 0 ? { error: truncateText(errorMessage, 240) } : {}),
+          },
+        },
+      };
+    }
+
+    const executed = Array.isArray(data?.executed) ? data.executed : [];
+    const executedCount = executed.length;
+    const summary =
+      executedCount > 0
+        ? `Done. Executed ${executedCount} action${executedCount === 1 ? "" : "s"}.`
+        : "Done.";
+    return {
+      body: summary,
+      metadata: {
+        automated: true,
+        sourceContext: "CHAT",
+        actionPreview: {
+          type: "command",
+          status: "success",
+          title: "Command completed",
+          summary: commandName,
+          executedCount,
+        },
+      },
+    };
+  }
+
+  private async sendNonWriteChatCompletion(input: {
+    command: Command;
+    body: string;
+    metadata: Record<string, unknown>;
+  }): Promise<boolean> {
+    if (!this.ctx.callAgentChatBridge) return false;
+    const chatTarget = resolveChatTargetFromPayload(input.command.payload);
+    if (!chatTarget) return false;
+    const route = chatTarget.conversationId
+      ? { conversationId: chatTarget.conversationId }
+      : { channelId: chatTarget.channelId };
+    try {
+      await this.ctx.callAgentChatBridge({
+        action: "send_message",
+        clientMessageId: `runtime_chat_result_${Date.now().toString(36)}_${crypto
+          .randomUUID()
+          .replaceAll("-", "")
+          .slice(0, 10)}`,
+        ...route,
+        body: clampPublishText(input.body, 1200),
+        format: "markdown",
+        metadata: input.metadata,
+      });
+      await this.ctx.memory
+        .recordWrite({
+          type: "chat_command_result_sent",
+          at: nowIso(),
+          commandId: input.command.id,
+          kind: input.command.kind,
+          ok: true,
+          targetConversationId: chatTarget.conversationId ?? null,
+          targetChannelId: chatTarget.channelId ?? null,
+        })
+        .catch(() => undefined);
+      return true;
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "chat_command_result_send_failed",
+          at: nowIso(),
+          commandId: input.command.id,
+          kind: input.command.kind,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return false;
+    }
+  }
+
   private async emitChatOutcome(command: Command, outcome: CommandOutcome): Promise<void> {
-    if (!this.ctx.callAgentChatBridge) return;
+    const payload = isRecord(command.payload) ? command.payload : null;
+    const chatTarget = resolveChatTargetFromPayload(payload ?? null);
+    if (!chatTarget) return;
+    const outcomeData = isRecord(outcome.data) ? outcome.data : null;
+    const chatDeliveryHandled = outcomeData?.chatDeliveryHandled === true;
+
+    if (
+      (payload?.chatLiteralGenerate === true || payload?.requireDraftOnly === true) &&
+      outcome.ok &&
+      chatDeliveryHandled
+    ) {
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "chat_delivery",
+        status: "ok",
+        metadata: {
+          mode: payload.chatLiteralGenerate === true ? "chat_literal_generate_preview" : "draft_preview",
+        },
+      });
+      return;
+    }
+
     const kind = command.kind.trim().toLowerCase();
-    if (!kind.startsWith("write.")) return;
-    await sendChatResultMessageFromOutcome({
+    if (kind.startsWith("write.")) {
+      const delivered = await sendChatResultMessageFromOutcome({
+        command,
+        outcome,
+        chatTarget,
+        deps: {
+          callAgentChatBridge: this.ctx.callAgentChatBridge,
+          memory: this.ctx.memory,
+        },
+      });
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "chat_delivery",
+        status: delivered ? "ok" : "failed",
+        metadata: {
+          mode: "write_outcome",
+        },
+      });
+      return;
+    }
+
+    const completion = this.buildNonWriteChatCompletion({ command, outcome });
+    if (!completion) return;
+    const delivered = await this.sendNonWriteChatCompletion({
       command,
-      outcome,
-      deps: {
-        callAgentChatBridge: this.ctx.callAgentChatBridge,
-        memory: this.ctx.memory,
+      body: completion.body,
+      metadata: completion.metadata,
+    });
+    await this.recordCommandLifecycleCheckpoint({
+      command,
+      stage: "chat_delivery",
+      status: delivered ? "ok" : "failed",
+      message: delivered ? null : "chat_result_send_failed",
+      metadata: {
+        mode: "non_write_terminal",
       },
     });
   }
@@ -9597,67 +10633,77 @@ export class CommandExecutor {
   private async sendDraftPreviewMessage(input: {
     payload: Record<string, unknown>;
     preview: DraftPreviewPayload;
-  }): Promise<void> {
-    if (!this.ctx.callAgentChatBridge) return;
+  }): Promise<boolean> {
+    if (!this.ctx.callAgentChatBridge) return false;
     const chatTarget = resolveChatTargetFromPayload(input.payload);
-    if (!chatTarget) return;
-    await this.ctx.callAgentChatBridge({
-      action: "send_message",
-      clientMessageId: `runtime_draft_result_${Date.now().toString(36)}_${crypto
-        .randomUUID()
-        .replaceAll("-", "")
-        .slice(0, 10)}`,
-      ...(chatTarget.conversationId
-        ? { conversationId: chatTarget.conversationId }
-        : { channelId: chatTarget.channelId }),
-      body: input.preview.body,
-      format: "markdown",
-      metadata: {
-        automated: true,
-        sourceContext: "CHAT",
-        draftPreviewText: input.preview.draftPreviewText,
-        draftPostKind: input.preview.draftPostKind,
-        draftMode: input.preview.draftMode,
-        draftSlideCount: input.preview.draftSlideCount,
-        actionPreview: {
-          type: "draft",
-          status: "success",
-          title: "Draft ready",
-          summary: input.preview.summary,
+    if (!chatTarget) return false;
+    try {
+      await this.ctx.callAgentChatBridge({
+        action: "send_message",
+        clientMessageId: `runtime_draft_result_${Date.now().toString(36)}_${crypto
+          .randomUUID()
+          .replaceAll("-", "")
+          .slice(0, 10)}`,
+        ...(chatTarget.conversationId
+          ? { conversationId: chatTarget.conversationId }
+          : { channelId: chatTarget.channelId }),
+        body: input.preview.body,
+        format: "markdown",
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          draftPreviewText: input.preview.draftPreviewText,
+          draftPostKind: input.preview.draftPostKind,
+          draftMode: input.preview.draftMode,
+          draftSlideCount: input.preview.draftSlideCount,
+          actionPreview: {
+            type: "draft",
+            status: "success",
+            title: "Draft ready",
+            summary: input.preview.summary,
+          },
         },
-      },
-    });
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async sendDraftFailureMessage(input: {
     payload: Record<string, unknown>;
     message: string;
-  }): Promise<void> {
-    if (!this.ctx.callAgentChatBridge) return;
+  }): Promise<boolean> {
+    if (!this.ctx.callAgentChatBridge) return false;
     const chatTarget = resolveChatTargetFromPayload(input.payload);
-    if (!chatTarget) return;
-    await this.ctx.callAgentChatBridge({
-      action: "send_message",
-      clientMessageId: `runtime_draft_error_${Date.now().toString(36)}_${crypto
-        .randomUUID()
-        .replaceAll("-", "")
-        .slice(0, 10)}`,
-      ...(chatTarget.conversationId
-        ? { conversationId: chatTarget.conversationId }
-        : { channelId: chatTarget.channelId }),
-      body: input.message,
-      format: "markdown",
-      metadata: {
-        automated: true,
-        sourceContext: "CHAT",
-        actionPreview: {
-          type: "draft",
-          status: "failed",
-          title: "Draft failed",
-          error: input.message,
+    if (!chatTarget) return false;
+    try {
+      await this.ctx.callAgentChatBridge({
+        action: "send_message",
+        clientMessageId: `runtime_draft_error_${Date.now().toString(36)}_${crypto
+          .randomUUID()
+          .replaceAll("-", "")
+          .slice(0, 10)}`,
+        ...(chatTarget.conversationId
+          ? { conversationId: chatTarget.conversationId }
+          : { channelId: chatTarget.channelId }),
+        body: input.message,
+        format: "markdown",
+        metadata: {
+          automated: true,
+          sourceContext: "CHAT",
+          actionPreview: {
+            type: "draft",
+            status: "failed",
+            title: "Draft failed",
+            error: input.message,
+          },
         },
-      },
-    });
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async updateAvatar(
@@ -9712,14 +10758,37 @@ export class CommandExecutor {
       outcome.ok,
       outcome.ok ? null : outcome.error?.message ?? "failed",
     );
-    await this.agent().ackDirective.mutate({
-      directiveId,
-      status: outcome.ok ? "executed" : "failed",
-      kind: command.kind,
-      ...(outcome.ok ? {} : { error: outcome.error?.message ?? "Directive failed." }),
-      ...(command.actionNonce ? { actionNonce: command.actionNonce } : {}),
-      executionDigest,
-    });
+    try {
+      await this.agent().ackDirective.mutate({
+        directiveId,
+        status: outcome.ok ? "executed" : "failed",
+        kind: command.kind,
+        ...(outcome.ok ? {} : { error: outcome.error?.message ?? "Directive failed." }),
+        ...(command.actionNonce ? { actionNonce: command.actionNonce } : {}),
+        executionDigest,
+      });
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "ack",
+        status: "ok",
+        metadata: {
+          directiveId,
+          outcomeOk: outcome.ok,
+        },
+      });
+    } catch (error: unknown) {
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "ack",
+        status: "failed",
+        message: error instanceof Error ? error.message : String(error),
+        metadata: {
+          directiveId,
+          outcomeOk: outcome.ok,
+        },
+      });
+      throw error;
+    }
   }
 
   private async writeOutcome(outcome: CommandOutcome): Promise<void> {

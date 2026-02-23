@@ -165,7 +165,6 @@ export type RuntimeConfig = {
 
   // WebSocket upload
   wsUploadDataUriMaxBytes: number;
-  allowSyntheticMediaFallback: boolean;
   httpUploadChunkBytes: number;
 
   // OpenClaw wake
