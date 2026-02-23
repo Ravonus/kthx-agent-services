@@ -41,10 +41,16 @@ import { AuthManager } from "./auth/auth-manager.js";
 import { MintManager } from "./mint/mint-manager.js";
 import { GrantManager } from "./grants/grant-manager.js";
 import { SubscriptionManager } from "./ws/subscription-manager.js";
+import { normalizePermissionStateEvent } from "./ws/permission-event.js";
 import { EventsManager } from "./ipc/events-manager.js";
 import { DirectiveManager } from "./directives/directive-manager.js";
 import { QueueManager } from "./queue/queue-manager.js";
-import { parseGrantCandidatesFromPermissionState } from "./grants/grant-state.js";
+import {
+  buildCreditsPermissionState,
+  buildGrantState,
+  parseGrantCandidatesFromPermissionState,
+  type GrantState,
+} from "./grants/grant-state.js";
 import { CommandExecutor } from "./commands/command-executor.js";
 import { OpenClawManager } from "./openclaw/openclaw-manager.js";
 import {
@@ -1022,6 +1028,29 @@ const main = async (): Promise<void> => {
   let triggerAutoCreditPlanner:
     | ((opts: { trigger: string; permissionState?: unknown }) => void)
     | null = null;
+  type AutoPostingAction = "post_media" | "post_text" | "story";
+  const AUTO_POSTING_ACTION_KEYS: Record<AutoPostingAction, readonly string[]> = {
+    post_media: ["post:post:media", "write.createPost"],
+    post_text: ["post:post:text", "write.createPost"],
+    story: ["story", "post:thread:text", "post:thread:media", "write.createStory"],
+  };
+  const autoPostingPlannerEnabled = isEnabledEnvFlag(
+    trimEnv("MG_AUTO_POSTING_PLANNER_ENABLED") ?? "1",
+  );
+  const autoPostingPlannerMinIntervalMs = Math.max(
+    5_000,
+    Number.parseInt(
+      trimEnv("MG_AUTO_POSTING_PLANNER_MIN_INTERVAL_MS") ??
+        `${autoCreditPlannerMinIntervalMs}`,
+      10,
+    ) || autoCreditPlannerMinIntervalMs,
+  );
+  let autoPostingPlanInFlight: Promise<void> | null = null;
+  let autoPostingPlanLastAtMs = 0;
+  const autoPostingRecentPlans = new Map<string, number>();
+  let triggerAutoPostingPlanner:
+    | ((opts: { trigger: string; permissionState?: unknown }) => void)
+    | null = null;
 
   const handleEnvelope = async (envelope: {
     receivedAt: string;
@@ -1054,6 +1083,7 @@ const main = async (): Promise<void> => {
       eventType === "directive" ||
       eventType === "director_grant" ||
       eventType === "director_credit" ||
+      eventType === "director_credits_added" ||
       topic === "director";
     const shouldIngestSocketEnvelope =
       isNotificationEnvelope || isFeedEnvelope || isDirectorEnvelope;
@@ -1084,12 +1114,31 @@ const main = async (): Promise<void> => {
     }
 
     // Permission state updates
-    if (eventType === "permission_state" && isRecord(payload.state)) {
-      ctx.debugSnapshot.permission = payload.state as Record<string, unknown>;
+    const permissionStateEvent = normalizePermissionStateEvent(eventType, payload);
+    if (permissionStateEvent) {
+      ctx.debugSnapshot.permission = permissionStateEvent.permissionState;
       await writeDebugSnapshot(ipcPaths, ctx.debugSnapshot);
+      const permissionGrantCandidates = parseGrantCandidatesFromPermissionState(
+        permissionStateEvent.permissionState,
+      );
+      if (permissionGrantCandidates.length > 0) {
+        let latestExpiring = permissionGrantCandidates[0]!;
+        for (const candidate of permissionGrantCandidates.slice(1)) {
+          if (candidate.expiresAtMs > latestExpiring.expiresAtMs) {
+            latestExpiring = candidate;
+          }
+        }
+        grantManager.setActiveGrant(latestExpiring);
+      } else if (grantManager.isGrantExpired()) {
+        grantManager.setActiveGrant(null);
+      }
       triggerAutoCreditPlanner?.({
-        trigger: "permission_state",
-        permissionState: payload.state,
+        trigger: permissionStateEvent.trigger,
+        permissionState: permissionStateEvent.permissionState,
+      });
+      triggerAutoPostingPlanner?.({
+        trigger: permissionStateEvent.trigger,
+        permissionState: permissionStateEvent.permissionState,
       });
     }
 
@@ -1168,17 +1217,39 @@ const main = async (): Promise<void> => {
 
     // Grant events
     if (eventType === "director_grant" && isRecord(payload.grant)) {
+      const directorGrantPayload = payload.grant as Record<string, unknown>;
       await grantManager.persistDirectorGrant(
-        payload.grant as Record<string, unknown>,
+        directorGrantPayload,
         envelope.receivedAt,
       );
+      grantManager.setActiveGrant(
+        buildGrantState(directorGrantPayload, envelope.receivedAt),
+      );
+      triggerAutoCreditPlanner?.({ trigger: "director_grant" });
+      triggerAutoPostingPlanner?.({ trigger: "director_grant" });
     }
-    if (eventType === "director_credit" && isRecord(payload.credit)) {
-      await grantManager.persistCreditsGrant(
-        payload.credit as Record<string, unknown>,
-        envelope.receivedAt,
-      );
-      triggerAutoCreditPlanner?.({ trigger: "director_credit" });
+    if (
+      (eventType === "director_credit" && isRecord(payload.credit)) ||
+      eventType === "director_credits_added"
+    ) {
+      const creditPayload =
+        eventType === "director_credit"
+          ? payload.credit
+          : payload;
+      if (isRecord(creditPayload)) {
+        await grantManager.persistCreditsGrant(
+          creditPayload as Record<string, unknown>,
+          envelope.receivedAt,
+        );
+        grantManager.setActiveGrant(
+          buildCreditsPermissionState(
+            creditPayload as Record<string, unknown>,
+            envelope.receivedAt,
+          ),
+        );
+        triggerAutoCreditPlanner?.({ trigger: eventType });
+        triggerAutoPostingPlanner?.({ trigger: eventType });
+      }
     }
 
     // OpenClaw wake
@@ -1352,6 +1423,15 @@ const main = async (): Promise<void> => {
     }
   };
 
+  const resolveGrantCandidates = (permissionState: unknown): GrantState[] => {
+    const candidates = parseGrantCandidatesFromPermissionState(permissionState);
+    if (candidates.length > 0) return candidates;
+    const activeGrant = grantManager.getActiveGrant();
+    if (!activeGrant) return [];
+    if (activeGrant.expiresAtMs <= Date.now()) return [];
+    return [activeGrant];
+  };
+
   triggerAutoCreditPlanner = (opts: {
     trigger: string;
     permissionState?: unknown;
@@ -1365,7 +1445,7 @@ const main = async (): Promise<void> => {
 
     autoCreditPlanInFlight = (async () => {
       const permissionState = opts.permissionState ?? ctx.debugSnapshot.permission;
-      const grantCandidates = parseGrantCandidatesFromPermissionState(permissionState);
+      const grantCandidates = resolveGrantCandidates(permissionState);
       if (!grantCandidates.length) return;
 
       const budgets: Record<
@@ -1656,6 +1736,175 @@ const main = async (): Promise<void> => {
       });
   };
 
+  triggerAutoPostingPlanner = (opts: {
+    trigger: string;
+    permissionState?: unknown;
+  }) => {
+    if (!autoPostingPlannerEnabled) return;
+    if (!ctx.directiveManager) return;
+    if (ctx.queueManager && !ctx.queueManager.isRunnerEnabled()) return;
+    const nowMs = Date.now();
+    if (autoPostingPlanInFlight) return;
+    if (nowMs - autoPostingPlanLastAtMs < autoPostingPlannerMinIntervalMs) return;
+
+    autoPostingPlanInFlight = (async () => {
+      const permissionState = opts.permissionState ?? ctx.debugSnapshot.permission;
+      const grantCandidates = resolveGrantCandidates(permissionState);
+      if (!grantCandidates.length) return;
+
+      const now = Date.now();
+      const availableForAction = (
+        grant: GrantState,
+        keys: readonly string[],
+      ): number => {
+        let available = 0;
+        for (const key of keys) {
+          const actionState = grant.actions.get(key);
+          if (!actionState || actionState.remainingCount <= 0) continue;
+          const notBeforeAtMs =
+            typeof actionState.notBeforeAtMs === "number" &&
+            Number.isFinite(actionState.notBeforeAtMs)
+              ? actionState.notBeforeAtMs
+              : grant.issuedAtMs + actionState.notBeforeSeconds * 1000;
+          if (notBeforeAtMs > now) continue;
+          available += actionState.remainingCount;
+        }
+        return available;
+      };
+
+      let selected:
+        | {
+            action: AutoPostingAction;
+            grantId: string | null;
+            available: number;
+          }
+        | null = null;
+      const actionPriority: AutoPostingAction[] = ["post_media", "post_text", "story"];
+      for (const candidate of grantCandidates) {
+        if (candidate.expiresAtMs <= now) continue;
+        const grantId = candidate.id.trim().length > 0 ? candidate.id.trim() : null;
+        for (const action of actionPriority) {
+          const available = availableForAction(candidate, AUTO_POSTING_ACTION_KEYS[action]);
+          if (available <= 0) continue;
+          const dedupeKey = `${action}:${grantId ?? "none"}`;
+          const lastPlannedAt = autoPostingRecentPlans.get(dedupeKey) ?? 0;
+          if (now - lastPlannedAt < autoCreditPlannerRecentTargetTtlMs) continue;
+          selected = {
+            action,
+            grantId,
+            available,
+          };
+          break;
+        }
+        if (selected) break;
+      }
+
+      if (!selected) {
+        await memory.recordWrite({
+          type: "auto_posting_planner_skipped",
+          at: nowIso(),
+          trigger: opts.trigger,
+          reason: "no_posting_window",
+        }).catch(() => {});
+        return;
+      }
+
+      const directiveId = `auto_post_${selected.action}_${Date.now().toString(36)}_${crypto
+        .randomUUID()
+        .replaceAll("-", "")
+        .slice(0, 12)}`;
+      const directivePayloadBase: Record<string, unknown> = {
+        id: directiveId,
+        kind: "brain.generateAndQueue",
+        createdAt: nowIso(),
+        ...(selected.grantId ? { grantId: selected.grantId } : {}),
+        forceNow: true,
+      };
+      const payloadByAction: Record<AutoPostingAction, Record<string, unknown>> = {
+        post_media: {
+          goal: "post",
+          kind: "media",
+          kinds: ["media"],
+          generatedAssetType: "image",
+          forceNow: true,
+          provenance: "runtime_auto_posting",
+          requireExplicitPublishVerb: false,
+          explicitPublishRequested: false,
+          directiveScope: {
+            allowedCommandKinds: ["write.createPost"],
+          },
+          autoPlanned: {
+            trigger: opts.trigger,
+            source: "posting_window_media",
+          },
+        },
+        post_text: {
+          goal: "post",
+          kind: "thread",
+          kinds: ["thread"],
+          forceNow: true,
+          provenance: "runtime_auto_posting",
+          requireExplicitPublishVerb: false,
+          explicitPublishRequested: false,
+          directiveScope: {
+            allowedCommandKinds: ["write.createPost"],
+          },
+          autoPlanned: {
+            trigger: opts.trigger,
+            source: "posting_window_text",
+          },
+        },
+        story: {
+          goal: "story",
+          kind: "story",
+          kinds: ["story"],
+          forceNow: true,
+          provenance: "runtime_auto_posting",
+          requireExplicitPublishVerb: false,
+          explicitPublishRequested: false,
+          directiveScope: {
+            allowedCommandKinds: ["write.createStory"],
+          },
+          autoPlanned: {
+            trigger: opts.trigger,
+            source: "posting_window_story",
+          },
+        },
+      };
+      await ctx.directiveManager?.intake({
+        ...directivePayloadBase,
+        payload: payloadByAction[selected.action],
+      });
+      const dedupeKey = `${selected.action}:${selected.grantId ?? "none"}`;
+      autoPostingRecentPlans.set(dedupeKey, Date.now());
+      const cutoff = Date.now() - autoCreditPlannerRecentTargetTtlMs;
+      for (const [key, seenAt] of autoPostingRecentPlans) {
+        if (seenAt < cutoff) autoPostingRecentPlans.delete(key);
+      }
+      await memory.recordWrite({
+        type: "auto_posting_planner_enqueued",
+        at: nowIso(),
+        trigger: opts.trigger,
+        action: selected.action,
+        grantId: selected.grantId,
+        available: selected.available,
+        directiveId,
+      }).catch(() => {});
+    })()
+      .catch(async (error: unknown) => {
+        await memory.recordWrite({
+          type: "auto_posting_planner_failed",
+          at: nowIso(),
+          trigger: opts.trigger,
+          error: error instanceof Error ? error.message : String(error),
+        }).catch(() => {});
+      })
+      .finally(() => {
+        autoPostingPlanLastAtMs = Date.now();
+        autoPostingPlanInFlight = null;
+      });
+  };
+
   const commandExecutor = new CommandExecutor({
     config: {
       imageGenerateCmd:
@@ -1747,6 +1996,7 @@ const main = async (): Promise<void> => {
   });
   ctx.directiveManager = directiveManager;
   triggerAutoCreditPlanner?.({ trigger: "runtime_startup" });
+  triggerAutoPostingPlanner?.({ trigger: "runtime_startup" });
 
   // -- ChatManager
   const chatManager = new ChatManager({

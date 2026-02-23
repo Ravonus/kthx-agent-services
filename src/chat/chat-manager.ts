@@ -2766,9 +2766,15 @@ export class ChatManager implements ChatManagerLike {
       this.ctx.config.chatRuntimeReplyMaxChars,
     );
     if (!trimmedBody.length || /^(?:\u2026+|\.{3,})$/u.test(trimmedBody)) return null;
+    const routeScope = entry.conversationId ?? entry.channelId ?? "";
+    const clientMessageId = `runtime_chat_reply_${crypto
+      .createHash("sha256")
+      .update(`${entry.messageId}:${routeScope}`)
+      .digest("hex")
+      .slice(0, 28)}`;
     return this.ctx.callAgentChatBridge({
       action: "send_message",
-      clientMessageId: `runtime_chat_${Date.now().toString(36)}_${crypto.randomUUID().replaceAll("-", "").slice(0, 10)}`,
+      clientMessageId,
       body: trimmedBody, format: "markdown", replyToMessageId: entry.messageId,
       ...(entry.conversationId ? { conversationId: entry.conversationId } : { channelId: entry.channelId }),
     });

@@ -505,6 +505,56 @@ export interface ChatResultSenderDeps {
   memory: { recordWrite(payload: unknown): Promise<void> };
 }
 
+const buildDeterministicResultClientMessageId = (
+  command: Record<string, unknown> | null,
+): string => {
+  const commandId =
+    typeof command?.id === "string" && command.id.trim().length > 0
+      ? command.id.trim()
+      : null;
+  if (!commandId) {
+    return `runtime_chat_result_${crypto
+      .randomUUID()
+      .replaceAll("-", "")
+      .slice(0, 24)}`;
+  }
+  const digest = crypto
+    .createHash("sha256")
+    .update(commandId)
+    .digest("hex")
+    .slice(0, 32);
+  return `runtime_chat_result_${digest}`;
+};
+
+const buildDeterministicProgressClientMessageId = (
+  command: Record<string, unknown> | null,
+): string | null => {
+  const commandId =
+    typeof command?.id === "string" && command.id.trim().length > 0
+      ? command.id.trim()
+      : null;
+  if (!commandId) return null;
+  const payload = isRecord(command?.payload) ? command.payload : null;
+  const sourceContext =
+    typeof payload?.sourceContext === "string"
+      ? payload.sourceContext.trim().toLowerCase()
+      : "";
+  const chatContext = isRecord(payload?.chatContext) ? payload.chatContext : null;
+  if (sourceContext !== "chat" && !chatContext) return null;
+  if (payload?.chatLiteralGenerate === true || payload?.chatLiteralGenerate === "true") {
+    return null;
+  }
+  if (payload?.requireDraftOnly === true || payload?.requireDraftOnly === "true") {
+    return null;
+  }
+  const digest = crypto
+    .createHash("sha256")
+    .update(commandId)
+    .digest("hex")
+    .slice(0, 32);
+  return `runtime_chat_progress_${digest}`;
+};
+
 // ---------------------------------------------------------------------------
 // Send chat result message from write command outcome
 // ---------------------------------------------------------------------------
@@ -525,48 +575,86 @@ export const sendChatResultMessageFromOutcome = async ({
   if (!resolvedTarget) return false;
   const result = buildChatResultMessageFromOutcome({ command, outcome });
   if (!result) return false;
+  const route =
+    typeof resolvedTarget.conversationId === "string"
+      ? { conversationId: resolvedTarget.conversationId }
+      : { channelId: resolvedTarget.channelId };
+  const progressClientMessageId = buildDeterministicProgressClientMessageId(command);
+  if (progressClientMessageId) {
+    try {
+      await deps.callAgentChatBridge({
+        action: "edit_message",
+        clientMessageId: progressClientMessageId,
+        ...route,
+        body: clampPublishText(result.body, 1200),
+        metadata: result.metadata,
+      });
+      await deps.memory
+        .recordWrite({
+          type: "chat_command_result_edited",
+          at: nowIso(),
+          commandId:
+            typeof command?.id === "string" ? command.id : null,
+          kind:
+            typeof command?.kind === "string" ? command.kind : null,
+          ok: outcome?.ok === true,
+          targetConversationId:
+            typeof resolvedTarget.conversationId === "string"
+              ? resolvedTarget.conversationId
+              : null,
+          targetChannelId:
+            typeof resolvedTarget.channelId === "string"
+              ? resolvedTarget.channelId
+              : null,
+        })
+        .catch(() => undefined);
+      return true;
+    } catch {
+      // Fall back to terminal send when processing message edit isn't available.
+    }
+  }
+  const clientMessageId = buildDeterministicResultClientMessageId(command);
   try {
     await deps.callAgentChatBridge({
       action: "send_message",
-      clientMessageId: `runtime_chat_result_${Date.now().toString(36)}_${crypto
-        .randomUUID()
-        .replaceAll("-", "")
-        .slice(0, 10)}`,
-      ...(typeof resolvedTarget.conversationId === "string"
-        ? { conversationId: resolvedTarget.conversationId }
-        : { channelId: resolvedTarget.channelId }),
+      clientMessageId,
+      ...route,
       body: clampPublishText(result.body, 1200),
       format: "markdown",
       metadata: result.metadata,
     });
-    await deps.memory.recordWrite({
-      type: "chat_command_result_sent",
-      at: nowIso(),
-      commandId:
-        typeof command?.id === "string" ? command.id : null,
-      kind:
-        typeof command?.kind === "string" ? command.kind : null,
-      ok: outcome?.ok === true,
-      targetConversationId:
-        typeof resolvedTarget.conversationId === "string"
-          ? resolvedTarget.conversationId
-          : null,
-      targetChannelId:
-        typeof resolvedTarget.channelId === "string"
-          ? resolvedTarget.channelId
-          : null,
-    });
+    await deps.memory
+      .recordWrite({
+        type: "chat_command_result_sent",
+        at: nowIso(),
+        commandId:
+          typeof command?.id === "string" ? command.id : null,
+        kind:
+          typeof command?.kind === "string" ? command.kind : null,
+        ok: outcome?.ok === true,
+        targetConversationId:
+          typeof resolvedTarget.conversationId === "string"
+            ? resolvedTarget.conversationId
+            : null,
+        targetChannelId:
+          typeof resolvedTarget.channelId === "string"
+            ? resolvedTarget.channelId
+            : null,
+      })
+      .catch(() => undefined);
     return true;
   } catch (error: unknown) {
-    await deps.memory.recordWrite({
-      type: "chat_command_result_send_failed",
-      at: nowIso(),
-      commandId:
-        typeof command?.id === "string" ? command.id : null,
-      kind:
-        typeof command?.kind === "string" ? command.kind : null,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    await deps.memory
+      .recordWrite({
+        type: "chat_command_result_send_failed",
+        at: nowIso(),
+        commandId:
+          typeof command?.id === "string" ? command.id : null,
+        kind:
+          typeof command?.kind === "string" ? command.kind : null,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      .catch(() => undefined);
     return false;
   }
 };

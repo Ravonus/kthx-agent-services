@@ -772,6 +772,8 @@ type GeneratedCustomAssetSaveResult = {
   scope: GeneratedCustomAssetScope;
   name: string;
   id: number | null;
+  url: string | null;
+  mimeType: string | null;
 };
 type MediaGeneratorStreamFrame = {
   sourceFileName: string | null;
@@ -1129,7 +1131,7 @@ export class CommandExecutor {
 
   private resolveDelegatedFollowAction(
     payload: Record<string, unknown>,
-  ): "follow" | "follow_engagers" | "follow_accept" | null {
+  ): "follow" | "follow_engagers" | "follow_accept" | "follow_suggestions" | null {
     const explicitAction = asNonEmptyString(payload.followAction)?.toLowerCase() ?? "";
     if (explicitAction === "follow") return "follow";
     if (
@@ -1159,6 +1161,21 @@ export class CommandExecutor {
       chatCommandName === "followaccept"
     ) {
       return "follow_accept";
+    }
+    if (chatCommandName === "assist") {
+      const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+      const commandArgs = Array.isArray(chatContext?.commandArgs)
+        ? chatContext.commandArgs
+            .map((entry) => asNonEmptyString(entry)?.toLowerCase() ?? null)
+            .filter((entry): entry is string => Boolean(entry))
+        : [];
+      const assistAction = commandArgs[0] ?? "";
+      if (assistAction === "follow-suggestions" || assistAction === "followsuggestions") {
+        const autoFollowRequested = commandArgs.some(
+          (entry) => entry === "--auto-follow" || entry === "--autofollow",
+        );
+        return autoFollowRequested ? "follow_engagers" : "follow_suggestions";
+      }
     }
     return null;
   }
@@ -1287,6 +1304,105 @@ export class CommandExecutor {
       .find((value) => Number.isFinite(value) && value > 0);
     if (numeric) return Math.max(1, Math.min(12, Math.floor(numeric)));
     return 8;
+  }
+
+  private resolveFollowSuggestionOptions(payload: Record<string, unknown>): {
+    agentOnly: boolean;
+    topicHint: string | null;
+  } {
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    const commandArgs = Array.isArray(chatContext?.commandArgs)
+      ? chatContext.commandArgs
+          .map((entry) => asNonEmptyString(entry)?.toLowerCase() ?? null)
+          .filter((entry): entry is string => Boolean(entry))
+      : [];
+    const agentOnly = commandArgs.some(
+      (entry) =>
+        entry === "--agent-only" ||
+        entry === "--agentonly" ||
+        entry === "agent-only" ||
+        entry === "agentonly",
+    );
+    const topicTokens = commandArgs.filter((entry, index) => {
+      if (index === 0 && (entry === "follow-suggestions" || entry === "followsuggestions")) {
+        return false;
+      }
+      if (entry === "follow-suggestions" || entry === "followsuggestions") return false;
+      if (entry === "ask-count") return false;
+      if (/^\d{1,2}$/u.test(entry)) return false;
+      if (entry.startsWith("--")) return false;
+      if (
+        entry === "for-me" ||
+        entry === "forme" ||
+        entry === "as-agent" ||
+        entry === "as_agent" ||
+        entry === "asagent"
+      ) {
+        return false;
+      }
+      return true;
+    });
+    const topicHint =
+      topicTokens.length > 0 ? truncateText(topicTokens.join(" "), 120) : null;
+    return {
+      agentOnly,
+      topicHint,
+    };
+  }
+
+  private extractBrowsedAgentCandidates(
+    value: unknown,
+    limit: number,
+  ): Array<{
+    handle: string;
+    name: string | null;
+    score: number | null;
+    reason: string | null;
+  }> {
+    const data = isRecord(value) ? value : null;
+    const rows = Array.isArray(data?.items) ? data.items : [];
+    const deduped = new Map<
+      string,
+      {
+        handle: string;
+        name: string | null;
+        score: number | null;
+        reason: string | null;
+      }
+    >();
+    for (const row of rows) {
+      if (!isRecord(row)) continue;
+      const user = isRecord(row.user) ? row.user : null;
+      const handleCandidate =
+        asNonEmptyString(row.handle) ??
+        asNonEmptyString(row.username) ??
+        asNonEmptyString(user?.handle) ??
+        asNonEmptyString(user?.username);
+      if (!handleCandidate) continue;
+      const handle = this.normalizeFollowHandleCandidate(handleCandidate);
+      if (!handle) continue;
+      const name =
+        asNonEmptyString(row.name) ??
+        asNonEmptyString(user?.name) ??
+        asNonEmptyString(row.displayName) ??
+        null;
+      const score =
+        typeof row.score === "number" && Number.isFinite(row.score)
+          ? Math.max(0, Math.floor(row.score))
+          : null;
+      const reason = asNonEmptyString(row.reason)?.toLowerCase() ?? null;
+      const existing = deduped.get(handle);
+      if (!existing || (score ?? -1) > (existing.score ?? -1)) {
+        deduped.set(handle, {
+          handle,
+          name,
+          score,
+          reason,
+        });
+      }
+      if (deduped.size >= limit) break;
+    }
+    return Array.from(deduped.values()).slice(0, limit);
   }
 
   private extractTopEngagerHandlesFromLookup(value: unknown, limit: number): string[] {
@@ -1626,6 +1742,7 @@ export class CommandExecutor {
       stage: "executing",
       status: "ok",
     });
+    await this.emitChatProcessingIndicator(command).catch(() => undefined);
 
     const result = await this.executeCommand(command).catch(async (error: unknown) => {
       if (error instanceof RequeueCommandError) {
@@ -1866,12 +1983,12 @@ export class CommandExecutor {
     return ["repost", "write.repostPost"];
   }
 
-  private hasUsablePermissionWindowForAction(
+  private resolvePermissionWindowGrantIdForAction(
     permissionState: unknown,
     action: "comment" | "like" | "repost",
-  ): boolean {
+  ): string | null {
     const candidates = parseGrantCandidatesFromPermissionState(permissionState);
-    if (!candidates.length) return false;
+    if (!candidates.length) return null;
     const nowMs = Date.now();
     const actionKeys = this.grantActionKeysFor(action);
     for (const candidate of candidates) {
@@ -1885,10 +2002,21 @@ export class CommandExecutor {
             ? actionState.notBeforeAtMs
             : candidate.issuedAtMs + actionState.notBeforeSeconds * 1000;
         if (notBeforeAtMs > nowMs) continue;
-        return true;
+        const grantId = candidate.id.trim();
+        if (grantId.length > 0) return grantId;
       }
     }
-    return false;
+    return null;
+  }
+
+  private hasUsablePermissionWindowForAction(
+    permissionState: unknown,
+    action: "comment" | "like" | "repost",
+  ): boolean {
+    return (
+      this.resolvePermissionWindowGrantIdForAction(permissionState, action) !==
+      null
+    );
   }
 
   private buildActionIdempotencyKey(input: {
@@ -2087,6 +2215,24 @@ export class CommandExecutor {
       asNonEmptyString(input.command.grantId) ??
       asNonEmptyString(input.payload.grantId);
     if (grantId) return grantId;
+
+    const inferredGrantId = this.resolvePermissionWindowGrantIdForAction(
+      input.payload.permissionState,
+      input.action,
+    );
+    if (inferredGrantId) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "directive_preflight_grant_inferred",
+          at: nowIso(),
+          commandId: input.command.id,
+          directiveId: input.command.sourceDirectiveId ?? input.command.id,
+          action: input.action,
+          grantId: inferredGrantId,
+        })
+        .catch(() => undefined);
+      return inferredGrantId;
+    }
 
     const hasUsableWindow = this.hasUsablePermissionWindowForAction(
       input.payload.permissionState,
@@ -5450,13 +5596,15 @@ export class CommandExecutor {
   private async executeDelegatedFollowAction(input: {
     command: Command;
     payload: Record<string, unknown>;
-    action: "follow" | "follow_engagers" | "follow_accept";
+    action: "follow" | "follow_engagers" | "follow_accept" | "follow_suggestions";
   }): Promise<CommandOutcome> {
     const target = this.resolveFollowTargetMode(input.payload);
     const actionLabel = input.action === "follow_engagers"
       ? "follow-engagers"
       : input.action === "follow_accept"
         ? "follow-accept"
+        : input.action === "follow_suggestions"
+          ? "follow-suggestions"
         : "follow";
     const applyFollowForHandles = async (handles: string[]) => {
       const followed: string[] = [];
@@ -5596,32 +5744,69 @@ export class CommandExecutor {
       });
     }
 
-    if (input.action === "follow_engagers") {
+    if (input.action === "follow_engagers" || input.action === "follow_suggestions") {
       const requestedCount = this.resolveFollowEngagersCount(input.payload);
       const lookbackDays = asPositiveInt(input.payload.followLookbackDays) ?? 120;
+      const suggestionOptions = this.resolveFollowSuggestionOptions(input.payload);
+      const discoverySource: "browse_agents" | "browse_top_engagers" =
+        suggestionOptions.agentOnly ? "browse_agents" : "browse_top_engagers";
       let candidateHandles: string[] = [];
+      const browsedAgentByHandle = new Map<
+        string,
+        {
+          name: string | null;
+          score: number | null;
+          reason: string | null;
+        }
+      >();
       try {
-        const lookup = await this.callAgentBridgeLookupCached(
-          {
-            action: "browse_top_engagers",
-            limit: Math.min(60, Math.max(24, requestedCount * 4)),
-            windowHours: lookbackDays * 24,
-          },
-          4_000,
-        );
-        candidateHandles = this.extractTopEngagerHandlesFromLookup(lookup.value, 60);
+        if (discoverySource === "browse_agents") {
+          const lookup = await this.callAgentBridgeLookupCached(
+            {
+              action: "browse_agents",
+              ...(suggestionOptions.topicHint ? { query: suggestionOptions.topicHint } : {}),
+              limit: Math.min(60, Math.max(24, requestedCount * 4)),
+              includeFollowing: true,
+              includeFollowers: true,
+              includeRecentPosters: true,
+            },
+            4_000,
+          );
+          const browsedCandidates = this.extractBrowsedAgentCandidates(lookup.value, 60);
+          for (const candidate of browsedCandidates) {
+            browsedAgentByHandle.set(candidate.handle, {
+              name: candidate.name,
+              score: candidate.score,
+              reason: candidate.reason,
+            });
+          }
+          candidateHandles = browsedCandidates.map((entry) => entry.handle);
+        } else {
+          const lookup = await this.callAgentBridgeLookupCached(
+            {
+              action: "browse_top_engagers",
+              limit: Math.min(60, Math.max(24, requestedCount * 4)),
+              windowHours: lookbackDays * 24,
+            },
+            4_000,
+          );
+          candidateHandles = this.extractTopEngagerHandlesFromLookup(lookup.value, 60);
+        }
       } catch (error: unknown) {
         return this.failedOutcome(
           input.command,
-          `Follow-engagers lookup failed: ${
+          `Follow candidate lookup failed: ${
             error instanceof Error ? error.message : String(error)
           }`,
-          "follow_engagers_lookup_failed",
+          "follow_candidate_lookup_failed",
         );
       }
       if (candidateHandles.length === 0) {
-        const body =
-          target === "agent"
+        const body = discoverySource === "browse_agents"
+          ? suggestionOptions.topicHint
+            ? `I could not find agent accounts matching "${suggestionOptions.topicHint}" yet.`
+            : "I could not find discoverable agent accounts right now."
+          : target === "agent"
             ? `I do not have recent engagers left to follow on the agent account (last ${lookbackDays} days).`
             : `I do not see recent engagers left to follow on your account (last ${lookbackDays} days).`;
         return this.successOutcome(input.command, {
@@ -5630,6 +5815,8 @@ export class CommandExecutor {
           requestedCount,
           lookbackDays,
           candidatesFound: 0,
+          discoverySource,
+          agentOnly: suggestionOptions.agentOnly,
           chatCompletion: {
             body,
             metadata: {
@@ -5646,8 +5833,99 @@ export class CommandExecutor {
         });
       }
       const selectedHandles = candidateHandles.slice(0, requestedCount);
+      if (input.action === "follow_suggestions") {
+        const remainingCount = Math.max(0, candidateHandles.length - selectedHandles.length);
+        const compactHandles = selectedHandles.slice(0, 12);
+        const summaryText = (() => {
+          if (compactHandles.length === 0) {
+            return "I found candidates, but could not shape a follow suggestion list right now.";
+          }
+          if (discoverySource === "browse_agents") {
+            const listLines = compactHandles.map((handle, index) => {
+              const browsed = browsedAgentByHandle.get(handle);
+              return `${index + 1}. @${handle}${browsed?.name ? ` — ${browsed.name}` : ""}`;
+            });
+            const listedProfiles = compactHandles
+              .map((handle) => browsedAgentByHandle.get(handle) ?? null)
+              .filter(
+                (entry): entry is { name: string | null; score: number | null; reason: string | null } =>
+                  Boolean(entry),
+              );
+            const mostlyDiscoverableSeed =
+              listedProfiles.length > 0 &&
+              listedProfiles.every(
+                (entry) =>
+                  entry.reason === "discoverable_agent" &&
+                  (entry.score === null || entry.score <= 55),
+              );
+            const lines = [
+              `Found ${candidateHandles.length} agent account${candidateHandles.length === 1 ? "" : "s"}${suggestionOptions.topicHint ? ` for "${suggestionOptions.topicHint}"` : ""}.`,
+              `Top ${listLines.length}:`,
+              ...listLines,
+            ];
+            if (remainingCount > 0) {
+              lines.push(`+${remainingCount} more available.`);
+            }
+            if (mostlyDiscoverableSeed) {
+              lines.push(
+                "Fair warning: most results currently look like seed placeholders with limited activity signals.",
+              );
+            }
+            lines.push(
+              `Reply with /follow @handle or /follow-engagers ${compactHandles.length} to apply follows.`,
+            );
+            return lines.join("\n");
+          }
+          const compactHandleText = compactHandles.map((entry) => `@${entry}`).join(", ");
+          return `Top ${compactHandles.length} account${compactHandles.length === 1 ? "" : "s"} to consider: ${compactHandleText}.${remainingCount > 0 ? ` (+${remainingCount} more)` : ""} Reply with /follow @handle or /follow-engagers ${compactHandles.length} to apply follows.`;
+        })();
+        await this.recordCommandLifecycleCheckpoint({
+          command: input.command,
+          stage: "generated",
+          status: "ok",
+          metadata: {
+            action: actionLabel,
+            target,
+            requestedCount,
+            candidatesFound: candidateHandles.length,
+            suggestedCount: compactHandles.length,
+            remainingCount,
+            discoverySource,
+            agentOnly: suggestionOptions.agentOnly,
+            topicHint: suggestionOptions.topicHint,
+          },
+        });
+        return this.successOutcome(input.command, {
+          followAction: actionLabel,
+          target,
+          requestedCount,
+          lookbackDays,
+          candidateHandles,
+          suggestedHandles: selectedHandles,
+          remainingCount,
+          discoverySource,
+          agentOnly: suggestionOptions.agentOnly,
+          topicHint: suggestionOptions.topicHint,
+          chatCompletion: {
+            body: summaryText,
+            metadata: {
+              automated: true,
+              sourceContext: "CHAT",
+              actionPreview: {
+                type: "follow",
+                status: "success",
+                title: "Follow suggestions",
+                summary: summaryText,
+                suggestedCount: compactHandles.length,
+                requestedCount,
+              },
+            },
+          },
+        });
+      }
       const applied = await applyFollowForHandles(selectedHandles);
       const remainingCount = Math.max(0, candidateHandles.length - selectedHandles.length);
+      const sourcedFromEngagers = discoverySource === "browse_top_engagers";
       const summaryText = this.buildFollowSummaryText({
         target,
         followed: applied.followed,
@@ -5656,8 +5934,8 @@ export class CommandExecutor {
         self: applied.self,
         blocked: applied.blocked,
         failed: applied.failed,
-        remainingCount,
-        followEngagers: true,
+        ...(sourcedFromEngagers ? { remainingCount } : {}),
+        followEngagers: sourcedFromEngagers,
       });
       await this.recordCommandLifecycleCheckpoint({
         command: input.command,
@@ -5679,6 +5957,9 @@ export class CommandExecutor {
             applied.self.length +
             applied.blocked.length,
           remainingCount,
+          discoverySource,
+          agentOnly: suggestionOptions.agentOnly,
+          topicHint: suggestionOptions.topicHint,
         },
       });
       return this.successOutcome(input.command, {
@@ -5696,6 +5977,9 @@ export class CommandExecutor {
         failedHandles: applied.failed,
         errors: applied.errors,
         remainingCount,
+        discoverySource,
+        agentOnly: suggestionOptions.agentOnly,
+        topicHint: suggestionOptions.topicHint,
         chatCompletion: {
           body: summaryText,
           metadata: {
@@ -5707,7 +5991,10 @@ export class CommandExecutor {
                 applied.followed.length > 0 || applied.alreadyFollowed.length > 0
                   ? "success"
                   : "failed",
-              title: "Follow-engagers update",
+              title:
+                discoverySource === "browse_top_engagers"
+                  ? "Follow-engagers update"
+                  : "Follow update",
               summary: summaryText,
             },
           },
@@ -6429,6 +6716,9 @@ export class CommandExecutor {
       ? payload.generatedCustomAssetSave
       : null;
     if (explicit) {
+      if (explicit.disabled === true || explicit.enabled === false) {
+        return null;
+      }
       const explicitKind = this.parseGeneratedCustomAssetKind(explicit.kind);
       const explicitScope =
         this.parseGeneratedCustomAssetScope(explicit.scope) ?? "mine";
@@ -6587,6 +6877,8 @@ export class CommandExecutor {
       scope: input.intent.scope,
       name,
       id,
+      url: asNonEmptyString(savedRecord?.url),
+      mimeType: asNonEmptyString(savedRecord?.mimeType)?.toLowerCase() ?? null,
     };
   }
 
@@ -7042,6 +7334,20 @@ export class CommandExecutor {
             maxAttempts: input.kind === "processing" ? 4 : 8,
             fallbackDelayMs: input.kind === "processing" ? 220 : 420,
           });
+        const editedByClientMessageId = await callEdit({
+          action: "edit_message",
+          clientMessageId: previewClientMessageId,
+          ...chatRoute,
+          body: input.body,
+          ...(input.attachments ? { attachments: input.attachments } : {}),
+          metadata: input.metadata,
+        });
+        const editedByClientMessageIdResolved = extractBridgeMessageId(
+          editedByClientMessageId,
+        );
+        if (editedByClientMessageIdResolved) {
+          return editedByClientMessageIdResolved;
+        }
         if (resolvedPreviewMessageId) {
           const editedByMessageId = await callEdit({
             action: "edit_message",
@@ -7053,15 +7359,7 @@ export class CommandExecutor {
           });
           return extractBridgeMessageId(editedByMessageId) ?? resolvedPreviewMessageId;
         }
-        const editedByClientMessageId = await callEdit({
-          action: "edit_message",
-          clientMessageId: previewClientMessageId,
-          ...chatRoute,
-          body: input.body,
-          ...(input.attachments ? { attachments: input.attachments } : {}),
-          metadata: input.metadata,
-        });
-        return extractBridgeMessageId(editedByClientMessageId);
+        return null;
       };
       try {
         const editedMessageId = await runEdit();
@@ -7567,17 +7865,6 @@ export class CommandExecutor {
         });
       }
 
-      const streamPreviewForSuccess = buildStreamPreviewMetadata({
-        frames: snapshotStreamFrames(),
-        maxFrames: MAX_FINALIZE_STREAM_FRAMES,
-        finalPreviewUrl: chatDeliveryUrl,
-      });
-      const streamPreviewDeltaForSuccess = buildStreamPreviewDeltaMetadata({
-        frames: snapshotStreamFrames(),
-        deltaBaseCount: previewStreamFrameCursor,
-        maxDeltaFrames: MAX_FINALIZE_STREAM_FRAMES,
-        finalPreviewUrl: chatDeliveryUrl,
-      });
       let generatedCustomAssetSaveResult: GeneratedCustomAssetSaveResult | null = null;
       let generatedCustomAssetSaveError: string | null = null;
       if (generatedCustomAssetSaveIntent) {
@@ -7608,13 +7895,26 @@ export class CommandExecutor {
           : generatedCustomAssetSaveError && generatedCustomAssetSaveIntent
             ? `Generated ${generatedLabel} for "${summary}". Could not save to ${generatedCustomAssetSaveIntent.scope} ${generatedCustomAssetSaveIntent.kind}s (${truncateText(generatedCustomAssetSaveError, 120)}).`
             : `Generated ${generatedLabel} for "${summary}".`;
+      const finalChatDeliveryUrl = generatedCustomAssetSaveResult?.url ?? chatDeliveryUrl;
+      const finalMimeType = generatedCustomAssetSaveResult?.mimeType ?? mimeType;
+      const streamPreviewForSuccess = buildStreamPreviewMetadata({
+        frames: snapshotStreamFrames(),
+        maxFrames: MAX_FINALIZE_STREAM_FRAMES,
+        finalPreviewUrl: finalChatDeliveryUrl,
+      });
+      const streamPreviewDeltaForSuccess = buildStreamPreviewDeltaMetadata({
+        frames: snapshotStreamFrames(),
+        deltaBaseCount: previewStreamFrameCursor,
+        maxDeltaFrames: MAX_FINALIZE_STREAM_FRAMES,
+        finalPreviewUrl: finalChatDeliveryUrl,
+      });
       const chatDeliveryHandled = await sendOrEditPreviewMessage({
         kind: "success",
         body: successBody,
         attachments: [
           {
-            url: chatDeliveryUrl,
-            mimeType,
+            url: finalChatDeliveryUrl,
+            mimeType: finalMimeType,
             sizeBytes,
             metadata: {
               source: "runtime.generate",
@@ -7631,8 +7931,8 @@ export class CommandExecutor {
             title: `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generated`,
             summary,
             streamSessionId: previewClientMessageId,
-            previewUrl: chatDeliveryUrl,
-            href: chatDeliveryUrl,
+            previewUrl: finalChatDeliveryUrl,
+            href: finalChatDeliveryUrl,
             hrefLabel: `Open ${generatedLabel}`,
             ...(generatedCustomAssetSaveResult
               ? {
@@ -7667,7 +7967,7 @@ export class CommandExecutor {
         at: nowIso(),
         commandId: command.id,
         generatedAssetType,
-        mediaUrl: media.mediaUrl,
+        mediaUrl: finalChatDeliveryUrl,
         prompt: summary,
         customAssetKind: generatedCustomAssetSaveResult?.kind ?? null,
         customAssetScope: generatedCustomAssetSaveResult?.scope ?? null,
@@ -7679,7 +7979,7 @@ export class CommandExecutor {
       });
       return this.successOutcome(command, {
         generatedAssetType,
-        mediaUrl: media.mediaUrl,
+        mediaUrl: finalChatDeliveryUrl,
         prompt: summary,
         ...(generatedCustomAssetSaveResult
           ? { customAsset: generatedCustomAssetSaveResult }
@@ -10782,6 +11082,130 @@ export class CommandExecutor {
     });
   }
 
+  private buildDeterministicChatClientMessageId(input: {
+    prefix: string;
+    stableKey: string;
+  }): string {
+    const normalizedPrefix = input.prefix
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_]+/gu, "_")
+      .slice(0, 32);
+    const fallbackPrefix = normalizedPrefix.length > 0 ? normalizedPrefix : "runtime_chat";
+    const digest = crypto
+      .createHash("sha256")
+      .update(input.stableKey)
+      .digest("hex")
+      .slice(0, 32);
+    return `${fallbackPrefix}_${digest}`;
+  }
+
+  private resolveChatProcessingClientMessageId(command: Command): string | null {
+    const payload = isRecord(command.payload) ? command.payload : null;
+    if (!payload) return null;
+    const sourceContext = asNonEmptyString(payload.sourceContext)?.toLowerCase() ?? "";
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    if (sourceContext !== "chat" && !chatContext) return null;
+    if (payload.chatLiteralGenerate === true || payload.chatLiteralGenerate === "true") {
+      return null;
+    }
+    if (payload.requireDraftOnly === true || payload.requireDraftOnly === "true") {
+      return null;
+    }
+    return this.buildDeterministicChatClientMessageId({
+      prefix: "runtime_chat_progress",
+      stableKey: command.id,
+    });
+  }
+
+  private buildChatProcessingIndicator(command: Command): {
+    body: string;
+    metadata: Record<string, unknown>;
+  } | null {
+    const payload = isRecord(command.payload) ? command.payload : null;
+    if (!payload) return null;
+    const commandName = this.resolveChatCommandName(payload) ?? command.kind;
+    const normalizedName = commandName.trim().toLowerCase();
+    const shortName = normalizedName.startsWith("write.")
+      ? normalizedName.slice("write.".length)
+      : normalizedName.startsWith("brain.")
+        ? normalizedName.slice("brain.".length)
+        : normalizedName;
+    const previewType =
+      shortName.includes("follow")
+        ? "follow"
+        : shortName.includes("repost")
+          ? "repost"
+          : shortName.includes("vote") || shortName.includes("like")
+            ? "like"
+            : "command";
+    const summary =
+      shortName.length > 0
+        ? `Running ${shortName.replace(/[_-]+/gu, " ")}.`
+        : "Running your request.";
+    return {
+      body: "Working on that now.",
+      metadata: {
+        automated: true,
+        sourceContext: "CHAT",
+        actionPreview: {
+          type: previewType,
+          status: "processing",
+          title: "In progress",
+          summary,
+          commandId: command.id,
+          commandName,
+        },
+      },
+    };
+  }
+
+  private async emitChatProcessingIndicator(command: Command): Promise<boolean> {
+    const callAgentChatBridge = this.ctx.callAgentChatBridge;
+    if (!callAgentChatBridge) return false;
+    const chatTarget = resolveChatTargetFromPayload(command.payload);
+    if (!chatTarget) return false;
+    const processingClientMessageId = this.resolveChatProcessingClientMessageId(command);
+    if (!processingClientMessageId) return false;
+    const processingIndicator = this.buildChatProcessingIndicator(command);
+    if (!processingIndicator) return false;
+    const route = chatTarget.conversationId
+      ? { conversationId: chatTarget.conversationId }
+      : { channelId: chatTarget.channelId };
+    try {
+      await callAgentChatBridge({
+        action: "send_message",
+        clientMessageId: processingClientMessageId,
+        ...route,
+        body: clampPublishText(processingIndicator.body, 1200),
+        format: "markdown",
+        metadata: processingIndicator.metadata,
+      });
+      await this.ctx.memory
+        .recordWrite({
+          type: "chat_command_processing_sent",
+          at: nowIso(),
+          commandId: command.id,
+          kind: command.kind,
+          targetConversationId: chatTarget.conversationId ?? null,
+          targetChannelId: chatTarget.channelId ?? null,
+        })
+        .catch(() => undefined);
+      return true;
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "chat_command_processing_send_failed",
+          at: nowIso(),
+          commandId: command.id,
+          kind: command.kind,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return false;
+    }
+  }
+
   private buildNonWriteChatCompletion(input: {
     command: Command;
     outcome: CommandOutcome;
@@ -10830,10 +11254,79 @@ export class CommandExecutor {
 
     const executed = Array.isArray(data?.executed) ? data.executed : [];
     const executedCount = executed.length;
-    const summary =
-      executedCount > 0
-        ? `Done. Executed ${executedCount} action${executedCount === 1 ? "" : "s"}.`
-        : "Done.";
+    const readHandleList = (value: unknown): string[] =>
+      Array.from(
+        new Set(
+          (Array.isArray(value) ? value : [])
+            .map((entry) =>
+              asNonEmptyString(entry)
+                ?.replace(/^@+/u, "")
+                .toLowerCase() ?? null,
+            )
+            .filter((entry): entry is string => Boolean(entry)),
+        ),
+      );
+    const followedHandles = readHandleList(data?.followedHandles);
+    const alreadyFollowedHandles = readHandleList(data?.alreadyFollowedHandles);
+    const failedHandles = readHandleList(data?.failedHandles);
+    const normalizeKindForSummary = (value: string): string => {
+      const normalized = value.trim().toLowerCase();
+      if (normalized.startsWith("write.")) {
+        return normalized.slice("write.".length);
+      }
+      if (normalized.startsWith("brain.")) {
+        return normalized.slice("brain.".length);
+      }
+      return normalized;
+    };
+    const executedKinds = Array.from(
+      new Set(
+        executed
+          .map((entry) =>
+            isRecord(entry) ? asNonEmptyString(entry.kind) : null,
+          )
+          .filter((entry): entry is string => Boolean(entry))
+          .map((entry) => normalizeKindForSummary(entry)),
+      ),
+    );
+    let summary = "Done.";
+    if (
+      followedHandles.length > 0 ||
+      alreadyFollowedHandles.length > 0 ||
+      failedHandles.length > 0
+    ) {
+      const parts: string[] = [];
+      if (followedHandles.length > 0) {
+        parts.push(
+          `Followed: ${followedHandles
+            .slice(0, 8)
+            .map((entry) => `@${entry}`)
+            .join(", ")}${followedHandles.length > 8 ? ` (+${followedHandles.length - 8} more)` : ""}.`,
+        );
+      }
+      if (alreadyFollowedHandles.length > 0) {
+        parts.push(
+          `Already followed: ${alreadyFollowedHandles
+            .slice(0, 8)
+            .map((entry) => `@${entry}`)
+            .join(", ")}${alreadyFollowedHandles.length > 8 ? ` (+${alreadyFollowedHandles.length - 8} more)` : ""}.`,
+        );
+      }
+      if (failedHandles.length > 0) {
+        parts.push(
+          `Could not follow: ${failedHandles
+            .slice(0, 8)
+            .map((entry) => `@${entry}`)
+            .join(", ")}${failedHandles.length > 8 ? ` (+${failedHandles.length - 8} more)` : ""}.`,
+        );
+      }
+      summary = parts.length > 0 ? parts.join(" ") : summary;
+    } else if (executedCount > 0 && executedKinds.length > 0) {
+      summary =
+        `Done. Executed ${executedCount} action${executedCount === 1 ? "" : "s"}: ${executedKinds.slice(0, 4).join(", ")}${executedKinds.length > 4 ? ` (+${executedKinds.length - 4} more)` : ""}.`;
+    } else if (executedCount > 0) {
+      summary = `Done. Executed ${executedCount} action${executedCount === 1 ? "" : "s"}.`;
+    }
     return {
       body: summary,
       metadata: {
@@ -10844,7 +11337,14 @@ export class CommandExecutor {
           status: "success",
           title: "Command completed",
           summary: commandName,
+          detail: summary,
           executedCount,
+          ...(executedKinds.length > 0 ? { executedKinds } : {}),
+          ...(followedHandles.length > 0 ? { followedHandles } : {}),
+          ...(alreadyFollowedHandles.length > 0
+            ? { alreadyFollowedHandles }
+            : {}),
+          ...(failedHandles.length > 0 ? { failedHandles } : {}),
         },
       },
     };
@@ -10861,13 +11361,40 @@ export class CommandExecutor {
     const route = chatTarget.conversationId
       ? { conversationId: chatTarget.conversationId }
       : { channelId: chatTarget.channelId };
+    const processingClientMessageId = this.resolveChatProcessingClientMessageId(input.command);
+    if (processingClientMessageId) {
+      try {
+        await this.ctx.callAgentChatBridge({
+          action: "edit_message",
+          clientMessageId: processingClientMessageId,
+          ...route,
+          body: clampPublishText(input.body, 1200),
+          metadata: input.metadata,
+        });
+        await this.ctx.memory
+          .recordWrite({
+            type: "chat_command_result_edited",
+            at: nowIso(),
+            commandId: input.command.id,
+            kind: input.command.kind,
+            ok: true,
+            targetConversationId: chatTarget.conversationId ?? null,
+            targetChannelId: chatTarget.channelId ?? null,
+          })
+          .catch(() => undefined);
+        return true;
+      } catch {
+        // Fallback to sending a dedicated terminal message when progress message edit is unavailable.
+      }
+    }
+    const clientMessageId = this.buildDeterministicChatClientMessageId({
+      prefix: "runtime_chat_result",
+      stableKey: input.command.id,
+    });
     try {
       await this.ctx.callAgentChatBridge({
         action: "send_message",
-        clientMessageId: `runtime_chat_result_${Date.now().toString(36)}_${crypto
-          .randomUUID()
-          .replaceAll("-", "")
-          .slice(0, 10)}`,
+        clientMessageId,
         ...route,
         body: clampPublishText(input.body, 1200),
         format: "markdown",
