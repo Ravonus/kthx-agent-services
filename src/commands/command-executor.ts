@@ -1395,8 +1395,7 @@ export class CommandExecutor {
             code: "invalid_command_sig",
           },
         };
-        await this.writeOutcome(outcome);
-        await this.ackDirectiveForOutcome(command, outcome).catch(() => undefined);
+        await this.finalizeCommandOutcome({ command, outcome });
         await this.moveInboxFileToProcessed(filePath, "rejected");
         await this.markQueueItemCompletedByInbox(inboxFile, "failed", "invalid command signature");
         return true;
@@ -1461,8 +1460,7 @@ export class CommandExecutor {
         kind: command.kind,
         reason: sealError,
       }).catch(() => undefined);
-      await this.writeOutcome(outcome);
-      await this.ackDirectiveForOutcome(command, outcome).catch(() => undefined);
+      await this.finalizeCommandOutcome({ command, outcome });
       await this.moveInboxFileToProcessed(filePath, "rejected");
       await this.markQueueItemCompletedByInbox(
         inboxFile,
@@ -1545,9 +1543,7 @@ export class CommandExecutor {
       });
     }
 
-    await this.writeOutcome(outcome);
-    await this.ackDirectiveForOutcome(command, outcome).catch(() => undefined);
-    await this.emitChatOutcome(command, outcome).catch(() => undefined);
+    await this.finalizeCommandOutcome({ command, outcome });
 
     if (outcome.ok) {
       await this.moveInboxFileToProcessed(filePath, "done");
@@ -5906,10 +5902,22 @@ export class CommandExecutor {
     }
     if (permissionFilteredDrafts.length === 0) {
       if (payload.requireDraftOnly === true) {
-        await this.sendDraftFailureMessage({
+        const previewDelivered = await this.sendDraftFailureMessage({
           payload,
           message: "I couldn't generate a draft right now. Please try again.",
-        }).catch(() => undefined);
+        }).catch(() => false);
+        const failed = this.failedOutcome(
+          command,
+          "generate returned no permission-allowed drafts.",
+          "no_permitted_drafts",
+        );
+        return {
+          ...failed,
+          data: {
+            mode: "draft_preview",
+            chatDeliveryHandled: previewDelivered,
+          },
+        };
       }
       return this.failedOutcome(
         command,
@@ -5922,15 +5930,22 @@ export class CommandExecutor {
     if (requireDraftOnly) {
       const draftPreview = this.buildDraftPreviewPayload(permissionFilteredDrafts);
       if (!draftPreview) {
-        await this.sendDraftFailureMessage({
+        const previewDelivered = await this.sendDraftFailureMessage({
           payload,
           message: "I generated output, but couldn't shape a readable draft preview.",
-        }).catch(() => undefined);
-        return this.failedOutcome(
+        }).catch(() => false);
+        const failed = this.failedOutcome(
           command,
           "generate returned drafts without previewable text.",
           "draft_preview_missing",
         );
+        return {
+          ...failed,
+          data: {
+            mode: "draft_preview",
+            chatDeliveryHandled: previewDelivered,
+          },
+        };
       }
       const previewDelivered = await this.sendDraftPreviewMessage({
         payload,
@@ -6609,6 +6624,8 @@ export class CommandExecutor {
     let previewProgressFingerprint = "";
     let previewProgressUpdatedAtMs = 0;
     let latestMediaProgress: MediaGenerationProgress | null = null;
+    let generationCompleted = false;
+    let uploadCompleted = false;
     const snapshotStreamFrames = (): MediaGeneratorStreamFrame[] => {
       const progress = latestMediaProgress;
       return progress && Array.isArray(progress.streamFrames)
@@ -6853,6 +6870,7 @@ export class CommandExecutor {
         referenceInputs,
         onProgress: emitStreamProgress,
       });
+      generationCompleted = true;
       const mimeType = this.resolveGeneratedAttachmentMimeType({
         generatedAssetType,
         mediaUrl: media.mediaUrl,
@@ -6864,6 +6882,19 @@ export class CommandExecutor {
         media.mediaSizeBytes > 0
           ? Math.max(1, Math.floor(media.mediaSizeBytes))
           : 1;
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "generated",
+        status: "ok",
+        metadata: {
+          generatedAssetType,
+          mode: avatarRequest
+            ? "chat_avatar_update"
+            : bannerRequest
+              ? "chat_banner_update"
+              : "chat_literal_generate",
+        },
+      });
       await this.recordCommandLifecycleCheckpoint({
         command,
         stage: "uploaded",
@@ -6879,6 +6910,7 @@ export class CommandExecutor {
               : "chat_literal_generate",
         },
       });
+      uploadCompleted = true;
       if (avatarRequest) {
         const avatarCropSpec =
           profileCropSpec?.target === "avatar"
@@ -7266,18 +7298,14 @@ export class CommandExecutor {
       const message = error instanceof Error ? error.message : String(error);
       const isPromptCurationFailure = /prompt_curation_/iu.test(message);
       const isChatDeliveryFailure = /chat_preview_finalize_failed:/iu.test(message);
-      await this.recordCommandLifecycleCheckpoint({
-        command,
-        stage: isChatDeliveryFailure ? "chat_delivery" : "uploaded",
-        status: "failed",
-        message,
-        metadata: {
-          generatedAssetType,
-          avatarRequest,
-          bannerRequest,
-        },
-      });
-      await sendOrEditPreviewMessage({
+      const failureStage: CommandLifecycleCheckpointStage = isChatDeliveryFailure
+        ? "chat_delivery"
+        : uploadCompleted
+          ? "uploaded"
+          : generationCompleted
+            ? "generated"
+            : "generated";
+      const previewFailureDelivered = await sendOrEditPreviewMessage({
         kind: "failed",
         body: avatarRequest
           ? "I could not update that avatar right now. Please retry in a moment."
@@ -7307,7 +7335,27 @@ export class CommandExecutor {
             error: truncateText(message, 240),
           },
         },
-      }).catch(() => undefined);
+      }).catch(() => false);
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: failureStage,
+        status:
+          failureStage === "chat_delivery" && previewFailureDelivered
+            ? "ok"
+            : "failed",
+        message:
+          failureStage === "chat_delivery" && previewFailureDelivered
+            ? null
+            : message,
+        metadata: {
+          generatedAssetType,
+          avatarRequest,
+          bannerRequest,
+          ...(failureStage === "chat_delivery"
+            ? { recoveredWithFailureMessage: previewFailureDelivered }
+            : {}),
+        },
+      });
       await this.ctx.memory.recordWrite({
         type: "chat_literal_generate_failed",
         at: nowIso(),
@@ -7317,7 +7365,7 @@ export class CommandExecutor {
         bannerRequest,
         error: message,
       });
-      return this.failedOutcome(
+      const failed = this.failedOutcome(
         command,
         avatarRequest
           ? `Avatar update failed: ${message}`
@@ -7334,6 +7382,15 @@ export class CommandExecutor {
               ? "chat_delivery_failed"
             : "literal_generate_failed",
       );
+      return {
+        ...failed,
+        data: {
+          mode: "chat_literal_generate",
+          generatedAssetType,
+          chatDeliveryHandled: previewFailureDelivered,
+          chatDeliveryCheckpointRecorded: failureStage === "chat_delivery",
+        },
+      };
     }
   }
 
@@ -10435,32 +10492,50 @@ export class CommandExecutor {
     }
   }
 
-  private async emitChatOutcome(command: Command, outcome: CommandOutcome): Promise<void> {
+  private async emitChatOutcome(command: Command, outcome: CommandOutcome): Promise<boolean> {
     const payload = isRecord(command.payload) ? command.payload : null;
     const chatTarget = resolveChatTargetFromPayload(payload ?? null);
-    if (!chatTarget) return;
+    if (!chatTarget) {
+      const sourceContext = asNonEmptyString(payload?.sourceContext)?.toLowerCase() ?? "";
+      if (sourceContext === "chat" || isRecord(payload?.chatContext)) {
+        await this.recordCommandLifecycleCheckpoint({
+          command,
+          stage: "chat_delivery",
+          status: "failed",
+          message: "chat_target_missing",
+          metadata: {
+            mode: "terminal_delivery",
+          },
+        });
+      }
+      return false;
+    }
     const outcomeData = isRecord(outcome.data) ? outcome.data : null;
     const chatDeliveryHandled = outcomeData?.chatDeliveryHandled === true;
 
     if (
       (payload?.chatLiteralGenerate === true || payload?.requireDraftOnly === true) &&
-      outcome.ok &&
       chatDeliveryHandled
     ) {
+      if (outcomeData?.chatDeliveryCheckpointRecorded === true) {
+        return true;
+      }
       await this.recordCommandLifecycleCheckpoint({
         command,
         stage: "chat_delivery",
         status: "ok",
         metadata: {
           mode: payload.chatLiteralGenerate === true ? "chat_literal_generate_preview" : "draft_preview",
+          outcomeOk: outcome.ok,
         },
       });
-      return;
+      return true;
     }
 
     const kind = command.kind.trim().toLowerCase();
     if (kind.startsWith("write.")) {
-      const delivered = await sendChatResultMessageFromOutcome({
+      let fallbackUsed = false;
+      let delivered = await sendChatResultMessageFromOutcome({
         command,
         outcome,
         chatTarget,
@@ -10469,19 +10544,43 @@ export class CommandExecutor {
           memory: this.ctx.memory,
         },
       });
+      if (!delivered) {
+        const fallbackCompletion = this.buildNonWriteChatCompletion({ command, outcome });
+        if (fallbackCompletion) {
+          fallbackUsed = true;
+          delivered = await this.sendNonWriteChatCompletion({
+            command,
+            body: fallbackCompletion.body,
+            metadata: fallbackCompletion.metadata,
+          });
+        }
+      }
       await this.recordCommandLifecycleCheckpoint({
         command,
         stage: "chat_delivery",
         status: delivered ? "ok" : "failed",
+        message: delivered ? null : "chat_result_send_failed",
         metadata: {
           mode: "write_outcome",
+          usedFallback: fallbackUsed,
         },
       });
-      return;
+      return delivered;
     }
 
     const completion = this.buildNonWriteChatCompletion({ command, outcome });
-    if (!completion) return;
+    if (!completion) {
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "chat_delivery",
+        status: "failed",
+        message: "chat_completion_unavailable",
+        metadata: {
+          mode: "non_write_terminal",
+        },
+      });
+      return false;
+    }
     const delivered = await this.sendNonWriteChatCompletion({
       command,
       body: completion.body,
@@ -10496,6 +10595,7 @@ export class CommandExecutor {
         mode: "non_write_terminal",
       },
     });
+    return delivered;
   }
 
   private buildDraftPreviewPayload(drafts: GeneratedDraft[]): DraftPreviewPayload | null {
@@ -10745,6 +10845,25 @@ export class CommandExecutor {
         ...(code ? { code } : {}),
       },
     };
+  }
+
+  private async finalizeCommandOutcome(input: {
+    command: Command;
+    outcome: CommandOutcome;
+  }): Promise<void> {
+    await this.writeOutcome(input.outcome);
+    await this.emitChatOutcome(input.command, input.outcome).catch(async (error: unknown) => {
+      await this.recordCommandLifecycleCheckpoint({
+        command: input.command,
+        stage: "chat_delivery",
+        status: "failed",
+        message: error instanceof Error ? error.message : String(error),
+        metadata: {
+          mode: "emit_exception",
+        },
+      });
+    });
+    await this.ackDirectiveForOutcome(input.command, input.outcome).catch(() => undefined);
   }
 
   private async ackDirectiveForOutcome(
