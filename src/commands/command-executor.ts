@@ -6663,7 +6663,7 @@ export class CommandExecutor {
         const listed = await callAgentChatBridge({
           action: "list_messages",
           ...chatRoute,
-          limit: 120,
+          limit: 80,
         });
         const data = isRecord(listed) ? listed : null;
         const items = data ? toUnknownArray(data.items) : [];
@@ -6700,40 +6700,35 @@ export class CommandExecutor {
     }): Promise<boolean> => {
       const callAgentChatBridge = this.ctx.callAgentChatBridge;
       if (!callAgentChatBridge) return false;
-      const runEdit = async (messageId: string): Promise<void> => {
-        await callAgentChatBridge({
+      const runEdit = async (messageId: string | null): Promise<string | null> => {
+        const edited = await callAgentChatBridge({
           action: "edit_message",
-          messageId,
+          ...(messageId ? { messageId } : {}),
+          clientMessageId: previewClientMessageId,
+          ...chatRoute,
           body: input.body,
           ...(input.attachments ? { attachments: input.attachments } : {}),
           metadata: input.metadata,
         });
+        return extractBridgeMessageId(edited);
       };
       let messageId = previewMessageId ?? (await maybeResolvePreviewMessageId(true));
-      if (!messageId) return false;
       try {
-        await runEdit(messageId);
-        previewMessageId = messageId;
+        const editedMessageId = await runEdit(messageId);
+        previewMessageId = messageId ?? editedMessageId ?? previewMessageId;
+        if (!previewMessageId) {
+          previewMessageId = await maybeResolvePreviewMessageId(true);
+        }
         return true;
       } catch (firstError: unknown) {
         previewMessageId = null;
         messageId = await maybeResolvePreviewMessageId(true);
-        if (!messageId) {
-          await this.ctx.memory
-            .recordWrite({
-              type: "chat_literal_generate_preview_edit_failed",
-              at: nowIso(),
-              commandId: command.id,
-              kind: input.kind,
-              message:
-                firstError instanceof Error ? firstError.message : String(firstError),
-            })
-            .catch(() => undefined);
-          return false;
-        }
         try {
-          await runEdit(messageId);
-          previewMessageId = messageId;
+          const editedMessageId = await runEdit(messageId);
+          previewMessageId = messageId ?? editedMessageId ?? previewMessageId;
+          if (!previewMessageId) {
+            previewMessageId = await maybeResolvePreviewMessageId(true);
+          }
           return true;
         } catch (retryError: unknown) {
           await this.ctx.memory
