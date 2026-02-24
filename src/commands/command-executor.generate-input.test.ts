@@ -237,4 +237,59 @@ describe("command executor generate input", () => {
       "https://cdn.example.com/persona/fullbody-opt.jpg",
     ]);
   });
+
+  it("infers main persona references for selfie prompts when mediaPersona is generic", async () => {
+    const executor = createExecutor({
+      personaFrames: [
+        {
+          id: 11,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/main-selfie.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/main-selfie-opt.jpg",
+          updatedAt: "2026-02-24T05:30:00.000Z",
+        },
+        {
+          id: 12,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/main-midshot.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/main-midshot-opt.jpg",
+          updatedAt: "2026-02-24T05:31:00.000Z",
+        },
+        {
+          id: 13,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/main-fullbody.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/main-fullbody-opt.jpg",
+          updatedAt: "2026-02-24T05:32:00.000Z",
+        },
+      ],
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        mediaPersona: "default",
+        mediaPrompt: "Create a selfie of yourself at sunset on a city rooftop.",
+        mediaReferenceUrls: ["https://cdn.example.com/noise/temporary-ref.png"],
+      },
+      baseCommand(),
+    );
+
+    expect(Array.isArray(result.mediaReferenceUrls)).toBe(true);
+    if (!Array.isArray(result.mediaReferenceUrls)) return;
+    expect(result.mediaReferenceUrls).toEqual([
+      "https://cdn.example.com/persona/main-selfie-opt.jpg",
+      "https://cdn.example.com/persona/main-midshot-opt.jpg",
+      "https://cdn.example.com/persona/main-fullbody-opt.jpg",
+    ]);
+  });
 });

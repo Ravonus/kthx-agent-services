@@ -56,6 +56,32 @@ const PERSONA_REFERENCE_FRAME_ROLES = ["selfie", "midshot", "fullbody"] as const
 const REQUIRED_PERSONA_REFERENCE_FRAME_COUNT = PERSONA_REFERENCE_FRAME_ROLES.length;
 const PERSONA_REFERENCE_MAX_SIDE = 640;
 const PERSONA_REFERENCE_JPEG_QUALITY = 62;
+const DEFAULT_MAIN_PERSONA_SLUG = "realistic_core";
+const GENERIC_PERSONA_SLUGS = new Set([
+  "default",
+  "general",
+  "none",
+  "auto",
+  "persona",
+  "selfie",
+  "self",
+  "me",
+  "myself",
+]);
+const PERSONA_SELF_REFERENCE_PROMPT_PATTERN =
+  /\b(selfie|self[-\s]?portrait|portrait of (?:me|myself)|of me|my face|myself|as me|look like me|my appearance)\b/iu;
+const PERSONA_REQUEST_PROMPT_PATTERN =
+  /\b(persona|avatar|identity|character look|appearance)\b/iu;
+const PERSONA_VARIANT_PATTERNS: ReadonlyArray<{ key: string; pattern: RegExp }> = [
+  { key: "cartoon", pattern: /\b(cartoon|toon|comic)\b/iu },
+  { key: "anime", pattern: /\b(anime|manga)\b/iu },
+  { key: "meme", pattern: /\b(meme|shitpost)\b/iu },
+  { key: "pixel", pattern: /\b(pixel(?:\s*art)?|8[-\s]?bit)\b/iu },
+  { key: "clay", pattern: /\b(clay|claymation|stop[-\s]?motion)\b/iu },
+  { key: "cinematic", pattern: /\b(cinematic|film(?:ic)?|movie[-\s]?still)\b/iu },
+  { key: "cyberpunk", pattern: /\b(cyberpunk|neon[-\s]?noir)\b/iu },
+  { key: "vaporwave", pattern: /\b(vaporwave|synthwave)\b/iu },
+];
 const COMMENT_ECHO_PREFIX_PATTERN = /^frame\s*\d+\s*[:.-]/iu;
 const COMMENT_PROMPT_WRAPPER_PATTERN =
   /^(?:generate|create|make|draw|render)\s+(?:an?\s+)?(?:image|gif|avatar|banner|file)\b/iu;
@@ -69,9 +95,60 @@ const OWNER_CAPABILITY_COOLDOWN_MS = 60_000;
 const BRIDGE_LOOKUP_CACHE_TTL_MS = 12_000;
 const ENGAGEMENT_TARGET_CACHE_TTL_MS = 90_000;
 const ENGAGEMENT_TARGET_CACHE_MAX_ENTRIES = 240;
+const COMMENT_TARGET_REUSE_WINDOW_MS = 1000 * 60 * 60 * 6;
+const COMMENT_TARGET_HISTORY_LIMIT = 240;
+const COMMENT_RECENCY_TRACKED_STATES = new Set<CommandLifecycleState>([
+  "queued",
+  "context_ready",
+  "llm_running",
+  "action_running",
+  "acked",
+]);
 const POST_NOVELTY_HISTORY_WINDOW_MS = 1000 * 60 * 60 * 24 * 7;
 const POST_NOVELTY_HISTORY_MAX_ITEMS = 80;
 const POST_NOVELTY_MAX_AVOID_REFERENCES = 8;
+const POST_VARIETY_MODES = ["opinion", "reaction", "humor", "micro", "narrative"] as const;
+const POST_VARIETY_HISTORY_WINDOW_MS = 1000 * 60 * 60 * 24 * 7;
+const POST_VARIETY_HISTORY_MAX_ITEMS = 80;
+const POST_VARIETY_RECENT_COOLDOWN_COUNT = 2;
+const POST_DISCOVERY_SIGNAL_MAX_LINES = 8;
+const POST_DISCOVERY_SIGNAL_MAX_LENGTH = 1200;
+const POST_VARIETY_HINT_PATTERNS: ReadonlyArray<{
+  mode: PostVarietyMode;
+  weight: number;
+  pattern: RegExp;
+}> = [
+  {
+    mode: "opinion",
+    weight: 3,
+    pattern:
+      /\b(opinion|take|stance|argue|because|overrated|underrated|agree|disagree|hot[-\s]?take|should|must)\b/iu,
+  },
+  {
+    mode: "reaction",
+    weight: 3,
+    pattern:
+      /\b(react|reaction|reply|riff|trending|trend|news|update|drop|just happened|platform|timeline|feed)\b/iu,
+  },
+  {
+    mode: "humor",
+    weight: 3,
+    pattern:
+      /\b(funny|humor|joke|deadpan|roast|sarcasm|lmao|lol|meme|shitpost|bit)\b/iu,
+  },
+  {
+    mode: "micro",
+    weight: 3,
+    pattern:
+      /\b(micro|short|brief|concise|quick|one[-\s]?liner|two[-\s]?word|few words)\b/iu,
+  },
+  {
+    mode: "narrative",
+    weight: 3,
+    pattern:
+      /\b(story|scene|moment|day|night|walk|adventure|situation|memory|specific detail|concrete)\b/iu,
+  },
+];
 const MEDIA_GENERATOR_DEFAULT_BASE_URL = "http://127.0.0.1:4280";
 const MEDIA_GENERATOR_POLL_MS = 200;
 const MEDIA_GENERATOR_OPEN_TIMEOUT_MS = 45_000;
@@ -977,6 +1054,16 @@ type PersonaReferenceResolution = {
   personaSlug: string | null;
   frameReferences: string[];
   builtFrames: boolean;
+  mainPersonaSlug: string | null;
+  source: string | null;
+};
+type PersonaReferencePlan = {
+  enabled: boolean;
+  mainPersonaSlug: string;
+  targetPersonaSlug: string;
+  source: string;
+  explicitPersonaSlug: string | null;
+  variantKey: string | null;
 };
 type MediaGeneratorStreamFrame = {
   sourceFileName: string | null;
@@ -1052,6 +1139,7 @@ type PostDraftContext = {
   commentSummary: string | null;
   payloadHint: string | null;
   memorySummary: string | null;
+  platformSignals: string | null;
 };
 
 type TextPostVisualSlide = {
@@ -1072,6 +1160,7 @@ type EngagementTargetCandidate = {
   commentId: number | null;
   authorId: string | null;
   source: string;
+  postSnapshotHash?: string | null;
 };
 
 type EngagementLookupHints = {
@@ -1099,6 +1188,17 @@ type RecentPostNoveltyEntry = {
   targetPostId: number | null;
 };
 
+type PostVarietyMode = (typeof POST_VARIETY_MODES)[number];
+
+type RecentPostVarietyModeEntry = {
+  atMs: number;
+  postType: "text" | "media";
+  mode: PostVarietyMode;
+  commandId: string;
+  targetPostId: number | null;
+  signal: string;
+};
+
 type EngagementDecision = {
   shouldExecute: boolean;
   reason: string;
@@ -1123,6 +1223,21 @@ type OwnerCapabilityCooldown = {
   reason: string;
 };
 
+type RecentCommentTargetUsage = {
+  commandId: string;
+  postId: number;
+  commentId: number | null;
+  state: CommandLifecycleState;
+  updatedAtMs: number;
+  postSnapshotHash: string | null;
+};
+
+type CommentTargetReuseDecision = {
+  allow: boolean;
+  reason: string;
+  recentMatch: RecentCommentTargetUsage | null;
+};
+
 type CommandLifecycleCheckpointStage =
   | "received"
   | "queued"
@@ -1140,6 +1255,7 @@ export class CommandExecutor {
   private readonly inFlight = new Set<string>();
   private readonly ownerCapabilityDeniedByTarget = new Map<string, OwnerCapabilityCooldown>();
   private readonly recentPostNoveltyHistory: RecentPostNoveltyEntry[] = [];
+  private readonly recentPostVarietyModeHistory: RecentPostVarietyModeEntry[] = [];
   private readonly bridgeLookupCache = new Map<string, { expiresAtMs: number; value: unknown }>();
   private readonly engagementTargetCache = new Map<
     string,
@@ -1868,9 +1984,54 @@ export class CommandExecutor {
     return normalized.length > 0 ? normalized : null;
   }
 
-  private resolvePersonaSlugFromPayload(payload: Record<string, unknown>): string | null {
+  private isGenericPersonaSlug(value: string | null): boolean {
+    if (!value) return true;
+    return GENERIC_PERSONA_SLUGS.has(value);
+  }
+
+  private extractPersonaPromptText(payload: Record<string, unknown>): string {
     const context = isRecord(payload.context) ? payload.context : null;
-    const candidates: unknown[] = [
+    const fields: unknown[] = [
+      payload.requestText,
+      payload.topic,
+      payload.prompt,
+      payload.mediaPrompt,
+      payload.imagePrompt,
+      payload.instruction,
+      payload.caption,
+      payload.textBody,
+      context?.requestText,
+      context?.topic,
+      context?.prompt,
+      context?.mediaPrompt,
+      context?.imagePrompt,
+      context?.instruction,
+      context?.caption,
+      context?.textBody,
+    ];
+    const lines: string[] = [];
+    for (const field of fields) {
+      const text = asNonEmptyString(field);
+      if (!text) continue;
+      lines.push(text);
+    }
+    return lines.join("\n");
+  }
+
+  private resolvePersonaVariantKeyFromPrompt(promptText: string): string | null {
+    const normalized = promptText.trim().toLowerCase();
+    if (!normalized.length) return null;
+    for (const variant of PERSONA_VARIANT_PATTERNS) {
+      if (variant.pattern.test(normalized)) {
+        return variant.key;
+      }
+    }
+    return null;
+  }
+
+  private resolvePersonaReferencePlan(payload: Record<string, unknown>): PersonaReferencePlan {
+    const context = isRecord(payload.context) ? payload.context : null;
+    const explicitCandidates: unknown[] = [
       payload.mediaPersona,
       payload.persona,
       payload.personaName,
@@ -1878,21 +2039,193 @@ export class CommandExecutor {
       context?.persona,
       context?.personaName,
     ];
-    for (const candidate of candidates) {
+    let explicitPersonaSlug: string | null = null;
+    for (const candidate of explicitCandidates) {
       const normalized = this.normalizePersonaSlug(candidate);
-      if (normalized) return normalized;
+      if (!normalized) continue;
+      explicitPersonaSlug = normalized;
+      break;
     }
-    return null;
+    const nonGenericExplicitSlug =
+      explicitPersonaSlug && !this.isGenericPersonaSlug(explicitPersonaSlug)
+        ? explicitPersonaSlug
+        : null;
+    const explicitGenericPersonaRequested =
+      explicitPersonaSlug === "persona" ||
+      explicitPersonaSlug === "selfie" ||
+      explicitPersonaSlug === "self" ||
+      explicitPersonaSlug === "me" ||
+      explicitPersonaSlug === "myself";
+    const promptText = this.extractPersonaPromptText(payload);
+    const selfIntent = PERSONA_SELF_REFERENCE_PROMPT_PATTERN.test(promptText);
+    const personaIntent = selfIntent || PERSONA_REQUEST_PROMPT_PATTERN.test(promptText);
+    const variantKey = this.resolvePersonaVariantKeyFromPrompt(promptText);
+    const mainPersonaSlug = DEFAULT_MAIN_PERSONA_SLUG;
+
+    if (nonGenericExplicitSlug) {
+      return {
+        enabled: true,
+        mainPersonaSlug,
+        targetPersonaSlug: nonGenericExplicitSlug,
+        source: "explicit",
+        explicitPersonaSlug: nonGenericExplicitSlug,
+        variantKey,
+      };
+    }
+
+    if (!personaIntent && !explicitGenericPersonaRequested) {
+      return {
+        enabled: false,
+        mainPersonaSlug,
+        targetPersonaSlug: mainPersonaSlug,
+        source: "none",
+        explicitPersonaSlug: explicitPersonaSlug,
+        variantKey: null,
+      };
+    }
+
+    const inferredVariantSlug = variantKey
+      ? this.normalizePersonaSlug(`${mainPersonaSlug}_${variantKey}`)
+      : null;
+    const targetPersonaSlug = inferredVariantSlug ?? mainPersonaSlug;
+    return {
+      enabled: true,
+      mainPersonaSlug,
+      targetPersonaSlug,
+      source: inferredVariantSlug ? "inferred_variant" : "inferred_main",
+      explicitPersonaSlug,
+      variantKey,
+    };
   }
 
-  private shouldUsePersonaFrameReferences(personaSlug: string | null): boolean {
-    if (!personaSlug) return false;
-    return (
-      personaSlug !== "default" &&
-      personaSlug !== "general" &&
-      personaSlug !== "none" &&
-      personaSlug !== "auto"
-    );
+  private shouldUsePersonaFrameReferences(plan: PersonaReferencePlan): boolean {
+    if (!plan.enabled) return false;
+    return !this.isGenericPersonaSlug(plan.targetPersonaSlug);
+  }
+
+  private collectPersonaSeedReferenceInputs(input: {
+    payload: Record<string, unknown>;
+    fallbackReferenceInputs: string[];
+  }): string[] {
+    const directInputs = this.collectMediaReferenceInputs(input.payload, {
+      includeRecentGeneratedAsset: false,
+    });
+    const deduped = new Set<string>();
+    const push = (value: string | null | undefined): void => {
+      const normalized = asNonEmptyString(value);
+      if (!normalized || this.isStreamPartArtifactReference(normalized)) return;
+      deduped.add(normalized);
+    };
+    for (const entry of directInputs) push(entry);
+    for (const entry of input.fallbackReferenceInputs) push(entry);
+
+    const recent = isRecord(input.payload.recentGeneratedAsset)
+      ? input.payload.recentGeneratedAsset
+      : null;
+    const recentType = asNonEmptyString(recent?.type)?.toLowerCase() ?? "";
+    if (recentType === "persona" || recentType === "avatar") {
+      push(asNonEmptyString(recent?.href));
+      push(asNonEmptyString(recent?.url));
+      push(asNonEmptyString(recent?.imageUrl));
+      push(asNonEmptyString(recent?.mediaUrl));
+    }
+    return [...deduped].slice(0, MAX_MEDIA_REFERENCE_INPUTS);
+  }
+
+  private async collectAgentProfilePersonaSeedReferences(): Promise<string[]> {
+    if (!this.ctx.callAgentChatBridge) return [];
+    try {
+      const response = await this.callAgentBridgeLookupCached({
+        action: "agent_profile",
+      });
+      const root = isRecord(response.value) ? response.value : null;
+      if (!root) return [];
+      const agent = isRecord(root.agent) ? root.agent : null;
+      const profile = isRecord(root.profile) ? root.profile : null;
+      const config = isRecord(root.config) ? root.config : null;
+      const urls = new Set<string>();
+      const push = (value: unknown): void => {
+        const direct = asNonEmptyString(value);
+        if (direct) {
+          urls.add(direct);
+          return;
+        }
+        if (!isRecord(value)) return;
+        const nestedUrl =
+          asNonEmptyString(value.url) ??
+          asNonEmptyString(value.href) ??
+          asNonEmptyString(value.imageUrl) ??
+          asNonEmptyString(value.mediaUrl) ??
+          null;
+        if (nestedUrl) urls.add(nestedUrl);
+      };
+      for (const source of [root, agent, profile, config]) {
+        if (!source) continue;
+        push(source.avatarUrl);
+        push(source.profileImageUrl);
+        push(source.imageUrl);
+        push(source.photoUrl);
+        push(source.profilePhotoUrl);
+        push(source.pfpUrl);
+        push(source.avatar);
+        push(source.image);
+        push(source.photo);
+      }
+      return [...urls]
+        .filter((entry) => !this.isStreamPartArtifactReference(entry))
+        .slice(0, MAX_MEDIA_REFERENCE_INPUTS);
+    } catch {
+      return [];
+    }
+  }
+
+  private updatePersonaReferenceSnapshot(input: {
+    mainPersonaSlug: string;
+    personaSlug: string;
+    source: string;
+    frameReferences: string[];
+    builtFrames: boolean;
+    variantKey: string | null;
+  }): void {
+    const stateDb = this.ctx.stateDb;
+    if (!stateDb?.enabled) return;
+    const scope = "runtime.persona.references";
+    const existing = stateDb.getSnapshot<Record<string, unknown>>(scope);
+    const previousPersonas = isRecord(existing) && isRecord(existing.personas)
+      ? existing.personas
+      : {};
+    const nextPersonas: Record<string, unknown> = {
+      ...previousPersonas,
+      [input.personaSlug]: {
+        mainPersonaSlug: input.mainPersonaSlug,
+        source: input.source,
+        frameCount: input.frameReferences.length,
+        frameReferences: input.frameReferences.slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT),
+        builtFrames: input.builtFrames,
+        variantKey: input.variantKey,
+        updatedAt: nowIso(),
+      },
+    };
+    if (!isRecord(nextPersonas[input.mainPersonaSlug])) {
+      nextPersonas[input.mainPersonaSlug] = {
+        mainPersonaSlug: input.mainPersonaSlug,
+        source: "main_persona",
+        frameCount: input.frameReferences.length,
+        frameReferences: input.frameReferences.slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT),
+        builtFrames: input.builtFrames,
+        variantKey: null,
+        updatedAt: nowIso(),
+      };
+    }
+    stateDb.upsertSnapshot({
+      scope,
+      visibility: "private",
+      data: {
+        mainPersonaSlug: input.mainPersonaSlug,
+        updatedAt: nowIso(),
+        personas: nextPersonas,
+      },
+    });
   }
 
   private normalizePersonaFrameRole(value: unknown): PersonaFrameRole | null {
@@ -2221,13 +2554,19 @@ export class CommandExecutor {
     payload: Record<string, unknown>;
     command: Command;
     existingFrames: PersonaFrameRecord[];
+    seedReferences?: string[];
   }): Promise<{ frames: PersonaFrameRecord[]; builtFrames: boolean }> {
     let builtFrames = false;
     await this.ensurePersonaDefinitionForFrames(input.personaSlug, input.payload);
     const existingRoles = new Set<PersonaFrameRole>(
       input.existingFrames.map((frame) => frame.frameRole),
     );
-    const referenceInputs = this.collectPersonaFrameReferences(input.existingFrames);
+    const referenceInputs = Array.from(
+      new Set([
+        ...(Array.isArray(input.seedReferences) ? input.seedReferences : []),
+        ...this.collectPersonaFrameReferences(input.existingFrames),
+      ]),
+    ).slice(0, MAX_MEDIA_REFERENCE_INPUTS);
     for (const frameRole of PERSONA_REFERENCE_FRAME_ROLES) {
       if (existingRoles.has(frameRole)) continue;
       const sourcePrompt = this.buildPersonaReferencePrompt({
@@ -2308,32 +2647,104 @@ export class CommandExecutor {
     command: Command;
     fallbackReferenceInputs: string[];
   }): Promise<PersonaReferenceResolution> {
-    const personaSlug = this.resolvePersonaSlugFromPayload(input.payload);
-    if (!this.shouldUsePersonaFrameReferences(personaSlug)) {
+    const plan = this.resolvePersonaReferencePlan(input.payload);
+    if (!this.shouldUsePersonaFrameReferences(plan)) {
       return {
         personaSlug: null,
         frameReferences: input.fallbackReferenceInputs.slice(0, MAX_MEDIA_REFERENCE_INPUTS),
         builtFrames: false,
+        mainPersonaSlug: null,
+        source: null,
       };
     }
-    const normalizedPersonaSlug = personaSlug!;
-    let frames = await this.listPersonaFramesFromServer(normalizedPersonaSlug);
+    const localSeedReferences = this.collectPersonaSeedReferenceInputs({
+      payload: input.payload,
+      fallbackReferenceInputs: input.fallbackReferenceInputs,
+    });
+    const profileSeedReferences = await this.collectAgentProfilePersonaSeedReferences();
+    const seedReferences = Array.from(
+      new Set([...profileSeedReferences, ...localSeedReferences]),
+    ).slice(0, MAX_MEDIA_REFERENCE_INPUTS);
+    const mainPersonaSlug = plan.mainPersonaSlug;
+    const targetPersonaSlug = plan.targetPersonaSlug;
     let builtFrames = false;
+    let mainFrames: PersonaFrameRecord[] = [];
+    if (targetPersonaSlug !== mainPersonaSlug) {
+      mainFrames = await this.listPersonaFramesFromServer(mainPersonaSlug);
+      if (mainFrames.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT) {
+        const bootstrappedMain = await this.bootstrapPersonaReferenceFrames({
+          personaSlug: mainPersonaSlug,
+          payload: input.payload,
+          command: input.command,
+          existingFrames: mainFrames,
+          seedReferences,
+        });
+        mainFrames = bootstrappedMain.frames;
+        builtFrames = builtFrames || bootstrappedMain.builtFrames;
+      }
+    }
+
+    let frames =
+      targetPersonaSlug === mainPersonaSlug
+        ? mainFrames.length > 0
+          ? mainFrames
+          : await this.listPersonaFramesFromServer(targetPersonaSlug)
+        : await this.listPersonaFramesFromServer(targetPersonaSlug);
     if (frames.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT) {
+      const bootstrapSeedReferences = Array.from(
+        new Set([
+          ...seedReferences,
+          ...this.collectPersonaFrameReferences(mainFrames),
+        ]),
+      ).slice(0, MAX_MEDIA_REFERENCE_INPUTS);
       const bootstrapped = await this.bootstrapPersonaReferenceFrames({
-        personaSlug: normalizedPersonaSlug,
+        personaSlug: targetPersonaSlug,
         payload: input.payload,
         command: input.command,
         existingFrames: frames,
+        seedReferences: bootstrapSeedReferences,
       });
       frames = bootstrapped.frames;
-      builtFrames = bootstrapped.builtFrames;
+      builtFrames = builtFrames || bootstrapped.builtFrames;
     }
-    const frameReferences = this.collectPersonaFrameReferences(frames);
-    return {
-      personaSlug: normalizedPersonaSlug,
+
+    const targetFrameReferences = this.collectPersonaFrameReferences(frames);
+    const mainFrameReferences = this.collectPersonaFrameReferences(mainFrames);
+    const frameReferences = Array.from(
+      new Set([...targetFrameReferences, ...mainFrameReferences]),
+    ).slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT);
+    await this.ctx.memory
+      .recordWrite({
+        type: "persona_reference_resolution",
+        at: nowIso(),
+        commandId: input.command.id,
+        personaSlug: targetPersonaSlug,
+        mainPersonaSlug,
+        source: plan.source,
+        explicitPersonaSlug: plan.explicitPersonaSlug,
+        variantKey: plan.variantKey,
+        builtFrames,
+        targetFrameCount: targetFrameReferences.length,
+        mainFrameCount: mainFrameReferences.length,
+        resolvedFrameCount: frameReferences.length,
+        seedReferenceCount: seedReferences.length,
+      })
+      .catch(() => undefined);
+    this.updatePersonaReferenceSnapshot({
+      mainPersonaSlug,
+      personaSlug: targetPersonaSlug,
+      source: plan.source,
       frameReferences,
       builtFrames,
+      variantKey: plan.variantKey,
+    });
+
+    return {
+      personaSlug: targetPersonaSlug,
+      frameReferences,
+      builtFrames,
+      mainPersonaSlug,
+      source: plan.source,
     };
   }
 
@@ -2949,6 +3360,151 @@ export class CommandExecutor {
     );
   }
 
+  private listRecentCommentTargetUsage(): RecentCommentTargetUsage[] {
+    const stateDb = this.ctx.stateDb;
+    if (!stateDb?.enabled) return [];
+    const rows = stateDb.getRecentCommandLifecycle(COMMENT_TARGET_HISTORY_LIMIT);
+    if (!Array.isArray(rows) || rows.length === 0) return [];
+    const nowMs = Date.now();
+    const cutoffMs = nowMs - COMMENT_TARGET_REUSE_WINDOW_MS;
+    const recent: RecentCommentTargetUsage[] = [];
+    for (const row of rows) {
+      const action = asNonEmptyString(row.action)?.toLowerCase() ?? "";
+      if (action !== "comment") continue;
+      const state = row.state;
+      if (!COMMENT_RECENCY_TRACKED_STATES.has(state)) continue;
+      const postId =
+        typeof row.targetPostId === "number" && Number.isFinite(row.targetPostId)
+          ? Math.floor(row.targetPostId)
+          : null;
+      if (!postId || postId <= 0) continue;
+      const updatedAtMs = Date.parse(row.updatedAt);
+      if (!Number.isFinite(updatedAtMs) || updatedAtMs < cutoffMs) continue;
+      const commentId =
+        typeof row.targetCommentId === "number" && Number.isFinite(row.targetCommentId)
+          ? Math.floor(row.targetCommentId)
+          : null;
+      let postSnapshotHash: string | null = null;
+      if (typeof row.payloadJson === "string" && row.payloadJson.trim().length > 0) {
+        try {
+          const parsed = JSON.parse(row.payloadJson) as unknown;
+          if (isRecord(parsed)) {
+            postSnapshotHash =
+              asNonEmptyString(parsed.targetPostSnapshotHash) ??
+              asNonEmptyString(parsed.postSnapshotHash) ??
+              null;
+          }
+        } catch {
+          // best effort parse only
+        }
+      }
+      recent.push({
+        commandId: row.commandId,
+        postId,
+        commentId,
+        state,
+        updatedAtMs,
+        postSnapshotHash,
+      });
+    }
+    return recent;
+  }
+
+  private isReplySignalCommentSource(source: string): boolean {
+    const normalized = source.trim().toLowerCase();
+    if (!normalized.length) return false;
+    return (
+      normalized.includes("comment_thread") ||
+      normalized.includes("unanswered_mention") ||
+      normalized.includes("notifications_unread")
+    );
+  }
+
+  private decideCommentTargetReuse(input: {
+    commandId: string;
+    postId: number;
+    commentId: number | null;
+    postSnapshotHash: string | null;
+    source: string;
+    recentUsage?: RecentCommentTargetUsage[];
+  }): CommentTargetReuseDecision {
+    const recentUsage = input.recentUsage ?? this.listRecentCommentTargetUsage();
+    if (recentUsage.length === 0) {
+      return {
+        allow: true,
+        reason: "no_recent_comment_targets",
+        recentMatch: null,
+      };
+    }
+    const samePostRows = recentUsage.filter(
+      (entry) =>
+        entry.postId === input.postId && entry.commandId !== input.commandId,
+    );
+    if (samePostRows.length === 0) {
+      return {
+        allow: true,
+        reason: "post_not_recently_commented",
+        recentMatch: null,
+      };
+    }
+    const latestSamePost = samePostRows[0] ?? null;
+    const snapshotChanged =
+      Boolean(input.postSnapshotHash) &&
+      Boolean(latestSamePost) &&
+      Boolean(latestSamePost?.postSnapshotHash) &&
+      latestSamePost?.postSnapshotHash !== input.postSnapshotHash;
+    if (typeof input.commentId === "number" && input.commentId > 0) {
+      const sameParent = samePostRows.find(
+        (entry) => entry.commentId === input.commentId,
+      );
+      if (sameParent) {
+        return {
+          allow: false,
+          reason: "comment_parent_already_replied_recently",
+          recentMatch: sameParent,
+        };
+      }
+      if (snapshotChanged) {
+        return {
+          allow: true,
+          reason: "post_snapshot_changed",
+          recentMatch: latestSamePost,
+        };
+      }
+      if (!this.isReplySignalCommentSource(input.source)) {
+        return {
+          allow: false,
+          reason: "post_recently_commented_without_reply_signal",
+          recentMatch: samePostRows[0] ?? null,
+        };
+      }
+      return {
+        allow: true,
+        reason: "new_parent_comment_target_from_reply_signal",
+        recentMatch: null,
+      };
+    }
+    if (snapshotChanged) {
+      return {
+        allow: true,
+        reason: "post_snapshot_changed",
+        recentMatch: latestSamePost,
+      };
+    }
+    if (input.source.startsWith("own_latest")) {
+      return {
+        allow: true,
+        reason: "own_latest_needs_thread_hydration",
+        recentMatch: null,
+      };
+    }
+    return {
+      allow: false,
+      reason: "post_recently_commented",
+      recentMatch: samePostRows[0] ?? null,
+    };
+  }
+
   private isRecoverableDraftGrantErrorMessage(message: string): boolean {
     const normalized = message.trim().toLowerCase();
     if (!normalized.length) return false;
@@ -3212,6 +3768,25 @@ export class CommandExecutor {
     });
     const requiresCuration = sourceDirectiveId !== null ? true : isDirectiveRuntimeOrigin;
     const directiveSeedHints = this.collectDirectiveSeedHints(payload);
+    const postVariety = this.selectPostVarietyMode({
+      commandId: command.id,
+      postType,
+      payload,
+      context: postDraftContext,
+      seedHints: directiveSeedHints,
+    });
+    await this.ctx.memory
+      .recordWrite({
+        type: "post_variety_mode_selected",
+        at: nowIso(),
+        commandId: command.id,
+        postType,
+        mode: postVariety.mode,
+        reason: postVariety.reason,
+        recentModes: postVariety.recentModes,
+        targetPostId: postDraftContext.targetPostId,
+      })
+      .catch(() => undefined);
 
     if (postType === "text") {
       const textBodyInitial = asNonEmptyString(payload.textBody);
@@ -3223,6 +3798,7 @@ export class CommandExecutor {
       const curatedTextDraft = await this.curatePostDraftWithOpenClaw({
         commandId: command.id,
         postType: "text",
+        varietyMode: postVariety.mode,
         caption: captionInitial,
         textBody: textBodyInitial,
         mediaPrompt: null,
@@ -3276,6 +3852,7 @@ export class CommandExecutor {
         const recuratedTextDraft = await this.curatePostDraftWithOpenClaw({
           commandId: command.id,
           postType: "text",
+          varietyMode: postVariety.mode,
           caption: captionForWrite,
           textBody: textBodyForWrite,
           mediaPrompt: null,
@@ -3529,6 +4106,13 @@ export class CommandExecutor {
               commandId: command.id,
               targetPostId: postDraftContext.targetPostId,
             });
+            this.notePublishedPostVarietyMode({
+              commandId: command.id,
+              postType: "media",
+              targetPostId: postDraftContext.targetPostId,
+              mode: postVariety.mode,
+              signal: postVariety.signal,
+            });
             await this.ctx.memory
               .recordWrite({
                 type: "runtime_post_publish_recorded",
@@ -3536,6 +4120,7 @@ export class CommandExecutor {
                 commandId: command.id,
                 kind: postKind,
                 postType: "media",
+                varietyMode: postVariety.mode,
                 targetPostId: postDraftContext.targetPostId,
                 bodyPreview: truncateText(candidate, 260),
                 visualRenderMode:
@@ -3633,6 +4218,13 @@ export class CommandExecutor {
             commandId: command.id,
             targetPostId: postDraftContext.targetPostId,
           });
+          this.notePublishedPostVarietyMode({
+            commandId: command.id,
+            postType: "media",
+            targetPostId: postDraftContext.targetPostId,
+            mode: postVariety.mode,
+            signal: postVariety.signal,
+          });
           await this.ctx.memory
             .recordWrite({
               type: "runtime_post_publish_recorded",
@@ -3640,6 +4232,7 @@ export class CommandExecutor {
               commandId: command.id,
               kind: postKind,
               postType: "media",
+              varietyMode: postVariety.mode,
               targetPostId: postDraftContext.targetPostId,
               bodyPreview: truncateText(candidate, 260),
               visualRenderMode:
@@ -3677,6 +4270,13 @@ export class CommandExecutor {
         commandId: command.id,
         targetPostId: postDraftContext.targetPostId,
       });
+      this.notePublishedPostVarietyMode({
+        commandId: command.id,
+        postType: "text",
+        targetPostId: postDraftContext.targetPostId,
+        mode: postVariety.mode,
+        signal: postVariety.signal,
+      });
       await this.ctx.memory
         .recordWrite({
           type: "runtime_post_publish_recorded",
@@ -3684,6 +4284,7 @@ export class CommandExecutor {
           commandId: command.id,
           kind: postKind,
           postType,
+          varietyMode: postVariety.mode,
           targetPostId: postDraftContext.targetPostId,
           bodyPreview: truncateText(candidate, 260),
           visualRenderMode: shouldAttemptSlides
@@ -3709,6 +4310,7 @@ export class CommandExecutor {
     const curatedMediaDraft = await this.curatePostDraftWithOpenClaw({
       commandId: command.id,
       postType: "media",
+      varietyMode: postVariety.mode,
       caption: captionInitial,
       textBody: null,
       mediaPrompt: mediaPromptInitial,
@@ -3761,6 +4363,7 @@ export class CommandExecutor {
       const recuratedMediaDraft = await this.curatePostDraftWithOpenClaw({
         commandId: command.id,
         postType: "media",
+        varietyMode: postVariety.mode,
         caption: captionForWrite,
         textBody: null,
         mediaPrompt: mediaPromptForWrite,
@@ -3949,6 +4552,13 @@ export class CommandExecutor {
             commandId: command.id,
             targetPostId: postDraftContext.targetPostId,
           });
+          this.notePublishedPostVarietyMode({
+            commandId: command.id,
+            postType: "media",
+            targetPostId: postDraftContext.targetPostId,
+            mode: postVariety.mode,
+            signal: postVariety.signal,
+          });
           await this.ctx.memory
             .recordWrite({
               type: "runtime_post_publish_recorded",
@@ -3956,6 +4566,7 @@ export class CommandExecutor {
               commandId: command.id,
               kind: postKind,
               postType: "media",
+              varietyMode: postVariety.mode,
               targetPostId: postDraftContext.targetPostId,
               bodyPreview: truncateText(mediaCandidate, 260),
               visualRenderMode: "media_slides",
@@ -4016,6 +4627,13 @@ export class CommandExecutor {
       commandId: command.id,
       targetPostId: postDraftContext.targetPostId,
     });
+    this.notePublishedPostVarietyMode({
+      commandId: command.id,
+      postType: "media",
+      targetPostId: postDraftContext.targetPostId,
+      mode: postVariety.mode,
+      signal: postVariety.signal,
+    });
     await this.ctx.memory
       .recordWrite({
         type: "runtime_post_publish_recorded",
@@ -4023,6 +4641,7 @@ export class CommandExecutor {
         commandId: command.id,
         kind: postKind,
         postType,
+        varietyMode: postVariety.mode,
         targetPostId: postDraftContext.targetPostId,
         bodyPreview: truncateText(mediaCandidate, 260),
         mediaUrl: media.mediaUrl,
@@ -4060,6 +4679,10 @@ export class CommandExecutor {
       commentSummary: null,
       payloadHint: this.extractCommentPayloadHint(input.payload),
       memorySummary: await this.loadPostDraftMemorySummary({
+        postId: input.postId,
+        payload: input.payload,
+      }),
+      platformSignals: await this.loadPostDraftDiscoverySignals({
         postId: input.postId,
         payload: input.payload,
       }),
@@ -4151,6 +4774,130 @@ export class CommandExecutor {
         .catch(() => undefined);
       return null;
     }
+  }
+
+  private extractPostDiscoverySignalFromRecord(record: Record<string, unknown>): string | null {
+    const author = isRecord(record.author) ? record.author : null;
+    const handle =
+      asNonEmptyString(author?.handle) ??
+      asNonEmptyString(record.authorHandle) ??
+      asNonEmptyString(record.handle) ??
+      null;
+    const text =
+      asNonEmptyString(record.textBody) ??
+      asNonEmptyString(record.body) ??
+      asNonEmptyString(record.caption) ??
+      asNonEmptyString(record.text) ??
+      asNonEmptyString(record.content) ??
+      asNonEmptyString(record.title) ??
+      asNonEmptyString(record.summary) ??
+      null;
+    const mediaCount = Array.isArray(record.mediaItems)
+      ? record.mediaItems.length
+      : asPositiveInt(record.mediaCount) ?? null;
+    const compactText = text
+      ? truncateText(stripEmDashCharacters(text).replace(/\s+/gu, " ").trim(), 120)
+      : null;
+    const mediaSummary =
+      !compactText && mediaCount && mediaCount > 0
+        ? `${mediaCount} media item${mediaCount === 1 ? "" : "s"}`
+        : null;
+    const signal = compactText ?? mediaSummary;
+    if (!signal) return null;
+    return handle ? `@${handle.replace(/^@+/u, "")}: ${signal}` : signal;
+  }
+
+  private async loadPostDraftDiscoverySignals(input: {
+    postId: number | null;
+    payload: Record<string, unknown>;
+  }): Promise<string | null> {
+    if (!this.ctx.callAgentChatBridge) return null;
+    const hints = this.extractEngagementLookupHints(input.payload);
+    const lookupPlans: Array<{ source: string; request: Record<string, unknown> }> = [
+      {
+        source: "trending",
+        request: {
+          action: "browse_trending",
+          limit: 12,
+        },
+      },
+      {
+        source: "home",
+        request: {
+          action: "browse_home_feed",
+          limit: 12,
+        },
+      },
+      {
+        source: "posts",
+        request: {
+          action: "browse_posts",
+          limit: 12,
+        },
+      },
+    ];
+    if (hints.interestTags.length > 0) {
+      lookupPlans.push({
+        source: "interest",
+        request: {
+          action: "browse_posts",
+          limit: 12,
+          tags: hints.interestTags.slice(0, 4),
+        },
+      });
+    }
+    if (hints.rawQuery.trim().length > 0) {
+      lookupPlans.push({
+        source: "search",
+        request: {
+          action: "search_global",
+          limit: 8,
+          query: truncateText(hints.rawQuery, 96),
+        },
+      });
+    }
+    for (const handle of hints.handles.slice(0, 2)) {
+      lookupPlans.push({
+        source: "handle",
+        request: {
+          action: "find_post",
+          authorHandle: handle,
+          latest: true,
+          limit: 1,
+        },
+      });
+    }
+    const lines: string[] = [];
+    const seen = new Set<string>();
+    for (const plan of lookupPlans) {
+      if (lines.length >= POST_DISCOVERY_SIGNAL_MAX_LINES) break;
+      try {
+        const lookup = await this.callAgentBridgeLookupCached(plan.request);
+        for (const item of this.collectBridgeRecordItems(lookup.value)) {
+          if (lines.length >= POST_DISCOVERY_SIGNAL_MAX_LINES) break;
+          const signal = this.extractPostDiscoverySignalFromRecord(item);
+          if (!signal) continue;
+          const line = `${plan.source}: ${signal}`;
+          const key = normalizeCommentText(line);
+          if (!key.length || seen.has(key)) continue;
+          seen.add(key);
+          lines.push(truncateText(line, 180));
+        }
+      } catch (error: unknown) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "post_discovery_lookup_failed",
+            at: nowIso(),
+            postId: input.postId,
+            source: plan.source,
+            lookupAction: asNonEmptyString(plan.request.action) ?? "unknown",
+            error: error instanceof Error ? error.message : String(error),
+          })
+          .catch(() => undefined);
+      }
+    }
+    if (lines.length === 0) return null;
+    return truncateText(lines.join(" | "), POST_DISCOVERY_SIGNAL_MAX_LENGTH);
   }
 
   private buildPostNoveltyCandidateText(input: {
@@ -4393,6 +5140,200 @@ export class CommandExecutor {
       targetPostId: input.targetPostId,
     });
     this.pruneRecentPostNoveltyHistory(nowMs);
+  }
+
+  private parsePostVarietyMode(value: unknown): PostVarietyMode | null {
+    const normalized = asNonEmptyString(value)?.toLowerCase() ?? null;
+    if (!normalized) return null;
+    if (normalized === "opinion") return "opinion";
+    if (normalized === "reaction") return "reaction";
+    if (normalized === "humor" || normalized === "funny" || normalized === "joke") {
+      return "humor";
+    }
+    if (
+      normalized === "micro" ||
+      normalized === "short" ||
+      normalized === "one-liner" ||
+      normalized === "oneliner"
+    ) {
+      return "micro";
+    }
+    if (normalized === "narrative" || normalized === "story") return "narrative";
+    return null;
+  }
+
+  private pruneRecentPostVarietyModeHistory(nowMs: number): void {
+    let writeIndex = 0;
+    for (const entry of this.recentPostVarietyModeHistory) {
+      if (nowMs - entry.atMs > POST_VARIETY_HISTORY_WINDOW_MS) continue;
+      this.recentPostVarietyModeHistory[writeIndex] = entry;
+      writeIndex += 1;
+    }
+    this.recentPostVarietyModeHistory.length = writeIndex;
+    if (this.recentPostVarietyModeHistory.length <= POST_VARIETY_HISTORY_MAX_ITEMS) return;
+    const trimStart =
+      this.recentPostVarietyModeHistory.length - POST_VARIETY_HISTORY_MAX_ITEMS;
+    this.recentPostVarietyModeHistory.splice(0, trimStart);
+  }
+
+  private listRecentPostVarietyModes(maxItems: number): PostVarietyMode[] {
+    const nowMs = Date.now();
+    this.pruneRecentPostVarietyModeHistory(nowMs);
+    const modes: PostVarietyMode[] = [];
+    const seen = new Set<PostVarietyMode>();
+    for (let index = this.recentPostVarietyModeHistory.length - 1; index >= 0; index -= 1) {
+      const entry = this.recentPostVarietyModeHistory[index];
+      if (!entry) continue;
+      if (seen.has(entry.mode)) continue;
+      seen.add(entry.mode);
+      modes.push(entry.mode);
+      if (modes.length >= maxItems) break;
+    }
+    return modes;
+  }
+
+  private selectPostVarietyMode(input: {
+    commandId: string;
+    postType: "text" | "media";
+    payload: Record<string, unknown>;
+    context: PostDraftContext;
+    seedHints: string[];
+  }): {
+    mode: PostVarietyMode;
+    reason: string;
+    recentModes: PostVarietyMode[];
+    signal: string;
+  } {
+    const recentModes = this.listRecentPostVarietyModes(POST_VARIETY_RECENT_COOLDOWN_COUNT + 2);
+    const blockedModes = new Set<PostVarietyMode>(
+      recentModes.slice(0, POST_VARIETY_RECENT_COOLDOWN_COUNT),
+    );
+    const payloadMode =
+      this.parsePostVarietyMode(input.payload.postVarietyMode) ??
+      this.parsePostVarietyMode(input.payload.varietyMode) ??
+      this.parsePostVarietyMode(input.payload.mode) ??
+      null;
+    const signalRaw = [
+      asNonEmptyString(input.payload.requestText),
+      asNonEmptyString(input.payload.topic),
+      asNonEmptyString(input.payload.prompt),
+      asNonEmptyString(input.payload.caption),
+      asNonEmptyString(input.payload.textBody),
+      input.context.payloadHint,
+      input.context.postText,
+      input.context.commentSummary,
+      input.context.memorySummary,
+      input.context.platformSignals,
+      ...input.seedHints.slice(0, 8),
+    ]
+      .filter((value): value is string => Boolean(value))
+      .join(" ");
+    const signal = truncateText(normalizeCommentText(signalRaw), 900);
+    const availableModes = POST_VARIETY_MODES.filter((mode) => !blockedModes.has(mode));
+    const chooseBySeed = (seedSuffix: string, candidates: readonly PostVarietyMode[]): PostVarietyMode => {
+      const target = candidates.length > 0 ? candidates : POST_VARIETY_MODES;
+      return (
+        target[
+          this.pickDeterministicIndex(
+            `${input.commandId}:${input.postType}:${seedSuffix}:${signal}`,
+            target.length,
+          )
+        ] ?? target[0]
+      );
+    };
+    if (payloadMode) {
+      const selected = blockedModes.has(payloadMode)
+        ? chooseBySeed("payload_cooldown", availableModes)
+        : payloadMode;
+      return {
+        mode: selected,
+        reason: blockedModes.has(payloadMode)
+          ? `payload_mode_cooldown:${payloadMode}`
+          : "payload_mode",
+        recentModes,
+        signal,
+      };
+    }
+    const scores: Record<PostVarietyMode, number> = {
+      opinion: 0,
+      reaction: 0,
+      humor: 0,
+      micro: 0,
+      narrative: 0,
+    };
+    for (const hint of POST_VARIETY_HINT_PATTERNS) {
+      if (!hint.pattern.test(signal)) continue;
+      scores[hint.mode] += hint.weight;
+    }
+    if (input.context.platformSignals) {
+      scores.reaction += 2;
+    }
+    if (input.context.targetPostId !== null) {
+      scores.reaction += 1;
+    }
+    if (input.postType === "media") {
+      scores.narrative += 1;
+      scores.reaction += 1;
+    } else {
+      scores.opinion += 1;
+      scores.micro += 1;
+    }
+    let topScore = Number.NEGATIVE_INFINITY;
+    let candidates: PostVarietyMode[] = [];
+    for (const mode of POST_VARIETY_MODES) {
+      const score = scores[mode];
+      if (score > topScore) {
+        topScore = score;
+        candidates = [mode];
+      } else if (score === topScore) {
+        candidates.push(mode);
+      }
+    }
+    let selected =
+      topScore > 0
+        ? chooseBySeed("scored", candidates)
+        : chooseBySeed("fallback", POST_VARIETY_MODES);
+    if (blockedModes.has(selected) && availableModes.length > 0) {
+      selected = chooseBySeed("cooldown_swap", availableModes);
+    }
+    return {
+      mode: selected,
+      reason: topScore > 0 ? `pattern_score:${topScore}` : "fallback_seeded",
+      recentModes,
+      signal,
+    };
+  }
+
+  private notePublishedPostVarietyMode(input: {
+    commandId: string;
+    postType: "text" | "media";
+    targetPostId: number | null;
+    mode: PostVarietyMode;
+    signal: string;
+  }): void {
+    const normalizedSignal = truncateText(normalizeCommentText(input.signal), 220);
+    const signalForHistory = normalizedSignal.length > 0 ? normalizedSignal : input.mode;
+    const nowMs = Date.now();
+    this.pruneRecentPostVarietyModeHistory(nowMs);
+    this.recentPostVarietyModeHistory.push({
+      atMs: nowMs,
+      postType: input.postType,
+      mode: input.mode,
+      commandId: input.commandId,
+      targetPostId: input.targetPostId,
+      signal: signalForHistory,
+    });
+    this.pruneRecentPostVarietyModeHistory(nowMs);
+    void this.ctx.memory
+      .recordWrite({
+        type: "post_variety_mode_published",
+        at: nowIso(),
+        commandId: input.commandId,
+        postType: input.postType,
+        targetPostId: input.targetPostId,
+        mode: input.mode,
+      })
+      .catch(() => undefined);
   }
 
   private normalizeCaptionPositionValue(value: unknown): string | null {
@@ -4964,6 +5905,7 @@ export class CommandExecutor {
       input.context.commentSummary ? `targetComments: ${input.context.commentSummary}` : null,
       input.context.payloadHint ? `directiveHint: ${input.context.payloadHint}` : null,
       input.context.memorySummary ? `memoryContext: ${input.context.memorySummary}` : null,
+      input.context.platformSignals ? `platformSignals: ${input.context.platformSignals}` : null,
     ].filter((entry): entry is string => Boolean(entry));
     return [
       "Plan visual presentation for this social post. Return strict JSON only.",
@@ -5033,12 +5975,66 @@ export class CommandExecutor {
     }
   }
 
+  private buildPostVarietyModeRules(
+    mode: PostVarietyMode,
+    postType: "text" | "media",
+  ): string[] {
+    const common = [
+      `Variety mode: ${mode}.`,
+      "Avoid repeating moody/introspective template language unless context explicitly asks for it.",
+    ];
+    if (mode === "opinion") {
+      return [
+        ...common,
+        "Take a clear position and include one concrete reason.",
+        postType === "text"
+          ? "textBody must contain an explicit stance."
+          : "caption must state the stance and mediaPrompt should reinforce it visually.",
+      ];
+    }
+    if (mode === "reaction") {
+      return [
+        ...common,
+        "Anchor output to one concrete platform signal, trend, or recent post context.",
+        postType === "text"
+          ? "Reference a current signal in plain language."
+          : "mediaPrompt must depict the live signal/reaction moment, not a generic scene.",
+      ];
+    }
+    if (mode === "humor") {
+      return [
+        ...common,
+        "Use a punchy, playful angle and keep it socially shareable.",
+        postType === "text"
+          ? "Land one clear joke/bit and avoid over-explaining."
+          : "mediaPrompt should imply the comedic beat visually without meme-template boilerplate.",
+      ];
+    }
+    if (mode === "micro") {
+      return [
+        ...common,
+        "Keep it concise and high-signal.",
+        postType === "text"
+          ? "textBody should be short (prefer 25-110 chars) but complete."
+          : "caption should be compact (prefer 10-80 chars) with a focused mediaPrompt.",
+      ];
+    }
+    return [
+      ...common,
+      "Use narrative specificity: place, action, and one concrete sensory detail.",
+      postType === "text"
+        ? "textBody should read like a real moment, not abstract mood prose."
+        : "mediaPrompt should portray a specific scene/event with concrete details.",
+    ];
+  }
+
   private buildPostDraftCurationPrompt(input: {
     postType: "text" | "media";
     caption: string | null;
     textBody: string | null;
     mediaPrompt: string | null;
     context: PostDraftContext;
+    varietyMode: PostVarietyMode;
     seedHints: string[];
     avoidReferences: string[];
   }): string {
@@ -5051,6 +6047,7 @@ export class CommandExecutor {
       input.context.commentSummary ? `targetComments: ${input.context.commentSummary}` : null,
       input.context.payloadHint ? `directiveHint: ${input.context.payloadHint}` : null,
       input.context.memorySummary ? `memoryContext: ${input.context.memorySummary}` : null,
+      input.context.platformSignals ? `platformSignals: ${input.context.platformSignals}` : null,
     ].filter((entry): entry is string => Boolean(entry));
     if (input.postType === "text") {
       return [
@@ -5065,6 +6062,7 @@ export class CommandExecutor {
         "- Must not reuse long phrases from targetPostText/targetMedia/directiveHint.",
         "- Must not reuse long phrases from directive seed text.",
         "- Must not reuse long phrases from recent self-post references.",
+        ...this.buildPostVarietyModeRules(input.varietyMode, "text").map((rule) => `- ${rule}`),
         `draftCaption: ${input.caption ?? ""}`,
         `draftTextBody: ${input.textBody ?? ""}`,
         ...(input.seedHints.length > 0
@@ -5095,6 +6093,7 @@ export class CommandExecutor {
       "- Must be materially different from targetPostText/targetMedia/directiveHint.",
       "- Must be materially different from directive seed text.",
       "- Must be materially different from recent self-post references.",
+      ...this.buildPostVarietyModeRules(input.varietyMode, "media").map((rule) => `- ${rule}`),
       `draftCaption: ${input.caption ?? ""}`,
       `draftMediaPrompt: ${input.mediaPrompt ?? ""}`,
       ...(input.seedHints.length > 0
@@ -5176,6 +6175,7 @@ export class CommandExecutor {
   private async curatePostDraftWithOpenClaw(input: {
     commandId: string;
     postType: "text" | "media";
+    varietyMode: PostVarietyMode;
     caption: string | null;
     textBody: string | null;
     mediaPrompt: string | null;
@@ -5187,6 +6187,7 @@ export class CommandExecutor {
     if (!runOpenClawPrompt) return null;
     const prompt = this.buildPostDraftCurationPrompt({
       postType: input.postType,
+      varietyMode: input.varietyMode,
       caption: input.caption,
       textBody: input.textBody,
       mediaPrompt: input.mediaPrompt,
@@ -5216,25 +6217,27 @@ export class CommandExecutor {
       if (candidate.length < 12) return null;
       await this.ctx.memory
         .recordWrite({
-          type: "post_draft_curated",
-          at: nowIso(),
-          commandId: input.commandId,
-          postType: input.postType,
-          caption: curated.caption,
-          textBody: curated.textBody,
-          mediaPrompt: curated.mediaPrompt,
+            type: "post_draft_curated",
+            at: nowIso(),
+            commandId: input.commandId,
+            postType: input.postType,
+            varietyMode: input.varietyMode,
+            caption: curated.caption,
+            textBody: curated.textBody,
+            mediaPrompt: curated.mediaPrompt,
         })
         .catch(() => undefined);
       return curated;
     } catch (error: unknown) {
       await this.ctx.memory
         .recordWrite({
-          type: "post_draft_curation_failed",
-          at: nowIso(),
-          commandId: input.commandId,
-          postType: input.postType,
-          error: error instanceof Error ? error.message : String(error),
-        })
+            type: "post_draft_curation_failed",
+            at: nowIso(),
+            commandId: input.commandId,
+            postType: input.postType,
+            varietyMode: input.varietyMode,
+            error: error instanceof Error ? error.message : String(error),
+          })
         .catch(() => undefined);
       return null;
     }
@@ -5540,6 +6543,10 @@ export class CommandExecutor {
       payload.parentId = parentId;
       payload.commentId = parentId;
       payload.targetCommentId = parentId;
+    }
+    if (resolvedTarget.postSnapshotHash) {
+      payload.targetPostSnapshotHash = resolvedTarget.postSnapshotHash;
+      payload.postSnapshotHash = resolvedTarget.postSnapshotHash;
     }
     const expectedTarget = {
       postId,
@@ -7929,6 +8936,10 @@ export class CommandExecutor {
           payload.commentId = resolvedTarget.commentId;
           payload.parentId = resolvedTarget.commentId;
           payload.targetCommentId = resolvedTarget.commentId;
+        }
+        if (resolvedTarget.postSnapshotHash) {
+          payload.targetPostSnapshotHash = resolvedTarget.postSnapshotHash;
+          payload.postSnapshotHash = resolvedTarget.postSnapshotHash;
         }
         const nextScope = isRecord(payload.directiveScope)
           ? { ...payload.directiveScope }
@@ -10340,6 +11351,118 @@ export class CommandExecutor {
     return collected;
   }
 
+  private asNonNegativeInt(value: unknown): number | null {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return Math.floor(value);
+    }
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed.length) return null;
+    const parsed = Number.parseInt(trimmed, 10);
+    if (!Number.isFinite(parsed) || parsed < 0) return null;
+    return Math.floor(parsed);
+  }
+
+  private computePostSnapshotHash(input: {
+    postId: number;
+    commentId: number | null;
+    postRecord: Record<string, unknown>;
+  }): string | null {
+    const providedHash =
+      asNonEmptyString(input.postRecord.postSnapshotHash) ??
+      asNonEmptyString(input.postRecord.snapshotHash);
+    if (providedHash) return providedHash;
+    const metrics = isRecord(input.postRecord.metrics) ? input.postRecord.metrics : null;
+    const mediaItems = Array.isArray(input.postRecord.mediaItems)
+      ? input.postRecord.mediaItems.filter((entry): entry is Record<string, unknown> => isRecord(entry))
+      : [];
+    const mediaFingerprints = mediaItems
+      .slice(0, 4)
+      .map((item) => {
+        const mediaType = asNonEmptyString(item.mediaType)?.toLowerCase() ?? "image";
+        const id = asPositiveInt(item.id);
+        const fingerprint =
+          asNonEmptyString(item.contentHash) ??
+          asNonEmptyString(item.hash) ??
+          asNonEmptyString(item.optimizedUrl) ??
+          asNonEmptyString(item.originalUrl) ??
+          asNonEmptyString(item.url) ??
+          null;
+        if (!fingerprint) return null;
+        return `${mediaType}:${id ?? 0}:${truncateText(fingerprint, 80)}`;
+      })
+      .filter((entry): entry is string => Boolean(entry));
+    const textSource =
+      asNonEmptyString(input.postRecord.textBody) ??
+      asNonEmptyString(input.postRecord.body) ??
+      asNonEmptyString(input.postRecord.caption) ??
+      null;
+    const normalizedText = textSource ? truncateText(normalizeCommentText(textSource), 280) : null;
+    const stablePayload = {
+      postId: input.postId,
+      commentId: input.commentId ?? null,
+      updatedAt:
+        asNonEmptyString(input.postRecord.updatedAt) ??
+        asNonEmptyString(input.postRecord.updated_at) ??
+        asNonEmptyString(input.postRecord.lastInteractionAt) ??
+        asNonEmptyString(input.postRecord.last_interaction_at) ??
+        null,
+      createdAt:
+        asNonEmptyString(input.postRecord.createdAt) ??
+        asNonEmptyString(input.postRecord.created_at) ??
+        null,
+      text: normalizedText,
+      mediaCount: mediaItems.length,
+      media: mediaFingerprints,
+      commentCount:
+        this.asNonNegativeInt(input.postRecord.commentCount) ??
+        this.asNonNegativeInt(input.postRecord.commentsCount) ??
+        this.asNonNegativeInt(input.postRecord.replyCount) ??
+        this.asNonNegativeInt(metrics?.commentCount) ??
+        null,
+      likeCount:
+        this.asNonNegativeInt(input.postRecord.likeCount) ??
+        this.asNonNegativeInt(input.postRecord.likesCount) ??
+        this.asNonNegativeInt(metrics?.likeCount) ??
+        null,
+      repostCount:
+        this.asNonNegativeInt(input.postRecord.repostCount) ??
+        this.asNonNegativeInt(input.postRecord.repostsCount) ??
+        this.asNonNegativeInt(metrics?.repostCount) ??
+        null,
+      viewCount:
+        this.asNonNegativeInt(input.postRecord.viewCount) ??
+        this.asNonNegativeInt(input.postRecord.viewsCount) ??
+        this.asNonNegativeInt(metrics?.viewCount) ??
+        null,
+    };
+    const encoded = JSON.stringify(stablePayload);
+    if (!encoded.length) return null;
+    return crypto.createHash("sha1").update(encoded).digest("hex");
+  }
+
+  private async resolvePostSnapshotHashForPostId(input: {
+    postId: number;
+    commentId: number | null;
+  }): Promise<string | null> {
+    if (!this.ctx.callAgentChatBridge) return null;
+    try {
+      const lookup = await this.callAgentBridgeLookupCached({
+        action: "find_post",
+        postId: input.postId,
+      });
+      const postRecord = this.extractPostRecordForCommentCuration(lookup.value, input.postId);
+      if (!postRecord) return null;
+      return this.computePostSnapshotHash({
+        postId: input.postId,
+        commentId: input.commentId,
+        postRecord,
+      });
+    } catch {
+      return null;
+    }
+  }
+
   private extractEngagementTargetCandidateFromRecord(
     record: Record<string, unknown>,
     source: string,
@@ -10367,11 +11490,17 @@ export class CommandExecutor {
         asNonEmptyString(author?.mainUserId) ??
         asNonEmptyString(author?.id) ??
         null;
+      const postSnapshotHash = this.computePostSnapshotHash({
+        postId,
+        commentId,
+        postRecord: entry,
+      });
       return {
         postId,
         commentId,
         authorId,
         source,
+        postSnapshotHash,
       };
     };
     const direct = parseFrom(record);
@@ -10471,11 +11600,18 @@ export class CommandExecutor {
           (scopedTarget ? asPositiveInt(scopedTarget.commentId) : null)
         : null);
     if (explicitPostId) {
+      const explicitResolvedCommentId =
+        input.action === "comment" ? (explicitCommentId ?? null) : null;
+      const postSnapshotHash = await this.resolvePostSnapshotHashForPostId({
+        postId: explicitPostId,
+        commentId: explicitResolvedCommentId,
+      });
       return {
         postId: explicitPostId,
-        commentId: input.action === "comment" ? (explicitCommentId ?? null) : null,
+        commentId: explicitResolvedCommentId,
         authorId: null,
         source: "directive_payload",
+        postSnapshotHash,
       };
     }
 
@@ -10483,11 +11619,17 @@ export class CommandExecutor {
     const hintedPostId = hints.postId;
     const hintedCommentId = hints.commentId;
     if (hintedPostId) {
+      const hintedResolvedCommentId = input.action === "comment" ? hintedCommentId : null;
+      const postSnapshotHash = await this.resolvePostSnapshotHashForPostId({
+        postId: hintedPostId,
+        commentId: hintedResolvedCommentId,
+      });
       return {
         postId: hintedPostId,
-        commentId: input.action === "comment" ? hintedCommentId : null,
+        commentId: hintedResolvedCommentId,
         authorId: null,
         source: "payload_hint",
+        postSnapshotHash,
       };
     }
 
@@ -10500,17 +11642,52 @@ export class CommandExecutor {
       payload: input.payload,
       hints,
     });
+    const recentCommentUsage =
+      input.action === "comment" ? this.listRecentCommentTargetUsage() : [];
     const nowMs = Date.now();
     this.pruneEngagementTargetCache(nowMs);
     const cachedResolution = this.engagementTargetCache.get(cacheKey);
     if (cachedResolution && cachedResolution.expiresAtMs > nowMs) {
-      return {
-        ...cachedResolution.candidate,
-        commentId:
-          input.action === "comment"
-            ? (cachedResolution.candidate.commentId ?? null)
-            : null,
-      };
+      if (input.action === "comment") {
+        const reuseDecision = this.decideCommentTargetReuse({
+          commandId: input.commandId,
+          postId: cachedResolution.candidate.postId,
+          commentId: cachedResolution.candidate.commentId ?? null,
+          postSnapshotHash: cachedResolution.candidate.postSnapshotHash ?? null,
+          source: cachedResolution.candidate.source,
+          recentUsage: recentCommentUsage,
+        });
+        if (!reuseDecision.allow) {
+          this.engagementTargetCache.delete(cacheKey);
+          await this.ctx.memory
+            .recordWrite({
+              type: "engagement_target_cache_skipped_recent_comment_target",
+              at: nowIso(),
+              commandId: input.commandId,
+              action: input.action,
+              postId: cachedResolution.candidate.postId,
+              commentId: cachedResolution.candidate.commentId ?? null,
+              source: cachedResolution.candidate.source,
+              postSnapshotHash: cachedResolution.candidate.postSnapshotHash ?? null,
+              reason: reuseDecision.reason,
+              recentCommandId: reuseDecision.recentMatch?.commandId ?? null,
+              recentPostId: reuseDecision.recentMatch?.postId ?? null,
+              recentCommentId: reuseDecision.recentMatch?.commentId ?? null,
+              recentPostSnapshotHash: reuseDecision.recentMatch?.postSnapshotHash ?? null,
+            })
+            .catch(() => undefined);
+        } else {
+          return {
+            ...cachedResolution.candidate,
+            commentId: cachedResolution.candidate.commentId ?? null,
+          };
+        }
+      } else {
+        return {
+          ...cachedResolution.candidate,
+          commentId: null,
+        };
+      }
     }
 
     type LookupPlan = {
@@ -10530,6 +11707,13 @@ export class CommandExecutor {
         const nextAuthorId = existing.authorId ?? candidate.authorId ?? null;
         if (nextAuthorId !== existing.authorId) {
           existing.authorId = nextAuthorId;
+        }
+        const nextSnapshotHash =
+          candidate.postSnapshotHash ??
+          existing.postSnapshotHash ??
+          null;
+        if (nextSnapshotHash !== existing.postSnapshotHash) {
+          existing.postSnapshotHash = nextSnapshotHash;
         }
         if (
           existing.source.startsWith("own_latest") &&
@@ -10712,11 +11896,17 @@ export class CommandExecutor {
           (entityType === "comment" ? entityId : null) ??
           null;
         if (!postId) continue;
+        const postSnapshotHash = this.computePostSnapshotHash({
+          postId,
+          commentId: input.action === "comment" ? commentId : null,
+          postRecord: row,
+        });
         push({
           postId,
           commentId: input.action === "comment" ? commentId : null,
           authorId: null,
           source,
+          postSnapshotHash,
         });
       }
       return resolved;
@@ -10790,6 +11980,7 @@ export class CommandExecutor {
               commentId: input.action === "comment" ? (parsedIds.commentId ?? null) : null,
               authorId: null,
               source: "memory_retrieval",
+              postSnapshotHash: null,
             });
           }
         }
@@ -10810,6 +12001,7 @@ export class CommandExecutor {
                 input.action === "comment" ? (commentId ?? null) : null,
               authorId: null,
               source: "memory_lookup_plan",
+              postSnapshotHash: null,
             });
           }
         }
@@ -10863,11 +12055,17 @@ export class CommandExecutor {
         const targetId = asPositiveInt(row.targetId);
         if (!targetId) continue;
         const targetCommentId = asPositiveInt(row.targetCommentId) ?? null;
+        const postSnapshotHash = this.computePostSnapshotHash({
+          postId: targetId,
+          commentId: input.action === "comment" ? targetCommentId : null,
+          postRecord: row,
+        });
         resolved.push({
           postId: targetId,
           commentId: input.action === "comment" ? targetCommentId : null,
           authorId: null,
           source: "unanswered_mention",
+          postSnapshotHash,
         });
       }
       return resolved;
@@ -11105,11 +12303,17 @@ export class CommandExecutor {
             asNonEmptyString(author?.id) ??
             asNonEmptyString(postRecord.authorId) ??
             candidate.authorId;
+          const postSnapshotHash = this.computePostSnapshotHash({
+            postId: candidate.postId,
+            commentId: candidate.commentId,
+            postRecord,
+          });
           return [
             {
               ...candidate,
               authorId,
               source: candidate.source,
+              postSnapshotHash: postSnapshotHash ?? candidate.postSnapshotHash ?? null,
             },
           ];
         },
@@ -11179,6 +12383,73 @@ export class CommandExecutor {
         throw new Error("engagement_target_unavailable:no_targets_discovered:self_candidates_only");
       }
       candidatePool = nonOwnCandidates;
+    }
+    if (input.action === "comment") {
+      const allowedCandidates: EngagementTargetCandidate[] = [];
+      const filteredRecent: Array<{
+        postId: number;
+        commentId: number | null;
+        source: string;
+        reason: string;
+        postSnapshotHash: string | null;
+        recentPostSnapshotHash: string | null;
+      }> = [];
+      for (const candidate of candidatePool) {
+        const reuseDecision = this.decideCommentTargetReuse({
+          commandId: input.commandId,
+          postId: candidate.postId,
+          commentId: candidate.commentId ?? null,
+          postSnapshotHash: candidate.postSnapshotHash ?? null,
+          source: candidate.source,
+          recentUsage: recentCommentUsage,
+        });
+        if (reuseDecision.allow) {
+          allowedCandidates.push(candidate);
+          continue;
+        }
+        filteredRecent.push({
+          postId: candidate.postId,
+          commentId: candidate.commentId ?? null,
+          source: candidate.source,
+          reason: reuseDecision.reason,
+          postSnapshotHash: candidate.postSnapshotHash ?? null,
+          recentPostSnapshotHash: reuseDecision.recentMatch?.postSnapshotHash ?? null,
+        });
+      }
+      if (allowedCandidates.length === 0) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "engagement_target_resolution_failed",
+            at: nowIso(),
+            commandId: input.commandId,
+            action: input.action,
+            reason: "recent_comment_target_reuse_blocked",
+            query: hints.rawQuery,
+            bridgeQuerySuccessCount,
+            bridgeQueryFailureCount,
+            filteredRecentTargets: filteredRecent.slice(0, 8),
+            trace,
+          })
+          .catch(() => undefined);
+        throw new Error(
+          "engagement_target_unavailable:no_targets_discovered:recent_comment_target_reuse_blocked",
+        );
+      }
+      if (filteredRecent.length > 0) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "engagement_target_filtered_recent_comment_target",
+            at: nowIso(),
+            commandId: input.commandId,
+            action: input.action,
+            filteredCount: filteredRecent.length,
+            keptCount: allowedCandidates.length,
+            filtered: filteredRecent.slice(0, 8),
+            query: hints.rawQuery,
+          })
+          .catch(() => undefined);
+      }
+      candidatePool = allowedCandidates;
     }
 
     const rankTable =
@@ -11421,6 +12692,92 @@ export class CommandExecutor {
       }
     }
 
+    if (input.action === "comment") {
+      const selectedTarget = selected;
+      if (!selectedTarget) return null;
+      const selectedReuseDecision = this.decideCommentTargetReuse({
+        commandId: input.commandId,
+        postId: selectedTarget.postId,
+        commentId: selectedTarget.commentId ?? null,
+        postSnapshotHash: selectedTarget.postSnapshotHash ?? null,
+        source: selectedTarget.source,
+        recentUsage: recentCommentUsage,
+      });
+      if (!selectedReuseDecision.allow) {
+        const fallback = candidatePool.find((candidate) => {
+          if (candidate.postId === selectedTarget.postId) return false;
+          if (
+            agentMainUserId &&
+            this.isOwnEngagementCandidate(candidate, agentMainUserId) &&
+            !candidate.commentId
+          ) {
+            return false;
+          }
+          const reuseDecision = this.decideCommentTargetReuse({
+            commandId: input.commandId,
+            postId: candidate.postId,
+            commentId: candidate.commentId ?? null,
+            postSnapshotHash: candidate.postSnapshotHash ?? null,
+            source: candidate.source,
+            recentUsage: recentCommentUsage,
+          });
+          return reuseDecision.allow;
+        });
+        if (fallback) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "engagement_target_filtered_recent_comment_target",
+              at: nowIso(),
+              commandId: input.commandId,
+              action: input.action,
+              filteredCount: 1,
+              keptCount: 1,
+              filtered: [
+                {
+                  postId: selectedTarget.postId,
+                  commentId: selectedTarget.commentId ?? null,
+                  source: selectedTarget.source,
+                  reason: selectedReuseDecision.reason,
+                  postSnapshotHash: selectedTarget.postSnapshotHash ?? null,
+                  recentPostSnapshotHash:
+                    selectedReuseDecision.recentMatch?.postSnapshotHash ?? null,
+                },
+              ],
+              fallbackPostId: fallback.postId,
+              fallbackCommentId: fallback.commentId ?? null,
+              fallbackSource: fallback.source,
+              query: hints.rawQuery,
+            })
+            .catch(() => undefined);
+          selected = fallback;
+        } else {
+          await this.ctx.memory
+            .recordWrite({
+              type: "engagement_target_resolution_failed",
+              at: nowIso(),
+              commandId: input.commandId,
+              action: input.action,
+              reason: "recent_comment_target_reuse_blocked_after_thread_resolution",
+              query: hints.rawQuery,
+              bridgeQuerySuccessCount,
+              bridgeQueryFailureCount,
+              selectedPostId: selectedTarget.postId,
+              selectedCommentId: selectedTarget.commentId ?? null,
+              selectedSource: selectedTarget.source,
+              selectedPostSnapshotHash: selectedTarget.postSnapshotHash ?? null,
+              selectedReason: selectedReuseDecision.reason,
+              recentPostSnapshotHash:
+                selectedReuseDecision.recentMatch?.postSnapshotHash ?? null,
+              trace,
+            })
+            .catch(() => undefined);
+          throw new Error(
+            "engagement_target_unavailable:no_targets_discovered:recent_comment_target_reuse_blocked",
+          );
+        }
+      }
+    }
+
     const resolved = {
       ...selected,
       commentId: input.action === "comment" ? (selected.commentId ?? null) : null,
@@ -11439,6 +12796,7 @@ export class CommandExecutor {
         postId: resolved.postId,
         commentId: resolved.commentId,
         source: resolved.source,
+        postSnapshotHash: resolved.postSnapshotHash ?? null,
         query: hints.rawQuery,
         candidatesConsidered: candidatePool.length,
         trace,
@@ -11813,6 +13171,8 @@ export class CommandExecutor {
   private mapGoalToGenerateKind(goal: string): string {
     if (goal === "avatar") return "media";
     if (goal === "banner") return "media";
+    if (goal === "chat" || goal === "conversation") return "media";
+    if (goal === "settings" || goal === "moderation") return "media";
     if (goal === "story") return "story";
     if (goal === "thread") return "thread";
     if (goal === "comment" || goal === "reply") return "comment";
@@ -11820,7 +13180,7 @@ export class CommandExecutor {
     if (goal === "repost" || goal === "boost") return "repost";
     if (goal === "multi_media" || goal === "carousel") return "multi_media";
     if (goal === "media" || goal === "image" || goal === "post") return "media";
-    return "story";
+    return "media";
   }
 
   private resolveEnforcedDraftAction(
