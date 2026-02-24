@@ -27,7 +27,7 @@ const baseCommand = (): Command => ({
   runtimeSig: null,
 });
 
-const createExecutor = () => {
+const createExecutor = (options?: { personaFrames?: unknown[] }) => {
   const root = path.join(
     os.tmpdir(),
     `molkgram-command-executor-generate-input-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -42,6 +42,7 @@ const createExecutor = () => {
   };
 
   const noopMutate = async () => ({ ok: true });
+  const listPersonaFrames = async () => options?.personaFrames ?? [];
 
   return new CommandExecutor({
     config: {
@@ -67,6 +68,10 @@ const createExecutor = () => {
         generate: { mutate: noopMutate },
         uploadDataUri: { mutate: noopMutate },
         uploadRemote: { mutate: noopMutate },
+        listPersonas: { query: async () => [] },
+        upsertPersona: { mutate: noopMutate },
+        listPersonaFrames: { query: listPersonaFrames },
+        upsertPersonaFrame: { mutate: noopMutate },
       },
     },
     commandSeal: {
@@ -176,5 +181,60 @@ describe("command executor generate input", () => {
       expect.arrayContaining(["https://cdn.example.com/reference-c.png"]),
     );
     expect(isRecord(result)).toBe(true);
+  });
+
+  it("overrides persona media references with tracked persona frames", async () => {
+    const executor = createExecutor({
+      personaFrames: [
+        {
+          id: 3,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/fullbody.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/fullbody-opt.jpg",
+          updatedAt: "2026-02-24T05:20:00.000Z",
+        },
+        {
+          id: 1,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/selfie.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/selfie-opt.jpg",
+          updatedAt: "2026-02-24T05:10:00.000Z",
+        },
+        {
+          id: 2,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/midshot.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/midshot-opt.jpg",
+          updatedAt: "2026-02-24T05:15:00.000Z",
+        },
+      ],
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "story",
+        topic: "night city walk",
+        mediaPersona: "realistic_core",
+        mediaReferenceUrls: ["https://cdn.example.com/noise/unscoped-a.png"],
+      },
+      baseCommand(),
+    );
+
+    expect(Array.isArray(result.mediaReferenceUrls)).toBe(true);
+    if (!Array.isArray(result.mediaReferenceUrls)) return;
+    expect(result.mediaReferenceUrls).toEqual([
+      "https://cdn.example.com/persona/selfie-opt.jpg",
+      "https://cdn.example.com/persona/midshot-opt.jpg",
+      "https://cdn.example.com/persona/fullbody-opt.jpg",
+    ]);
   });
 });

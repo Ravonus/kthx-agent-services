@@ -1498,22 +1498,45 @@ const main = async (): Promise<void> => {
         source: string,
       ): AutoCreditPostTarget | null => {
         if (!isRecord(value)) return null;
+        const postRecord = isRecord(value.post) ? value.post : null;
         const postId =
           parsePositiveInt(value.id) ??
           parsePositiveInt(value.postId) ??
-          parsePositiveInt(value.targetPostId);
+          parsePositiveInt(value.targetPostId) ??
+          (postRecord ? parsePositiveInt(postRecord.id) ?? parsePositiveInt(postRecord.postId) : null);
         if (!postId) return null;
         const commentId =
           parsePositiveInt(value.commentId) ??
           parsePositiveInt(value.parentId) ??
-          parsePositiveInt(value.targetCommentId);
+          parsePositiveInt(value.targetCommentId) ??
+          (postRecord ? parsePositiveInt(postRecord.commentId) : null);
         const author = isRecord(value.author) ? value.author : null;
+        const postAuthor = postRecord && isRecord(postRecord.author) ? postRecord.author : null;
+        const userRecord = isRecord(value.user) ? value.user : null;
         const authorId =
           (typeof value.authorId === "string" && value.authorId.trim().length > 0
             ? value.authorId.trim()
             : null) ??
+          (typeof author?.mainUserId === "string" && author.mainUserId.trim().length > 0
+            ? author.mainUserId.trim()
+            : null) ??
           (typeof author?.id === "string" && author.id.trim().length > 0
             ? author.id.trim()
+            : null) ??
+          (typeof postRecord?.authorId === "string" && postRecord.authorId.trim().length > 0
+            ? postRecord.authorId.trim()
+            : null) ??
+          (typeof postAuthor?.mainUserId === "string" && postAuthor.mainUserId.trim().length > 0
+            ? postAuthor.mainUserId.trim()
+            : null) ??
+          (typeof postAuthor?.id === "string" && postAuthor.id.trim().length > 0
+            ? postAuthor.id.trim()
+            : null) ??
+          (typeof userRecord?.mainUserId === "string" && userRecord.mainUserId.trim().length > 0
+            ? userRecord.mainUserId.trim()
+            : null) ??
+          (typeof userRecord?.id === "string" && userRecord.id.trim().length > 0
+            ? userRecord.id.trim()
             : null);
         return {
           postId,
@@ -1527,9 +1550,120 @@ const main = async (): Promise<void> => {
         const items = Array.isArray(value.items) ? value.items : [];
         return items.filter((entry): entry is Record<string, unknown> => isRecord(entry));
       };
+      const resolveAuthorIdFromPostRecord = (record: Record<string, unknown>): string | null => {
+        const author = isRecord(record.author) ? record.author : null;
+        return (
+          (typeof record.authorId === "string" && record.authorId.trim().length > 0
+            ? record.authorId.trim()
+            : null) ??
+          (typeof author?.mainUserId === "string" && author.mainUserId.trim().length > 0
+            ? author.mainUserId.trim()
+            : null) ??
+          (typeof author?.id === "string" && author.id.trim().length > 0
+            ? author.id.trim()
+            : null)
+        );
+      };
+      const resolveFindPostAuthorId = (value: unknown, postId: number): string | null => {
+        if (!isRecord(value)) return null;
+        if (isRecord(value.data)) {
+          const nested = resolveFindPostAuthorId(value.data, postId);
+          if (nested) return nested;
+        }
+        if (isRecord(value.post)) {
+          const id =
+            parsePositiveInt(value.post.id) ??
+            parsePositiveInt(value.post.postId);
+          if (id === postId) {
+            return resolveAuthorIdFromPostRecord(value.post);
+          }
+        }
+        if (Array.isArray(value.items)) {
+          for (const entry of value.items) {
+            if (!isRecord(entry)) continue;
+            const id =
+              parsePositiveInt(entry.id) ??
+              parsePositiveInt(entry.postId);
+            if (id !== postId) continue;
+            const resolved = resolveAuthorIdFromPostRecord(entry);
+            if (resolved) return resolved;
+          }
+        }
+        const rootId = parsePositiveInt(value.id) ?? parsePositiveInt(value.postId);
+        if (rootId === postId) {
+          return resolveAuthorIdFromPostRecord(value);
+        }
+        return null;
+      };
+      const resolveFindCommentAuthorId = (
+        value: unknown,
+        postId: number,
+        commentId: number,
+      ): string | null => {
+        if (!isRecord(value)) return null;
+        if (isRecord(value.data)) {
+          const nested = resolveFindCommentAuthorId(value.data, postId, commentId);
+          if (nested) return nested;
+        }
+        const readAuthorId = (record: Record<string, unknown>): string | null => {
+          const author = isRecord(record.author) ? record.author : null;
+          return (
+            (typeof record.authorId === "string" && record.authorId.trim().length > 0
+              ? record.authorId.trim()
+              : null) ??
+            (typeof author?.mainUserId === "string" && author.mainUserId.trim().length > 0
+              ? author.mainUserId.trim()
+              : null) ??
+            (typeof author?.id === "string" && author.id.trim().length > 0
+              ? author.id.trim()
+              : null)
+          );
+        };
+        if (isRecord(value.comment)) {
+          const rowPostId = parsePositiveInt(value.comment.postId);
+          const rowCommentId =
+            parsePositiveInt(value.comment.commentId) ??
+            parsePositiveInt(value.comment.id);
+          if (rowPostId === postId && rowCommentId === commentId) {
+            return readAuthorId(value.comment);
+          }
+        }
+        if (Array.isArray(value.comments)) {
+          for (const entry of value.comments) {
+            if (!isRecord(entry)) continue;
+            const rowPostId = parsePositiveInt(entry.postId);
+            const rowCommentId =
+              parsePositiveInt(entry.commentId) ??
+              parsePositiveInt(entry.id);
+            if (rowPostId !== postId || rowCommentId !== commentId) continue;
+            const resolved = readAuthorId(entry);
+            if (resolved) return resolved;
+          }
+        }
+        const rootPostId = parsePositiveInt(value.postId);
+        const rootCommentId =
+          parsePositiveInt(value.commentId) ??
+          parsePositiveInt(value.id);
+        if (rootPostId === postId && rootCommentId === commentId) {
+          return readAuthorId(value);
+        }
+        return null;
+      };
+      const normalizeInterestTag = (value: unknown): string | null => {
+        if (typeof value !== "string") return null;
+        const normalized = value
+          .trim()
+          .toLowerCase()
+          .replace(/^#+/u, "")
+          .replace(/[^a-z0-9_-]+/gu, "-")
+          .replace(/-+/gu, "-")
+          .replace(/^-+|-+$/gu, "")
+          .slice(0, 40);
+        return normalized.length >= 2 ? normalized : null;
+      };
 
       let agentMainUserId: string | null = null;
-      let agentHandle: string | null = null;
+      let interestTags: string[] = [];
       const profileData = await callAgentChatBridge({ action: "agent_profile" }).catch(
         () => null,
       );
@@ -1540,10 +1674,23 @@ const main = async (): Promise<void> => {
           agentRecord.mainUserId.trim().length > 0
             ? agentRecord.mainUserId.trim()
             : null;
-        agentHandle =
-          typeof agentRecord.handle === "string" && agentRecord.handle.trim().length > 0
-            ? agentRecord.handle.trim().toLowerCase()
-            : null;
+        interestTags = Array.from(
+          new Set(
+            [
+              ...(Array.isArray(agentRecord.preferredTags)
+                ? agentRecord.preferredTags
+                : []),
+              ...(Array.isArray(profileData.preferredTags)
+                ? profileData.preferredTags
+                : []),
+              ...(isRecord(profileData.config) && Array.isArray(profileData.config.preferredTags)
+                ? profileData.config.preferredTags
+                : []),
+            ]
+              .map((value) => normalizeInterestTag(value))
+              .filter((value): value is string => Boolean(value)),
+          ),
+        ).slice(0, 8);
       }
 
       const targets: AutoCreditPostTarget[] = [];
@@ -1556,21 +1703,6 @@ const main = async (): Promise<void> => {
         targets.push(candidate);
       };
 
-      if (agentHandle) {
-        const ownLatest = await callAgentChatBridge({
-          action: "find_post",
-          authorHandle: `@${agentHandle}`,
-          latest: true,
-        }).catch(() => null);
-        const ownCandidate = parsePostTarget(ownLatest, "own_latest");
-        if (ownCandidate) {
-          pushTarget({
-            ...ownCandidate,
-            authorId: agentMainUserId ?? ownCandidate.authorId,
-          });
-        }
-      }
-
       const mentionsData = await callAgentChatBridge({
         action: "browse_unanswered_mentions",
         limit: 16,
@@ -1582,18 +1714,36 @@ const main = async (): Promise<void> => {
         if (targetType !== "post") continue;
         const targetId = parsePositiveInt(mention.targetId);
         if (!targetId) continue;
+        const targetCommentId =
+          parsePositiveInt(mention.targetCommentId) ??
+          parsePositiveInt(mention.commentId) ??
+          parsePositiveInt(mention.parentId);
         pushTarget({
           postId: targetId,
-          commentId: null,
+          commentId: targetCommentId ?? null,
           authorId: null,
           source: "unanswered_mention",
         });
       }
 
-      const [homeData, trendingData, exploreData] = await Promise.all([
+      const [homeData, trendingData, exploreData, interestTrendingData, interestExploreData] = await Promise.all([
         callAgentChatBridge({ action: "browse_home_feed", limit: 24 }).catch(() => null),
         callAgentChatBridge({ action: "browse_trending", limit: 24 }).catch(() => null),
         callAgentChatBridge({ action: "browse_posts", limit: 24 }).catch(() => null),
+        interestTags.length > 0
+          ? callAgentChatBridge({
+              action: "browse_trending",
+              limit: 24,
+              tags: interestTags.slice(0, 8),
+            }).catch(() => null)
+          : Promise.resolve(null),
+        interestTags.length > 0
+          ? callAgentChatBridge({
+              action: "browse_posts",
+              limit: 24,
+              tags: interestTags.slice(0, 8),
+            }).catch(() => null)
+          : Promise.resolve(null),
       ]);
       for (const item of parseRecordItems(homeData)) {
         pushTarget(parsePostTarget(item, "home_feed"));
@@ -1603,6 +1753,43 @@ const main = async (): Promise<void> => {
       }
       for (const item of parseRecordItems(exploreData)) {
         pushTarget(parsePostTarget(item, "explore"));
+      }
+      for (const item of parseRecordItems(interestTrendingData)) {
+        pushTarget(parsePostTarget(item, "interest_trending"));
+      }
+      for (const item of parseRecordItems(interestExploreData)) {
+        pushTarget(parsePostTarget(item, "interest_explore"));
+      }
+
+      const unresolvedTargets = targets.filter((entry) => !entry.authorId).slice(0, 36);
+      if (unresolvedTargets.length > 0) {
+        const resolvedAuthorByTarget = new Map<string, string>();
+        await Promise.all(
+          unresolvedTargets.map(async (target) => {
+            const response = await callAgentChatBridge({
+              action: "find_post",
+              postId: target.postId,
+            }).catch(() => null);
+            const resolvedAuthorId = resolveFindPostAuthorId(response, target.postId);
+            if (!resolvedAuthorId) return;
+            resolvedAuthorByTarget.set(
+              `${target.postId}:${target.commentId ?? 0}`,
+              resolvedAuthorId,
+            );
+          }),
+        );
+        if (resolvedAuthorByTarget.size > 0) {
+          for (const target of targets) {
+            if (target.authorId) continue;
+            const key = `${target.postId}:${target.commentId ?? 0}`;
+            const resolvedAuthorId = resolvedAuthorByTarget.get(key);
+            if (!resolvedAuthorId) continue;
+            target.authorId = resolvedAuthorId;
+            if (!target.source.includes("+hydrated")) {
+              target.source = `${target.source}+hydrated`;
+            }
+          }
+        }
       }
 
       if (targets.length === 0) {
@@ -1631,11 +1818,77 @@ const main = async (): Promise<void> => {
       const ownTargets = agentMainUserId
         ? targets.filter((entry) => entry.authorId === agentMainUserId)
         : [];
-      const nonOwnTargets = agentMainUserId
-        ? targets.filter((entry) => entry.authorId !== agentMainUserId)
+      const knownNonOwnTargets = agentMainUserId
+        ? targets.filter((entry) => entry.authorId !== null && entry.authorId !== agentMainUserId)
         : targets.slice();
-      const commentTargets = [...ownTargets, ...nonOwnTargets];
-      const engagementTargets = nonOwnTargets.length > 0 ? nonOwnTargets : targets;
+      const unknownAuthorTargets = agentMainUserId
+        ? targets.filter((entry) => entry.authorId === null)
+        : [];
+      const nonOwnTargets = agentMainUserId
+        ? knownNonOwnTargets.length > 0
+          ? knownNonOwnTargets
+          : unknownAuthorTargets
+        : targets.slice();
+      const ownReplyCommentCandidates = ownTargets.filter(
+        (entry): entry is AutoCreditPostTarget & { commentId: number } =>
+          typeof entry.commentId === "number" && entry.commentId > 0,
+      );
+      const ownReplyAuthorByTargetKey = new Map<string, string | null>();
+      await Promise.all(
+        ownReplyCommentCandidates.map(async (entry) => {
+          const response = await callAgentChatBridge({
+            action: "find_comment",
+            postId: entry.postId,
+            commentId: entry.commentId,
+          }).catch(() => null);
+          const authorId = resolveFindCommentAuthorId(response, entry.postId, entry.commentId);
+          ownReplyAuthorByTargetKey.set(
+            `${entry.postId}:${entry.commentId}`,
+            authorId,
+          );
+        }),
+      );
+      const ownReplyTargets = ownReplyCommentCandidates.filter((entry) => {
+        const key = `${entry.postId}:${entry.commentId}`;
+        const parentAuthorId = ownReplyAuthorByTargetKey.get(key) ?? null;
+        if (agentMainUserId && parentAuthorId === agentMainUserId) {
+          return false;
+        }
+        if (!parentAuthorId) {
+          return entry.source.startsWith("unanswered_mention");
+        }
+        return true;
+      });
+      const commentTargets = (
+        nonOwnTargets.length > 0 ? [...nonOwnTargets, ...ownReplyTargets] : ownReplyTargets
+      ).sort((left, right) => {
+        const score = (entry: AutoCreditPostTarget): number => {
+          const isOwnReply =
+            agentMainUserId !== null &&
+            entry.authorId === agentMainUserId &&
+            typeof entry.commentId === "number" &&
+            entry.commentId > 0;
+          if (isOwnReply) return 0;
+          const isMentionSource = entry.source.startsWith("unanswered_mention");
+          if (isMentionSource && typeof entry.commentId === "number" && entry.commentId > 0) {
+            return 1;
+          }
+          if (isMentionSource) return 2;
+          if (typeof entry.commentId === "number" && entry.commentId > 0) return 3;
+          if (entry.source.startsWith("interest_")) return 4;
+          if (entry.source === "home_feed") return 5;
+          if (entry.source === "trending") return 6;
+          if (entry.source === "explore") return 7;
+          return 8;
+        };
+        const rankDelta = score(left) - score(right);
+        if (rankDelta !== 0) return rankDelta;
+        if ((right.commentId ?? 0) !== (left.commentId ?? 0)) {
+          return (right.commentId ?? 0) - (left.commentId ?? 0);
+        }
+        return right.postId - left.postId;
+      });
+      const engagementTargets = nonOwnTargets;
 
       const allowedWriteKindForAction: Record<EngagementAction, string> = {
         comment: "write.commentPost",
@@ -1720,6 +1973,10 @@ const main = async (): Promise<void> => {
         },
         planned: plannedCounts,
         targetPoolSize: targets.length,
+        nonOwnTargetPoolSize: nonOwnTargets.length,
+        unknownAuthorTargetPoolSize: unknownAuthorTargets.length,
+        commentTargetPoolSize: commentTargets.length,
+        interestTags,
       }).catch(() => {});
     })()
       .catch(async (error: unknown) => {

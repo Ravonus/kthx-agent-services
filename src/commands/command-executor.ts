@@ -52,6 +52,10 @@ const MEDIA_FILE_RE =
   /\.(png|jpe?g|webp|gif|svg|mp4|mov|webm|pdf|csv|txt|md|json|js)$/iu;
 const MAX_MEDIA_REFERENCE_INPUTS = 8;
 const MAX_COLLECTED_REFERENCE_INPUTS = 12;
+const PERSONA_REFERENCE_FRAME_ROLES = ["selfie", "midshot", "fullbody"] as const;
+const REQUIRED_PERSONA_REFERENCE_FRAME_COUNT = PERSONA_REFERENCE_FRAME_ROLES.length;
+const PERSONA_REFERENCE_MAX_SIDE = 640;
+const PERSONA_REFERENCE_JPEG_QUALITY = 62;
 const COMMENT_ECHO_PREFIX_PATTERN = /^frame\s*\d+\s*[:.-]/iu;
 const COMMENT_PROMPT_WRAPPER_PATTERN =
   /^(?:generate|create|make|draw|render)\s+(?:an?\s+)?(?:image|gif|avatar|banner|file)\b/iu;
@@ -273,7 +277,9 @@ const AUTONOMOUS_SEQUENCE_SIGNAL_PATTERN =
   /\b(first|second|third|fourth|next|then|finally|steps?|checklist|roadmap|before|after|vs|versus|reasons?|ways?|lessons?|takeaways?|timeline)\b/iu;
 const SELF_COMMENT_CLARIFICATION_INTENT_PATTERN =
   /\b(clarif(?:y|ication)|correction|follow(?:\s|-)?up|update|status|note|context|addendum|psa)\b/iu;
-const SELF_TOP_LEVEL_COMMENT_RARE_PERCENT = 14;
+const SELF_COMMENT_OWN_TARGET_QUERY_PATTERN =
+  /\b(?:my|our|own)\b[\w\s-]{0,32}\b(?:post|story|thread|comment|reply|update|follow(?:\s|-)?up)\b/iu;
+const SELF_TOP_LEVEL_COMMENT_RARE_PERCENT = 3;
 
 const isHttpUrl = (value: string): boolean => /^https?:\/\//iu.test(value.trim());
 const isDataUri = (value: string): boolean => /^data:/iu.test(value.trim());
@@ -297,6 +303,19 @@ const asNonEmptyString = (value: unknown): string | null => {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+};
+
+const normalizeInterestTagToken = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/^#+/u, "")
+    .replace(/[^a-z0-9_-]+/gu, "-")
+    .replace(/-+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 40);
+  return normalized.length >= 2 ? normalized : null;
 };
 
 const asPositiveInt = (value: unknown): number | null => {
@@ -811,6 +830,15 @@ type AgentMutator = {
   mutate(input: Record<string, unknown>): Promise<unknown>;
 };
 
+type AgentQuery = {
+  query(input?: Record<string, unknown>): Promise<unknown>;
+};
+
+type AgentProcedure = {
+  mutate?: (input: Record<string, unknown>) => Promise<unknown>;
+  query?: (input?: Record<string, unknown>) => Promise<unknown>;
+};
+
 type AgentRouterLike = {
   ackDirective: AgentMutator;
   createPost: AgentMutator;
@@ -826,8 +854,8 @@ type AgentRouterLike = {
 };
 
 type TrpcLike = {
-  agent: Record<string, AgentMutator>;
-  realtime?: Record<string, AgentMutator>;
+  agent: Record<string, AgentProcedure>;
+  realtime?: Record<string, AgentProcedure>;
 };
 
 type CommandOutcome = {
@@ -915,6 +943,7 @@ type GeneratedDraft = {
 type GeneratedAssetType = "image" | "gif" | "pdf" | "csv" | "code" | "file" | "txt" | "md";
 type GeneratedCustomAssetKind = "emote" | "sticker" | "gif";
 type GeneratedCustomAssetScope = "mine" | "group" | "server";
+type PersonaFrameRole = (typeof PERSONA_REFERENCE_FRAME_ROLES)[number];
 type GeneratedCustomAssetSaveIntent = {
   kind: GeneratedCustomAssetKind;
   scope: GeneratedCustomAssetScope;
@@ -927,6 +956,27 @@ type GeneratedCustomAssetSaveResult = {
   id: number | null;
   url: string | null;
   mimeType: string | null;
+};
+type PersonaFrameRecord = {
+  id: number;
+  personaSlug: string;
+  frameRole: PersonaFrameRole;
+  mediaUrl: string;
+  originalUrl: string | null;
+  optimizedUrl: string | null;
+  mimeType: string | null;
+  width: number | null;
+  height: number | null;
+  sizeBytes: number | null;
+  sourcePrompt: string | null;
+  sourceCommandId: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+type PersonaReferenceResolution = {
+  personaSlug: string | null;
+  frameReferences: string[];
+  builtFrames: boolean;
 };
 type MediaGeneratorStreamFrame = {
   sourceFileName: string | null;
@@ -1029,6 +1079,7 @@ type EngagementLookupHints = {
   postId: number | null;
   commentId: number | null;
   handles: string[];
+  interestTags: string[];
 };
 
 type EngagementResolutionTrace = {
@@ -1181,6 +1232,7 @@ export class CommandExecutor {
       input.hints.postId ? `p:${input.hints.postId}` : "p:none",
       input.hints.commentId ? `c:${input.hints.commentId}` : "c:none",
       input.hints.handles.slice(0, 3).join(","),
+      input.hints.interestTags.slice(0, 4).join(","),
       truncateText(input.hints.rawQuery, 120).toLowerCase(),
       channelId,
       conversationId,
@@ -1208,6 +1260,17 @@ export class CommandExecutor {
   }
 
   private extractEngagementLookupHints(payload: Record<string, unknown>): EngagementLookupHints {
+    const context = isRecord(payload.context) ? payload.context : null;
+    const collectTagTokens = (value: unknown): string[] => {
+      if (!Array.isArray(value)) return [];
+      const collected: string[] = [];
+      for (const entry of value) {
+        const normalized = normalizeInterestTagToken(entry);
+        if (!normalized) continue;
+        collected.push(normalized);
+      }
+      return collected;
+    };
     const fields = [
       asNonEmptyString(payload.requestText),
       asNonEmptyString(payload.topic),
@@ -1237,11 +1300,32 @@ export class CommandExecutor {
       .map((match) => (match[1] ?? "").trim().toLowerCase())
       .filter((value) => value.length > 0)
       .slice(0, 8);
+    const tagsFromQuery = [...rawQuery.matchAll(/#([a-z0-9_-]{2,40})/giu)]
+      .map((match) => normalizeInterestTagToken(match[1] ?? ""))
+      .filter((value): value is string => Boolean(value));
+    const interestTags = Array.from(
+      new Set(
+        [
+          ...collectTagTokens(payload.tags),
+          ...collectTagTokens(payload.mediaLabels),
+          ...collectTagTokens(payload.labels),
+          ...collectTagTokens(payload.interests),
+          ...collectTagTokens(payload.preferredTags),
+          ...collectTagTokens(context?.tags),
+          ...collectTagTokens(context?.mediaLabels),
+          ...collectTagTokens(context?.labels),
+          ...collectTagTokens(context?.interests),
+          ...collectTagTokens(context?.preferredTags),
+          ...tagsFromQuery,
+        ],
+      ),
+    ).slice(0, 10);
     return {
       rawQuery,
       postId: postIdFromText,
       commentId: commentIdFromText,
       handles,
+      interestTags,
     };
   }
 
@@ -1723,7 +1807,12 @@ export class CommandExecutor {
     }
     const requireMutator = (name: keyof AgentRouterLike): AgentMutator => {
       const candidate = router[String(name)];
-      if (candidate && typeof candidate.mutate === "function") return candidate;
+      const mutateFn = candidate?.mutate;
+      if (typeof mutateFn === "function") {
+        return {
+          mutate: (input: Record<string, unknown>) => mutateFn(input),
+        };
+      }
       throw new Error(`tRPC agent mutator is unavailable: agent.${String(name)}`);
     };
     return {
@@ -1738,6 +1827,513 @@ export class CommandExecutor {
       generate: requireMutator("generate"),
       uploadDataUri: requireMutator("uploadDataUri"),
       uploadRemote: requireMutator("uploadRemote"),
+    };
+  }
+
+  private agentQueryOptional(name: string): AgentQuery | null {
+    const router = this.ctx.trpc?.agent;
+    if (!router) return null;
+    const candidate = router[name];
+    const queryFn = candidate?.query;
+    if (typeof queryFn === "function") {
+      return {
+        query: (input?: Record<string, unknown>) => queryFn(input),
+      };
+    }
+    return null;
+  }
+
+  private agentMutatorOptional(name: string): AgentMutator | null {
+    const router = this.ctx.trpc?.agent;
+    if (!router) return null;
+    const candidate = router[name];
+    const mutateFn = candidate?.mutate;
+    if (typeof mutateFn === "function") {
+      return {
+        mutate: (input: Record<string, unknown>) => mutateFn(input),
+      };
+    }
+    return null;
+  }
+
+  private normalizePersonaSlug(value: unknown): string | null {
+    const raw = asNonEmptyString(value);
+    if (!raw) return null;
+    const normalized = raw
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gu, "_")
+      .replace(/^_+|_+$/gu, "")
+      .slice(0, 64);
+    return normalized.length > 0 ? normalized : null;
+  }
+
+  private resolvePersonaSlugFromPayload(payload: Record<string, unknown>): string | null {
+    const context = isRecord(payload.context) ? payload.context : null;
+    const candidates: unknown[] = [
+      payload.mediaPersona,
+      payload.persona,
+      payload.personaName,
+      context?.mediaPersona,
+      context?.persona,
+      context?.personaName,
+    ];
+    for (const candidate of candidates) {
+      const normalized = this.normalizePersonaSlug(candidate);
+      if (normalized) return normalized;
+    }
+    return null;
+  }
+
+  private shouldUsePersonaFrameReferences(personaSlug: string | null): boolean {
+    if (!personaSlug) return false;
+    return (
+      personaSlug !== "default" &&
+      personaSlug !== "general" &&
+      personaSlug !== "none" &&
+      personaSlug !== "auto"
+    );
+  }
+
+  private normalizePersonaFrameRole(value: unknown): PersonaFrameRole | null {
+    const normalized = asNonEmptyString(value)?.toLowerCase() ?? "";
+    if (normalized === "selfie") return "selfie";
+    if (normalized === "midshot" || normalized === "halfbody" || normalized === "half_body") {
+      return "midshot";
+    }
+    if (
+      normalized === "fullbody" ||
+      normalized === "full_body" ||
+      normalized === "full" ||
+      normalized === "fullshot" ||
+      normalized === "full_shot"
+    ) {
+      return "fullbody";
+    }
+    return null;
+  }
+
+  private parseIsoOrNull(value: unknown): string | null {
+    const text = asNonEmptyString(value);
+    if (!text) return null;
+    const parsed = new Date(text);
+    if (Number.isNaN(parsed.getTime())) return null;
+    return parsed.toISOString();
+  }
+
+  private parsePersonaFrameRecords(value: unknown): PersonaFrameRecord[] {
+    const asRows = (input: unknown): unknown[] => {
+      if (Array.isArray(input)) return input;
+      if (isRecord(input) && Array.isArray(input.frames)) return input.frames;
+      return [];
+    };
+    const records: PersonaFrameRecord[] = [];
+    for (const rawEntry of asRows(value)) {
+      if (!isRecord(rawEntry)) continue;
+      const idRaw =
+        asPositiveInt(rawEntry.id) ??
+        (typeof rawEntry.id === "number" && Number.isFinite(rawEntry.id)
+          ? Math.max(1, Math.floor(rawEntry.id))
+          : null);
+      const personaSlug = this.normalizePersonaSlug(rawEntry.personaSlug);
+      const frameRole = this.normalizePersonaFrameRole(rawEntry.frameRole);
+      const mediaUrl = asNonEmptyString(rawEntry.mediaUrl);
+      if (!idRaw || !personaSlug || !frameRole || !mediaUrl) continue;
+      const width =
+        typeof rawEntry.width === "number" && Number.isFinite(rawEntry.width)
+          ? Math.max(1, Math.floor(rawEntry.width))
+          : null;
+      const height =
+        typeof rawEntry.height === "number" && Number.isFinite(rawEntry.height)
+          ? Math.max(1, Math.floor(rawEntry.height))
+          : null;
+      const sizeBytes =
+        typeof rawEntry.sizeBytes === "number" && Number.isFinite(rawEntry.sizeBytes)
+          ? Math.max(1, Math.floor(rawEntry.sizeBytes))
+          : null;
+      records.push({
+        id: idRaw,
+        personaSlug,
+        frameRole,
+        mediaUrl,
+        originalUrl: asNonEmptyString(rawEntry.originalUrl),
+        optimizedUrl: asNonEmptyString(rawEntry.optimizedUrl),
+        mimeType: asNonEmptyString(rawEntry.mimeType),
+        width,
+        height,
+        sizeBytes,
+        sourcePrompt: asNonEmptyString(rawEntry.sourcePrompt),
+        sourceCommandId: asNonEmptyString(rawEntry.sourceCommandId),
+        createdAt: this.parseIsoOrNull(rawEntry.createdAt),
+        updatedAt: this.parseIsoOrNull(rawEntry.updatedAt),
+      });
+    }
+    return records;
+  }
+
+  private getPersonaFrameRoleSortValue(frameRole: PersonaFrameRole): number {
+    const index = PERSONA_REFERENCE_FRAME_ROLES.indexOf(frameRole);
+    return index >= 0 ? index : PERSONA_REFERENCE_FRAME_ROLES.length + 1;
+  }
+
+  private sortPersonaFrames(frames: PersonaFrameRecord[]): PersonaFrameRecord[] {
+    return [...frames].sort((left, right) => {
+      const roleDelta =
+        this.getPersonaFrameRoleSortValue(left.frameRole) -
+        this.getPersonaFrameRoleSortValue(right.frameRole);
+      if (roleDelta !== 0) return roleDelta;
+      const leftUpdated = left.updatedAt ? Date.parse(left.updatedAt) : 0;
+      const rightUpdated = right.updatedAt ? Date.parse(right.updatedAt) : 0;
+      if (leftUpdated !== rightUpdated) return rightUpdated - leftUpdated;
+      return right.id - left.id;
+    });
+  }
+
+  private pickPersonaFrameReferenceUrl(frame: PersonaFrameRecord): string | null {
+    const candidates = [frame.optimizedUrl, frame.mediaUrl, frame.originalUrl];
+    for (const candidate of candidates) {
+      const normalized = asNonEmptyString(candidate);
+      if (!normalized) continue;
+      if (this.isStreamPartArtifactReference(normalized)) continue;
+      return normalized;
+    }
+    return null;
+  }
+
+  private collectPersonaFrameReferences(frames: PersonaFrameRecord[]): string[] {
+    const ordered = this.sortPersonaFrames(frames);
+    const seen = new Set<string>();
+    const collected: string[] = [];
+    for (const role of PERSONA_REFERENCE_FRAME_ROLES) {
+      const match = ordered.find((frame) => frame.frameRole === role);
+      if (!match) continue;
+      const selected = this.pickPersonaFrameReferenceUrl(match);
+      if (!selected || seen.has(selected)) continue;
+      seen.add(selected);
+      collected.push(selected);
+    }
+    return collected.slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT);
+  }
+
+  private async listPersonaFramesFromServer(personaSlug: string): Promise<PersonaFrameRecord[]> {
+    const listFrames = this.agentQueryOptional("listPersonaFrames");
+    if (!listFrames) return [];
+    try {
+      const response = await listFrames.query({ personaSlug });
+      const parsed = this.parsePersonaFrameRecords(response).filter(
+        (frame) => frame.personaSlug === personaSlug,
+      );
+      return this.sortPersonaFrames(parsed);
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "persona_frame_list_failed",
+          at: nowIso(),
+          personaSlug,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return [];
+    }
+  }
+
+  private async ensurePersonaDefinitionForFrames(
+    personaSlug: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    const listPersonas = this.agentQueryOptional("listPersonas");
+    const upsertPersona = this.agentMutatorOptional("upsertPersona");
+    if (!upsertPersona) return;
+    let personaExists = false;
+    if (listPersonas) {
+      try {
+        const listedRaw = await listPersonas.query();
+        const listed = Array.isArray(listedRaw)
+          ? listedRaw
+          : isRecord(listedRaw) && Array.isArray(listedRaw.personas)
+            ? listedRaw.personas
+            : [];
+        personaExists = listed.some((entry) => {
+          if (!isRecord(entry)) return false;
+          return this.normalizePersonaSlug(entry.slug) === personaSlug;
+        });
+      } catch {
+        personaExists = false;
+      }
+    }
+    if (personaExists) return;
+    const styleHint =
+      asNonEmptyString(payload.mediaPersonaStyleHint) ??
+      asNonEmptyString(payload.personaStyleHint) ??
+      null;
+    const displayName =
+      personaSlug
+        .split("_")
+        .map((part) =>
+          part.length > 0
+            ? `${part.charAt(0).toUpperCase()}${part.slice(1)}`
+            : "",
+        )
+        .join(" ")
+        .trim() || "Persona";
+    try {
+      await upsertPersona.mutate({
+        slug: personaSlug,
+        name: displayName,
+        labels: [personaSlug, "persona_reference", "realistic_reference"],
+        weight: 100,
+        isActive: true,
+        ...(styleHint ? { styleHint } : {}),
+      });
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "persona_definition_upsert_failed",
+          at: nowIso(),
+          personaSlug,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+    }
+  }
+
+  private buildPersonaReferencePrompt(input: {
+    personaSlug: string;
+    frameRole: PersonaFrameRole;
+    payload: Record<string, unknown>;
+  }): string {
+    const styleHint =
+      asNonEmptyString(input.payload.mediaPersonaStyleHint) ??
+      asNonEmptyString(input.payload.personaStyleHint) ??
+      null;
+    const sourcePrompt =
+      asNonEmptyString(input.payload.mediaPrompt) ??
+      asNonEmptyString(input.payload.prompt) ??
+      asNonEmptyString(input.payload.topic) ??
+      null;
+    const frameInstruction =
+      input.frameRole === "selfie"
+        ? "Selfie reference frame: chest-up portrait, direct eye contact, neutral expression, natural lighting."
+        : input.frameRole === "midshot"
+          ? "Midshot reference frame: waist-up framing, clear body proportions, neutral pose, realistic streetwear details."
+          : "Fullbody reference frame: full-body standing pose, realistic proportions, plain uncluttered background.";
+    const continuityLine =
+      "Keep identity continuity with existing persona references (same face, age range, skin tone, hair, and body proportions).";
+    const realismLine =
+      "Photorealistic style only. No anime, no cartoon, no painterly treatment.";
+    return [
+      `Build a persistent persona reference image for slug "${input.personaSlug}".`,
+      frameInstruction,
+      continuityLine,
+      realismLine,
+      "Single subject only. Keep image clean, sharp, and unoccluded.",
+      styleHint ? `Style hint: ${styleHint}` : null,
+      sourcePrompt ? `Persona context: ${truncateText(sourcePrompt, 220)}` : null,
+    ]
+      .filter((entry): entry is string => Boolean(entry))
+      .join("\n");
+  }
+
+  private async compressPersonaReferenceImage(input: {
+    sourceUrl: string;
+    sourceMimeType: string | null;
+    personaSlug: string;
+    frameRole: PersonaFrameRole;
+  }): Promise<ResolvedMediaUpload | null> {
+    const transformed = await transformCustomAssetMedia({
+      sourceUrl: input.sourceUrl,
+      sourceMimeType: input.sourceMimeType ?? "image/png",
+      kind: "sticker",
+      spec: {
+        width: PERSONA_REFERENCE_MAX_SIDE,
+        height: PERSONA_REFERENCE_MAX_SIDE,
+        fit: "inside",
+        format: "jpeg",
+        quality: PERSONA_REFERENCE_JPEG_QUALITY,
+      },
+    }).catch(() => null);
+    if (!transformed?.bytes?.byteLength) return null;
+    const fileName = `persona-${input.personaSlug}-${input.frameRole}-${Date.now()}.jpg`;
+    const uploadedByChunk = await this.uploadBytesViaChunkRoute({
+      bytes: transformed.bytes,
+      mimeType: transformed.mimeType,
+      filename: fileName,
+      keepOriginal: false,
+    });
+    if (uploadedByChunk) return uploadedByChunk;
+    const dataUri = `data:${transformed.mimeType};base64,${transformed.bytes.toString("base64")}`;
+    const uploaded = await this.agent().uploadDataUri.mutate({
+      dataUri,
+      keepOriginal: false,
+    });
+    return this.mapUploadResult(uploaded);
+  }
+
+  private async upsertPersonaFrameRecord(input: {
+    personaSlug: string;
+    frameRole: PersonaFrameRole;
+    media: ResolvedMediaUpload;
+    sourcePrompt: string;
+    sourceCommandId: string;
+  }): Promise<boolean> {
+    const upsertFrame = this.agentMutatorOptional("upsertPersonaFrame");
+    if (!upsertFrame) return false;
+    try {
+      const mimeType =
+        inferMimeTypeFromUrl(input.media.mediaOptimizedUrl ?? input.media.mediaUrl) ??
+        inferMimeTypeFromUrl(input.media.mediaOriginalUrl ?? input.media.mediaUrl) ??
+        "image/jpeg";
+      await upsertFrame.mutate({
+        personaSlug: input.personaSlug,
+        frameRole: input.frameRole,
+        mediaUrl: input.media.mediaUrl,
+        ...(input.media.mediaOriginalUrl
+          ? { originalUrl: input.media.mediaOriginalUrl }
+          : {}),
+        ...(input.media.mediaOptimizedUrl
+          ? { optimizedUrl: input.media.mediaOptimizedUrl }
+          : {}),
+        mimeType,
+        ...(typeof input.media.mediaSizeBytes === "number" &&
+        Number.isFinite(input.media.mediaSizeBytes)
+          ? { sizeBytes: Math.max(1, Math.floor(input.media.mediaSizeBytes)) }
+          : {}),
+        sourcePrompt: truncateText(input.sourcePrompt, 2000),
+        sourceCommandId: input.sourceCommandId,
+      });
+      return true;
+    } catch (error: unknown) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "persona_frame_upsert_failed",
+          at: nowIso(),
+          personaSlug: input.personaSlug,
+          frameRole: input.frameRole,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+      return false;
+    }
+  }
+
+  private async bootstrapPersonaReferenceFrames(input: {
+    personaSlug: string;
+    payload: Record<string, unknown>;
+    command: Command;
+    existingFrames: PersonaFrameRecord[];
+  }): Promise<{ frames: PersonaFrameRecord[]; builtFrames: boolean }> {
+    let builtFrames = false;
+    await this.ensurePersonaDefinitionForFrames(input.personaSlug, input.payload);
+    const existingRoles = new Set<PersonaFrameRole>(
+      input.existingFrames.map((frame) => frame.frameRole),
+    );
+    const referenceInputs = this.collectPersonaFrameReferences(input.existingFrames);
+    for (const frameRole of PERSONA_REFERENCE_FRAME_ROLES) {
+      if (existingRoles.has(frameRole)) continue;
+      const sourcePrompt = this.buildPersonaReferencePrompt({
+        personaSlug: input.personaSlug,
+        frameRole,
+        payload: input.payload,
+      });
+      try {
+        const generated = await this.generateAndUploadMediaFromPrompt(sourcePrompt, {
+          generatedAssetType: "image",
+          mode: "persona_reference_bootstrap",
+          referenceInputs,
+          keepOriginal: false,
+        });
+        const compressed =
+          (await this.compressPersonaReferenceImage({
+            sourceUrl: generated.mediaOptimizedUrl ?? generated.mediaUrl,
+            sourceMimeType:
+              inferMimeTypeFromUrl(generated.mediaOptimizedUrl ?? generated.mediaUrl) ??
+              inferMimeTypeFromUrl(generated.mediaOriginalUrl ?? generated.mediaUrl),
+            personaSlug: input.personaSlug,
+            frameRole,
+          }).catch(() => null)) ?? null;
+        const media = compressed ?? generated;
+        const upserted = await this.upsertPersonaFrameRecord({
+          personaSlug: input.personaSlug,
+          frameRole,
+          media,
+          sourcePrompt,
+          sourceCommandId: input.command.id,
+        });
+        if (upserted) {
+          builtFrames = true;
+        }
+        const frameReference =
+          this.resolvePreferredMediaUrl(
+            media.mediaOptimizedUrl,
+            media.mediaUrl,
+            media.mediaOriginalUrl,
+          ) ?? null;
+        if (
+          frameReference &&
+          !this.isStreamPartArtifactReference(frameReference) &&
+          !referenceInputs.includes(frameReference)
+        ) {
+          referenceInputs.push(frameReference);
+        }
+        await this.ctx.memory
+          .recordWrite({
+            type: "persona_frame_bootstrapped",
+            at: nowIso(),
+            commandId: input.command.id,
+            personaSlug: input.personaSlug,
+            frameRole,
+            mediaUrl: frameReference ?? media.mediaUrl,
+            compressed: Boolean(compressed),
+          })
+          .catch(() => undefined);
+      } catch (error: unknown) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "persona_frame_bootstrap_failed",
+            at: nowIso(),
+            commandId: input.command.id,
+            personaSlug: input.personaSlug,
+            frameRole,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          .catch(() => undefined);
+      }
+    }
+    const refreshed = await this.listPersonaFramesFromServer(input.personaSlug);
+    return { frames: refreshed, builtFrames };
+  }
+
+  private async resolvePersonaFrameReferences(input: {
+    payload: Record<string, unknown>;
+    command: Command;
+    fallbackReferenceInputs: string[];
+  }): Promise<PersonaReferenceResolution> {
+    const personaSlug = this.resolvePersonaSlugFromPayload(input.payload);
+    if (!this.shouldUsePersonaFrameReferences(personaSlug)) {
+      return {
+        personaSlug: null,
+        frameReferences: input.fallbackReferenceInputs.slice(0, MAX_MEDIA_REFERENCE_INPUTS),
+        builtFrames: false,
+      };
+    }
+    const normalizedPersonaSlug = personaSlug!;
+    let frames = await this.listPersonaFramesFromServer(normalizedPersonaSlug);
+    let builtFrames = false;
+    if (frames.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT) {
+      const bootstrapped = await this.bootstrapPersonaReferenceFrames({
+        personaSlug: normalizedPersonaSlug,
+        payload: input.payload,
+        command: input.command,
+        existingFrames: frames,
+      });
+      frames = bootstrapped.frames;
+      builtFrames = bootstrapped.builtFrames;
+    }
+    const frameReferences = this.collectPersonaFrameReferences(frames);
+    return {
+      personaSlug: normalizedPersonaSlug,
+      frameReferences,
+      builtFrames,
     };
   }
 
@@ -5580,6 +6176,55 @@ export class CommandExecutor {
     return value;
   }
 
+  private async resolveCommentAuthorIdForTarget(input: {
+    postId: number;
+    commentId: number;
+  }): Promise<string | null> {
+    if (!this.ctx.callAgentChatBridge) return null;
+    try {
+      const lookup = await this.callAgentBridgeLookupCached({
+        action: "find_comment",
+        postId: input.postId,
+        commentId: input.commentId,
+      });
+      const record = this.extractCommentRecordForCommentCuration(lookup.value);
+      if (record) {
+        const author = isRecord(record.author) ? record.author : null;
+        const authorId =
+          asNonEmptyString(record.authorId) ??
+          asNonEmptyString(author?.mainUserId) ??
+          asNonEmptyString(author?.id) ??
+          null;
+        if (authorId) return authorId;
+      }
+    } catch {
+      // best effort only
+    }
+    try {
+      const lookup = await this.callAgentBridgeLookupCached({
+        action: "browse_comments",
+        postId: input.postId,
+        limit: 40,
+      });
+      for (const item of this.collectBridgeRecordItems(lookup.value)) {
+        const entryCommentId =
+          asPositiveInt(item.commentId) ??
+          asPositiveInt(item.id);
+        if (!entryCommentId || entryCommentId !== input.commentId) continue;
+        const author = isRecord(item.author) ? item.author : null;
+        const authorId =
+          asNonEmptyString(item.authorId) ??
+          asNonEmptyString(author?.mainUserId) ??
+          asNonEmptyString(author?.id) ??
+          null;
+        if (authorId) return authorId;
+      }
+    } catch {
+      // best effort only
+    }
+    return null;
+  }
+
   private summarizeCommentsForPostDraft(value: unknown): string | null {
     if (!isRecord(value)) return null;
     const root = isRecord(value.data) ? value.data : value;
@@ -6274,6 +6919,29 @@ export class CommandExecutor {
         ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
         ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       });
+      const resultRecord = isRecord(result) ? result : null;
+      if (resultRecord?.applied === false) {
+        this.updateActionLifecycle({
+          command,
+          action: "like",
+          idempotencyKey,
+          target,
+          state: "acked",
+          lastError: null,
+        });
+        return this.successOutcome(command, {
+          skipped: true,
+          action: "like",
+          postId,
+          applied: false,
+          ...(typeof resultRecord.delta === "number" && Number.isFinite(resultRecord.delta)
+            ? { delta: resultRecord.delta }
+            : {}),
+          decision:
+            asNonEmptyString(resultRecord.decision) ??
+            (resultRecord.liked === false ? "noop_not_liked" : "noop"),
+        });
+      }
       this.updateActionLifecycle({
         command,
         action: "like",
@@ -6492,6 +7160,29 @@ export class CommandExecutor {
         ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
         ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       });
+      const resultRecord = isRecord(result) ? result : null;
+      if (resultRecord?.applied === false) {
+        this.updateActionLifecycle({
+          command,
+          action: "repost",
+          idempotencyKey,
+          target,
+          state: "acked",
+          lastError: null,
+        });
+        return this.successOutcome(command, {
+          skipped: true,
+          action: "repost",
+          postId,
+          applied: false,
+          ...(typeof resultRecord.delta === "number" && Number.isFinite(resultRecord.delta)
+            ? { delta: resultRecord.delta }
+            : {}),
+          decision:
+            asNonEmptyString(resultRecord.decision) ??
+            (resultRecord.reposted === false ? "noop_not_reposted" : "noop"),
+        });
+      }
       this.updateActionLifecycle({
         command,
         action: "repost",
@@ -7667,15 +8358,39 @@ export class CommandExecutor {
 
     return this.successOutcome(command, {
       generated: generatedResult,
-      executed: executedOutcomes.map((entry) => ({
-        commandId: entry.commandId,
-        kind: entry.kind,
-        ok: entry.ok,
-        skipped: isRecord(entry.data) ? entry.data.skipped === true : false,
-        ...(isRecord(entry.data) && asNonEmptyString(entry.data.decision)
-          ? { decision: asNonEmptyString(entry.data.decision) }
-          : {}),
-      })),
+      executed: executedOutcomes.map((entry) => {
+        const entryData = isRecord(entry.data) ? entry.data : null;
+        const commandId = asNonEmptyString(entry.commandId) ?? "";
+        const kind = asNonEmptyString(entry.kind) ?? "";
+        const postId =
+          asPositiveInt(entryData?.postId) ??
+          asPositiveInt(entryData?.targetPostId) ??
+          null;
+        const commentId =
+          asPositiveInt(entryData?.commentId) ??
+          asPositiveInt(entryData?.parentId) ??
+          asPositiveInt(entryData?.targetCommentId) ??
+          null;
+        const action = asNonEmptyString(entryData?.action) ?? null;
+        const decision = asNonEmptyString(entryData?.decision) ?? null;
+        const delta =
+          typeof entryData?.delta === "number" && Number.isFinite(entryData.delta)
+            ? entryData.delta
+            : null;
+        const applied = typeof entryData?.applied === "boolean" ? entryData.applied : null;
+        return {
+          commandId,
+          kind,
+          ok: entry.ok,
+          skipped: entryData?.skipped === true,
+          ...(action ? { action } : {}),
+          ...(postId ? { postId } : {}),
+          ...(commentId ? { commentId } : {}),
+          ...(decision ? { decision } : {}),
+          ...(delta !== null ? { delta } : {}),
+          ...(applied !== null ? { applied } : {}),
+        };
+      }),
       ...(skippedDrafts.length > 0
         ? {
             skippedDrafts: skippedDrafts.slice(0, 24),
@@ -8283,8 +8998,26 @@ export class CommandExecutor {
       null;
 
     const generatedAssetType = this.resolveGeneratedAssetType(payload.generatedAssetType);
-    const referenceInputs = this.collectMediaReferenceInputs(payload);
+    const fallbackReferenceInputs = this.collectMediaReferenceInputs(payload);
+    const personaReferences = await this.resolvePersonaFrameReferences({
+      payload,
+      command,
+      fallbackReferenceInputs,
+    });
+    const referenceInputs =
+      personaReferences.personaSlug !== null
+        ? [...personaReferences.frameReferences]
+        : [...fallbackReferenceInputs];
     if (
+      personaReferences.personaSlug !== null &&
+      referenceInputs.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT
+    ) {
+      throw new Error(
+        `persona_reference_setup_required:${personaReferences.personaSlug}`,
+      );
+    }
+    if (
+      personaReferences.personaSlug === null &&
       shouldReusePersonaReference &&
       recentGeneratedAssetHref &&
       !referenceInputs.includes(recentGeneratedAssetHref)
@@ -8638,9 +9371,7 @@ export class CommandExecutor {
         const editedMessageId = await runEdit();
         previewLastEditError = null;
         previewMessageId = editedMessageId ?? previewMessageId;
-        if (!previewMessageId) {
-          previewMessageId = await maybeResolvePreviewMessageId(true);
-        }
+        previewMessageId ??= await maybeResolvePreviewMessageId(true);
         return true;
       } catch (firstError: unknown) {
         previewLastEditError =
@@ -8651,9 +9382,7 @@ export class CommandExecutor {
           const editedMessageId = await runEdit();
           previewLastEditError = null;
           previewMessageId = editedMessageId ?? previewMessageId;
-          if (!previewMessageId) {
-            previewMessageId = await maybeResolvePreviewMessageId(true);
-          }
+          previewMessageId ??= await maybeResolvePreviewMessageId(true);
           return true;
         } catch (retryError: unknown) {
           previewLastEditError =
@@ -8699,9 +9428,7 @@ export class CommandExecutor {
         });
         previewMessageCreateAttempted = true;
         previewMessageId = extractBridgeMessageId(rebound) ?? previewMessageId;
-        if (!previewMessageId) {
-          previewMessageId = await maybeResolvePreviewMessageId(true);
-        }
+        previewMessageId ??= await maybeResolvePreviewMessageId(true);
         return Boolean(previewMessageId);
       } catch (error: unknown) {
         previewLastEditError = error instanceof Error ? error.message : String(error);
@@ -9276,6 +10003,13 @@ export class CommandExecutor {
       const message = error instanceof Error ? error.message : String(error);
       const isPromptCurationFailure = /prompt_curation_/iu.test(message);
       const isChatDeliveryFailure = /chat_preview_finalize_failed:/iu.test(message);
+      const isPersonaReferenceSetupFailure =
+        /persona_reference_setup_required:/iu.test(message);
+      const personaReferenceSetupSlug = (() => {
+        if (!isPersonaReferenceSetupFailure) return null;
+        const match = /persona_reference_setup_required:([a-z0-9_]{1,64})/iu.exec(message);
+        return match?.[1]?.trim().toLowerCase() ?? null;
+      })();
       const failureStreamFrames = snapshotStreamFrames();
       const streamPreviewForFailure = failureStreamFrames.length > 0
         ? buildStreamPreviewDeltaMetadata({
@@ -9297,6 +10031,8 @@ export class CommandExecutor {
           ? "I could not update that avatar right now. Please retry in a moment."
           : bannerRequest
             ? "I could not update that banner right now. Please retry in a moment."
+            : isPersonaReferenceSetupFailure
+              ? `I couldn't prepare persona references for ${personaReferenceSetupSlug ? `\`${personaReferenceSetupSlug}\`` : "that persona"} yet. I need three baseline frames (selfie, midshot, fullbody) before generating with persona continuity.`
             : isChatDeliveryFailure
               ? `I generated that ${generatedLabel}, but failed to finalize delivery in chat. Please retry.`
             : isPromptCurationFailure
@@ -9359,6 +10095,8 @@ export class CommandExecutor {
           ? `Avatar update failed: ${message}`
           : bannerRequest
             ? `Banner update failed: ${message}`
+          : isPersonaReferenceSetupFailure
+            ? `Persona reference setup failed: ${message}`
           : isChatDeliveryFailure
             ? `Literal generate delivery failed: ${message}`
           : `Literal generate failed: ${message}`,
@@ -9626,6 +10364,7 @@ export class CommandExecutor {
       const author = isRecord(entry.author) ? entry.author : null;
       const authorId =
         asNonEmptyString(entry.authorId) ??
+        asNonEmptyString(author?.mainUserId) ??
         asNonEmptyString(author?.id) ??
         null;
       return {
@@ -9654,6 +10393,17 @@ export class CommandExecutor {
       return true;
     }
     return candidate.source === "own_latest" || candidate.source.startsWith("own_latest+");
+  }
+
+  private shouldIncludeOwnLatestCommentLookup(input: {
+    rawQuery: string;
+    explicitPostId: number | null;
+    explicitCommentId: number | null;
+  }): boolean {
+    if (input.explicitPostId || input.explicitCommentId) return true;
+    const query = input.rawQuery.trim();
+    if (!query.length) return false;
+    return SELF_COMMENT_OWN_TARGET_QUERY_PATTERN.test(query);
   }
 
   private shouldAllowRareTopLevelSelfComment(input: {
@@ -9770,22 +10520,35 @@ export class CommandExecutor {
     };
     const trace: EngagementResolutionTrace[] = [];
     const candidates: EngagementTargetCandidate[] = [];
-    const seenTargetKeys = new Set<string>();
-    const pushCandidate = (candidate: EngagementTargetCandidate | null): void => {
-      if (!candidate) return;
+    const candidateByTargetKey = new Map<string, EngagementTargetCandidate>();
+    const pushCandidate = (candidate: EngagementTargetCandidate | null): boolean => {
+      if (!candidate) return false;
+      if (!candidate.postId || candidate.postId <= 0) return false;
       const key = `${candidate.postId}:${candidate.commentId ?? 0}`;
-      if (seenTargetKeys.has(key)) return;
-      seenTargetKeys.add(key);
+      const existing = candidateByTargetKey.get(key);
+      if (existing) {
+        const nextAuthorId = existing.authorId ?? candidate.authorId ?? null;
+        if (nextAuthorId !== existing.authorId) {
+          existing.authorId = nextAuthorId;
+        }
+        if (
+          existing.source.startsWith("own_latest") &&
+          !candidate.source.startsWith("own_latest")
+        ) {
+          existing.source = candidate.source;
+        }
+        return false;
+      }
+      candidateByTargetKey.set(key, candidate);
       candidates.push(candidate);
+      return true;
     };
     const addCandidatesFrom = (value: unknown, source: string): number => {
       let added = 0;
       for (const item of this.collectBridgeRecordItems(value)) {
         const parsed = this.extractEngagementTargetCandidateFromRecord(item, source);
         if (!parsed) continue;
-        const before = candidates.length;
-        pushCandidate(parsed);
-        if (candidates.length > before) added += 1;
+        if (pushCandidate(parsed)) added += 1;
       }
       return added;
     };
@@ -9805,9 +10568,7 @@ export class CommandExecutor {
           if (result.cacheHit) cacheHits += 1;
           if (typeof plan.parser === "function") {
             for (const candidate of plan.parser(result.value)) {
-              const before = candidates.length;
-              pushCandidate(candidate);
-              if (candidates.length > before) addedCandidates += 1;
+              if (pushCandidate(candidate)) addedCandidates += 1;
             }
           } else {
             addedCandidates += addCandidatesFrom(result.value, plan.source);
@@ -9839,6 +10600,7 @@ export class CommandExecutor {
 
     let agentMainUserId: string | null = null;
     let agentHandle: string | null = null;
+    let agentPreferenceTags: string[] = [];
     if (hasBridge) {
       const profileResult = await this.callAgentBridgeLookupCached({
         action: "agent_profile",
@@ -9860,12 +10622,34 @@ export class CommandExecutor {
       });
       if (profileResult) {
         bridgeQuerySuccessCount += 1;
-        if (isRecord(profileResult.value) && isRecord(profileResult.value.agent)) {
-          const agentRecord = profileResult.value.agent;
+        const profileRecord = isRecord(profileResult.value) ? profileResult.value : null;
+        if (profileRecord && isRecord(profileRecord.agent)) {
+          const agentRecord = profileRecord.agent;
           agentMainUserId = asNonEmptyString(agentRecord.mainUserId) ?? null;
           agentHandle =
             asNonEmptyString(agentRecord.handle)?.replace(/^@+/u, "").toLowerCase() ??
             null;
+          const agentPreferredTags = Array.isArray(agentRecord.preferredTags)
+            ? (agentRecord.preferredTags as unknown[])
+            : [];
+          const profilePreferredTags = Array.isArray(profileRecord.preferredTags)
+            ? (profileRecord.preferredTags as unknown[])
+            : [];
+          const configPreferredTags =
+            isRecord(profileRecord.config) && Array.isArray(profileRecord.config.preferredTags)
+              ? (profileRecord.config.preferredTags as unknown[])
+              : [];
+          agentPreferenceTags = Array.from(
+            new Set(
+              [
+                ...agentPreferredTags,
+                ...profilePreferredTags,
+                ...configPreferredTags,
+              ]
+                .map((value) => normalizeInterestTagToken(value))
+                .filter((value): value is string => Boolean(value)),
+            ),
+          ).slice(0, 8);
         }
         trace.push({
           step: "agent_profile",
@@ -10088,8 +10872,16 @@ export class CommandExecutor {
       }
       return resolved;
     };
+    const discoveryTags = Array.from(
+      new Set([...hints.interestTags, ...agentPreferenceTags]),
+    ).slice(0, 8);
+    const allowOwnLatestCommentLookup = this.shouldIncludeOwnLatestCommentLookup({
+      rawQuery: hints.rawQuery,
+      explicitPostId,
+      explicitCommentId,
+    });
     const ownCommentPlans: LookupPlan[] = [];
-    if (input.action === "comment" && agentHandle) {
+    if (input.action === "comment" && agentHandle && allowOwnLatestCommentLookup) {
       ownCommentPlans.push({
         source: "own_latest",
         request: {
@@ -10109,6 +10901,47 @@ export class CommandExecutor {
       parser: mentionParser,
     });
     await runLookupStep("high_signal", ownCommentPlans);
+
+    const interestLookupPlans: LookupPlan[] = [];
+    if (discoveryTags.length > 0) {
+      interestLookupPlans.push(
+        {
+          source: "interest_trending",
+          request: {
+            action: "browse_trending",
+            limit: 24,
+            tags: discoveryTags.slice(0, 8),
+          },
+        },
+        {
+          source: "interest_explore",
+          request: {
+            action: "browse_posts",
+            limit: 24,
+            tags: discoveryTags.slice(0, 8),
+          },
+        },
+      );
+      const interestSearchQuery = truncateText(
+        [hints.rawQuery, ...discoveryTags.slice(0, 4)]
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.length > 0)
+          .join(" "),
+        220,
+      );
+      if (interestSearchQuery.length > 2) {
+        interestLookupPlans.push({
+          source: "interest_search",
+          request: {
+            action: "search_global",
+            query: interestSearchQuery,
+            limit: 24,
+            includePeople: false,
+          },
+        });
+      }
+    }
+    await runLookupStep("interest_discovery", interestLookupPlans);
 
     let topEngagerHandles: string[] = [];
     if (hasBridge) {
@@ -10174,13 +11007,18 @@ export class CommandExecutor {
           return (
             candidate.source === "notifications_unread" ||
             candidate.source === "notifications_recent" ||
-            candidate.source === "own_latest" ||
+            candidate.source === "interest_trending" ||
+            candidate.source === "interest_explore" ||
+            candidate.source === "interest_search" ||
             candidate.source === "unanswered_mention"
           );
         }
         return (
           candidate.source === "notifications_unread" ||
           candidate.source === "notifications_recent" ||
+          candidate.source === "interest_trending" ||
+          candidate.source === "interest_explore" ||
+          candidate.source === "interest_search" ||
           candidate.source === "unanswered_mention" ||
           candidate.source === "top_engager_latest" ||
           candidate.source === "recent_actions"
@@ -10284,16 +11122,19 @@ export class CommandExecutor {
       ["payload_hint", 2],
       ["memory_lookup_plan", 2],
       ["memory_retrieval", 2],
-      ["own_latest", 3],
-      ["unanswered_mention", 4],
-      ["top_engager_latest", 5],
-      ["recent_actions", 6],
-      ["home_feed", 7],
-      ["trending", 8],
-      ["search_global", 9],
-      ["explore", 10],
-      ["memory_event", 11],
-      ["directive_payload", 12],
+      ["unanswered_mention", 3],
+      ["interest_trending", 4],
+      ["interest_explore", 5],
+      ["interest_search", 6],
+      ["top_engager_latest", 7],
+      ["recent_actions", 8],
+      ["home_feed", 9],
+      ["trending", 10],
+      ["search_global", 11],
+      ["explore", 12],
+      ["memory_event", 13],
+      ["own_latest", 14],
+      ["directive_payload", 15],
     ]);
     const preferredSourceOrderEngagement = new Map<string, number>([
       ["notifications_unread", 0],
@@ -10301,17 +11142,44 @@ export class CommandExecutor {
       ["payload_hint", 2],
       ["memory_lookup_plan", 2],
       ["unanswered_mention", 2],
-      ["top_engager_latest", 3],
-      ["recent_actions", 4],
-      ["home_feed", 5],
-      ["trending", 6],
-      ["search_global", 7],
-      ["explore", 8],
-      ["memory_retrieval", 9],
-      ["memory_event", 10],
-      ["own_latest", 11],
-      ["directive_payload", 12],
+      ["interest_trending", 3],
+      ["interest_explore", 4],
+      ["interest_search", 5],
+      ["top_engager_latest", 6],
+      ["recent_actions", 7],
+      ["home_feed", 8],
+      ["trending", 9],
+      ["search_global", 10],
+      ["explore", 11],
+      ["memory_retrieval", 12],
+      ["memory_event", 13],
+      ["own_latest", 14],
+      ["directive_payload", 15],
     ]);
+
+    let candidatePool = [...candidates];
+    if (input.action !== "comment") {
+      const nonOwnCandidates = candidatePool.filter(
+        (candidate) => !this.isOwnEngagementCandidate(candidate, agentMainUserId),
+      );
+      if (nonOwnCandidates.length === 0) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "engagement_target_resolution_failed",
+            at: nowIso(),
+            commandId: input.commandId,
+            action: input.action,
+            reason: "self_candidates_only",
+            query: hints.rawQuery,
+            bridgeQuerySuccessCount,
+            bridgeQueryFailureCount,
+            trace,
+          })
+          .catch(() => undefined);
+        throw new Error("engagement_target_unavailable:no_targets_discovered:self_candidates_only");
+      }
+      candidatePool = nonOwnCandidates;
+    }
 
     const rankTable =
       input.action === "comment"
@@ -10319,7 +11187,7 @@ export class CommandExecutor {
         : preferredSourceOrderEngagement;
     const hasNonOwnCandidate =
       input.action === "comment"
-        ? candidates.some(
+        ? candidatePool.some(
             (candidate) =>
               !this.isOwnEngagementCandidate(candidate, agentMainUserId),
           )
@@ -10331,11 +11199,11 @@ export class CommandExecutor {
         input.action === "comment"
           ? isOwn
             ? candidate.commentId
-              ? 18
+              ? 8
               : hasNonOwnCandidate
-                ? -220
-                : -120
-            : 28
+                ? -420
+                : -260
+            : 36
           : isOwn
             ? -140
             : 40;
@@ -10343,7 +11211,7 @@ export class CommandExecutor {
         input.action === "comment" && candidate.commentId ? 26 : 0;
       return 10_000 - sourceRank * 120 + ownBias + commentBias + (candidate.postId % 17);
     };
-    candidates.sort((a, b) => {
+    candidatePool.sort((a, b) => {
       const delta = scoreCandidate(b) - scoreCandidate(a);
       if (delta !== 0) return delta;
       if (a.postId !== b.postId) return b.postId - a.postId;
@@ -10351,7 +11219,7 @@ export class CommandExecutor {
       const bComment = b.commentId ?? 0;
       return bComment - aComment;
     });
-    let selected = candidates[0] ?? null;
+    let selected = candidatePool[0] ?? null;
     if (!selected) return null;
 
     if (input.action === "comment" && !selected.commentId) {
@@ -10404,6 +11272,82 @@ export class CommandExecutor {
     }
 
     if (input.action === "comment") {
+      const commentAuthorById = new Map<number, string | null>();
+      const isAllowedOwnReplyCandidate = async (
+        candidate: EngagementTargetCandidate,
+      ): Promise<boolean> => {
+        if (!agentMainUserId) return true;
+        if (!this.isOwnEngagementCandidate(candidate, agentMainUserId)) return true;
+        if (!candidate.commentId) return true;
+        const cached = commentAuthorById.get(candidate.commentId);
+        if (cached !== undefined) {
+          return cached !== agentMainUserId;
+        }
+        const resolvedAuthorId = await this.resolveCommentAuthorIdForTarget({
+          postId: candidate.postId,
+          commentId: candidate.commentId,
+        });
+        commentAuthorById.set(candidate.commentId, resolvedAuthorId);
+        return resolvedAuthorId !== agentMainUserId;
+      };
+      if (
+        agentMainUserId &&
+        this.isOwnEngagementCandidate(selected, agentMainUserId) &&
+        typeof selected.commentId === "number" &&
+        selected.commentId > 0
+      ) {
+        const selectedAllowed = await isAllowedOwnReplyCandidate(selected);
+        if (!selectedAllowed) {
+          let fallback: EngagementTargetCandidate | null = null;
+          for (const candidate of candidatePool) {
+            if (
+              candidate.postId === selected.postId &&
+              candidate.commentId === selected.commentId
+            ) {
+              continue;
+            }
+            if (!(await isAllowedOwnReplyCandidate(candidate))) continue;
+            fallback = candidate;
+            break;
+          }
+          if (fallback) {
+            await this.ctx.memory
+              .recordWrite({
+                type: "engagement_target_filtered_self_own_comment_reply",
+                at: nowIso(),
+                commandId: input.commandId,
+                action: input.action,
+                postId: selected.postId,
+                commentId: selected.commentId,
+                source: selected.source,
+                reason: "fallback_to_non_self_parent",
+                fallbackPostId: fallback.postId,
+                fallbackCommentId: fallback.commentId,
+                fallbackSource: fallback.source,
+                query: hints.rawQuery,
+              })
+              .catch(() => undefined);
+            selected = fallback;
+          } else {
+            await this.ctx.memory
+              .recordWrite({
+                type: "engagement_target_filtered_self_own_comment_reply",
+                at: nowIso(),
+                commandId: input.commandId,
+                action: input.action,
+                postId: selected.postId,
+                commentId: selected.commentId,
+                source: selected.source,
+                reason: "no_fallback",
+                query: hints.rawQuery,
+              })
+              .catch(() => undefined);
+            throw new Error(
+              "engagement_target_unavailable:no_targets_discovered:self_own_comment_reply_filtered",
+            );
+          }
+        }
+      }
       const selectedIsOwn = this.isOwnEngagementCandidate(selected, agentMainUserId);
       if (selectedIsOwn && !selected.commentId) {
         const selectedPostId = selected.postId;
@@ -10413,7 +11357,7 @@ export class CommandExecutor {
           postId: selectedPostId,
           rawQuery: hints.rawQuery,
         });
-        const fallback = candidates.find((candidate) => {
+        const fallback = candidatePool.find((candidate) => {
           if (candidate.postId === selectedPostId && candidate.commentId === selectedCommentId) {
             return false;
           }
@@ -10496,7 +11440,7 @@ export class CommandExecutor {
         commentId: resolved.commentId,
         source: resolved.source,
         query: hints.rawQuery,
-        candidatesConsidered: candidates.length,
+        candidatesConsidered: candidatePool.length,
         trace,
       })
       .catch(() => undefined);
@@ -10624,10 +11568,36 @@ export class CommandExecutor {
       payloadHint ??
       (contextLines.length > 0 ? truncateText(contextLines.join(" | "), 120) : null);
 
+    const fallbackReferenceInputs = Array.isArray(base.mediaReferenceUrls)
+      ? base.mediaReferenceUrls
+          .filter((entry): entry is string => typeof entry === "string")
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.length > 0)
+          .slice(0, MAX_MEDIA_REFERENCE_INPUTS)
+      : [];
+    const personaReferences = await this.resolvePersonaFrameReferences({
+      payload,
+      command,
+      fallbackReferenceInputs,
+    });
+    if (
+      personaReferences.personaSlug !== null &&
+      personaReferences.frameReferences.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT
+    ) {
+      throw new Error(
+        `persona_reference_setup_required:${personaReferences.personaSlug}`,
+      );
+    }
+    const mediaReferenceUrls =
+      personaReferences.personaSlug !== null
+        ? personaReferences.frameReferences
+        : fallbackReferenceInputs;
+
     return {
       ...base,
       ...(topic ? { topic: truncateText(topic, 120) } : {}),
       ...(contextHint.length > 0 ? { contextHint } : {}),
+      ...(mediaReferenceUrls.length > 0 ? { mediaReferenceUrls } : {}),
     };
   }
 
@@ -11024,8 +11994,14 @@ export class CommandExecutor {
     return command;
   }
 
-  private collectMediaReferenceInputs(payload: Record<string, unknown>): string[] {
+  private collectMediaReferenceInputs(
+    payload: Record<string, unknown>,
+    options?: {
+      includeRecentGeneratedAsset?: boolean;
+    },
+  ): string[] {
     const context = isRecord(payload.context) ? payload.context : null;
+    const includeRecentGeneratedAsset = options?.includeRecentGeneratedAsset !== false;
     const collected: string[] = [];
     const pushMaybe = (value: unknown): void => {
       if (typeof value !== "string") return;
@@ -11081,13 +12057,15 @@ export class CommandExecutor {
       context?.referenceMediaUrl,
     ].forEach((value) => pushMaybe(value));
 
-    const recentGeneratedAsset = isRecord(payload.recentGeneratedAsset)
-      ? payload.recentGeneratedAsset
-      : null;
-    pushMaybe(recentGeneratedAsset?.href);
-    pushMaybe(recentGeneratedAsset?.url);
-    pushMaybe(recentGeneratedAsset?.imageUrl);
-    pushMaybe(recentGeneratedAsset?.mediaUrl);
+    if (includeRecentGeneratedAsset) {
+      const recentGeneratedAsset = isRecord(payload.recentGeneratedAsset)
+        ? payload.recentGeneratedAsset
+        : null;
+      pushMaybe(recentGeneratedAsset?.href);
+      pushMaybe(recentGeneratedAsset?.url);
+      pushMaybe(recentGeneratedAsset?.imageUrl);
+      pushMaybe(recentGeneratedAsset?.mediaUrl);
+    }
 
     return Array.from(new Set(collected)).slice(0, MAX_COLLECTED_REFERENCE_INPUTS);
   }
@@ -11244,10 +12222,31 @@ export class CommandExecutor {
     if (!prompt) {
       throw new Error("no_media_url");
     }
+    const fallbackReferenceInputs = this.collectMediaReferenceInputs(payload);
+    let referenceInputs = fallbackReferenceInputs;
+    if (input.command) {
+      const personaReferences = await this.resolvePersonaFrameReferences({
+        payload,
+        command: input.command,
+        fallbackReferenceInputs,
+      });
+      if (
+        personaReferences.personaSlug !== null &&
+        personaReferences.frameReferences.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT
+      ) {
+        throw new Error(
+          `persona_reference_setup_required:${personaReferences.personaSlug}`,
+        );
+      }
+      referenceInputs =
+        personaReferences.personaSlug !== null
+          ? personaReferences.frameReferences
+          : fallbackReferenceInputs;
+    }
     const generated = await this.generateAndUploadMediaFromPrompt(prompt, {
       generatedAssetType: this.resolveGeneratedAssetType(payload.generatedAssetType),
       mode: "write_media_generate",
-      referenceInputs: this.collectMediaReferenceInputs(payload),
+      referenceInputs,
       keepOriginal,
     });
     return markUploaded(generated, "generated_prompt");
@@ -12885,7 +13884,8 @@ export class CommandExecutor {
       return entry.skipped !== true;
     });
     const skippedExecutionEntries = executedAll.filter(
-      (entry) => isRecord(entry) && entry.skipped === true,
+      (entry): entry is Record<string, unknown> =>
+        isRecord(entry) && entry.skipped === true,
     );
     const skippedDraftEntries = Array.isArray(data?.skippedDrafts)
       ? data.skippedDrafts.filter((entry): entry is Record<string, unknown> => isRecord(entry))
@@ -12896,6 +13896,17 @@ export class CommandExecutor {
     const executedCount = executedApplied.length;
     const skippedCount = skippedExecutionEntries.length + skippedDraftEntries.length;
     const failedCount = failedDraftEntries.length;
+    const skippedDecisionReasons = Array.from(
+      new Set(
+        skippedExecutionEntries
+          .map((entry) => asNonEmptyString(entry.decision)?.toLowerCase() ?? null)
+          .filter((entry): entry is string => Boolean(entry)),
+      ),
+    ).slice(0, 4);
+    const skippedReasonSuffix =
+      skippedDecisionReasons.length > 0
+        ? ` (${skippedDecisionReasons.join(", ")})`
+        : " due to unavailable grant budget or action constraints";
     const readHandleList = (value: unknown): string[] =>
       Array.from(
         new Set(
@@ -12931,6 +13942,74 @@ export class CommandExecutor {
           .map((entry) => normalizeKindForSummary(entry)),
       ),
     );
+    const resolveActionLabel = (entry: Record<string, unknown>): string | null => {
+      const explicit = asNonEmptyString(entry.action)?.trim().toLowerCase() ?? null;
+      if (explicit) return explicit;
+      const kind = asNonEmptyString(entry.kind);
+      if (!kind) return null;
+      const normalizedKind = normalizeKindForSummary(kind);
+      if (normalizedKind.includes("comment")) return "comment";
+      if (normalizedKind.includes("vote") || normalizedKind === "like") return "like";
+      if (normalizedKind.includes("repost")) return "repost";
+      return normalizedKind;
+    };
+    const executedTargetDetails = executedApplied
+      .map((entry) => {
+        if (!isRecord(entry)) return null;
+        const action = resolveActionLabel(entry);
+        if (!action) return null;
+        const postId = asPositiveInt(entry.postId);
+        const commentId =
+          asPositiveInt(entry.commentId) ??
+          asPositiveInt(entry.parentId) ??
+          null;
+        return {
+          action,
+          postId,
+          commentId,
+        };
+      })
+      .filter(
+        (
+          entry,
+        ): entry is {
+          action: string;
+          postId: number | null;
+          commentId: number | null;
+        } => Boolean(entry),
+      );
+    const summarizeExecutedTargets = (
+      action: "comment" | "like" | "repost",
+      label: string,
+    ): string | null => {
+      const matches = executedTargetDetails.filter(
+        (entry) => entry.action === action && entry.postId !== null,
+      );
+      if (matches.length === 0) return null;
+      if (action === "comment") {
+        const formatted = matches.slice(0, 5).map((entry) => {
+          const postRef = `#${entry.postId}`;
+          if (entry.commentId && entry.commentId > 0) {
+            return `${postRef} (reply #${entry.commentId})`;
+          }
+          return postRef;
+        });
+        return `${label}: ${formatted.join(", ")}${matches.length > 5 ? ` (+${matches.length - 5} more)` : ""}.`;
+      }
+      const uniquePostIds = Array.from(
+        new Set(matches.map((entry) => entry.postId).filter((id): id is number => id !== null)),
+      );
+      if (uniquePostIds.length === 0) return null;
+      return `${label}: ${uniquePostIds
+        .slice(0, 6)
+        .map((id) => `#${id}`)
+        .join(", ")}${uniquePostIds.length > 6 ? ` (+${uniquePostIds.length - 6} more)` : ""}.`;
+    };
+    const executedTargetSummaries = [
+      summarizeExecutedTargets("like", "Likes"),
+      summarizeExecutedTargets("comment", "Comments"),
+      summarizeExecutedTargets("repost", "Reposts"),
+    ].filter((entry): entry is string => entry !== null);
     let summary = "Done.";
     if (
       followedHandles.length > 0 ||
@@ -12967,25 +14046,31 @@ export class CommandExecutor {
       summary =
         `Done. Executed ${executedCount} action${executedCount === 1 ? "" : "s"}: ${executedKinds.slice(0, 4).join(", ")}${executedKinds.length > 4 ? ` (+${executedKinds.length - 4} more)` : ""}.`;
       if (skippedCount > 0) {
-        summary += ` Skipped ${skippedCount} due to unavailable grant budget or action constraints.`;
+        summary += ` Skipped ${skippedCount}${skippedReasonSuffix}.`;
       }
       if (failedCount > 0) {
         summary += ` Failed ${failedCount} action${failedCount === 1 ? "" : "s"} during execution.`;
+      }
+      if (executedTargetSummaries.length > 0) {
+        summary += ` ${executedTargetSummaries.join(" ")}`;
       }
     } else if (executedCount > 0) {
       summary = `Done. Executed ${executedCount} action${executedCount === 1 ? "" : "s"}.`;
       if (skippedCount > 0) {
-        summary += ` Skipped ${skippedCount} due to unavailable grant budget or action constraints.`;
+        summary += ` Skipped ${skippedCount}${skippedReasonSuffix}.`;
       }
       if (failedCount > 0) {
         summary += ` Failed ${failedCount} action${failedCount === 1 ? "" : "s"} during execution.`;
+      }
+      if (executedTargetSummaries.length > 0) {
+        summary += ` ${executedTargetSummaries.join(" ")}`;
       }
     } else if (skippedCount > 0 && failedCount > 0) {
       summary =
         `No actions were executed. Skipped ${skippedCount} and failed ${failedCount} during execution.`;
     } else if (skippedCount > 0) {
       summary =
-        `No actions were executed. Skipped ${skippedCount} due to unavailable grant budget or action constraints.`;
+        `No actions were executed. Skipped ${skippedCount}${skippedReasonSuffix}.`;
     } else if (failedCount > 0) {
       summary =
         `No actions were executed. Failed ${failedCount} action${failedCount === 1 ? "" : "s"} during execution.`;
@@ -13005,6 +14090,9 @@ export class CommandExecutor {
           skippedCount,
           failedCount,
           ...(executedKinds.length > 0 ? { executedKinds } : {}),
+          ...(executedTargetDetails.length > 0
+            ? { executedTargets: executedTargetDetails.slice(0, 16) }
+            : {}),
           ...(followedHandles.length > 0 ? { followedHandles } : {}),
           ...(alreadyFollowedHandles.length > 0
             ? { alreadyFollowedHandles }
@@ -13628,12 +14716,30 @@ export class CommandExecutor {
       { action: "browse_trending", limit: 24 },
       { action: "browse_posts", limit: 24 },
     ];
+    if (hints.interestTags.length > 0) {
+      const tags = hints.interestTags.slice(0, 8);
+      bridgeRequests.push(
+        { action: "browse_trending", limit: 24, tags },
+        { action: "browse_posts", limit: 24, tags },
+      );
+    }
     if (hints.rawQuery.trim().length > 2) {
       bridgeRequests.push({
         action: "search_global",
         query: truncateText(hints.rawQuery, 220),
         limit: 24,
       });
+    }
+    if (hints.interestTags.length > 0) {
+      const tagQuery = truncateText(hints.interestTags.slice(0, 4).join(" "), 220);
+      if (tagQuery.length > 2) {
+        bridgeRequests.push({
+          action: "search_global",
+          query: tagQuery,
+          limit: 24,
+          includePeople: false,
+        });
+      }
     }
     if (hints.postId) {
       bridgeRequests.unshift({
