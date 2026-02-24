@@ -292,4 +292,21 @@ describe("command executor generate input", () => {
       "https://cdn.example.com/persona/main-fullbody-opt.jpg",
     ]);
   });
+
+  it("normalizes runtime auto provenance to AGENT_AUTONOMOUS", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      buildGenerateInput(payload: Record<string, unknown>, command: Command): Record<string, unknown>;
+    };
+
+    const result = invoker.buildGenerateInput(
+      {
+        goal: "post",
+        provenance: "runtime_auto_posting",
+      },
+      baseCommand(),
+    );
+
+    expect(result.provenance).toBe("AGENT_AUTONOMOUS");
+  });
 });

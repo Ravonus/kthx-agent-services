@@ -79,6 +79,7 @@ const parseIsoToMs = (value: unknown): number | null => {
 
 const NOT_READY_MIN_REQUEUE_DELAY_SECONDS = 2;
 const NOT_READY_MAX_REQUEUE_DELAY_SECONDS = 300;
+const RUNNING_RECOVERY_MIN_AGE_MS = 60_000;
 
 const computeNotReadyRequeueDelaySeconds = (attempts: number): number => {
   const normalizedAttempts =
@@ -238,6 +239,8 @@ export class QueueManager implements QueueManagerLike {
     if (this.ctx.queue.queueRunnerTickInFlight) return;
     this.ctx.queue.queueRunnerTickInFlight = true;
     try {
+      await this.recoverAbandonedRunningItems();
+
       // Deterministic plan first
       await this.planQueueDeterministic("queue_runner_tick");
 
@@ -328,6 +331,7 @@ export class QueueManager implements QueueManagerLike {
           .catch(() => undefined)
           .finally(() => {
             this.activeExecutions.delete(candidate.item.id);
+            void this.runnerTick().catch(() => undefined);
           });
       }
     } finally {
@@ -341,6 +345,60 @@ export class QueueManager implements QueueManagerLike {
 
   dispose(): void {
     this.activeExecutions.clear();
+  }
+
+  private async recoverAbandonedRunningItems(): Promise<void> {
+    const nowMs = Date.now();
+    let recovered = 0;
+    await this.mutateQueueState((current) => {
+      const nextItems = current.items.map((item) => {
+        if (item.status !== "running") return item;
+        if (this.activeExecutions.has(item.id)) return item;
+        const startedAtMs = parseIsoToMs(item.startedAt);
+        const lastAttemptAtMs = parseIsoToMs(item.lastAttemptAt);
+        const referenceMs =
+          typeof startedAtMs === "number" && Number.isFinite(startedAtMs)
+            ? startedAtMs
+            : typeof lastAttemptAtMs === "number" && Number.isFinite(lastAttemptAtMs)
+              ? lastAttemptAtMs
+              : null;
+        if (
+          typeof referenceMs === "number" &&
+          Number.isFinite(referenceMs) &&
+          nowMs - referenceMs < RUNNING_RECOVERY_MIN_AGE_MS
+        ) {
+          return item;
+        }
+        recovered += 1;
+        const attempts =
+          typeof item.attempts === "number" &&
+          Number.isFinite(item.attempts) &&
+          item.attempts > 0
+            ? Math.trunc(item.attempts)
+            : 1;
+        const retryDelaySeconds = computeNotReadyRequeueDelaySeconds(attempts);
+        return {
+          ...item,
+          status: "scheduled" as QueueItem["status"],
+          dueAt: new Date(nowMs + retryDelaySeconds * 1000).toISOString(),
+          scheduledBy: "queue_running_recovery",
+          startedAt: null,
+          lastError: item.lastError ?? "running_item_recovered",
+        };
+      });
+      if (recovered === 0) return current;
+      return {
+        ...current,
+        items: nextItems,
+      };
+    });
+    if (recovered > 0) {
+      await this.ctx.memory.recordWrite({
+        type: "directive_queue_running_recovered",
+        at: nowIso(),
+        recovered,
+      });
+    }
   }
 
   private async executeCandidate(item: QueueItem): Promise<void> {

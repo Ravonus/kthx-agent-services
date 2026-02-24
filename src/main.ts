@@ -1030,9 +1030,9 @@ const main = async (): Promise<void> => {
     | null = null;
   type AutoPostingAction = "post_media" | "post_text" | "story";
   const AUTO_POSTING_ACTION_KEYS: Record<AutoPostingAction, readonly string[]> = {
-    post_media: ["post:post:media", "write.createPost"],
-    post_text: ["post:post:text", "write.createPost"],
-    story: ["story", "post:thread:text", "post:thread:media", "write.createStory"],
+    post_media: ["post:post:media", "post:thread:media", "write.createPost"],
+    post_text: ["post:post:text", "post:thread:text", "write.createPost"],
+    story: ["story", "write.createStory"],
   };
   const autoPostingPlannerEnabled = isEnabledEnvFlag(
     trimEnv("MG_AUTO_POSTING_PLANNER_ENABLED") ?? "1",
@@ -2176,6 +2176,7 @@ const main = async (): Promise<void> => {
       generatedDir: ipcPaths.generatedDir,
       queueStatePath: ipcPaths.queueStatePath,
       resultsPath: ipcPaths.resultsPath,
+      pendingDir: ipcPaths.pendingDir,
     },
     memory: {
       recordWrite: (p: unknown) => memory.recordWrite(p),

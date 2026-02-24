@@ -487,11 +487,6 @@ export class DirectiveManager implements DirectiveManagerLike {
         skippedTerminal += 1;
         continue;
       }
-      if (this.hasSeenDirective(pendingId, null)) {
-        skippedAlreadySeen += 1;
-        continue;
-      }
-      this.markDirectiveSeen(pendingId, null);
       const sourceKind = typeof pendingDoc.sourceKind === "string" && pendingDoc.sourceKind.trim().length > 0
         ? pendingDoc.sourceKind.trim() : "brain.retryPending";
       const sourcePayload = isRecord(pendingDoc.intent) ? pendingDoc.intent : {};

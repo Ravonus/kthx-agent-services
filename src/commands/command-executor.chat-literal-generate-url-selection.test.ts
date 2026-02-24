@@ -292,4 +292,80 @@ describe("command executor chat literal delivery url selection", () => {
     if (!actionPreview) return;
     expect(actionPreview.previewUrl).toBe("https://cdn.example.com/generated/final-sticker.png");
   });
+
+  it("treats clientMessageId edit as authoritative even when edit response omits message id", async () => {
+    const command = baseCommand();
+    const bridge = vi.fn(async (payload: unknown) => {
+      if (!isRecord(payload)) {
+        throw new Error("bridge payload must be an object");
+      }
+      const action = typeof payload.action === "string" ? payload.action : "";
+      if (action === "send_message") {
+        return {
+          message: {
+            id: "msg-preview-authoritative",
+            clientMessageId: payload.clientMessageId,
+          },
+        };
+      }
+      if (action === "edit_message") {
+        if (typeof payload.messageId === "string" && payload.messageId.length > 0) {
+          throw new Error("messageId fallback edit should not execute");
+        }
+        return { ok: true };
+      }
+      if (action === "list_messages") {
+        return {
+          items: [
+            {
+              message: {
+                id: "msg-preview-authoritative",
+                clientMessageId: `runtime_generate_${command.id}`,
+              },
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected bridge action: ${action}`);
+    });
+
+    const executor = createExecutor(bridge);
+    const invoker = executor as unknown as CommandExecutorInvoker;
+    invoker.generateAndUploadMediaFromPrompt = vi.fn(
+      async () => ({
+        mediaUrl: "https://cdn.example.com/generated/final-authoritative.png",
+        mediaOriginalUrl: "https://cdn.example.com/generated/final-authoritative.png",
+        mediaOptimizedUrl: "https://cdn.example.com/generated/final-authoritative.png",
+        mediaType: "image",
+        mediaSizeBytes: 1024,
+      }),
+    ) as CommandExecutorInvoker["generateAndUploadMediaFromPrompt"];
+
+    const outcome = await invoker.executeGenerateAndQueue({
+      ...command,
+      payload: {
+        chatLiteralGenerate: true,
+        generatedAssetType: "image",
+        mediaPrompt: "Generate an authoritative preview test image",
+        chatContext: {
+          conversationId: "conv-test",
+        },
+      },
+    });
+
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(true);
+
+    const messageIdEdits = bridge.mock.calls
+      .map((call) => call[0])
+      .filter(
+        (payload): payload is Record<string, unknown> =>
+          isRecord(payload) &&
+          payload.action === "edit_message" &&
+          typeof payload.messageId === "string" &&
+          payload.messageId.trim().length > 0,
+      );
+    expect(messageIdEdits).toHaveLength(0);
+  });
 });

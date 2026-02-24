@@ -94,6 +94,10 @@ const createExecutor = (options?: {
 type StoryPolicyInvoker = {
   executeGenerateAndQueue(command: Command): Promise<unknown>;
   executeWriteCreateStory(command: Command): Promise<unknown>;
+  executeChatLiteralGenerate(
+    command: Command,
+    payload: Record<string, unknown>,
+  ): Promise<unknown>;
   resolveMediaUpload: (input: unknown) => Promise<{
     mediaUrl: string;
     mediaOriginalUrl?: string;
@@ -202,6 +206,39 @@ describe("command executor story policy", () => {
     expect(error.code).toBe("story_chat_disabled");
   });
 
+  it("blocks agent-decide chat requests when the user explicitly asks to make a story", async () => {
+    const generateMutate = vi.fn(async () => ({
+      items: [],
+    }));
+    const executor = createExecutor({ generateMutate });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+    const outcome = await invoker.executeGenerateAndQueue(
+      baseCommand({
+        runtimeOrigin: "chat_command",
+        payload: {
+          sourceContext: "chat",
+          goal: "chat",
+          chatContext: {
+            commandName: "agent-decide",
+            commandArgs: ["make me a story about tonight"],
+            commandRawArgs: "make me a story about tonight",
+            originalMessage: "make me a story about tonight",
+            conversationId: "conv-policy",
+          },
+        },
+      }),
+    );
+
+    expect(generateMutate).toHaveBeenCalledTimes(0);
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(false);
+    const error = isRecord(outcome.error) ? outcome.error : null;
+    expect(error).not.toBeNull();
+    if (!error) return;
+    expect(error.code).toBe("story_chat_disabled");
+  });
+
   it("blocks direct chat-origin write.createStory commands", async () => {
     const createStoryMutate = vi.fn(async () => ({
       story: { id: 42 },
@@ -232,6 +269,49 @@ describe("command executor story policy", () => {
     expect(error).not.toBeNull();
     if (!error) return;
     expect(error.code).toBe("story_chat_disabled");
+  });
+
+  it("redirects non-explicit chat-origin story writes to chat literal generation", async () => {
+    const createStoryMutate = vi.fn(async () => ({
+      story: { id: 42 },
+    }));
+    const executor = createExecutor({ createStoryMutate });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+    const literalGenerateSpy = vi.fn(async () => ({
+      at: new Date().toISOString(),
+      commandId: "test-story-policy",
+      kind: "write.createStory",
+      grantId: null,
+      ok: true,
+      data: {
+        mode: "chat_literal_generate",
+      },
+    }));
+    invoker.executeChatLiteralGenerate = literalGenerateSpy;
+
+    const outcome = await invoker.executeWriteCreateStory(
+      baseCommand({
+        kind: "write.createStory",
+        runtimeOrigin: "chat_command",
+        payload: {
+          sourceContext: "chat",
+          mediaPrompt: "refresh this with a transparent background",
+          chatContext: {
+            commandName: "agent-decide",
+            commandArgs: ["send the updated sticker to chat"],
+            commandRawArgs: "send the updated sticker to chat",
+            originalMessage: "send the updated sticker to chat",
+            conversationId: "conv-policy",
+          },
+        },
+      }),
+    );
+
+    expect(createStoryMutate).toHaveBeenCalledTimes(0);
+    expect(literalGenerateSpy).toHaveBeenCalledTimes(1);
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(true);
   });
 
   it("strips carryover media fields and generates fresh media for directive stories", async () => {
@@ -382,6 +462,107 @@ describe("command executor story policy", () => {
         : [];
       expect(kinds).not.toContain("story");
     }
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    const error = isRecord(outcome.error) ? outcome.error : null;
+    expect(error?.code).not.toBe("story_chat_disabled");
+  });
+
+  it("does not block agent-decide chat requests when planner payload drifts to story", async () => {
+    let capturedGenerateInput: unknown = null;
+    const generateMutate = vi.fn(async (input: unknown) => {
+      capturedGenerateInput = input;
+      return {
+        items: [
+          {
+            drafts: [
+              {
+                action: "post",
+                payload: {
+                  postType: "text",
+                  textBody: "Handled as a normal chat request.",
+                },
+              },
+            ],
+          },
+        ],
+      };
+    });
+    const executor = createExecutor({ generateMutate });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+    const outcome = await invoker.executeGenerateAndQueue(
+      baseCommand({
+        runtimeOrigin: "chat_command",
+        payload: {
+          sourceContext: "chat",
+          goal: "story",
+          generateKind: "story",
+          chatContext: {
+            commandName: "agent-decide",
+            commandArgs: ["bafkreifdi4aeaodix7qoxu6vcngb76w"],
+            commandRawArgs: "bafkreifdi4aeaodix7qoxu6vcngb76w",
+            originalMessage: "bafkreifdi4aeaodix7qoxu6vcngb76w",
+            conversationId: "conv-policy",
+          },
+        },
+      }),
+    );
+
+    expect(generateMutate).toHaveBeenCalledTimes(1);
+    const generateInput = capturedGenerateInput;
+    expect(isRecord(generateInput)).toBe(true);
+    if (isRecord(generateInput)) {
+      expect(generateInput.kind).toBe("media");
+      const kinds: unknown[] = Array.isArray(generateInput.kinds)
+        ? (generateInput.kinds as unknown[])
+        : [];
+      expect(kinds).not.toContain("story");
+    }
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    const error = isRecord(outcome.error) ? outcome.error : null;
+    expect(error?.code).not.toBe("story_chat_disabled");
+  });
+
+  it("does not treat story words in internal prompt fields as explicit chat story requests", async () => {
+    const generateMutate = vi.fn(async () => ({
+      items: [
+        {
+          drafts: [
+            {
+              action: "post",
+              payload: {
+                postType: "text",
+                textBody: "Handled as normal chat follow-up.",
+              },
+            },
+          ],
+        },
+      ],
+    }));
+    const executor = createExecutor({ generateMutate });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+    const outcome = await invoker.executeGenerateAndQueue(
+      baseCommand({
+        runtimeOrigin: "chat_command",
+        payload: {
+          sourceContext: "chat",
+          goal: "chat",
+          prompt: "internal story planning field",
+          instruction: "internal story planning field",
+          topic: "internal story planning field",
+          chatContext: {
+            commandName: "agent-decide",
+            commandArgs: ["send the latest sticker with no background"],
+            commandRawArgs: "send the latest sticker with no background",
+            originalMessage: "send the latest sticker with no background",
+            conversationId: "conv-policy",
+          },
+        },
+      }),
+    );
+
+    expect(generateMutate).toHaveBeenCalledTimes(1);
     expect(isRecord(outcome)).toBe(true);
     if (!isRecord(outcome)) return;
     const error = isRecord(outcome.error) ? outcome.error : null;

@@ -382,6 +382,40 @@ const asNonEmptyString = (value: unknown): string | null => {
   return trimmed.length > 0 ? trimmed : null;
 };
 
+const AGENT_PROVENANCE_VALUES = new Set([
+  "USER_DIRECTED",
+  "AGENT_AUTONOMOUS",
+  "SYSTEM_DIRECTIVE",
+  "RESEARCH_ASSISTED",
+]);
+
+const normalizeAgentProvenanceValue = (value: unknown): string | null => {
+  const raw = asNonEmptyString(value);
+  if (!raw) return null;
+  const normalized = raw.replace(/[-\s]+/gu, "_").toUpperCase();
+  if (AGENT_PROVENANCE_VALUES.has(normalized)) return normalized;
+  if (
+    normalized === "RUNTIME_AUTO_POSTING" ||
+    normalized === "RUNTIME_AUTO_CREDIT" ||
+    normalized === "AUTO_POSTING" ||
+    normalized === "AUTO_CREDIT" ||
+    normalized === "AUTO" ||
+    normalized === "AUTONOMOUS"
+  ) {
+    return "AGENT_AUTONOMOUS";
+  }
+  if (normalized === "USER" || normalized === "DIRECTED") {
+    return "USER_DIRECTED";
+  }
+  if (normalized === "SYSTEM" || normalized === "DIRECTIVE") {
+    return "SYSTEM_DIRECTIVE";
+  }
+  if (normalized === "RESEARCH") {
+    return "RESEARCH_ASSISTED";
+  }
+  return null;
+};
+
 const normalizeInterestTagToken = (value: unknown): string | null => {
   if (typeof value !== "string") return null;
   const normalized = value
@@ -964,6 +998,7 @@ type CommandExecutorContext = {
     generatedDir: string;
     queueStatePath: string;
     resultsPath: string;
+    pendingDir?: string;
   };
   memory: {
     recordWrite(payload: unknown): Promise<void>;
@@ -2949,6 +2984,9 @@ export class CommandExecutor {
     }
     const outcome = result.outcome;
     if (!outcome) {
+      await this.updatePendingDirectiveStatusForOutcome(command, null).catch(
+        () => undefined,
+      );
       await this.moveInboxFileToProcessed(filePath, "done");
       await this.markQueueItemCompletedByInbox(inboxFile, "done", null);
       return true;
@@ -2964,6 +3002,9 @@ export class CommandExecutor {
     }
 
     await this.finalizeCommandOutcome({ command, outcome });
+    await this.updatePendingDirectiveStatusForOutcome(command, outcome).catch(
+      () => undefined,
+    );
 
     if (outcome.ok) {
       await this.moveInboxFileToProcessed(filePath, "done");
@@ -2977,6 +3018,105 @@ export class CommandExecutor {
       );
     }
     return true;
+  }
+
+  private resolvePendingDirectiveTerminalStatus(
+    outcome: CommandOutcome | null,
+  ): "completed" | "permission_denied" | "no_executable_draft" | "max_retry_exceeded" {
+    if (!outcome || outcome.ok) return "completed";
+    const errorCode = asNonEmptyString(outcome.error?.code)?.toLowerCase() ?? "";
+    const errorMessage = asNonEmptyString(outcome.error?.message)?.toLowerCase() ?? "";
+    if (
+      errorCode.includes("permission_denied") ||
+      errorCode.includes("not_granted") ||
+      errorMessage.includes("permission denied") ||
+      errorMessage.includes("not_granted")
+    ) {
+      return "permission_denied";
+    }
+    if (
+      errorCode.includes("no_executable_draft") ||
+      errorMessage.includes("no executable draft") ||
+      errorMessage.includes("unable to generate drafts")
+    ) {
+      return "no_executable_draft";
+    }
+    if (
+      errorCode.includes("max_retry") ||
+      errorMessage.includes("max retry")
+    ) {
+      return "max_retry_exceeded";
+    }
+    return "no_executable_draft";
+  }
+
+  private async resolvePendingDirectiveFilePath(
+    pendingDirectiveId: string,
+  ): Promise<string | null> {
+    const pendingDir = asNonEmptyString(this.ctx.ipcPaths.pendingDir);
+    if (!pendingDir) return null;
+    const exactPath = path.join(pendingDir, `${pendingDirectiveId}.json`);
+    const exactExists = await fs
+      .access(exactPath)
+      .then(() => true)
+      .catch(() => false);
+    if (exactExists) return exactPath;
+
+    const entries = await fs.readdir(pendingDir).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      const candidatePath = path.join(pendingDir, entry);
+      if (path.basename(entry, ".json") === pendingDirectiveId) {
+        return candidatePath;
+      }
+      const parsed = await readJsonMaybeIncomplete(candidatePath);
+      if (parsed.status !== "ok" || !isRecord(parsed.value)) continue;
+      const candidateId = asNonEmptyString(parsed.value.id);
+      if (candidateId === pendingDirectiveId) {
+        return candidatePath;
+      }
+    }
+    return null;
+  }
+
+  private async updatePendingDirectiveStatusForOutcome(
+    command: Command,
+    outcome: CommandOutcome | null,
+  ): Promise<void> {
+    const pendingDirectiveId = asNonEmptyString(command.pendingDirectiveId);
+    if (!pendingDirectiveId) return;
+    const pendingPath = await this.resolvePendingDirectiveFilePath(pendingDirectiveId);
+    if (!pendingPath) return;
+    const pendingRaw = await readJsonMaybeIncomplete(pendingPath);
+    if (pendingRaw.status !== "ok" || !isRecord(pendingRaw.value)) return;
+
+    const pendingDoc: Record<string, unknown> = {
+      ...(pendingRaw.value as Record<string, unknown>),
+    };
+    const status = this.resolvePendingDirectiveTerminalStatus(outcome);
+    const updatedAt = nowIso();
+    pendingDoc.status = status;
+    pendingDoc.updatedAt = updatedAt;
+    pendingDoc.lastRuntimeOutcome = {
+      at: updatedAt,
+      commandId: command.id,
+      sourceDirectiveId: command.sourceDirectiveId ?? null,
+      pendingDirectiveId,
+      ok: !outcome || outcome.ok,
+      error: outcome && !outcome.ok ? outcome.error?.message ?? null : null,
+      code: outcome && !outcome.ok ? outcome.error?.code ?? null : null,
+    };
+    if (status === "permission_denied") {
+      pendingDoc.permissionDenied = true;
+    } else if ("permissionDenied" in pendingDoc) {
+      delete pendingDoc.permissionDenied;
+    }
+    if (status === "completed") {
+      pendingDoc.completedAt = updatedAt;
+    } else if ("completedAt" in pendingDoc) {
+      delete pendingDoc.completedAt;
+    }
+    await writeJsonFile(pendingPath, pendingDoc).catch(() => undefined);
   }
 
   private async executeCommand(command: Command): Promise<ExecuteResult> {
@@ -3736,7 +3876,7 @@ export class CommandExecutor {
     const postType = postTypeRaw === "text" ? "text" : "media";
     const kindRaw = asNonEmptyString(payload.kind)?.toLowerCase();
     const postKind = kindRaw === "thread" ? "thread" : "post";
-    const provenance = asNonEmptyString(payload.provenance);
+    const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
       command.sourceDirectiveId ??
@@ -6289,12 +6429,61 @@ export class CommandExecutor {
     return deduped.slice(0, 12);
   }
 
+  private buildChatLiteralFallbackPayloadFromStory(input: {
+    payload: Record<string, unknown>;
+    fallbackPrompt?: string | null;
+  }): Record<string, unknown> {
+    const chatContext = isRecord(input.payload.chatContext) ? input.payload.chatContext : null;
+    const fallbackPrompt =
+      asNonEmptyString(input.fallbackPrompt) ??
+      asNonEmptyString(input.payload.mediaPrompt) ??
+      asNonEmptyString(input.payload.imagePrompt) ??
+      asNonEmptyString(input.payload.prompt) ??
+      asNonEmptyString(input.payload.topic) ??
+      asNonEmptyString(input.payload.caption) ??
+      asNonEmptyString(chatContext?.originalMessage) ??
+      "Generate an image that fulfills this chat request.";
+
+    const nextPayload: Record<string, unknown> = {
+      ...input.payload,
+      goal: "media",
+      generateKind: "media",
+      generatedAssetType: "image",
+      chatLiteralGenerate: true,
+      requireExplicitPublishVerb: false,
+      explicitPublishRequested: false,
+      explicitPublishVerbDetected: false,
+    };
+    nextPayload.prompt = fallbackPrompt;
+    nextPayload.instruction = fallbackPrompt;
+    nextPayload.topic = fallbackPrompt;
+    nextPayload.mediaPrompt = fallbackPrompt;
+    nextPayload.imagePrompt = fallbackPrompt;
+    return nextPayload;
+  }
+
   private async executeWriteCreateStory(command: Command): Promise<CommandOutcome> {
     const payload = isRecord(command.payload) ? command.payload : null;
     if (!payload) {
       return this.failedOutcome(command, "Invalid payload for write.createStory.");
     }
     if (this.isChatOriginCommand(command, payload)) {
+      const explicitStoryRequest = this.didChatMessageExplicitlyRequestStory(payload);
+      if (!explicitStoryRequest) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "story_write_redirected_chat_request",
+            at: nowIso(),
+            commandId: command.id,
+            commandKind: command.kind,
+            sourceDirectiveId: command.sourceDirectiveId ?? null,
+          })
+          .catch(() => undefined);
+        const fallbackPayload = this.buildChatLiteralFallbackPayloadFromStory({
+          payload,
+        });
+        return this.executeChatLiteralGenerate(command, fallbackPayload);
+      }
       await this.ctx.memory
         .recordWrite({
           type: "story_write_blocked_chat_request",
@@ -6310,7 +6499,7 @@ export class CommandExecutor {
         "story_chat_disabled",
       );
     }
-    const provenance = asNonEmptyString(payload.provenance);
+    const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
       command.sourceDirectiveId ??
@@ -6419,7 +6608,7 @@ export class CommandExecutor {
       targetRaw === "owner" || targetRaw === "for-me" || targetRaw === "for_owner" || targetRaw === "me"
         ? "owner"
         : "agent";
-    const provenance = asNonEmptyString(payload.provenance);
+    const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
       command.sourceDirectiveId ??
@@ -6464,7 +6653,7 @@ export class CommandExecutor {
       targetRaw === "owner" || targetRaw === "for-me" || targetRaw === "for_owner" || targetRaw === "me"
         ? "owner"
         : "agent";
-    const provenance = asNonEmptyString(payload.provenance);
+    const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
       command.sourceDirectiveId ??
@@ -6609,7 +6798,7 @@ export class CommandExecutor {
           target,
         },
       });
-      const provenance = asNonEmptyString(payload.provenance);
+      const provenance = normalizeAgentProvenanceValue(payload.provenance);
       const sourceDirectiveId =
         asNonEmptyString(payload.sourceDirectiveId) ??
         command.sourceDirectiveId ??
@@ -8867,7 +9056,17 @@ export class CommandExecutor {
     }
 
     const isChatOrigin = this.isChatOriginCommand(command, payload);
-    if (isChatOrigin && this.isStoryGenerateRequestFromChatPayload(payload)) {
+    const chatCommandName = this.resolveChatCommandName(payload);
+    const isAgentDecideChatCommand =
+      (chatCommandName?.trim().toLowerCase() ?? "") === "agent-decide";
+    const explicitStoryChatRequest = isChatOrigin
+      ? this.didChatMessageExplicitlyRequestStory(payload)
+      : false;
+    if (
+      isChatOrigin &&
+      (!isAgentDecideChatCommand || explicitStoryChatRequest) &&
+      this.isStoryGenerateRequestFromChatPayload(payload)
+    ) {
       await this.ctx.memory
         .recordWrite({
           type: "story_generate_blocked_chat_request",
@@ -8895,7 +9094,7 @@ export class CommandExecutor {
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
       null;
-    const provenance = asNonEmptyString(payload.provenance);
+    const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const enforcedDraftAction = this.resolveEnforcedDraftAction(payload);
     if (enforcedDraftAction) {
       const scopedDirective = isRecord(payload.directiveScope) ? payload.directiveScope : null;
@@ -9055,11 +9254,18 @@ export class CommandExecutor {
     }
     let executionDrafts = permissionFilteredDrafts;
     if (isChatOrigin && executionDrafts.length > 0) {
-      const blockedStoryDraftCount = executionDrafts.filter(
+      const chatCandidateDrafts = executionDrafts;
+      const blockedStoryDraftCount = chatCandidateDrafts.filter(
         (draft) => draft.action.trim().toLowerCase() === "story",
       ).length;
+      const firstBlockedStoryDraft =
+        blockedStoryDraftCount > 0
+          ? chatCandidateDrafts.find(
+              (draft) => draft.action.trim().toLowerCase() === "story",
+            ) ?? null
+          : null;
       if (blockedStoryDraftCount > 0) {
-        executionDrafts = executionDrafts.filter(
+        executionDrafts = chatCandidateDrafts.filter(
           (draft) => draft.action.trim().toLowerCase() !== "story",
         );
         await this.ctx.memory
@@ -9075,10 +9281,47 @@ export class CommandExecutor {
           .catch(() => undefined);
       }
       if (executionDrafts.length === 0 && blockedStoryDraftCount > 0) {
+        if (!explicitStoryChatRequest) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "story_drafts_suppressed_chat_request",
+              at: nowIso(),
+              commandId: command.id,
+              commandKind: command.kind,
+              sourceDirectiveId: command.sourceDirectiveId ?? null,
+              blockedStoryDraftCount,
+            })
+            .catch(() => undefined);
+        }
+        if (!explicitStoryChatRequest) {
+          const storyFallbackPrompt =
+            asNonEmptyString(firstBlockedStoryDraft?.payload.mediaPrompt) ??
+            asNonEmptyString(firstBlockedStoryDraft?.payload.imagePrompt) ??
+            asNonEmptyString(firstBlockedStoryDraft?.payload.prompt) ??
+            asNonEmptyString(firstBlockedStoryDraft?.payload.topic) ??
+            asNonEmptyString(firstBlockedStoryDraft?.payload.caption);
+          await this.ctx.memory
+            .recordWrite({
+              type: "story_drafts_redirected_chat_literal_generate",
+              at: nowIso(),
+              commandId: command.id,
+              commandKind: command.kind,
+              sourceDirectiveId: command.sourceDirectiveId ?? null,
+              blockedStoryDraftCount,
+            })
+            .catch(() => undefined);
+          const fallbackPayload = this.buildChatLiteralFallbackPayloadFromStory({
+            payload,
+            fallbackPrompt: storyFallbackPrompt,
+          });
+          return this.executeChatLiteralGenerate(command, fallbackPayload);
+        }
         return this.failedOutcome(
           command,
-          "Story creation is directive-only. Chat requests can create posts, but not stories.",
-          "story_chat_disabled",
+          explicitStoryChatRequest
+            ? "Story creation is directive-only. Chat requests can create posts, but not stories."
+            : "generate returned no permission-allowed drafts.",
+          explicitStoryChatRequest ? "story_chat_disabled" : "no_permitted_drafts",
         );
       }
     }
@@ -9495,6 +9738,9 @@ export class CommandExecutor {
   private isStoryGenerateRequestFromChatPayload(
     payload: Record<string, unknown>,
   ): boolean {
+    if (!this.didChatMessageExplicitlyRequestStory(payload)) {
+      return false;
+    }
     const requestedKinds = this.resolveRequestedGenerateKinds(payload, "media");
     if (requestedKinds.includes("story")) return true;
     const commandName = this.resolveChatCommandName(payload);
@@ -9517,6 +9763,61 @@ export class CommandExecutor {
       if (this.normalizeRequestedGenerateKind(entry) === "story") {
         return true;
       }
+    }
+    return true;
+  }
+
+  private didChatMessageExplicitlyRequestStory(
+    payload: Record<string, unknown>,
+  ): boolean {
+    const commandName = this.resolveChatCommandName(payload);
+    if (commandName) {
+      const normalizedCommandName = commandName
+        .trim()
+        .toLowerCase()
+        .replace(/[\s-]+/gu, "_");
+      if (
+        normalizedCommandName === "story" ||
+        normalizedCommandName === "stories" ||
+        normalizedCommandName === "generate_story" ||
+        normalizedCommandName === "generate_stories"
+      ) {
+        return true;
+      }
+    }
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    const commandArgs = Array.isArray(chatContext?.commandArgs)
+      ? chatContext.commandArgs
+      : [];
+    for (const entry of commandArgs) {
+      if (this.normalizeRequestedGenerateKind(entry) === "story") {
+        return true;
+      }
+    }
+
+    const explicitTextCandidates = [
+      asNonEmptyString(chatContext?.originalMessage),
+      asNonEmptyString(chatContext?.commandRawArgs),
+    ]
+      .map((entry) => entry?.trim() ?? "")
+      .filter((entry) => entry.length > 0);
+    if (explicitTextCandidates.length === 0) return false;
+
+    const messageText = explicitTextCandidates[0] ?? "";
+    if (!/\bstor(?:y|ies)\b/iu.test(messageText)) return false;
+    if (
+      /\b(?:make|create|generate|post|publish|share|write|queue|start|do)\b[\w\s,.'"!?-]{0,64}\bstor(?:y|ies)\b/iu.test(
+        messageText,
+      )
+    ) {
+      return true;
+    }
+    if (
+      /\bstor(?:y|ies)\b[\w\s,.'"!?-]{0,32}\b(?:post|publish|share|make|create|generate)\b/iu.test(
+        messageText,
+      )
+    ) {
+      return true;
     }
     return false;
   }
@@ -9998,7 +10299,7 @@ export class CommandExecutor {
           .filter((entry) => entry.trim().length > 0)
           .join("\n\n")
       : promptBase;
-    const provenance = asNonEmptyString(payload.provenance);
+    const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
       command.sourceDirectiveId ??
@@ -10067,13 +10368,16 @@ export class CommandExecutor {
           ? "Working on your banner now..."
           : `Generating ${generatedLabel} for "${summary}".`;
     let previewMessageId: string | null = null;
-    let previewMessageCreateAttempted = false;
+    const existingProcessingClientMessageId =
+      this.resolveChatProcessingClientMessageId(command);
+    const previewClientMessageId =
+      existingProcessingClientMessageId ?? `runtime_generate_${command.id}`;
+    let previewMessageCreateAttempted = Boolean(existingProcessingClientMessageId);
     let previewProgressFingerprint = "";
     let previewProgressUpdatedAtMs = 0;
     let latestMediaProgress: MediaGenerationProgress | null = null;
     let generationCompleted = false;
     let uploadCompleted = false;
-    const previewClientMessageId = `runtime_generate_${command.id}`;
     let previewStreamFrameCursor = 0;
     const snapshotStreamFrames = (): MediaGeneratorStreamFrame[] => {
       const progress = latestMediaProgress;
@@ -10351,21 +10655,31 @@ export class CommandExecutor {
             maxAttempts: input.kind === "processing" ? 4 : 8,
             fallbackDelayMs: input.kind === "processing" ? 220 : 420,
           });
-        const editedByClientMessageId = await callEdit({
-          action: "edit_message",
-          clientMessageId: previewClientMessageId,
-          ...chatRoute,
-          body: input.body,
-          ...(input.attachments ? { attachments: input.attachments } : {}),
-          metadata: input.metadata,
-        });
-        const editedByClientMessageIdResolved = extractBridgeMessageId(
-          editedByClientMessageId,
-        );
-        if (editedByClientMessageIdResolved) {
-          return editedByClientMessageIdResolved;
-        }
-        if (resolvedPreviewMessageId) {
+        try {
+          const editedByClientMessageId = await callEdit({
+            action: "edit_message",
+            clientMessageId: previewClientMessageId,
+            ...chatRoute,
+            body: input.body,
+            ...(input.attachments ? { attachments: input.attachments } : {}),
+            metadata: input.metadata,
+          });
+          const editedByClientMessageIdResolved = extractBridgeMessageId(
+            editedByClientMessageId,
+          );
+          if (editedByClientMessageIdResolved) {
+            return editedByClientMessageIdResolved;
+          }
+          const resolvedAfterClientEdit =
+            previewMessageId ??
+            (input.kind === "processing"
+              ? await maybeResolvePreviewMessageId(false)
+              : await maybeResolvePreviewMessageId(true));
+          return resolvedAfterClientEdit ?? resolvedPreviewMessageId ?? null;
+        } catch (clientEditError: unknown) {
+          if (!resolvedPreviewMessageId) {
+            throw clientEditError;
+          }
           const editedByMessageId = await callEdit({
             action: "edit_message",
             messageId: resolvedPreviewMessageId,
@@ -10376,7 +10690,6 @@ export class CommandExecutor {
           });
           return extractBridgeMessageId(editedByMessageId) ?? resolvedPreviewMessageId;
         }
-        return null;
       };
       try {
         const editedMessageId = await runEdit();
@@ -11294,7 +11607,7 @@ export class CommandExecutor {
             .replaceAll("-", "")
             .slice(0, 8)}`
         : `${Date.now().toString(36)}_${crypto.randomUUID().replaceAll("-", "").slice(0, 10)}`);
-    const provenance = asNonEmptyString(payload.provenance);
+    const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
       command.sourceDirectiveId ??
@@ -13639,11 +13952,88 @@ export class CommandExecutor {
       return this.mapUploadResult(uploaded);
     }
     if (isHttpUrl(trimmed)) {
-      const uploaded = await this.agent().uploadRemote.mutate({
-        url: trimmed,
-        keepOriginal,
-      });
-      return this.mapUploadResult(uploaded);
+      try {
+        const uploaded = await this.agent().uploadRemote.mutate({
+          url: trimmed,
+          keepOriginal,
+        });
+        return this.mapUploadResult(uploaded);
+      } catch (remoteError: unknown) {
+        await this.ctx.memory
+          .recordWrite({
+            type: "remote_upload_failed",
+            at: nowIso(),
+            url: trimmed,
+            keepOriginal,
+            error: remoteError instanceof Error ? remoteError.message : String(remoteError),
+          })
+          .catch(() => undefined);
+        try {
+          const response = await fetch(trimmed);
+          if (response.ok) {
+            const bytes = Buffer.from(await response.arrayBuffer());
+            if (bytes.byteLength > 0) {
+              const headerMime = response.headers.get("content-type");
+              const mimeRaw =
+                headerMime && headerMime.trim().length > 0
+                  ? headerMime
+                  : inferMimeTypeFromUrl(trimmed) ?? "application/octet-stream";
+              const mime = mimeRaw.split(";", 1)[0]?.trim() || "application/octet-stream";
+              const parsedUrl = new URL(trimmed);
+              const baseName = path.basename(parsedUrl.pathname).trim();
+              const filename =
+                baseName.length > 0
+                  ? baseName
+                  : `upload-${Date.now()}.${mimeToExt(mime)}`;
+              const uploadedByChunk = await this.uploadBytesViaChunkRoute({
+                bytes,
+                mimeType: mime,
+                filename,
+                keepOriginal,
+              });
+              if (uploadedByChunk) {
+                await this.ctx.memory
+                  .recordWrite({
+                    type: "remote_upload_fallback_succeeded",
+                    at: nowIso(),
+                    url: trimmed,
+                    keepOriginal,
+                    fallback: "chunk",
+                  })
+                  .catch(() => undefined);
+                return uploadedByChunk;
+              }
+              const dataUri = `data:${mime};base64,${bytes.toString("base64")}`;
+              const uploaded = await this.agent().uploadDataUri.mutate({
+                dataUri,
+                keepOriginal,
+              });
+              await this.ctx.memory
+                .recordWrite({
+                  type: "remote_upload_fallback_succeeded",
+                  at: nowIso(),
+                  url: trimmed,
+                  keepOriginal,
+                  fallback: "data_uri",
+                })
+                .catch(() => undefined);
+              return this.mapUploadResult(uploaded);
+            }
+          }
+        } catch (fallbackError: unknown) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "remote_upload_fallback_failed",
+              at: nowIso(),
+              url: trimmed,
+              keepOriginal,
+              error:
+                fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+            })
+            .catch(() => undefined);
+        }
+        throw remoteError;
+      }
     }
     const localPath = path.resolve(trimmed);
     const bytes = await fs.readFile(localPath);
@@ -15589,17 +15979,31 @@ export class CommandExecutor {
       if (outcomeData?.chatDeliveryCheckpointRecorded === true) {
         return chatDeliveryHandled;
       }
+      let delivered = chatDeliveryHandled;
+      let fallbackUsed = false;
+      if (!delivered) {
+        const completion = this.buildNonWriteChatCompletion({ command, outcome });
+        if (completion) {
+          fallbackUsed = true;
+          delivered = await this.sendNonWriteChatCompletion({
+            command,
+            body: completion.body,
+            metadata: completion.metadata,
+          });
+        }
+      }
       await this.recordCommandLifecycleCheckpoint({
         command,
         stage: "chat_delivery",
-        status: chatDeliveryHandled ? "ok" : "failed",
-        message: chatDeliveryHandled ? null : "chat_preview_delivery_failed",
+        status: delivered ? "ok" : "failed",
+        message: delivered ? null : "chat_preview_delivery_failed",
         metadata: {
           mode: "chat_literal_generate_preview",
           outcomeOk: outcome.ok,
+          usedFallback: fallbackUsed,
         },
       });
-      return chatDeliveryHandled;
+      return delivered;
     }
 
     if (payload?.requireDraftOnly === true && chatDeliveryHandled) {

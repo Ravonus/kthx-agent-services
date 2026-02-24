@@ -12,8 +12,11 @@ const tempDirs: string[] = [];
 const createQueueManagerHarness = async (input?: {
   minSpacingSeconds?: number;
   maxSpacingSeconds?: number;
+  processCommandFile?: (inboxFile: string) => Promise<boolean>;
+  queueRunnerConcurrency?: number;
 }): Promise<{
   queueStatePath: string;
+  inboxDir: string;
   manager: QueueManager;
 }> => {
   const root = path.join(
@@ -21,7 +24,8 @@ const createQueueManagerHarness = async (input?: {
     `molkgram-queue-manager-${Date.now()}-${Math.random().toString(16).slice(2)}`,
   );
   tempDirs.push(root);
-  await fs.mkdir(path.join(root, "ipc", "inbox"), { recursive: true });
+  const inboxDir = path.join(root, "ipc", "inbox");
+  await fs.mkdir(inboxDir, { recursive: true });
   const queueStatePath = path.join(root, "ipc", "queue-state.json");
   const initialState: QueueState = {
     updatedAt: "2026-02-24T00:00:00.000Z",
@@ -35,11 +39,11 @@ const createQueueManagerHarness = async (input?: {
   const manager = new QueueManager({
     config: {
       terminalTriggerOnly: false,
-      queueRunnerConcurrency: 2,
+      queueRunnerConcurrency: input?.queueRunnerConcurrency ?? 2,
     },
     ipcPaths: {
       queueStatePath,
-      inboxDir: path.join(root, "ipc", "inbox"),
+      inboxDir,
       wakePath: path.join(root, "ipc", "wake"),
     },
     kthxQueueConfig: () => ({
@@ -55,12 +59,15 @@ const createQueueManagerHarness = async (input?: {
       queueRunnerTickInFlight: false,
       queueStateMutation: Promise.resolve(),
     },
-    processCommandFile: async () => true,
+    processCommandFile:
+      input?.processCommandFile ??
+      (async () => true),
     runMemoryCheckpoint: async () => undefined,
   });
 
   return {
     queueStatePath,
+    inboxDir,
     manager,
   };
 };
@@ -137,5 +144,51 @@ describe("queue manager planning", () => {
     expect(planned.status).toBe("scheduled");
     expect(planned.scheduledBy).toBe("queue_runner_tick");
     expect(typeof planned.dueAt).toBe("string");
+  });
+
+  it("recovers abandoned running items so queue drain can continue", async () => {
+    const { queueStatePath, manager, inboxDir } = await createQueueManagerHarness({
+      queueRunnerConcurrency: 1,
+      processCommandFile: async () => false,
+    });
+    const runningStartedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+    const state: QueueState = {
+      updatedAt: "2026-02-24T00:00:00.000Z",
+      runnerEnabled: true,
+      lastPlanAt: null,
+      lastPlanSource: null,
+      items: [
+        {
+          id: "item-stale-running",
+          directiveId: "directive-stale-running",
+          inboxFile: "stale-running.json",
+          queueClass: "comment",
+          forceNow: false,
+          commandFingerprint: null,
+          status: "running",
+          createdAt: "2026-02-24T00:00:00.000Z",
+          dueAt: null,
+          attempts: 1,
+          startedAt: runningStartedAt,
+          completedAt: null,
+          lastAttemptAt: runningStartedAt,
+          lastError: "previous_attempt_stalled",
+          scheduledBy: null,
+        },
+      ],
+    };
+    await fs.writeFile(queueStatePath, JSON.stringify(state, null, 2), "utf8");
+    await fs.writeFile(path.join(inboxDir, "stale-running.json"), "{}", "utf8");
+
+    await manager.runnerTick();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const nextRaw = JSON.parse(await fs.readFile(queueStatePath, "utf8")) as QueueState;
+    const recovered = nextRaw.items.find((item) => item.id === "item-stale-running");
+    expect(recovered).toBeDefined();
+    if (!recovered) return;
+    expect(recovered.status).toBe("scheduled");
+    expect(typeof recovered.dueAt).toBe("string");
+    expect(recovered.completedAt).toBeNull();
   });
 });
