@@ -537,12 +537,23 @@ export class QueueManager implements QueueManagerLike {
       for (const item of pending) {
         const target = next.items.find((qi) => qi.id === item.id);
         if (!target) continue;
+        const dueAtMs =
+          typeof target.dueAt === "string" && target.dueAt.trim().length > 0
+            ? parseIsoToMs(target.dueAt)
+            : null;
+        const shouldPreserveNotReadyBackoff =
+          target.status === "scheduled" &&
+          target.scheduledBy === "queue_not_ready_backoff" &&
+          typeof dueAtMs === "number" &&
+          Number.isFinite(dueAtMs) &&
+          dueAtMs > nowMs;
         const shouldKeepExistingSchedule =
+          !shouldPreserveNotReadyBackoff &&
           target.status === "scheduled" &&
           typeof target.dueAt === "string" &&
           target.dueAt.trim().length > 0 &&
           target.scheduledBy === reason;
-        if (shouldKeepExistingSchedule) {
+        if (shouldPreserveNotReadyBackoff || shouldKeepExistingSchedule) {
           continue;
         }
         const delaySeconds = delays.get(item.inboxFile) ?? 0;

@@ -271,6 +271,9 @@ const AUTONOMOUS_CAMERA_HINTS = [
 
 const AUTONOMOUS_SEQUENCE_SIGNAL_PATTERN =
   /\b(first|second|third|fourth|next|then|finally|steps?|checklist|roadmap|before|after|vs|versus|reasons?|ways?|lessons?|takeaways?|timeline)\b/iu;
+const SELF_COMMENT_CLARIFICATION_INTENT_PATTERN =
+  /\b(clarif(?:y|ication)|correction|follow(?:\s|-)?up|update|status|note|context|addendum|psa)\b/iu;
+const SELF_TOP_LEVEL_COMMENT_RARE_PERCENT = 14;
 
 const isHttpUrl = (value: string): boolean => /^https?:\/\//iu.test(value.trim());
 const isDataUri = (value: string): boolean => /^data:/iu.test(value.trim());
@@ -9643,6 +9646,54 @@ export class CommandExecutor {
     return null;
   }
 
+  private isOwnEngagementCandidate(
+    candidate: EngagementTargetCandidate,
+    agentMainUserId: string | null,
+  ): boolean {
+    if (agentMainUserId && candidate.authorId === agentMainUserId) {
+      return true;
+    }
+    return candidate.source === "own_latest" || candidate.source.startsWith("own_latest+");
+  }
+
+  private shouldAllowRareTopLevelSelfComment(input: {
+    commandId: string;
+    postId: number;
+    rawQuery: string;
+  }): { allow: boolean; reason: string; gateRoll: number } {
+    const normalizedQuery = input.rawQuery.trim().toLowerCase();
+    if (!normalizedQuery.length) {
+      return {
+        allow: false,
+        reason: "empty_query",
+        gateRoll: 100,
+      };
+    }
+    if (!SELF_COMMENT_CLARIFICATION_INTENT_PATTERN.test(normalizedQuery)) {
+      return {
+        allow: false,
+        reason: "no_clarification_intent",
+        gateRoll: 100,
+      };
+    }
+    const gateRoll = this.pickDeterministicIndex(
+      `self_top_level_comment:${input.commandId}:${input.postId}:${normalizedQuery}`,
+      100,
+    );
+    if (gateRoll < SELF_TOP_LEVEL_COMMENT_RARE_PERCENT) {
+      return {
+        allow: true,
+        reason: "clarification_intent_rare_allow",
+        gateRoll,
+      };
+    }
+    return {
+      allow: false,
+      reason: "clarification_intent_gate_blocked",
+      gateRoll,
+    };
+  }
+
   private async resolveEngagementTargetForDirective(input: {
     payload: Record<string, unknown>;
     action: "comment" | "like" | "repost";
@@ -10266,15 +10317,25 @@ export class CommandExecutor {
       input.action === "comment"
         ? preferredSourceOrderComment
         : preferredSourceOrderEngagement;
+    const hasNonOwnCandidate =
+      input.action === "comment"
+        ? candidates.some(
+            (candidate) =>
+              !this.isOwnEngagementCandidate(candidate, agentMainUserId),
+          )
+        : false;
     const scoreCandidate = (candidate: EngagementTargetCandidate): number => {
       const sourceRank = rankTable.get(candidate.source) ?? 999;
-      const isOwn =
-        Boolean(agentMainUserId) && candidate.authorId === agentMainUserId;
+      const isOwn = this.isOwnEngagementCandidate(candidate, agentMainUserId);
       const ownBias =
         input.action === "comment"
           ? isOwn
-            ? 80
-            : 15
+            ? candidate.commentId
+              ? 18
+              : hasNonOwnCandidate
+                ? -220
+                : -120
+            : 28
           : isOwn
             ? -140
             : 40;
@@ -10339,6 +10400,80 @@ export class CommandExecutor {
         }
       } catch {
         // best-effort parent comment enrichment only
+      }
+    }
+
+    if (input.action === "comment") {
+      const selectedIsOwn = this.isOwnEngagementCandidate(selected, agentMainUserId);
+      if (selectedIsOwn && !selected.commentId) {
+        const selectedPostId = selected.postId;
+        const selectedCommentId = selected.commentId;
+        const rareAllowance = this.shouldAllowRareTopLevelSelfComment({
+          commandId: input.commandId,
+          postId: selectedPostId,
+          rawQuery: hints.rawQuery,
+        });
+        const fallback = candidates.find((candidate) => {
+          if (candidate.postId === selectedPostId && candidate.commentId === selectedCommentId) {
+            return false;
+          }
+          const candidateIsOwn = this.isOwnEngagementCandidate(
+            candidate,
+            agentMainUserId,
+          );
+          if (candidateIsOwn && !candidate.commentId) return false;
+          return true;
+        });
+        if (fallback) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "engagement_target_filtered_self_root_comment",
+              at: nowIso(),
+              commandId: input.commandId,
+              action: input.action,
+              postId: selected.postId,
+              source: selected.source,
+              reason: "fallback_to_non_self_or_thread",
+              gateRoll: rareAllowance.gateRoll,
+              fallbackPostId: fallback.postId,
+              fallbackCommentId: fallback.commentId,
+              fallbackSource: fallback.source,
+              query: hints.rawQuery,
+            })
+            .catch(() => undefined);
+          selected = fallback;
+        } else if (!rareAllowance.allow) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "engagement_target_filtered_self_root_comment",
+              at: nowIso(),
+              commandId: input.commandId,
+              action: input.action,
+              postId: selected.postId,
+              source: selected.source,
+              reason: rareAllowance.reason,
+              gateRoll: rareAllowance.gateRoll,
+              query: hints.rawQuery,
+            })
+            .catch(() => undefined);
+          throw new Error(
+            "engagement_target_unavailable:no_targets_discovered:self_root_comment_filtered",
+          );
+        } else if (rareAllowance.allow) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "engagement_target_allowed_self_root_comment",
+              at: nowIso(),
+              commandId: input.commandId,
+              action: input.action,
+              postId: selected.postId,
+              source: selected.source,
+              reason: rareAllowance.reason,
+              gateRoll: rareAllowance.gateRoll,
+              query: hints.rawQuery,
+            })
+            .catch(() => undefined);
+        }
       }
     }
 

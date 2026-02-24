@@ -313,6 +313,23 @@ const RAPID_SPACING: Record<string, number> = {
 };
 
 /**
+ * Upper cap (seconds) used to keep queue drain practical in development.
+ * This prevents large batches from stretching into multi-hour schedules.
+ */
+const DRAIN_SPACING_CAP: Record<string, number> = {
+  control: 3,
+  engagement: 8,
+  comment: 10,
+  story: 28,
+  post: 24,
+  media: 32,
+  general: 14,
+};
+
+const DRAIN_BACKLOG_STEP_SECONDS = 2;
+const DRAIN_BACKLOG_MAX_BONUS_SECONDS = 16;
+
+/**
  * Compute a deterministic delay (in seconds) for each pending queue item.
  *
  * Items with `forceNow` are assigned near-zero delays. Non-force items are
@@ -399,6 +416,16 @@ export const computeDeterministicDelay = ({
     }
 
     previousQueueClass = queueClass;
+    const drainCapBase = DRAIN_SPACING_CAP[queueClass] ?? DRAIN_SPACING_CAP.general!;
+    const backlogBonusSeconds = Math.min(
+      DRAIN_BACKLOG_MAX_BONUS_SECONDS,
+      Math.max(0, nonForceCount - 1) * DRAIN_BACKLOG_STEP_SECONDS,
+    );
+    const adaptiveDrainCap = Math.max(
+      4,
+      drainCapBase + backlogBonusSeconds,
+    );
+    spacingSeconds = Math.min(spacingSeconds, adaptiveDrainCap);
     const minSpacingFloor = rapidMode ? 3 : 10;
     spacingSeconds = Math.max(
       minSpacingFloor,
