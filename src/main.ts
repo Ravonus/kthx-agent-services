@@ -1045,9 +1045,26 @@ const main = async (): Promise<void> => {
       10,
     ) || autoCreditPlannerMinIntervalMs,
   );
+  const autoPostingPlanCooldownMs = Math.max(
+    autoPostingPlannerMinIntervalMs,
+    Number.parseInt(
+      trimEnv("MG_AUTO_POSTING_PLAN_COOLDOWN_MS") ??
+        `${Math.max(autoPostingPlannerMinIntervalMs, 60_000)}`,
+      10,
+    ) || Math.max(autoPostingPlannerMinIntervalMs, 60_000),
+  );
+  const autoPostingFollowupDelayMs = Math.max(
+    autoPostingPlannerMinIntervalMs + 250,
+    Number.parseInt(
+      trimEnv("MG_AUTO_POSTING_FOLLOWUP_DELAY_MS") ??
+        `${autoPostingPlannerMinIntervalMs + 250}`,
+      10,
+    ) || autoPostingPlannerMinIntervalMs + 250,
+  );
   let autoPostingPlanInFlight: Promise<void> | null = null;
   let autoPostingPlanLastAtMs = 0;
   const autoPostingRecentPlans = new Map<string, number>();
+  let autoPostingFollowupTimer: ReturnType<typeof setTimeout> | null = null;
   let triggerAutoPostingPlanner:
     | ((opts: { trigger: string; permissionState?: unknown }) => void)
     | null = null;
@@ -1424,12 +1441,55 @@ const main = async (): Promise<void> => {
   };
 
   const resolveGrantCandidates = (permissionState: unknown): GrantState[] => {
+    const now = Date.now();
     const candidates = parseGrantCandidatesFromPermissionState(permissionState);
-    if (candidates.length > 0) return candidates;
     const activeGrant = grantManager.getActiveGrant();
-    if (!activeGrant) return [];
-    if (activeGrant.expiresAtMs <= Date.now()) return [];
-    return [activeGrant];
+    const merged = new Map<string, GrantState>();
+    const scoreGrant = (grant: GrantState): number => {
+      let score = 0;
+      for (const action of grant.actions.values()) {
+        if (action.remainingCount <= 0) continue;
+        score += action.remainingCount;
+      }
+      return score;
+    };
+    const addCandidate = (candidate: GrantState | null): void => {
+      if (!candidate) return;
+      if (candidate.expiresAtMs <= now) return;
+      const id = candidate.id.trim();
+      const key =
+        id.length > 0
+          ? id
+          : `anonymous:${candidate.issuedAtMs}:${candidate.expiresAtMs}:${candidate.actions.size}`;
+      const existing = merged.get(key);
+      if (!existing) {
+        merged.set(key, candidate);
+        return;
+      }
+      const existingScore = scoreGrant(existing);
+      const nextScore = scoreGrant(candidate);
+      if (
+        candidate.expiresAtMs > existing.expiresAtMs ||
+        (candidate.expiresAtMs === existing.expiresAtMs && nextScore > existingScore) ||
+        (candidate.expiresAtMs === existing.expiresAtMs &&
+          nextScore === existingScore &&
+          candidate.actions.size > existing.actions.size)
+      ) {
+        merged.set(key, candidate);
+      }
+    };
+    for (const candidate of candidates) addCandidate(candidate);
+    addCandidate(activeGrant);
+    return Array.from(merged.values()).sort((left, right) => right.expiresAtMs - left.expiresAtMs);
+  };
+
+  const scheduleAutoPostingPlannerFollowup = (trigger: string): void => {
+    if (!autoPostingPlannerEnabled) return;
+    if (autoPostingFollowupTimer) return;
+    autoPostingFollowupTimer = setTimeout(() => {
+      autoPostingFollowupTimer = null;
+      triggerAutoPostingPlanner?.({ trigger });
+    }, autoPostingFollowupDelayMs);
   };
 
   triggerAutoCreditPlanner = (opts: {
@@ -2013,8 +2073,14 @@ const main = async (): Promise<void> => {
       const availableForAction = (
         grant: GrantState,
         keys: readonly string[],
-      ): number => {
+      ): {
+        available: number;
+        notBeforeBlocked: number;
+        earliestNotBeforeAtMs: number | null;
+      } => {
         let available = 0;
+        let notBeforeBlocked = 0;
+        let earliestNotBeforeAtMs: number | null = null;
         for (const key of keys) {
           const actionState = grant.actions.get(key);
           if (!actionState || actionState.remainingCount <= 0) continue;
@@ -2023,10 +2089,20 @@ const main = async (): Promise<void> => {
             Number.isFinite(actionState.notBeforeAtMs)
               ? actionState.notBeforeAtMs
               : grant.issuedAtMs + actionState.notBeforeSeconds * 1000;
-          if (notBeforeAtMs > now) continue;
+          if (notBeforeAtMs > now) {
+            notBeforeBlocked += actionState.remainingCount;
+            if (earliestNotBeforeAtMs === null || notBeforeAtMs < earliestNotBeforeAtMs) {
+              earliestNotBeforeAtMs = notBeforeAtMs;
+            }
+            continue;
+          }
           available += actionState.remainingCount;
         }
-        return available;
+        return {
+          available,
+          notBeforeBlocked,
+          earliestNotBeforeAtMs,
+        };
       };
 
       let selected:
@@ -2037,15 +2113,39 @@ const main = async (): Promise<void> => {
           }
         | null = null;
       const actionPriority: AutoPostingAction[] = ["post_media", "post_text", "story"];
+      const availableByAction: Record<AutoPostingAction, number> = {
+        post_media: 0,
+        post_text: 0,
+        story: 0,
+      };
+      const notBeforeBlockedByAction: Record<AutoPostingAction, number> = {
+        post_media: 0,
+        post_text: 0,
+        story: 0,
+      };
+      let cooldownBlocked = 0;
+      let earliestNotBeforeAtMs: number | null = null;
       for (const candidate of grantCandidates) {
         if (candidate.expiresAtMs <= now) continue;
         const grantId = candidate.id.trim().length > 0 ? candidate.id.trim() : null;
         for (const action of actionPriority) {
-          const available = availableForAction(candidate, AUTO_POSTING_ACTION_KEYS[action]);
+          const availability = availableForAction(candidate, AUTO_POSTING_ACTION_KEYS[action]);
+          const available = availability.available;
+          availableByAction[action] += available;
+          notBeforeBlockedByAction[action] += availability.notBeforeBlocked;
+          if (
+            availability.earliestNotBeforeAtMs !== null &&
+            (earliestNotBeforeAtMs === null || availability.earliestNotBeforeAtMs < earliestNotBeforeAtMs)
+          ) {
+            earliestNotBeforeAtMs = availability.earliestNotBeforeAtMs;
+          }
           if (available <= 0) continue;
           const dedupeKey = `${action}:${grantId ?? "none"}`;
           const lastPlannedAt = autoPostingRecentPlans.get(dedupeKey) ?? 0;
-          if (now - lastPlannedAt < autoCreditPlannerRecentTargetTtlMs) continue;
+          if (now - lastPlannedAt < autoPostingPlanCooldownMs) {
+            cooldownBlocked += 1;
+            continue;
+          }
           selected = {
             action,
             grantId,
@@ -2057,11 +2157,32 @@ const main = async (): Promise<void> => {
       }
 
       if (!selected) {
+        const totalAvailable =
+          availableByAction.post_media + availableByAction.post_text + availableByAction.story;
+        const totalNotBeforeBlocked =
+          notBeforeBlockedByAction.post_media +
+          notBeforeBlockedByAction.post_text +
+          notBeforeBlockedByAction.story;
+        const reason =
+          totalAvailable > 0
+            ? cooldownBlocked > 0
+              ? "cooldown"
+              : "no_plan_targets"
+            : totalNotBeforeBlocked > 0
+              ? "not_before"
+              : "no_posting_window";
         await memory.recordWrite({
           type: "auto_posting_planner_skipped",
           at: nowIso(),
           trigger: opts.trigger,
-          reason: "no_posting_window",
+          reason,
+          availableByAction,
+          notBeforeBlockedByAction,
+          cooldownBlocked,
+          grantCandidateCount: grantCandidates.length,
+          ...(earliestNotBeforeAtMs !== null
+            ? { nextReadyAt: new Date(earliestNotBeforeAtMs).toISOString() }
+            : {}),
         }).catch(() => {});
         return;
       }
@@ -2134,7 +2255,7 @@ const main = async (): Promise<void> => {
       });
       const dedupeKey = `${selected.action}:${selected.grantId ?? "none"}`;
       autoPostingRecentPlans.set(dedupeKey, Date.now());
-      const cutoff = Date.now() - autoCreditPlannerRecentTargetTtlMs;
+      const cutoff = Date.now() - autoPostingPlanCooldownMs;
       for (const [key, seenAt] of autoPostingRecentPlans) {
         if (seenAt < cutoff) autoPostingRecentPlans.delete(key);
       }
@@ -2145,8 +2266,12 @@ const main = async (): Promise<void> => {
         action: selected.action,
         grantId: selected.grantId,
         available: selected.available,
+        availableByAction,
         directiveId,
       }).catch(() => {});
+      if (selected.available > 1) {
+        scheduleAutoPostingPlannerFollowup("auto_posting_followup");
+      }
     })()
       .catch(async (error: unknown) => {
         await memory.recordWrite({

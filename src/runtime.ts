@@ -106,6 +106,50 @@ const isUnauthorizedError = (value: unknown, message: string): boolean => {
   );
 };
 
+const parseDirectiveBackfillPollMs = (): number => {
+  const raw = trimEnv("MG_DIRECTIVE_BACKFILL_POLL_MS");
+  if (!raw) return 8_000;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return 8_000;
+  return Math.max(2_000, Math.min(120_000, parsed));
+};
+
+const parseDirectiveBackfillLimit = (): number => {
+  const raw = trimEnv("MG_DIRECTIVE_BACKFILL_LIMIT");
+  if (!raw) return 80;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return 80;
+  return Math.max(1, Math.min(200, parsed));
+};
+
+const parsePendingDirectiveRows = (
+  payload: unknown,
+): Array<{ directive: Record<string, unknown> }> => {
+  if (!isRecord(payload) || !Array.isArray(payload.directives)) return [];
+  const seenIds = new Set<string>();
+  const rows: Array<{ directive: Record<string, unknown>; createdAtMs: number }> = [];
+  for (const entry of payload.directives) {
+    if (!isRecord(entry) || !isRecord(entry.directive)) continue;
+    const directive = entry.directive;
+    const directiveId =
+      typeof directive.id === "string" && directive.id.trim().length > 0
+        ? directive.id.trim()
+        : "";
+    if (!directiveId.length || seenIds.has(directiveId)) continue;
+    seenIds.add(directiveId);
+    const createdAtMs =
+      typeof directive.createdAt === "string"
+        ? Date.parse(directive.createdAt)
+        : Number.NaN;
+    rows.push({
+      directive,
+      createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : Number.MAX_SAFE_INTEGER,
+    });
+  }
+  rows.sort((a, b) => a.createdAtMs - b.createdAtMs);
+  return rows.map((row) => ({ directive: row.directive }));
+};
+
 // ---------------------------------------------------------------------------
 // Backend call serialization gate
 // ---------------------------------------------------------------------------
@@ -345,16 +389,114 @@ const handleTransportStateChange = (
 export const startRuntime = async (deps: RuntimeDeps): Promise<void> => {
   const { ctx } = deps;
   const intervals: ReturnType<typeof setInterval>[] = [];
+  const directiveBackfillPollMs = parseDirectiveBackfillPollMs();
+  const directiveBackfillLimit = parseDirectiveBackfillLimit();
+  let directiveBackfillInFlight: Promise<void> | null = null;
 
   // -- Initial heartbeat
   await sendHeartbeat(ctx);
   await ctx.subscriptionManager?.bootstrap().catch(() => {});
+
+  const runDirectiveBackfill = async (
+    trigger: "runtime_boot" | "interval",
+  ): Promise<void> => {
+    if (directiveBackfillInFlight) {
+      await directiveBackfillInFlight;
+      return;
+    }
+    if (!ctx.directiveManager || !ctx.trpc) return;
+    const listPendingDirectivesQuery = (
+      (ctx.trpc as Record<string, unknown>)?.agent as
+        | { listPendingDirectives?: { query?: (input: Record<string, unknown>) => Promise<unknown> } }
+        | undefined
+    )?.listPendingDirectives?.query;
+    if (typeof listPendingDirectivesQuery !== "function") return;
+
+    directiveBackfillInFlight = (async () => {
+      const startedAtMs = Date.now();
+      try {
+        const response = await runBackendCall(
+          "agent.listPendingDirectives.query",
+          () =>
+            listPendingDirectivesQuery({
+              limit: directiveBackfillLimit,
+              includeReceived: false,
+            }),
+          ctx,
+        );
+        const rows = parsePendingDirectiveRows(response);
+        let queued = 0;
+        let failed = 0;
+        for (const row of rows) {
+          try {
+            await ctx.directiveManager?.intake(row.directive);
+            queued += 1;
+          } catch (error: unknown) {
+            failed += 1;
+            const directiveId =
+              typeof row.directive.id === "string" && row.directive.id.trim().length > 0
+                ? row.directive.id.trim()
+                : null;
+            await ctx.memory
+              .recordWrite({
+                type: "directive_backfill_intake_failed",
+                at: nowIso(),
+                trigger,
+                directiveId,
+                error: error instanceof Error ? error.message : String(error),
+              })
+              .catch(() => {});
+          }
+        }
+        if (rows.length > 0 || queued > 0 || failed > 0 || trigger !== "interval") {
+          await ctx.memory
+            .recordWrite({
+              type: "directive_backfill_scanned",
+              at: nowIso(),
+              trigger,
+              scanned: rows.length,
+              queued,
+              failed,
+              durationMs: Math.max(0, Date.now() - startedAtMs),
+            })
+            .catch(() => {});
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (isUnauthorizedError(error, message)) {
+          await ctx.authManager
+            ?.handleUnauthorized("directive_backfill_unauthorized", error)
+            .catch(() => {});
+        }
+        await ctx.memory
+          .recordWrite({
+            type: "directive_backfill_failed",
+            at: nowIso(),
+            trigger,
+            error: message,
+          })
+          .catch(() => {});
+      } finally {
+        directiveBackfillInFlight = null;
+      }
+    })();
+    await directiveBackfillInFlight;
+  };
+
+  void runDirectiveBackfill("runtime_boot").catch(() => {});
 
   // -- Heartbeat interval
   intervals.push(
     setInterval(() => {
       void sendHeartbeat(ctx);
     }, ctx.config.heartbeatIntervalMs),
+  );
+
+  // -- Directive backfill interval
+  intervals.push(
+    setInterval(() => {
+      void runDirectiveBackfill("interval").catch(() => {});
+    }, directiveBackfillPollMs),
   );
 
   // -- WS pending watchdog

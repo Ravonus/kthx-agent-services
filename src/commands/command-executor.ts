@@ -5372,14 +5372,15 @@ export class CommandExecutor {
     const availableModes = POST_VARIETY_MODES.filter((mode) => !blockedModes.has(mode));
     const chooseBySeed = (seedSuffix: string, candidates: readonly PostVarietyMode[]): PostVarietyMode => {
       const target = candidates.length > 0 ? candidates : POST_VARIETY_MODES;
-      return (
+      if (target.length === 0) return "reaction";
+      const selected =
         target[
           this.pickDeterministicIndex(
             `${input.commandId}:${input.postType}:${seedSuffix}:${signal}`,
             target.length,
           )
-        ] ?? target[0]
-      );
+        ];
+      return selected ?? target[0] ?? "reaction";
     };
     if (payloadMode) {
       const selected = blockedModes.has(payloadMode)
@@ -15482,6 +15483,10 @@ export class CommandExecutor {
     const sourceContext = asNonEmptyString(payload.sourceContext)?.toLowerCase() ?? "";
     const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
     if (sourceContext !== "chat" && !chatContext) return null;
+    const chatCommandName = this.resolveChatCommandName(payload);
+    if ((chatCommandName?.trim().toLowerCase() ?? "") === "agent-decide") {
+      return null;
+    }
     if (payload.chatLiteralGenerate === true || payload.chatLiteralGenerate === "true") {
       return null;
     }
@@ -15586,6 +15591,10 @@ export class CommandExecutor {
     command: Command;
     outcome: CommandOutcome;
   }): { body: string; metadata: Record<string, unknown> } | null {
+    const payload = isRecord(input.command.payload) ? input.command.payload : null;
+    const commandName = payload ? this.resolveChatCommandName(payload) ?? input.command.kind : input.command.kind;
+    const suppressCommandActionPreview =
+      commandName.trim().toLowerCase() === "agent-decide";
     const data = isRecord(input.outcome.data) ? input.outcome.data : null;
     const explicitCompletion = data && isRecord(data.chatCompletion)
       ? data.chatCompletion
@@ -15595,19 +15604,24 @@ export class CommandExecutor {
       const explicitMetadata = isRecord(explicitCompletion?.metadata)
         ? explicitCompletion.metadata
         : null;
+      const sanitizedExplicitMetadata =
+        suppressCommandActionPreview && explicitMetadata
+          ? (() => {
+              const { actionPreview: _ignoredActionPreview, ...rest } = explicitMetadata;
+              return rest;
+            })()
+          : explicitMetadata;
       return {
         body: explicitBody,
         metadata: {
           automated: true,
           sourceContext: "CHAT",
-          ...(explicitMetadata ?? {}),
+          ...(sanitizedExplicitMetadata ?? {}),
         },
       };
     }
 
-    const payload = isRecord(input.command.payload) ? input.command.payload : null;
     if (!payload) return null;
-    const commandName = this.resolveChatCommandName(payload) ?? input.command.kind;
     const errorMessage = input.outcome.error?.message?.trim() ?? "";
     if (!input.outcome.ok) {
       return {
@@ -15617,13 +15631,19 @@ export class CommandExecutor {
         metadata: {
           automated: true,
           sourceContext: "CHAT",
-          actionPreview: {
-            type: "command",
-            status: "failed",
-            title: "Command failed",
-            summary: commandName,
-            ...(errorMessage.length > 0 ? { error: truncateText(errorMessage, 240) } : {}),
-          },
+          ...(suppressCommandActionPreview
+            ? {}
+            : {
+                actionPreview: {
+                  type: "command",
+                  status: "failed",
+                  title: "Command failed",
+                  summary: commandName,
+                  ...(errorMessage.length > 0
+                    ? { error: truncateText(errorMessage, 240) }
+                    : {}),
+                },
+              }),
         },
       };
     }
@@ -15830,43 +15850,47 @@ export class CommandExecutor {
       metadata: {
         automated: true,
         sourceContext: "CHAT",
-        actionPreview: {
-          type: "command",
-          status: "success",
-          title: "Command completed",
-          summary: commandName,
-          detail: summary,
-          executedCount,
-          skippedCount,
-          failedCount,
-          ...(executedKinds.length > 0 ? { executedKinds } : {}),
-          ...(executedTargetDetails.length > 0
-            ? { executedTargets: executedTargetDetails.slice(0, 16) }
-            : {}),
-          ...(followedHandles.length > 0 ? { followedHandles } : {}),
-          ...(alreadyFollowedHandles.length > 0
-            ? { alreadyFollowedHandles }
-            : {}),
-          ...(failedHandles.length > 0 ? { failedHandles } : {}),
-          ...(failedDraftEntries.length > 0
-            ? {
-                failedDrafts: failedDraftEntries
-                  .map((entry) => ({
-                    kind: asNonEmptyString(entry.kind),
-                    reason: asNonEmptyString(entry.reason),
-                    code: asNonEmptyString(entry.code),
-                  }))
-                  .filter(
-                    (entry): entry is {
-                      kind: string | null;
-                      reason: string | null;
-                      code: string | null;
-                    } => entry.reason !== null,
-                  )
-                  .slice(0, 12),
-              }
-            : {}),
-        },
+        ...(suppressCommandActionPreview
+          ? {}
+          : {
+              actionPreview: {
+                type: "command",
+                status: "success",
+                title: "Command completed",
+                summary: commandName,
+                detail: summary,
+                executedCount,
+                skippedCount,
+                failedCount,
+                ...(executedKinds.length > 0 ? { executedKinds } : {}),
+                ...(executedTargetDetails.length > 0
+                  ? { executedTargets: executedTargetDetails.slice(0, 16) }
+                  : {}),
+                ...(followedHandles.length > 0 ? { followedHandles } : {}),
+                ...(alreadyFollowedHandles.length > 0
+                  ? { alreadyFollowedHandles }
+                  : {}),
+                ...(failedHandles.length > 0 ? { failedHandles } : {}),
+                ...(failedDraftEntries.length > 0
+                  ? {
+                      failedDrafts: failedDraftEntries
+                        .map((entry) => ({
+                          kind: asNonEmptyString(entry.kind),
+                          reason: asNonEmptyString(entry.reason),
+                          code: asNonEmptyString(entry.code),
+                        }))
+                        .filter(
+                          (entry): entry is {
+                            kind: string | null;
+                            reason: string | null;
+                            code: string | null;
+                          } => entry.reason !== null,
+                        )
+                        .slice(0, 12),
+                    }
+                  : {}),
+              },
+            }),
       },
     };
   }
