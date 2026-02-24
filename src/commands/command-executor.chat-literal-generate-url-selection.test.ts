@@ -209,21 +209,31 @@ describe("command executor chat literal delivery url selection", () => {
 
     const executor = createExecutor(bridge);
     const invoker = executor as unknown as CommandExecutorInvoker;
-    invoker.generateAndUploadMediaFromPrompt = vi.fn(async () => ({
+    const generatedUpload: Awaited<
+      ReturnType<CommandExecutorInvoker["generateAndUploadMediaFromPrompt"]>
+    > = {
       mediaUrl: "https://cdn.example.com/generated/partx.png",
       mediaOriginalUrl: "https://cdn.example.com/generated/final-sticker.png",
       mediaOptimizedUrl: "https://cdn.example.com/generated/partx.png",
       mediaType: "image",
       mediaSizeBytes: 2048,
-    }));
-    invoker.saveGeneratedCustomAsset = vi.fn(async () => ({
+    };
+    invoker.generateAndUploadMediaFromPrompt = vi.fn(
+      async () => generatedUpload,
+    ) as CommandExecutorInvoker["generateAndUploadMediaFromPrompt"];
+    const savedAsset: Awaited<
+      ReturnType<CommandExecutorInvoker["saveGeneratedCustomAsset"]>
+    > = {
       kind: "sticker",
       scope: "mine",
       name: "pepe_thumbsup",
       id: 42,
       url: "https://cdn.example.com/generated/partx.png",
       mimeType: "image/png",
-    }));
+    };
+    invoker.saveGeneratedCustomAsset = vi.fn(
+      async () => savedAsset,
+    ) as CommandExecutorInvoker["saveGeneratedCustomAsset"];
 
     const outcome = await invoker.executeGenerateAndQueue({
       ...command,

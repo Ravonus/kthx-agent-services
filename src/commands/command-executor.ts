@@ -109,7 +109,7 @@ const CAPTION_POSITION_KEYS = new Set([
   "bottom-right",
 ]);
 
-const TEXT_STYLE_THEME_KEYS = new Set([
+const TEXT_STYLE_THEMES = [
   "warm",
   "cool",
   "night",
@@ -118,7 +118,10 @@ const TEXT_STYLE_THEME_KEYS = new Set([
   "ocean",
   "plum",
   "sand",
-]);
+] as const;
+type TextStyleTheme = (typeof TEXT_STYLE_THEMES)[number];
+
+const TEXT_STYLE_THEME_KEYS = new Set<string>(TEXT_STYLE_THEMES);
 
 const TEXT_STYLE_ALIGN_KEYS = new Set(["left", "center", "right"]);
 const TEXT_STYLE_EMPHASIS_KEYS = new Set([
@@ -139,6 +142,135 @@ const TEXT_STYLE_COLOR_KEYS = new Set([
   "mint",
   "sky",
 ]);
+const TEXT_STYLE_DEFAULT_COLOR_BY_THEME: Record<TextStyleTheme, string> = {
+  warm: "ink",
+  cool: "ink",
+  night: "paper",
+  sunrise: "ink",
+  mint: "ink",
+  ocean: "ink",
+  plum: "paper",
+  sand: "ink",
+};
+
+const AUTONOMOUS_TEXT_GRADIENTS: Record<TextStyleTheme, string[]> = {
+  warm: [
+    "linear-gradient(140deg, #ffe4d6 0%, #ffd1da 48%, #fff1c2 100%)",
+    "linear-gradient(132deg, #ffd8c4 0%, #ffc8d2 44%, #ffe7b3 100%)",
+  ],
+  cool: [
+    "linear-gradient(138deg, #d8efff 0%, #dfe6ff 45%, #d8ffe9 100%)",
+    "linear-gradient(128deg, #cce8ff 0%, #d6ddff 46%, #c9f4ff 100%)",
+  ],
+  night: [
+    "linear-gradient(142deg, #121733 0%, #1d2550 45%, #0d1428 100%)",
+    "linear-gradient(134deg, #171c3f 0%, #222a58 44%, #101828 100%)",
+  ],
+  sunrise: [
+    "linear-gradient(136deg, #ffe0a6 0%, #ffcabf 44%, #ffb6ca 100%)",
+    "linear-gradient(128deg, #ffd99a 0%, #ffc1b1 45%, #ffadc0 100%)",
+  ],
+  mint: [
+    "linear-gradient(138deg, #d5ffe7 0%, #dbfff4 45%, #dff5ff 100%)",
+    "linear-gradient(130deg, #c9f8df 0%, #d5fff0 44%, #d4f1ff 100%)",
+  ],
+  ocean: [
+    "linear-gradient(140deg, #d4ecff 0%, #c2dbff 44%, #b8f2f5 100%)",
+    "linear-gradient(132deg, #c9e6ff 0%, #b9d4ff 45%, #a9ecef 100%)",
+  ],
+  plum: [
+    "linear-gradient(142deg, #1e0f2a 0%, #33204e 45%, #4a2a62 100%)",
+    "linear-gradient(134deg, #231238 0%, #382059 46%, #5a2e71 100%)",
+  ],
+  sand: [
+    "linear-gradient(136deg, #fff1d5 0%, #ffe2b8 45%, #ffd59d 100%)",
+    "linear-gradient(128deg, #ffebc8 0%, #ffddb0 46%, #ffd094 100%)",
+  ],
+};
+
+const AUTONOMOUS_THEME_KEYWORD_HINTS: Array<{
+  theme: TextStyleTheme;
+  keywords: string[];
+}> = [
+  {
+    theme: "ocean",
+    keywords: ["tech", "code", "build", "system", "engineer", "ai", "agent", "cloud"],
+  },
+  {
+    theme: "cool",
+    keywords: ["analysis", "plan", "explain", "update", "status", "report", "insight"],
+  },
+  {
+    theme: "night",
+    keywords: ["security", "risk", "late", "midnight", "focus", "deep", "serious"],
+  },
+  {
+    theme: "plum",
+    keywords: ["mystery", "cinematic", "dramatic", "moody", "noir", "intense"],
+  },
+  {
+    theme: "sunrise",
+    keywords: ["launch", "win", "growth", "energy", "hype", "breakthrough", "momentum"],
+  },
+  {
+    theme: "warm",
+    keywords: ["community", "friends", "team", "conversation", "human", "story"],
+  },
+  {
+    theme: "mint",
+    keywords: ["calm", "fresh", "wellness", "clean", "simple", "minimal"],
+  },
+  {
+    theme: "sand",
+    keywords: ["guide", "lesson", "tips", "how", "steps", "walkthrough"],
+  },
+];
+
+const AUTONOMOUS_PALETTE_HINTS_BY_THEME: Record<TextStyleTheme, string[]> = {
+  warm: [
+    "soft peach, rose cream, and warm gold",
+    "apricot, dusty pink, and pale amber",
+  ],
+  cool: [
+    "powder blue, periwinkle, and mint-white",
+    "frost blue, lilac haze, and aqua accents",
+  ],
+  night: [
+    "deep navy, indigo, and moonlit slate",
+    "midnight blue, steel violet, and low-key shadows",
+  ],
+  sunrise: [
+    "amber, coral blush, and sunrise pink",
+    "golden peach, salmon glow, and warm rose",
+  ],
+  mint: [
+    "mint leaf, seafoam, and pale cyan",
+    "fresh jade, cool mint, and white glow",
+  ],
+  ocean: [
+    "ocean blue, teal mist, and bright aqua",
+    "azure, cyan, and tropical sea tones",
+  ],
+  plum: [
+    "eggplant, violet, and magenta haze",
+    "dark plum, royal purple, and mulberry highlights",
+  ],
+  sand: [
+    "sandstone, beige, and warm tan",
+    "cream, dune gold, and soft caramel",
+  ],
+};
+
+const AUTONOMOUS_CAMERA_HINTS = [
+  "Wide framing with clear foreground-background depth.",
+  "Medium shot with one strong focal subject.",
+  "Close-up composition with layered texture and contrast.",
+  "Three-quarter angle with motion and candid energy.",
+  "Overhead composition with deliberate visual rhythm.",
+] as const;
+
+const AUTONOMOUS_SEQUENCE_SIGNAL_PATTERN =
+  /\b(first|second|third|fourth|next|then|finally|steps?|checklist|roadmap|before|after|vs|versus|reasons?|ways?|lessons?|takeaways?|timeline)\b/iu;
 
 const isHttpUrl = (value: string): boolean => /^https?:\/\//iu.test(value.trim());
 const isDataUri = (value: string): boolean => /^data:/iu.test(value.trim());
@@ -2604,8 +2736,75 @@ export class CommandExecutor {
           .catch(() => undefined);
       }
       const candidate = noveltyValidation.candidateText;
+      const autonomousTheme = this.resolveAutonomousTextTheme({
+        commandId: command.id,
+        postKind,
+        caption: captionForWrite,
+        textBody: textBodyForWrite,
+      });
+      const autonomousCaptionPosition = this.resolveAutonomousCaptionPosition({
+        commandId: command.id,
+        postKind,
+        seedText: `${captionForWrite ?? ""} ${textBodyForWrite}`,
+      });
+      const autonomousAlign = autonomousCaptionPosition.split("-")[1] ?? "center";
+      const emphasisOptions =
+        postKind === "thread"
+          ? (["display", "bold", "mono", "serif"] as const)
+          : (["soft", "bold", "serif", "mono"] as const);
+      const fontOptions =
+        postKind === "thread"
+          ? (["display", "sans", "mono", "serif"] as const)
+          : (["sans", "serif", "mono", "display"] as const);
+      const sizeOptions =
+        postKind === "thread"
+          ? (["xl", "2xl", "lg"] as const)
+          : (["lg", "xl", "md"] as const);
+      const autonomousStyleFallback: Record<string, unknown> = {
+        theme: autonomousTheme,
+        align:
+          autonomousAlign === "left" ||
+          autonomousAlign === "center" ||
+          autonomousAlign === "right"
+            ? autonomousAlign
+            : "center",
+        emphasis:
+          emphasisOptions[
+            this.pickDeterministicIndex(
+              `${command.id}:${candidate}:text_emphasis`,
+              emphasisOptions.length,
+            )
+          ] ?? "soft",
+        font:
+          fontOptions[
+            this.pickDeterministicIndex(
+              `${command.id}:${candidate}:text_font`,
+              fontOptions.length,
+            )
+          ] ?? "sans",
+        weight:
+          this.pickDeterministicIndex(`${command.id}:${candidate}:text_weight`, 100) < 52
+            ? "bold"
+            : "regular",
+        size:
+          sizeOptions[
+            this.pickDeterministicIndex(
+              `${command.id}:${candidate}:text_size`,
+              sizeOptions.length,
+            )
+          ] ?? "lg",
+        italic:
+          this.pickDeterministicIndex(`${command.id}:${candidate}:text_italic`, 100) < 24,
+        color: TEXT_STYLE_DEFAULT_COLOR_BY_THEME[autonomousTheme],
+        position: autonomousCaptionPosition,
+        background: this.resolveAutonomousGradientBackground(
+          autonomousTheme,
+          `${command.id}:${candidate}:text_background`,
+        ),
+      };
       const visualPlan = await this.planTextPostVisualWithOpenClaw({
         commandId: command.id,
+        postKind,
         caption: captionForWrite,
         textBody: textBodyForWrite,
         context: postDraftContext,
@@ -2613,21 +2812,42 @@ export class CommandExecutor {
       const captionPositionForWrite =
         this.normalizeCaptionPositionValue(payload.captionPosition) ??
         visualPlan?.captionPosition ??
-        null;
+        autonomousCaptionPosition;
       const normalizedTextStyle = this.normalizeAgentTextStyle(
         this.sanitizeTextStyleValue(payload.textStyle) ?? visualPlan?.textStyle ?? null,
         captionPositionForWrite,
+        autonomousStyleFallback,
       );
-      const planWantsSlides =
-        visualPlan?.renderMode === "slides" && visualPlan.slides.length >= 2;
-      const visualBackgroundPrompt = visualPlan?.backgroundImagePrompt
-        ? stripEmDashCharacters(visualPlan.backgroundImagePrompt).trim()
+      const plannerSlides = visualPlan?.slides.slice(0, 4) ?? [];
+      const autonomousSlides = this.buildAutonomousThreadSlides({
+        commandId: command.id,
+        caption: captionForWrite,
+        textBody: textBodyForWrite,
+        theme: autonomousTheme,
+        postKind,
+      });
+      const selectedSlides =
+        plannerSlides.length >= 2 ? plannerSlides : autonomousSlides;
+      const shouldAttemptSlides =
+        selectedSlides.length >= 2 &&
+        (visualPlan?.renderMode === "slides" || postKind === "thread");
+      const visualBackgroundPromptRaw =
+        visualPlan?.backgroundImagePrompt ??
+        this.buildAutonomousTextBackgroundPrompt({
+          commandId: command.id,
+          caption: captionForWrite,
+          textBody: textBodyForWrite,
+          theme: autonomousTheme,
+          postKind,
+        });
+      const visualBackgroundPrompt = visualBackgroundPromptRaw
+        ? stripEmDashCharacters(visualBackgroundPromptRaw).trim()
         : "";
-      const planWantsImageBackground =
-        !planWantsSlides && visualBackgroundPrompt.length >= 8;
-      if (planWantsSlides) {
+      const shouldAttemptImageBackground =
+        !shouldAttemptSlides && visualBackgroundPrompt.length >= 8;
+      if (shouldAttemptSlides) {
         const slideItems: Array<Record<string, unknown>> = [];
-        const slidePrompts = visualPlan.slides.slice(0, 4);
+        const slidePrompts = selectedSlides.slice(0, 4);
         for (const slide of slidePrompts) {
           const slidePrompt = stripEmDashCharacters(slide.imagePrompt).trim();
           if (slidePrompt.length < 8) continue;
@@ -2719,16 +2939,26 @@ export class CommandExecutor {
                 postType: "media",
                 targetPostId: postDraftContext.targetPostId,
                 bodyPreview: truncateText(candidate, 260),
-                visualRenderMode: "slides",
+                visualRenderMode:
+                  plannerSlides.length >= 2 ? "slides" : "autonomous_slides",
                 slideCount: slideItems.length,
+                textStyleTheme: autonomousTheme,
               })
               .catch(() => undefined);
             return this.successOutcome(command, slideResult);
           }
         }
+        await this.ctx.memory
+          .recordWrite({
+            type: "text_post_slides_fallback",
+            at: nowIso(),
+            commandId: command.id,
+            slideCountRequested: slidePrompts.length,
+            slideCountResolved: slideItems.length,
+          })
+          .catch(() => undefined);
       }
-
-      if (planWantsImageBackground) {
+      if (shouldAttemptImageBackground) {
         try {
           const backgroundMedia = await this.resolveMediaUpload({
             payload: {
@@ -2813,7 +3043,12 @@ export class CommandExecutor {
               postType: "media",
               targetPostId: postDraftContext.targetPostId,
               bodyPreview: truncateText(candidate, 260),
-              visualRenderMode: "image_text",
+              visualRenderMode:
+                visualPlan?.backgroundImagePrompt !== null &&
+                visualPlan?.backgroundImagePrompt !== undefined
+                  ? "image_text"
+                  : "autonomous_image_text",
+              textStyleTheme: autonomousTheme,
             })
             .catch(() => undefined);
           return this.successOutcome(command, imageTextResult);
@@ -2852,9 +3087,11 @@ export class CommandExecutor {
           postType,
           targetPostId: postDraftContext.targetPostId,
           bodyPreview: truncateText(candidate, 260),
-          visualRenderMode: planWantsSlides
-            ? "text_fallback"
-            : planWantsImageBackground
+          visualRenderMode: shouldAttemptSlides
+            ? shouldAttemptImageBackground
+              ? "text_after_slides_and_image_fallback"
+              : "text_after_slides_fallback"
+            : shouldAttemptImageBackground
               ? "text_after_image_background_fallback"
               : "text",
           textStyleTheme: asNonEmptyString(normalizedTextStyle.theme),
@@ -2985,6 +3222,162 @@ export class CommandExecutor {
         })
         .catch(() => undefined);
     }
+    const mediaCandidate = noveltyValidation.candidateText;
+    const mediaSeedText = mediaPromptForWrite ?? captionForWrite ?? mediaCandidate;
+    const autonomousMediaTheme = this.resolveAutonomousTextTheme({
+      commandId: command.id,
+      postKind,
+      caption: captionForWrite,
+      textBody: mediaSeedText,
+    });
+    const captionPositionForWrite =
+      this.normalizeCaptionPositionValue(payload.captionPosition) ??
+      this.resolveAutonomousCaptionPosition({
+        commandId: command.id,
+        postKind,
+        seedText: `${captionForWrite ?? ""} ${mediaSeedText}`,
+      });
+    const autonomousMediaSlides = this.buildAutonomousMediaSlides({
+      commandId: command.id,
+      postKind,
+      caption: captionForWrite,
+      mediaPrompt: mediaSeedText,
+      theme: autonomousMediaTheme,
+    });
+    const shouldAttemptMediaSlides = autonomousMediaSlides.length >= 2;
+    if (shouldAttemptMediaSlides) {
+      const slideItems: Array<Record<string, unknown>> = [];
+      const slidePrompts = autonomousMediaSlides.slice(0, 4);
+      for (let index = 0; index < slidePrompts.length; index += 1) {
+        const slide = slidePrompts[index];
+        if (!slide) continue;
+        const slidePrompt = stripEmDashCharacters(slide.imagePrompt).trim();
+        if (slidePrompt.length < 8) continue;
+        try {
+          const slideMedia = await this.resolveMediaUpload({
+            payload: {
+              ...payload,
+              generatedAssetType: "image",
+            },
+            keepOriginal: true,
+            promptFallbacks: [
+              slidePrompt,
+              mediaPromptForWrite,
+              asNonEmptyString(payload.prompt),
+            ],
+            command,
+          });
+          slideItems.push({
+            mediaUrl: slideMedia.mediaUrl,
+            ...(slideMedia.mediaOriginalUrl
+              ? { mediaOriginalUrl: slideMedia.mediaOriginalUrl }
+              : {}),
+            ...(slideMedia.mediaOptimizedUrl
+              ? { mediaOptimizedUrl: slideMedia.mediaOptimizedUrl }
+              : {}),
+            ...(slideMedia.mediaContentHash
+              ? { mediaContentHash: slideMedia.mediaContentHash }
+              : {}),
+            ...(slideMedia.mediaIpfsCid
+              ? { mediaIpfsCid: slideMedia.mediaIpfsCid }
+              : {}),
+            ...(typeof slideMedia.mediaSizeBytes === "number"
+              ? { mediaSizeBytes: slideMedia.mediaSizeBytes }
+              : {}),
+            ...(slideMedia.mediaType ? { mediaType: slideMedia.mediaType } : {}),
+            ...(slide.caption
+              ? { caption: slide.caption }
+              : captionForWrite
+                ? { caption: captionForWrite }
+                : {}),
+            ...(captionPositionForWrite
+              ? { captionPosition: captionPositionForWrite }
+              : {}),
+          });
+        } catch (error: unknown) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "media_post_slide_generation_failed",
+              at: nowIso(),
+              commandId: command.id,
+              slideIndex: index,
+              error: error instanceof Error ? error.message : String(error),
+            })
+            .catch(() => undefined);
+        }
+      }
+      if (slideItems.length >= 2) {
+        const firstSlide = slideItems[0] ?? {};
+        const firstSlideMediaUrl = asNonEmptyString(firstSlide.mediaUrl);
+        if (firstSlideMediaUrl) {
+          const slideResult = await this.agent().createPost.mutate({
+            ...buildBase(captionForWrite, "media"),
+            mediaUrl: firstSlideMediaUrl,
+            ...(asNonEmptyString(firstSlide.mediaOriginalUrl)
+              ? { mediaOriginalUrl: asNonEmptyString(firstSlide.mediaOriginalUrl) }
+              : {}),
+            ...(asNonEmptyString(firstSlide.mediaOptimizedUrl)
+              ? { mediaOptimizedUrl: asNonEmptyString(firstSlide.mediaOptimizedUrl) }
+              : {}),
+            ...(asNonEmptyString(firstSlide.mediaContentHash)
+              ? { mediaContentHash: asNonEmptyString(firstSlide.mediaContentHash) }
+              : {}),
+            ...(asNonEmptyString(firstSlide.mediaIpfsCid)
+              ? { mediaIpfsCid: asNonEmptyString(firstSlide.mediaIpfsCid) }
+              : {}),
+            ...(typeof firstSlide.mediaSizeBytes === "number" &&
+            Number.isFinite(firstSlide.mediaSizeBytes)
+              ? {
+                  mediaSizeBytes: Math.max(
+                    1,
+                    Math.floor(firstSlide.mediaSizeBytes),
+                  ),
+                }
+              : {}),
+            ...(asNonEmptyString(firstSlide.mediaType)
+              ? { mediaType: asNonEmptyString(firstSlide.mediaType) }
+              : {}),
+            mediaItems: slideItems,
+            ...(captionPositionForWrite
+              ? { captionPosition: captionPositionForWrite }
+              : {}),
+          });
+          this.notePublishedPostForNoveltyHistory({
+            postType: "media",
+            caption: captionForWrite,
+            textBody: null,
+            mediaPrompt: slidePrompts.map((entry) => entry.imagePrompt).join(" | "),
+            commandId: command.id,
+            targetPostId: postDraftContext.targetPostId,
+          });
+          await this.ctx.memory
+            .recordWrite({
+              type: "runtime_post_publish_recorded",
+              at: nowIso(),
+              commandId: command.id,
+              kind: postKind,
+              postType: "media",
+              targetPostId: postDraftContext.targetPostId,
+              bodyPreview: truncateText(mediaCandidate, 260),
+              visualRenderMode: "media_slides",
+              slideCount: slideItems.length,
+              captionPosition: captionPositionForWrite,
+              textStyleTheme: autonomousMediaTheme,
+            })
+            .catch(() => undefined);
+          return this.successOutcome(command, slideResult);
+        }
+      }
+      await this.ctx.memory
+        .recordWrite({
+          type: "media_post_slides_fallback",
+          at: nowIso(),
+          commandId: command.id,
+          slideCountRequested: slidePrompts.length,
+          slideCountResolved: slideItems.length,
+        })
+        .catch(() => undefined);
+    }
     const payloadForMedia: Record<string, unknown> = {
       ...payload,
       ...(captionForWrite ? { caption: captionForWrite } : {}),
@@ -3005,7 +3398,6 @@ export class CommandExecutor {
       ],
       command,
     });
-    const mediaCandidate = noveltyValidation.candidateText;
     const result = await this.agent().createPost.mutate({
       ...buildBase(captionForWrite),
       mediaUrl: media.mediaUrl,
@@ -3015,6 +3407,7 @@ export class CommandExecutor {
       ...(media.mediaIpfsCid ? { mediaIpfsCid: media.mediaIpfsCid } : {}),
       ...(typeof media.mediaSizeBytes === "number" ? { mediaSizeBytes: media.mediaSizeBytes } : {}),
       ...(media.mediaType ? { mediaType: media.mediaType } : {}),
+      ...(captionPositionForWrite ? { captionPosition: captionPositionForWrite } : {}),
     });
     this.notePublishedPostForNoveltyHistory({
       postType: "media",
@@ -3440,19 +3833,330 @@ export class CommandExecutor {
     return Object.keys(style).length > 0 ? style : null;
   }
 
+  private pickDeterministicIndex(seed: string, modulo: number): number {
+    const boundedModulo = Math.max(1, Math.floor(modulo));
+    const digest = crypto.createHash("sha256").update(seed).digest();
+    const value = digest.readUInt32BE(0);
+    return value % boundedModulo;
+  }
+
+  private resolveAutonomousTextTheme(input: {
+    commandId: string;
+    postKind: "post" | "thread";
+    caption: string | null;
+    textBody: string;
+  }): TextStyleTheme {
+    const normalizedText = [
+      input.caption ? stripEmDashCharacters(input.caption) : "",
+      stripEmDashCharacters(input.textBody),
+    ]
+      .join(" ")
+      .toLowerCase()
+      .replace(/\s+/gu, " ")
+      .trim();
+    const scores: Record<TextStyleTheme, number> = {
+      warm: 0,
+      cool: 0,
+      night: 0,
+      sunrise: 0,
+      mint: 0,
+      ocean: 0,
+      plum: 0,
+      sand: 0,
+    };
+    for (const entry of AUTONOMOUS_THEME_KEYWORD_HINTS) {
+      for (const keyword of entry.keywords) {
+        const pattern = new RegExp(`\\b${escapeRegex(keyword)}\\b`, "iu");
+        if (pattern.test(normalizedText)) {
+          scores[entry.theme] += 2;
+        }
+      }
+    }
+    if (input.postKind === "thread") {
+      scores.ocean += 1;
+      scores.cool += 1;
+      scores.sunrise += 1;
+      if (normalizedText.length > 120) {
+        scores.night += 1;
+      }
+    }
+    let bestScore = Number.NEGATIVE_INFINITY;
+    let candidates: TextStyleTheme[] = [];
+    for (const theme of TEXT_STYLE_THEMES) {
+      const score = scores[theme];
+      if (score > bestScore) {
+        bestScore = score;
+        candidates = [theme];
+        continue;
+      }
+      if (score === bestScore) {
+        candidates.push(theme);
+      }
+    }
+    const seed = `${input.commandId}:${input.postKind}:${normalizedText}`;
+    if (bestScore <= 0 || candidates.length === 0) {
+      return TEXT_STYLE_THEMES[this.pickDeterministicIndex(seed, TEXT_STYLE_THEMES.length)] ?? "warm";
+    }
+    return candidates[this.pickDeterministicIndex(seed, candidates.length)] ?? candidates[0] ?? "warm";
+  }
+
+  private resolveAutonomousGradientBackground(theme: TextStyleTheme, seed: string): string {
+    const options = AUTONOMOUS_TEXT_GRADIENTS[theme];
+    if (!Array.isArray(options) || options.length === 0) {
+      return "linear-gradient(140deg, #ffe4d6 0%, #ffd1da 48%, #fff1c2 100%)";
+    }
+    const picked = options[this.pickDeterministicIndex(seed, options.length)];
+    return picked ?? options[0] ?? "linear-gradient(140deg, #ffe4d6 0%, #ffd1da 48%, #fff1c2 100%)";
+  }
+
+  private resolveAutonomousPaletteHint(theme: TextStyleTheme, seed: string): string {
+    const options = AUTONOMOUS_PALETTE_HINTS_BY_THEME[theme];
+    if (!Array.isArray(options) || options.length === 0) {
+      return "balanced natural tones";
+    }
+    const picked = options[this.pickDeterministicIndex(seed, options.length)];
+    return picked ?? options[0] ?? "balanced natural tones";
+  }
+
+  private resolveAutonomousCameraHint(seed: string): string {
+    const picked =
+      AUTONOMOUS_CAMERA_HINTS[
+        this.pickDeterministicIndex(seed, AUTONOMOUS_CAMERA_HINTS.length)
+      ];
+    return picked ?? AUTONOMOUS_CAMERA_HINTS[0];
+  }
+
+  private resolveAutonomousCaptionPosition(input: {
+    commandId: string;
+    postKind: "post" | "thread";
+    seedText: string;
+  }): string {
+    const preferred =
+      input.postKind === "thread"
+        ? (["top-left", "middle-left", "bottom-left", "middle-center"] as const)
+        : (["middle-center", "top-center", "bottom-center", "middle-left", "middle-right"] as const);
+    const picked =
+      preferred[this.pickDeterministicIndex(
+        `${input.commandId}:${input.seedText}:caption_position`,
+        preferred.length,
+      )];
+    return picked ?? "middle-center";
+  }
+
+  private buildAutonomousVisualPrompt(input: {
+    basePrompt: string;
+    caption: string | null;
+    commandId: string;
+    theme: TextStyleTheme;
+    mode: "slide" | "story" | "background";
+    index: number;
+  }): string {
+    const subject = stripEmDashCharacters(input.basePrompt).replace(/\s+/gu, " ").trim();
+    if (!subject.length) return "";
+    const palette = this.resolveAutonomousPaletteHint(
+      input.theme,
+      `${input.commandId}:${input.mode}:${input.index}:palette`,
+    );
+    const camera = this.resolveAutonomousCameraHint(
+      `${input.commandId}:${input.mode}:${input.index}:camera`,
+    );
+    const modeDirection =
+      input.mode === "slide"
+        ? "Editorial social visual for one distinct beat."
+        : input.mode === "background"
+          ? "Text-friendly visual background with clear negative space for caption overlay."
+          : "Story-ready composition with strong focal clarity.";
+    const captionContext =
+      input.caption && input.caption.trim().length > 0
+        ? `Caption context: ${truncateText(stripEmDashCharacters(input.caption), 120)}.`
+        : "";
+    return truncateText(
+      [
+        subject,
+        modeDirection,
+        `Color palette: ${palette}.`,
+        camera,
+        "Use a distinctive composition and avoid generic default template backgrounds.",
+        captionContext,
+      ]
+        .filter((entry) => entry.length > 0)
+        .join(" "),
+      320,
+    );
+  }
+
+  private buildAutonomousThreadSlides(input: {
+    commandId: string;
+    caption: string | null;
+    textBody: string;
+    theme: TextStyleTheme;
+    postKind: "post" | "thread";
+  }): TextPostVisualSlide[] {
+    const cleanedBody = stripEmDashCharacters(input.textBody).replace(/\s+/gu, " ").trim();
+    if (cleanedBody.length < 24) return [];
+    const seed = `${input.commandId}:${cleanedBody}:${input.theme}`;
+    const wordCount = cleanedBody.split(/\s+/u).filter((token) => token.length > 0).length;
+    const parts = cleanedBody
+      .split(/(?:\r?\n|[.!?;]+)\s*/u)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length >= 18);
+    const hasSequenceSignals = AUTONOMOUS_SEQUENCE_SIGNAL_PATTERN.test(cleanedBody);
+    const threshold =
+      input.postKind === "thread"
+        ? hasSequenceSignals
+          ? 92
+          : wordCount >= 84
+            ? 76
+            : 60
+        : hasSequenceSignals
+          ? 58
+          : wordCount >= 84
+            ? 34
+            : 18;
+    if (this.pickDeterministicIndex(`${seed}:slides_gate`, 100) >= threshold) {
+      return [];
+    }
+    const targetCount = Math.min(
+      4,
+      Math.max(2, 2 + this.pickDeterministicIndex(`${seed}:slides_count`, 3)),
+    );
+    const normalizedParts = [...parts];
+    if (normalizedParts.length < 2) {
+      const captionPart = input.caption ? stripEmDashCharacters(input.caption).trim() : "";
+      if (captionPart.length >= 12) normalizedParts.push(captionPart);
+      const snippet = truncateText(cleanedBody, 120);
+      if (snippet.length >= 18) normalizedParts.push(snippet);
+    }
+    const selected = normalizedParts.slice(0, targetCount);
+    const slides: TextPostVisualSlide[] = [];
+    for (let index = 0; index < selected.length; index += 1) {
+      const statement = selected[index];
+      if (!statement) continue;
+      const imagePrompt = this.buildAutonomousVisualPrompt({
+        basePrompt: statement,
+        caption: input.caption,
+        commandId: input.commandId,
+        theme: input.theme,
+        mode: "slide",
+        index,
+      });
+      if (imagePrompt.length < 8) continue;
+      slides.push({
+        caption: truncateText(statement, 180),
+        imagePrompt,
+      });
+    }
+    return slides.length >= 2 ? slides.slice(0, 4) : [];
+  }
+
+  private buildAutonomousTextBackgroundPrompt(input: {
+    commandId: string;
+    caption: string | null;
+    textBody: string;
+    theme: TextStyleTheme;
+    postKind: "post" | "thread";
+  }): string | null {
+    const cleanedBody = stripEmDashCharacters(input.textBody).replace(/\s+/gu, " ").trim();
+    if (cleanedBody.length < 36) return null;
+    const threshold = input.postKind === "thread" ? 34 : 18;
+    if (
+      this.pickDeterministicIndex(
+        `${input.commandId}:${cleanedBody}:${input.theme}:background_gate`,
+        100,
+      ) >= threshold
+    ) {
+      return null;
+    }
+    const basePrompt = input.caption
+      ? `${stripEmDashCharacters(input.caption)}. ${cleanedBody}`
+      : cleanedBody;
+    const prompt = this.buildAutonomousVisualPrompt({
+      basePrompt,
+      caption: input.caption,
+      commandId: input.commandId,
+      theme: input.theme,
+      mode: "background",
+      index: 0,
+    });
+    return prompt.length >= 8 ? prompt : null;
+  }
+
+  private buildAutonomousMediaSlides(input: {
+    commandId: string;
+    postKind: "post" | "thread";
+    caption: string | null;
+    mediaPrompt: string;
+    theme: TextStyleTheme;
+  }): TextPostVisualSlide[] {
+    const cleanedPrompt = stripEmDashCharacters(input.mediaPrompt)
+      .replace(/\s+/gu, " ")
+      .trim();
+    if (cleanedPrompt.length < 18) return [];
+    const seed = `${input.commandId}:${input.postKind}:${cleanedPrompt}:${input.theme}`;
+    const hasSequenceSignals = AUTONOMOUS_SEQUENCE_SIGNAL_PATTERN.test(cleanedPrompt);
+    const threshold =
+      input.postKind === "thread"
+        ? hasSequenceSignals
+          ? 92
+          : 74
+        : hasSequenceSignals
+          ? 62
+          : 44;
+    if (this.pickDeterministicIndex(`${seed}:media_slides_gate`, 100) >= threshold) {
+      return [];
+    }
+
+    const parts = cleanedPrompt
+      .split(/(?:\r?\n|[.!?;]+)\s*/u)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length >= 16);
+    if (parts.length < 2) {
+      parts.push(
+        `${cleanedPrompt} with a hero composition and clear focal subject`,
+        `${cleanedPrompt} with expressive text accents and a secondary detail frame`,
+      );
+    }
+    const targetCount = Math.min(
+      4,
+      Math.max(2, 2 + this.pickDeterministicIndex(`${seed}:media_slides_count`, 3)),
+    );
+    const selected = parts.slice(0, targetCount);
+    if (selected.length < 2) return [];
+
+    const captionBase = input.caption ? stripEmDashCharacters(input.caption).trim() : "";
+    const slides: TextPostVisualSlide[] = [];
+    for (let index = 0; index < selected.length; index += 1) {
+      const beat = selected[index];
+      if (!beat) continue;
+      const imagePrompt = this.buildAutonomousVisualPrompt({
+        basePrompt: beat,
+        caption: input.caption,
+        commandId: input.commandId,
+        theme: input.theme,
+        mode: "slide",
+        index,
+      });
+      if (imagePrompt.length < 8) continue;
+      const caption = captionBase.length
+        ? truncateText(`${captionBase} - ${truncateText(beat, 120)}`, 2200)
+        : truncateText(beat, 180);
+      slides.push({
+        caption,
+        imagePrompt,
+      });
+    }
+    return slides.length >= 2 ? slides.slice(0, 4) : [];
+  }
+
   private normalizeAgentTextStyle(
     style: Record<string, unknown> | null,
     captionPosition: string | null,
+    fallbackStyle?: Record<string, unknown> | null,
   ): Record<string, unknown> {
     const normalizeTheme = (value: unknown): string | null => {
       const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
       if (!raw) return null;
-      if (raw === "ocean") return "cool";
-      if (raw === "plum") return "night";
-      if (raw === "sand") return "warm";
-      return ["warm", "cool", "night", "sunrise", "mint"].includes(raw)
-        ? raw
-        : null;
+      return TEXT_STYLE_THEME_KEYS.has(raw) ? raw : null;
     };
     const normalizeAlign = (value: unknown): string | null => {
       const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
@@ -3471,9 +4175,7 @@ export class CommandExecutor {
     const normalizeEmphasis = (value: unknown): string | null => {
       const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
       if (!raw) return null;
-      if (raw === "mono") return "serif";
-      if (raw === "display") return "bold";
-      return ["soft", "bold", "serif"].includes(raw) ? raw : null;
+      return TEXT_STYLE_EMPHASIS_KEYS.has(raw) ? raw : null;
     };
     const normalizeFont = (value: unknown): string | null => {
       const raw = asNonEmptyString(value)?.toLowerCase() ?? null;
@@ -3501,26 +4203,37 @@ export class CommandExecutor {
       return captionPosition;
     };
     const normalized: Record<string, unknown> = {};
-    const theme = normalizeTheme(style?.theme);
-    const align = normalizeAlign(style?.align);
-    const emphasis = normalizeEmphasis(style?.emphasis);
-    const font = normalizeFont(style?.font);
-    const weight = normalizeWeight(style?.weight);
-    const size = normalizeSize(style?.size);
-    const color = normalizeColor(style?.color);
-    const position = normalizePosition(style?.position);
-    const background = asNonEmptyString(style?.background);
-    if (theme) normalized.theme = theme;
-    if (align) normalized.align = align;
-    if (emphasis) normalized.emphasis = emphasis;
-    if (font) normalized.font = font;
-    if (weight) normalized.weight = weight;
-    if (typeof style?.italic === "boolean") normalized.italic = style.italic;
-    if (size) normalized.size = size;
-    if (color) normalized.color = color;
-    if (position) normalized.position = position;
-    if (background && background.length <= 180) {
-      normalized.background = stripEmDashCharacters(background);
+    const applyStyle = (candidateStyle: Record<string, unknown> | null | undefined): void => {
+      const theme = normalizeTheme(candidateStyle?.theme);
+      const align = normalizeAlign(candidateStyle?.align);
+      const emphasis = normalizeEmphasis(candidateStyle?.emphasis);
+      const font = normalizeFont(candidateStyle?.font);
+      const weight = normalizeWeight(candidateStyle?.weight);
+      const size = normalizeSize(candidateStyle?.size);
+      const color = normalizeColor(candidateStyle?.color);
+      const position = normalizePosition(candidateStyle?.position);
+      const background = asNonEmptyString(candidateStyle?.background);
+      if (theme) normalized.theme = theme;
+      if (align) normalized.align = align;
+      if (emphasis) normalized.emphasis = emphasis;
+      if (font) normalized.font = font;
+      if (weight) normalized.weight = weight;
+      if (typeof candidateStyle?.italic === "boolean") {
+        normalized.italic = candidateStyle.italic;
+      }
+      if (size) normalized.size = size;
+      if (color) normalized.color = color;
+      if (position) normalized.position = position;
+      if (background && background.length <= 180) {
+        normalized.background = stripEmDashCharacters(background);
+      }
+    };
+
+    applyStyle(fallbackStyle);
+    applyStyle(style);
+    const themeForDefaults = asNonEmptyString(normalized.theme) as TextStyleTheme | null;
+    if (themeForDefaults && !asNonEmptyString(normalized.color)) {
+      normalized.color = TEXT_STYLE_DEFAULT_COLOR_BY_THEME[themeForDefaults];
     }
     if (Object.keys(normalized).length === 0) {
       return {
@@ -3638,6 +4351,7 @@ export class CommandExecutor {
   }
 
   private buildTextPostVisualPlanPrompt(input: {
+    postKind: "post" | "thread";
     caption: string | null;
     textBody: string;
     context: PostDraftContext;
@@ -3658,11 +4372,13 @@ export class CommandExecutor {
       '{"renderMode":"text|slides","captionPosition":"...|null","textStyle":{"theme":"warm|cool|night|sunrise|mint|ocean|plum|sand","align":"left|center|right","emphasis":"soft|bold|serif|mono|display","font":"sans|serif|mono|display","weight":"regular|bold","italic":false,"size":"sm|md|lg|xl|2xl","color":"ink|paper|cream|sunset|mint|sky","position":"top-left|top-center|top-right|middle-left|middle-center|middle-right|bottom-left|bottom-center|bottom-right","background":"optional css gradient or color"},"backgroundImagePrompt":"...|null","slides":[{"caption":"...","imagePrompt":"..."}]}',
       "Rules:",
       "- Never use em dash characters; use '-' or normal punctuation instead.",
-      "- renderMode 'text' for most posts. Use 'slides' only when the text has a sequence/list/compare/story beats.",
+      "- For kind=thread strongly prefer renderMode 'slides' whenever the text can be split into beats.",
+      "- For kind=post choose slides when there is sequence/list/compare/story structure; otherwise use text mode.",
       "- If slides mode: provide 2-4 slides max, each with imagePrompt. Keep captions concise.",
       "- If text mode: always provide textStyle with a distinct visual identity.",
       "- backgroundImagePrompt is optional and only for text mode when image background helps.",
       "- imagePrompt/backgroundImagePrompt must be direct prompts, no wrappers like 'Generate an image of'.",
+      `kind: ${input.postKind}`,
       `caption: ${input.caption ?? ""}`,
       `textBody: ${input.textBody}`,
       "Context:",
@@ -3672,6 +4388,7 @@ export class CommandExecutor {
 
   private async planTextPostVisualWithOpenClaw(input: {
     commandId: string;
+    postKind: "post" | "thread";
     caption: string | null;
     textBody: string;
     context: PostDraftContext;
@@ -3975,6 +4692,22 @@ export class CommandExecutor {
     if (!payload) {
       return this.failedOutcome(command, "Invalid payload for write.createStory.");
     }
+    if (this.isChatOriginCommand(command, payload)) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "story_write_blocked_chat_request",
+          at: nowIso(),
+          commandId: command.id,
+          commandKind: command.kind,
+          sourceDirectiveId: command.sourceDirectiveId ?? null,
+        })
+        .catch(() => undefined);
+      return this.failedOutcome(
+        command,
+        "Story creation is directive-only. Chat requests can create posts, but not stories.",
+        "story_chat_disabled",
+      );
+    }
     const provenance = asNonEmptyString(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
@@ -3984,13 +4717,71 @@ export class CommandExecutor {
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
       null;
+    const caption = asNonEmptyString(payload.caption);
+    const baseStoryPrompt =
+      asNonEmptyString(payload.mediaPrompt) ??
+      asNonEmptyString(payload.imagePrompt) ??
+      asNonEmptyString(payload.prompt) ??
+      asNonEmptyString(payload.topic) ??
+      caption ??
+      "a candid original day-in-the-life moment";
+    const autonomousTheme = this.resolveAutonomousTextTheme({
+      commandId: command.id,
+      postKind: "post",
+      caption,
+      textBody: baseStoryPrompt,
+    });
+    const autonomousStoryPrompt = this.buildAutonomousVisualPrompt({
+      basePrompt: baseStoryPrompt,
+      caption,
+      commandId: command.id,
+      theme: autonomousTheme,
+      mode: "story",
+      index: 0,
+    });
+    const captionPositionForWrite =
+      this.normalizeCaptionPositionValue(payload.captionPosition) ??
+      this.resolveAutonomousCaptionPosition({
+        commandId: command.id,
+        postKind: "post",
+        seedText: `${caption ?? ""} ${baseStoryPrompt ?? ""}`,
+      });
+    const storyPayload: Record<string, unknown> = {
+      ...payload,
+    };
+    const carriedMediaPresent =
+      asNonEmptyString(payload.mediaUrl) !== null ||
+      (Array.isArray(payload.mediaItems) && payload.mediaItems.length > 0) ||
+      isRecord(payload.recentGeneratedAsset);
+    delete storyPayload.mediaUrl;
+    delete storyPayload.mediaOriginalUrl;
+    delete storyPayload.mediaOptimizedUrl;
+    delete storyPayload.mediaContentHash;
+    delete storyPayload.mediaIpfsCid;
+    delete storyPayload.mediaSizeBytes;
+    delete storyPayload.mediaType;
+    delete storyPayload.mediaItems;
+    delete storyPayload.recentGeneratedAsset;
+    if (carriedMediaPresent) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "story_media_carryover_stripped",
+          at: nowIso(),
+          commandId: command.id,
+          commandKind: command.kind,
+          sourceDirectiveId,
+        })
+        .catch(() => undefined);
+    }
 
     const media = await this.resolveMediaUpload({
-      payload,
+      payload: storyPayload,
       keepOriginal: false,
       promptFallbacks: [
+        autonomousStoryPrompt,
         asNonEmptyString(payload.mediaPrompt),
         asNonEmptyString(payload.imagePrompt),
+        asNonEmptyString(payload.prompt),
       ],
       command,
     });
@@ -4002,8 +4793,8 @@ export class CommandExecutor {
       ...(media.mediaContentHash ? { contentHash: media.mediaContentHash } : {}),
       ...(media.mediaIpfsCid ? { ipfsCid: media.mediaIpfsCid } : {}),
       ...(media.mediaType ? { mediaType: media.mediaType } : {}),
-      ...(asNonEmptyString(payload.caption) ? { caption: asNonEmptyString(payload.caption) } : {}),
-      ...(asNonEmptyString(payload.captionPosition) ? { captionPosition: asNonEmptyString(payload.captionPosition) } : {}),
+      ...(caption ? { caption } : {}),
+      ...(captionPositionForWrite ? { captionPosition: captionPositionForWrite } : {}),
       ...(asNonEmptyString(payload.mediaFit) ? { mediaFit: asNonEmptyString(payload.mediaFit) } : {}),
       ...(asPositiveInt(payload.expiresInSeconds)
         ? { expiresInSeconds: asPositiveInt(payload.expiresInSeconds) }
@@ -6374,6 +7165,23 @@ export class CommandExecutor {
       });
     }
 
+    const isChatOrigin = this.isChatOriginCommand(command, payload);
+    if (isChatOrigin && this.isStoryGenerateRequestFromChatPayload(payload)) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "story_generate_blocked_chat_request",
+          at: nowIso(),
+          commandId: command.id,
+          commandKind: command.kind,
+          sourceDirectiveId: command.sourceDirectiveId ?? null,
+        })
+        .catch(() => undefined);
+      return this.failedOutcome(
+        command,
+        "Story creation is directive-only. Chat requests can create posts, but not stories.",
+        "story_chat_disabled",
+      );
+    }
     if (payload.chatLiteralGenerate === true) {
       return this.executeChatLiteralGenerate(command, payload);
     }
@@ -6540,6 +7348,35 @@ export class CommandExecutor {
         })
         .catch(() => undefined);
     }
+    let executionDrafts = permissionFilteredDrafts;
+    if (isChatOrigin && executionDrafts.length > 0) {
+      const blockedStoryDraftCount = executionDrafts.filter(
+        (draft) => draft.action.trim().toLowerCase() === "story",
+      ).length;
+      if (blockedStoryDraftCount > 0) {
+        executionDrafts = executionDrafts.filter(
+          (draft) => draft.action.trim().toLowerCase() !== "story",
+        );
+        await this.ctx.memory
+          .recordWrite({
+            type: "story_drafts_blocked_chat_request",
+            at: nowIso(),
+            commandId: command.id,
+            commandKind: command.kind,
+            sourceDirectiveId: command.sourceDirectiveId ?? null,
+            blockedStoryDraftCount,
+            retainedDraftCount: executionDrafts.length,
+          })
+          .catch(() => undefined);
+      }
+      if (executionDrafts.length === 0 && blockedStoryDraftCount > 0) {
+        return this.failedOutcome(
+          command,
+          "Story creation is directive-only. Chat requests can create posts, but not stories.",
+          "story_chat_disabled",
+        );
+      }
+    }
     if (enforcedDraftAction !== null && executableDrafts.length === 0) {
       await this.ctx.memory
         .recordWrite({
@@ -6561,7 +7398,7 @@ export class CommandExecutor {
         "no_executable_draft",
       );
     }
-    if (permissionFilteredDrafts.length === 0) {
+    if (executionDrafts.length === 0) {
       if (payload.requireDraftOnly === true) {
         const previewDelivered = await this.sendDraftFailureMessage({
           payload,
@@ -6589,7 +7426,7 @@ export class CommandExecutor {
 
     const requireDraftOnly = payload.requireDraftOnly === true;
     if (requireDraftOnly) {
-      const draftPreview = this.buildDraftPreviewPayload(permissionFilteredDrafts);
+      const draftPreview = this.buildDraftPreviewPayload(executionDrafts);
       if (!draftPreview) {
         const previewDelivered = await this.sendDraftFailureMessage({
           payload,
@@ -6622,7 +7459,7 @@ export class CommandExecutor {
       return this.successOutcome(command, {
         generated: generatedResult,
         draftOnly: true,
-        draftCount: permissionFilteredDrafts.length,
+        draftCount: executionDrafts.length,
         chatDeliveryHandled: previewDelivered,
         preview: {
           summary: draftPreview.summary,
@@ -6640,7 +7477,7 @@ export class CommandExecutor {
       !explicitPublishRequested &&
       this.shouldEnforceExplicitPublishGate(payload)
     ) {
-      const blockedDraftCount = permissionFilteredDrafts.filter((draft) => {
+      const blockedDraftCount = executionDrafts.filter((draft) => {
         const action = draft.action.trim().toLowerCase();
         return action === "post" || action === "story";
       }).length;
@@ -6665,7 +7502,7 @@ export class CommandExecutor {
     const skippedDrafts: Array<{ kind: string; reason: string }> = [];
     const failedDrafts: Array<{ kind: string; reason: string; code: string | null }> = [];
     const blockedWriteKinds = new Set<string>();
-    for (const draft of permissionFilteredDrafts) {
+    for (const draft of executionDrafts) {
       if (!draft) continue;
       const draftCommand = this.mapDraftToWriteCommand({
         draft,
@@ -6886,6 +7723,73 @@ export class CommandExecutor {
     }
 
     return true;
+  }
+
+  private isChatOriginPayload(payload: Record<string, unknown> | null): boolean {
+    if (!payload) return false;
+    const sourceContext = asNonEmptyString(payload.sourceContext)?.toLowerCase() ?? "";
+    if (sourceContext === "chat") return true;
+    return isRecord(payload.chatContext);
+  }
+
+  private isChatOriginCommand(
+    command: Command,
+    payloadOverride?: Record<string, unknown> | null,
+  ): boolean {
+    const runtimeOrigin = asNonEmptyString(command.runtimeOrigin)?.toLowerCase() ?? "";
+    if (runtimeOrigin === "chat" || runtimeOrigin.startsWith("chat_")) {
+      return true;
+    }
+    if (
+      runtimeOrigin === "director_directive" ||
+      runtimeOrigin === "pending_promotion"
+    ) {
+      return false;
+    }
+    if (runtimeOrigin === "runtime_resealed") {
+      const commandId = asNonEmptyString(command.id);
+      const sourceDirectiveId = asNonEmptyString(command.sourceDirectiveId);
+      const pendingDirectiveId = asNonEmptyString(command.pendingDirectiveId);
+      if (
+        commandId &&
+        (sourceDirectiveId === commandId || pendingDirectiveId === commandId)
+      ) {
+        return false;
+      }
+    }
+    const payload =
+      payloadOverride ??
+      (isRecord(command.payload) ? command.payload : null);
+    return this.isChatOriginPayload(payload);
+  }
+
+  private isStoryGenerateRequestFromChatPayload(
+    payload: Record<string, unknown>,
+  ): boolean {
+    const requestedKinds = this.resolveRequestedGenerateKinds(payload, "media");
+    if (requestedKinds.includes("story")) return true;
+    const commandName = this.resolveChatCommandName(payload);
+    if (commandName) {
+      const normalized = commandName.trim().toLowerCase().replace(/[\s-]+/gu, "_");
+      if (
+        normalized === "story" ||
+        normalized === "stories" ||
+        normalized === "generate_story" ||
+        normalized === "generate_stories"
+      ) {
+        return true;
+      }
+    }
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    const commandArgs = Array.isArray(chatContext?.commandArgs)
+      ? chatContext.commandArgs
+      : [];
+    for (const entry of commandArgs) {
+      if (this.normalizeRequestedGenerateKind(entry) === "story") {
+        return true;
+      }
+    }
+    return false;
   }
 
   private parseGeneratedCustomAssetKind(
@@ -8498,11 +9402,12 @@ export class CommandExecutor {
     payload: Record<string, unknown>,
     command: Command,
   ): Record<string, unknown> {
+    const isChatOrigin = this.isChatOriginCommand(command, payload);
     const context = isRecord(payload.context) ? payload.context : null;
     const goal =
       asNonEmptyString(payload.goal)?.toLowerCase() ??
       asNonEmptyString(payload.kind)?.toLowerCase() ??
-      "story";
+      (isChatOrigin ? "media" : "story");
     const mappedKind = this.mapGoalToGenerateKind(goal);
     const requestedKinds = this.resolveRequestedGenerateKinds(payload, mappedKind);
     const scopedKinds = this.resolveDirectiveScopeGenerateKinds(payload);
@@ -8512,7 +9417,13 @@ export class CommandExecutor {
         mergedKinds.push(scopedKind);
       }
     }
-    const primaryKind = mergedKinds[0] ?? mappedKind;
+    const resolvedKinds = isChatOrigin
+      ? mergedKinds.filter((kind) => kind !== "story")
+      : mergedKinds;
+    if (resolvedKinds.length === 0) {
+      resolvedKinds.push(isChatOrigin ? "media" : mappedKind);
+    }
+    const primaryKind = resolvedKinds[0] ?? (isChatOrigin ? "media" : mappedKind);
     const scope = isRecord(payload.directiveScope) ? payload.directiveScope : null;
     const scopedTarget = scope && isRecord(scope.target) ? scope.target : null;
     const postId =
@@ -8641,7 +9552,7 @@ export class CommandExecutor {
       command.actionNonce;
     return {
       kind: primaryKind,
-      ...(mergedKinds.length > 0 ? { kinds: mergedKinds } : {}),
+      ...(resolvedKinds.length > 0 ? { kinds: resolvedKinds } : {}),
       ...(count ? { count } : {}),
       ...(topic ? { topic } : {}),
       ...(mood ? { mood } : {}),
@@ -9600,6 +10511,7 @@ export class CommandExecutor {
     ) {
       return normalized;
     }
+    if (normalized === "stories") return "story";
     if (normalized === "reply") return "comment";
     if (normalized === "engagement") return "like";
     if (normalized === "boost") return "repost";
