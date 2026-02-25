@@ -293,6 +293,72 @@ describe("command executor generate input", () => {
     ]);
   });
 
+  it("skips non-image persona frame artifacts and keeps valid persona frames", async () => {
+    const executor = createExecutor({
+      personaFrames: [
+        {
+          id: 41,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/selfie-latest.bin",
+          optimizedUrl: "https://cdn.example.com/persona/selfie-latest.data",
+          mimeType: "application/octet-stream",
+          updatedAt: "2026-02-24T05:33:00.000Z",
+        },
+        {
+          id: 40,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/selfie-stable.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/selfie-stable-opt.jpg",
+          mimeType: "image/jpeg",
+          updatedAt: "2026-02-24T05:30:00.000Z",
+        },
+        {
+          id: 42,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/midshot-stable.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/midshot-stable-opt.jpg",
+          mimeType: "image/jpeg",
+          updatedAt: "2026-02-24T05:31:00.000Z",
+        },
+        {
+          id: 43,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/fullbody-stable.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/fullbody-stable-opt.jpg",
+          mimeType: "image/jpeg",
+          updatedAt: "2026-02-24T05:32:00.000Z",
+        },
+      ],
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "story",
+        mediaPersona: "realistic_core",
+        mediaPrompt: "Create a selfie with consistent identity.",
+      },
+      baseCommand(),
+    );
+
+    expect(Array.isArray(result.mediaReferenceUrls)).toBe(true);
+    if (!Array.isArray(result.mediaReferenceUrls)) return;
+    expect(result.mediaReferenceUrls).toEqual([
+      "https://cdn.example.com/persona/selfie-stable-opt.jpg",
+      "https://cdn.example.com/persona/midshot-stable-opt.jpg",
+      "https://cdn.example.com/persona/fullbody-stable-opt.jpg",
+    ]);
+  });
+
   it("normalizes runtime auto provenance to AGENT_AUTONOMOUS", () => {
     const executor = createExecutor();
     const invoker = executor as unknown as {
@@ -308,5 +374,117 @@ describe("command executor generate input", () => {
     );
 
     expect(result.provenance).toBe("AGENT_AUTONOMOUS");
+  });
+
+  it("forces media-only generate kinds when persona media lock is enabled", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      buildGenerateInput(payload: Record<string, unknown>, command: Command): Record<string, unknown>;
+    };
+
+    const result = invoker.buildGenerateInput(
+      {
+        goal: "thread",
+        topic: "quick update",
+        mediaPersona: "selfie",
+        mediaPersonaLock: true,
+      },
+      baseCommand(),
+    );
+
+    expect(result.kind).toBe("media");
+    expect(result.mediaPersonaLock).toBe(true);
+    expect(Array.isArray(result.kinds)).toBe(true);
+    if (!Array.isArray(result.kinds)) return;
+    expect(result.kinds).toEqual(["media"]);
+  });
+
+  it("rejects text-only post drafts from persona-locked execution", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      isPersonaMediaCompatibleDraft(draft: {
+        action: string;
+        payload: Record<string, unknown>;
+      }): boolean;
+    };
+
+    expect(
+      invoker.isPersonaMediaCompatibleDraft({
+        action: "post",
+        payload: {
+          caption: "shipping notes for today",
+        },
+      }),
+    ).toBe(false);
+    expect(
+      invoker.isPersonaMediaCompatibleDraft({
+        action: "post",
+        payload: {
+          postType: "media",
+        },
+      }),
+    ).toBe(true);
+    expect(
+      invoker.isPersonaMediaCompatibleDraft({
+        action: "post",
+        payload: {
+          generatedAssetType: "image",
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("defaults autonomous media generation to main persona frame references", async () => {
+    const executor = createExecutor({
+      personaFrames: [
+        {
+          id: 21,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/auto-selfie.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/auto-selfie-opt.jpg",
+          updatedAt: "2026-02-24T06:10:00.000Z",
+        },
+        {
+          id: 22,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/auto-midshot.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/auto-midshot-opt.jpg",
+          updatedAt: "2026-02-24T06:11:00.000Z",
+        },
+        {
+          id: 23,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/auto-fullbody.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/auto-fullbody-opt.jpg",
+          updatedAt: "2026-02-24T06:12:00.000Z",
+        },
+      ],
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        provenance: "runtime_auto_posting",
+        mediaPrompt: "Street photo at dusk with ambient city lights.",
+      },
+      baseCommand(),
+    );
+
+    expect(Array.isArray(result.mediaReferenceUrls)).toBe(true);
+    if (!Array.isArray(result.mediaReferenceUrls)) return;
+    expect(result.mediaReferenceUrls).toEqual([
+      "https://cdn.example.com/persona/auto-selfie-opt.jpg",
+      "https://cdn.example.com/persona/auto-midshot-opt.jpg",
+      "https://cdn.example.com/persona/auto-fullbody-opt.jpg",
+    ]);
   });
 });

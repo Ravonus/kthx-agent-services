@@ -2672,6 +2672,7 @@ const main = async (): Promise<void> => {
           goal: "post",
           kind: "media",
           kinds: ["media"],
+          mediaPersonaLock: true,
           generatedAssetType: "image",
           forceNow: true,
           provenance: "runtime_auto_posting",

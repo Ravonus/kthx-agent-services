@@ -89,6 +89,8 @@ const STREAM_PART_ARTIFACT_PATTERN = /(?:^|[./_-])part(?:[_-]?(?:\d+|x))(?:\D|$)
 const STREAM_PART_INDEX_PATTERN = /(?:^|[._-])part[_-]?(\d+)(?:\D|$)/iu;
 const TRANSIENT_MEDIA_ARTIFACT_FILENAME_PATTERN =
   /(?:^|[._-])(?:tmp|temp|temporary|intermediate|working|partial|draft|frame[_-]?\d+|chunk[_-]?\d+)(?:[._-]|\d|$)|\.tmp$/iu;
+const NON_IMAGE_REFERENCE_EXTENSION_PATTERN =
+  /\.(?:bin|data|json|txt|md|csv|pdf|js|mjs|cjs|ts|tsx|mp4|mov|webm|wav|mp3|zip|tar|gz)(?:$|[?#])/iu;
 const ACTION_IDEMPOTENCY_IN_FLIGHT_WINDOW_MS = 45_000;
 const ACTION_REQUEUE_BACKOFF_MS = 15_000;
 const OWNER_CAPABILITY_COOLDOWN_MS = 60_000;
@@ -2016,13 +2018,16 @@ export class CommandExecutor {
 
   async processCommandFile(
     fileName: string,
-    _opts?: { interactiveRl?: unknown },
+    opts?: { interactiveRl?: unknown; attempts?: number; maxAttempts?: number },
   ): Promise<boolean> {
     const filePath = path.join(this.ctx.ipcPaths.inboxDir, fileName);
     if (this.inFlight.has(filePath)) return false;
     this.inFlight.add(filePath);
     try {
-      return await this.processCommandFilePath(filePath);
+      return await this.processCommandFilePath(filePath, {
+        attempts: opts?.attempts,
+        maxAttempts: opts?.maxAttempts,
+      });
     } finally {
       this.inFlight.delete(filePath);
     }
@@ -2141,9 +2146,107 @@ export class CommandExecutor {
     return null;
   }
 
+  private resolvePersonaSelectionStrategy(payload: Record<string, unknown>): string | null {
+    const selection = isRecord(payload.personaSelection) ? payload.personaSelection : null;
+    const context = isRecord(payload.context) ? payload.context : null;
+    const contextSelection = isRecord(context?.personaSelection)
+      ? context.personaSelection
+      : null;
+    return (
+      asNonEmptyString(selection?.strategy)?.trim().toLowerCase() ??
+      asNonEmptyString(contextSelection?.strategy)?.trim().toLowerCase() ??
+      null
+    );
+  }
+
+  private isPersonaMediaLockEnabled(payload: Record<string, unknown>): boolean {
+    const context = isRecord(payload.context) ? payload.context : null;
+    const keys = [
+      "mediaPersonaLock",
+      "personaLock",
+      "forcePersona",
+      "forcePersonaReference",
+      "enforcePersona",
+    ] as const;
+    for (const key of keys) {
+      if (payload[key] === true || context?.[key] === true) {
+        return true;
+      }
+    }
+    return this.resolvePersonaSelectionStrategy(payload) === "pinned";
+  }
+
+  private isMediaLikePayloadForPersona(
+    payload: Record<string, unknown>,
+    command: Command | null,
+  ): boolean {
+    const commandKind = command?.kind.trim().toLowerCase() ?? "";
+    if (
+      commandKind === "write.createstory" ||
+      commandKind === "write.updateavatar" ||
+      commandKind === "write.updatebanner"
+    ) {
+      return true;
+    }
+    if (commandKind === "write.createpost") {
+      const postType = asNonEmptyString(payload.postType)?.toLowerCase();
+      if (postType === "text") return false;
+      return true;
+    }
+    const context = isRecord(payload.context) ? payload.context : null;
+    const postType =
+      asNonEmptyString(payload.postType)?.toLowerCase() ??
+      asNonEmptyString(context?.postType)?.toLowerCase() ??
+      "";
+    if (postType === "media") return true;
+    if (postType === "text") return false;
+
+    const generatedAssetType =
+      asNonEmptyString(payload.generatedAssetType)?.toLowerCase() ??
+      asNonEmptyString(context?.generatedAssetType)?.toLowerCase() ??
+      "";
+    if (generatedAssetType === "image" || generatedAssetType === "gif") return true;
+
+    const mediaPrompt =
+      asNonEmptyString(payload.mediaPrompt) ??
+      asNonEmptyString(payload.imagePrompt) ??
+      asNonEmptyString(context?.mediaPrompt) ??
+      asNonEmptyString(context?.imagePrompt);
+    if (mediaPrompt) return true;
+
+    const requestedKinds = this.resolveRequestedGenerateKinds(payload, "media");
+    return requestedKinds.some(
+      (kind) => kind === "media" || kind === "multi_media" || kind === "story",
+    );
+  }
+
+  private shouldDefaultPersonaReferences(
+    payload: Record<string, unknown>,
+    command: Command | null,
+  ): boolean {
+    if (this.isPersonaMediaLockEnabled(payload)) return true;
+    if (!this.isMediaLikePayloadForPersona(payload, command)) return false;
+
+    const commandKind = command?.kind.trim().toLowerCase() ?? "";
+    if (
+      commandKind === "write.createstory" ||
+      commandKind === "write.createpost" ||
+      commandKind === "write.updateavatar" ||
+      commandKind === "write.updatebanner"
+    ) {
+      return true;
+    }
+    const context = isRecord(payload.context) ? payload.context : null;
+    const provenance =
+      normalizeAgentProvenanceValue(payload.provenance) ??
+      normalizeAgentProvenanceValue(context?.provenance);
+    return provenance === "AGENT_AUTONOMOUS";
+  }
+
   private resolvePersonaReferencePlan(
     payload: Record<string, unknown>,
     mainPersonaSlugRaw: string | null = null,
+    command: Command | null = null,
   ): PersonaReferencePlan {
     const context = isRecord(payload.context) ? payload.context : null;
     const explicitCandidates: unknown[] = [
@@ -2171,12 +2274,14 @@ export class CommandExecutor {
       explicitPersonaSlug === "self" ||
       explicitPersonaSlug === "me" ||
       explicitPersonaSlug === "myself";
+    const personaMediaLock = this.isPersonaMediaLockEnabled(payload);
     const promptText = this.extractPersonaPromptText(payload);
     const selfIntent = PERSONA_SELF_REFERENCE_PROMPT_PATTERN.test(promptText);
     const personaIntent = selfIntent || PERSONA_REQUEST_PROMPT_PATTERN.test(promptText);
     const variantKey = this.resolvePersonaVariantKeyFromPrompt(promptText);
     const mainPersonaSlug =
       this.normalizePersonaSlug(mainPersonaSlugRaw) ?? DEFAULT_MAIN_PERSONA_SLUG;
+    const shouldDefaultPersona = this.shouldDefaultPersonaReferences(payload, command);
 
     if (nonGenericExplicitSlug) {
       return {
@@ -2189,7 +2294,7 @@ export class CommandExecutor {
       };
     }
 
-    if (!personaIntent && !explicitGenericPersonaRequested) {
+    if (!personaIntent && !explicitGenericPersonaRequested && !shouldDefaultPersona) {
       return {
         enabled: false,
         mainPersonaSlug,
@@ -2208,7 +2313,14 @@ export class CommandExecutor {
       enabled: true,
       mainPersonaSlug,
       targetPersonaSlug,
-      source: inferredVariantSlug ? "inferred_variant" : "inferred_main",
+      source:
+        inferredVariantSlug
+          ? "inferred_variant"
+          : personaMediaLock
+            ? "forced_lock"
+            : shouldDefaultPersona
+              ? "default_media"
+              : "inferred_main",
       explicitPersonaSlug,
       variantKey,
     };
@@ -2217,6 +2329,29 @@ export class CommandExecutor {
   private shouldUsePersonaFrameReferences(plan: PersonaReferencePlan): boolean {
     if (!plan.enabled) return false;
     return !this.isGenericPersonaSlug(plan.targetPersonaSlug);
+  }
+
+  private isImageMimeType(value: string | null | undefined): boolean {
+    const normalized = asNonEmptyString(value)?.trim().toLowerCase() ?? "";
+    return normalized.startsWith("image/");
+  }
+
+  private isLikelyImageReference(
+    value: string | null | undefined,
+    fallbackMimeType: string | null = null,
+  ): boolean {
+    const normalized = asNonEmptyString(value);
+    if (!normalized) return false;
+    const parsedDataUri = parseDataUriPayload(normalized);
+    if (parsedDataUri) {
+      return this.isImageMimeType(parsedDataUri.mime);
+    }
+    const inferredMime = inferMimeTypeFromUrl(normalized);
+    if (inferredMime && this.isImageMimeType(inferredMime)) return true;
+    if (inferredMime && inferredMime !== "application/octet-stream") return false;
+    if (NON_IMAGE_REFERENCE_EXTENSION_PATTERN.test(normalized)) return false;
+    if (this.isImageMimeType(fallbackMimeType)) return true;
+    return false;
   }
 
   private async resolveMainPersonaSlugFromBridge(): Promise<string | null> {
@@ -2255,6 +2390,7 @@ export class CommandExecutor {
     const push = (value: string | null | undefined): void => {
       const normalized = asNonEmptyString(value);
       if (!normalized || this.isStreamPartArtifactReference(normalized)) return;
+      if (!this.isLikelyImageReference(normalized)) return;
       deduped.add(normalized);
     };
     for (const entry of directInputs) push(entry);
@@ -2313,7 +2449,11 @@ export class CommandExecutor {
         push(source.photo);
       }
       return [...urls]
-        .filter((entry) => !this.isStreamPartArtifactReference(entry))
+        .filter(
+          (entry) =>
+            !this.isStreamPartArtifactReference(entry) &&
+            this.isLikelyImageReference(entry),
+        )
         .slice(0, MAX_MEDIA_REFERENCE_INPUTS);
     } catch {
       return [];
@@ -2469,6 +2609,7 @@ export class CommandExecutor {
       const normalized = asNonEmptyString(candidate);
       if (!normalized) continue;
       if (this.isStreamPartArtifactReference(normalized)) continue;
+      if (!this.isLikelyImageReference(normalized, frame.mimeType)) continue;
       return normalized;
     }
     return null;
@@ -2479,12 +2620,14 @@ export class CommandExecutor {
     const seen = new Set<string>();
     const collected: string[] = [];
     for (const role of PERSONA_REFERENCE_FRAME_ROLES) {
-      const match = ordered.find((frame) => frame.frameRole === role);
-      if (!match) continue;
-      const selected = this.pickPersonaFrameReferenceUrl(match);
-      if (!selected || seen.has(selected)) continue;
-      seen.add(selected);
-      collected.push(selected);
+      const matches = ordered.filter((frame) => frame.frameRole === role);
+      for (const match of matches) {
+        const selected = this.pickPersonaFrameReferenceUrl(match);
+        if (!selected || seen.has(selected)) continue;
+        seen.add(selected);
+        collected.push(selected);
+        break;
+      }
     }
     return collected.slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT);
   }
@@ -2653,19 +2796,37 @@ export class CommandExecutor {
     const upsertFrame = this.agentMutatorOptional("upsertPersonaFrame");
     if (!upsertFrame) return false;
     try {
+      const canonicalMediaUrl =
+        this.resolvePreferredMediaUrl(
+          input.media.mediaOptimizedUrl,
+          input.media.mediaUrl,
+          input.media.mediaOriginalUrl,
+        ) ?? input.media.mediaUrl;
+      const canonicalOptimizedUrl =
+        this.resolvePreferredMediaUrl(
+          input.media.mediaOptimizedUrl,
+          canonicalMediaUrl,
+          input.media.mediaUrl,
+          input.media.mediaOriginalUrl,
+        ) ?? canonicalMediaUrl;
+      const canonicalOriginalUrl = this.resolvePreferredMediaUrl(
+        input.media.mediaOriginalUrl,
+        input.media.mediaUrl,
+        canonicalMediaUrl,
+      );
       const mimeType =
-        inferMimeTypeFromUrl(input.media.mediaOptimizedUrl ?? input.media.mediaUrl) ??
-        inferMimeTypeFromUrl(input.media.mediaOriginalUrl ?? input.media.mediaUrl) ??
+        inferMimeTypeFromUrl(canonicalOptimizedUrl) ??
+        inferMimeTypeFromUrl(canonicalOriginalUrl ?? canonicalMediaUrl) ??
         "image/jpeg";
       await upsertFrame.mutate({
         personaSlug: input.personaSlug,
         frameRole: input.frameRole,
-        mediaUrl: input.media.mediaUrl,
-        ...(input.media.mediaOriginalUrl
-          ? { originalUrl: input.media.mediaOriginalUrl }
+        mediaUrl: canonicalMediaUrl,
+        ...(canonicalOriginalUrl
+          ? { originalUrl: canonicalOriginalUrl }
           : {}),
-        ...(input.media.mediaOptimizedUrl
-          ? { optimizedUrl: input.media.mediaOptimizedUrl }
+        ...(canonicalOptimizedUrl
+          ? { optimizedUrl: canonicalOptimizedUrl }
           : {}),
         mimeType,
         ...(typeof input.media.mediaSizeBytes === "number" &&
@@ -2792,6 +2953,7 @@ export class CommandExecutor {
     const plan = this.resolvePersonaReferencePlan(
       input.payload,
       resolvedMainPersonaSlug,
+      input.command,
     );
     if (!this.shouldUsePersonaFrameReferences(plan)) {
       return {
@@ -2814,9 +2976,11 @@ export class CommandExecutor {
     const targetPersonaSlug = plan.targetPersonaSlug;
     let builtFrames = false;
     let mainFrames: PersonaFrameRecord[] = [];
+    let mainFrameReferences: string[] = [];
     if (targetPersonaSlug !== mainPersonaSlug) {
       mainFrames = await this.listPersonaFramesFromServer(mainPersonaSlug);
-      if (mainFrames.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT) {
+      mainFrameReferences = this.collectPersonaFrameReferences(mainFrames);
+      if (mainFrameReferences.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT) {
         const bootstrappedMain = await this.bootstrapPersonaReferenceFrames({
           personaSlug: mainPersonaSlug,
           payload: input.payload,
@@ -2825,6 +2989,7 @@ export class CommandExecutor {
           seedReferences,
         });
         mainFrames = bootstrappedMain.frames;
+        mainFrameReferences = this.collectPersonaFrameReferences(mainFrames);
         builtFrames = builtFrames || bootstrappedMain.builtFrames;
       }
     }
@@ -2835,11 +3000,12 @@ export class CommandExecutor {
           ? mainFrames
           : await this.listPersonaFramesFromServer(targetPersonaSlug)
         : await this.listPersonaFramesFromServer(targetPersonaSlug);
-    if (frames.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT) {
+    let targetFrameReferences = this.collectPersonaFrameReferences(frames);
+    if (targetFrameReferences.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT) {
       const bootstrapSeedReferences = Array.from(
         new Set([
+          ...mainFrameReferences,
           ...seedReferences,
-          ...this.collectPersonaFrameReferences(mainFrames),
         ]),
       ).slice(0, MAX_MEDIA_REFERENCE_INPUTS);
       const bootstrapped = await this.bootstrapPersonaReferenceFrames({
@@ -2850,14 +3016,19 @@ export class CommandExecutor {
         seedReferences: bootstrapSeedReferences,
       });
       frames = bootstrapped.frames;
+      targetFrameReferences = this.collectPersonaFrameReferences(frames);
       builtFrames = builtFrames || bootstrapped.builtFrames;
     }
+    if (targetPersonaSlug === mainPersonaSlug) {
+      mainFrameReferences = targetFrameReferences;
+    }
 
-    const targetFrameReferences = this.collectPersonaFrameReferences(frames);
-    const mainFrameReferences = this.collectPersonaFrameReferences(mainFrames);
-    const frameReferences = Array.from(
-      new Set([...targetFrameReferences, ...mainFrameReferences]),
-    ).slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT);
+    const frameReferences =
+      targetFrameReferences.length >= REQUIRED_PERSONA_REFERENCE_FRAME_COUNT
+        ? targetFrameReferences.slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT)
+        : Array.from(
+            new Set([...targetFrameReferences, ...mainFrameReferences]),
+          ).slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT);
     await this.ctx.memory
       .recordWrite({
         type: "persona_reference_resolution",
@@ -2893,7 +3064,10 @@ export class CommandExecutor {
     };
   }
 
-  private async processCommandFilePath(filePath: string): Promise<boolean> {
+  private async processCommandFilePath(
+    filePath: string,
+    queueContext?: { attempts?: number; maxAttempts?: number },
+  ): Promise<boolean> {
     const inboxFile = path.basename(filePath);
     const read = await readJsonMaybeIncomplete(filePath);
     if (read.status === "missing") {
@@ -3117,6 +3291,32 @@ export class CommandExecutor {
     });
 
     if (!result.processed) {
+      const attempts = queueContext?.attempts ?? 0;
+      const maxAttempts = queueContext?.maxAttempts ?? 0;
+      if (maxAttempts > 0 && attempts >= maxAttempts - 1) {
+        const terminalOutcome: CommandOutcome = {
+          at: nowIso(),
+          commandId: command.id,
+          kind: command.kind,
+          grantId: command.grantId,
+          ok: false,
+          error: {
+            message: `Command failed after ${attempts} attempts (max retry exceeded).`,
+            code: "max_retry_exceeded",
+          },
+        };
+        await this.finalizeCommandOutcome({ command, outcome: terminalOutcome });
+        await this.updatePendingDirectiveStatusForOutcome(command, terminalOutcome).catch(
+          () => undefined,
+        );
+        await this.moveInboxFileToProcessed(filePath, "failed");
+        await this.markQueueItemCompletedByInbox(
+          inboxFile,
+          "failed",
+          `max_retry_exceeded (${attempts} attempts)`,
+        );
+        return true;
+      }
       return false;
     }
     const outcome = result.outcome;
@@ -9493,6 +9693,41 @@ export class CommandExecutor {
         );
       }
     }
+    const personaMediaLock = this.isPersonaMediaLockEnabled(payload);
+    if (personaMediaLock) {
+      const personaCompatibleDrafts = executionDrafts.filter((draft) =>
+        this.isPersonaMediaCompatibleDraft(draft),
+      );
+      if (personaCompatibleDrafts.length > 0) {
+        executionDrafts = personaCompatibleDrafts;
+      } else {
+        const fallbackDraft = this.buildPersonaLockedMediaFallbackDraft({
+          payload,
+          drafts: executionDrafts.length > 0 ? executionDrafts : drafts,
+        });
+        const fallbackAllowed =
+          fallbackDraft &&
+          (!ENFORCE_PERMISSION_HINT_FILTERS ||
+            this.isGeneratedDraftAllowedByPermissionState(
+              fallbackDraft,
+              payload.permissionState,
+            ));
+        if (fallbackDraft && fallbackAllowed) {
+          executionDrafts = [fallbackDraft];
+          await this.ctx.memory
+            .recordWrite({
+              type: "persona_media_lock_fallback_draft",
+              at: nowIso(),
+              commandId: command.id,
+              sourceDirectiveId: command.sourceDirectiveId ?? null,
+              reason: "no_persona_compatible_generated_draft",
+            })
+            .catch(() => undefined);
+        } else {
+          executionDrafts = [];
+        }
+      }
+    }
     if (enforcedDraftAction !== null && executableDrafts.length === 0) {
       await this.ctx.memory
         .recordWrite({
@@ -11656,9 +11891,11 @@ export class CommandExecutor {
         mergedKinds.push(scopedKind);
       }
     }
-    const resolvedKinds = isChatOrigin
+    const personaMediaLock = this.isPersonaMediaLockEnabled(payload);
+    const resolvedKindsBase = isChatOrigin
       ? mergedKinds.filter((kind) => kind !== "story")
       : mergedKinds;
+    const resolvedKinds = personaMediaLock ? ["media"] : resolvedKindsBase;
     if (resolvedKinds.length === 0) {
       resolvedKinds.push(isChatOrigin ? "media" : mappedKind);
     }
@@ -11799,6 +12036,7 @@ export class CommandExecutor {
       ...(mediaMode ? { mediaMode } : {}),
       ...(mediaPersona ? { mediaPersona } : {}),
       ...(mediaPersonaStyleHint ? { mediaPersonaStyleHint } : {}),
+      ...(personaMediaLock ? { mediaPersonaLock: true } : {}),
       ...(taggedHandles.length > 0 ? { taggedHandles } : {}),
       ...(mediaReferenceUrls.length > 0 ? { mediaReferenceUrls } : {}),
       ...(variationSeed ? { variationSeed } : {}),
@@ -13751,6 +13989,95 @@ export class CommandExecutor {
       }
     }
     return drafts;
+  }
+
+  private isPersonaMediaCompatibleDraft(draft: GeneratedDraft): boolean {
+    const action = draft.action.trim().toLowerCase();
+    if (action === "story" || action === "avatar" || action === "banner") return true;
+    if (action !== "post") return false;
+    const payload = isRecord(draft.payload) ? draft.payload : null;
+    const postType = asNonEmptyString(payload?.postType)?.toLowerCase() ?? "";
+    if (postType.length > 0) {
+      if (
+        postType === "media" ||
+        postType === "image" ||
+        postType === "gif" ||
+        postType === "video" ||
+        postType === "photo" ||
+        postType === "sticker"
+      ) {
+        return true;
+      }
+      if (postType === "text" || postType === "thread") return false;
+    }
+    const generatedAssetType =
+      asNonEmptyString(payload?.generatedAssetType)?.toLowerCase() ?? "";
+    if (
+      generatedAssetType === "image" ||
+      generatedAssetType === "gif" ||
+      generatedAssetType === "video"
+    ) {
+      return true;
+    }
+    const mediaPrompt =
+      asNonEmptyString(payload?.mediaPrompt) ??
+      asNonEmptyString(payload?.imagePrompt);
+    if (mediaPrompt) return true;
+    if (asNonEmptyString(payload?.mediaUrl)) return true;
+    const mediaItemsRaw = payload?.mediaItems;
+    const mediaItems = Array.isArray(mediaItemsRaw) ? mediaItemsRaw : [];
+    return mediaItems.some((entry) => {
+      if (!isRecord(entry)) return false;
+      return Boolean(asNonEmptyString(entry.mediaUrl));
+    });
+  }
+
+  private buildPersonaLockedMediaFallbackDraft(input: {
+    payload: Record<string, unknown>;
+    drafts: GeneratedDraft[];
+  }): GeneratedDraft | null {
+    const sourceDraft = input.drafts.find(
+      (draft) => draft.action.trim().toLowerCase() === "post",
+    );
+    const sourcePayload = sourceDraft && isRecord(sourceDraft.payload)
+      ? sourceDraft.payload
+      : null;
+    const mediaPrompt =
+      asNonEmptyString(sourcePayload?.mediaPrompt) ??
+      asNonEmptyString(sourcePayload?.imagePrompt) ??
+      asNonEmptyString(sourcePayload?.prompt) ??
+      asNonEmptyString(sourcePayload?.textBody) ??
+      asNonEmptyString(sourcePayload?.caption) ??
+      asNonEmptyString(input.payload.mediaPrompt) ??
+      asNonEmptyString(input.payload.imagePrompt) ??
+      asNonEmptyString(input.payload.prompt) ??
+      asNonEmptyString(input.payload.topic) ??
+      "Photorealistic selfie of yourself with strong identity continuity.";
+    const caption =
+      asNonEmptyString(sourcePayload?.caption) ??
+      asNonEmptyString(input.payload.caption);
+    const mediaMode =
+      asNonEmptyString(input.payload.mediaMode) ??
+      asNonEmptyString(sourcePayload?.mediaMode) ??
+      "selfie";
+    const nextPayload: Record<string, unknown> = {
+      ...(sourcePayload ?? {}),
+      ...input.payload,
+      postType: "media",
+      generatedAssetType: "image",
+      mediaPrompt,
+      imagePrompt: mediaPrompt,
+      prompt: mediaPrompt,
+      mediaMode,
+      mediaPersonaLock: true,
+    };
+    if (caption) {
+      nextPayload.caption = caption;
+    }
+    return {
+      action: "post",
+      payload: nextPayload,
+    };
   }
 
   private mapDraftToWriteCommand(input: {
@@ -16206,8 +16533,26 @@ export class CommandExecutor {
       let delivered = chatDeliveryHandled;
       let fallbackUsed = false;
       if (!delivered) {
+        // Try editing the existing preview card first to avoid a stuck "processing" card
+        // alongside a separate terminal message.  The preview card clientMessageId is
+        // deterministic: `runtime_generate_${command.id}`.
+        const previewClientMessageId = `runtime_generate_${command.id}`;
         const completion = this.buildNonWriteChatCompletion({ command, outcome });
-        if (completion) {
+        if (completion && this.ctx.callAgentChatBridge) {
+          try {
+            await this.ctx.callAgentChatBridge({
+              action: "edit_message",
+              clientMessageId: previewClientMessageId,
+              ...route,
+              body: clampPublishText(completion.body, 1200),
+              metadata: completion.metadata,
+            });
+            delivered = true;
+          } catch {
+            // Preview card edit failed; fall through to fresh message fallback.
+          }
+        }
+        if (!delivered && completion) {
           fallbackUsed = true;
           delivered = await this.sendNonWriteChatCompletion({
             command,

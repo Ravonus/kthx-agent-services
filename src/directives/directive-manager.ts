@@ -64,6 +64,7 @@ export interface DirectiveManagerContext {
     source: string;
     queueClass: string;
     forceNow: boolean;
+    commandFingerprint?: string | undefined;
   }) => Promise<void>;
   planQueueWithOpenClaw: (opts: { source: string }) => Promise<unknown>;
   touchWake: (path: string) => Promise<void>;
@@ -380,12 +381,14 @@ export class DirectiveManager implements DirectiveManagerLike {
       forceNow,
     });
 
+    const commandFingerprint = `${id}:${actionNonce ?? ""}:${kind}`;
     await this.ctx.ensureDirectiveInQueue({
       directiveId: id,
       inboxFile: path.basename(filePath),
       source: "director_directive",
       queueClass,
       forceNow,
+      commandFingerprint,
     });
     await this.ctx.planQueueWithOpenClaw({ source: "directive_staged" }).catch(
       () => {},

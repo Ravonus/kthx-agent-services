@@ -881,8 +881,23 @@ const main = async (): Promise<void> => {
       return;
     }
 
-    const items = latest && Array.isArray(latest.items) ? latest.items as Record<string, unknown>[] : [];
-    const matched = messageId ? items.find((item) => isRecord(item) && isRecord((item as Record<string, unknown>).message) && ((item as Record<string, unknown>).message as Record<string, unknown>).id === messageId) : null;
+    let items = latest && Array.isArray(latest.items) ? latest.items as Record<string, unknown>[] : [];
+    let matched = messageId ? items.find((item) => isRecord(item) && isRecord((item as Record<string, unknown>).message) && ((item as Record<string, unknown>).message as Record<string, unknown>).id === messageId) : null;
+
+    // Retry once after a short delay — the message may not be immediately available via list API
+    if (messageId && !matched) {
+      await new Promise((r) => setTimeout(r, 600));
+      const retryResult = await callBridge({
+        action: "list_messages",
+        ...context,
+        limit: 8,
+      }).catch(() => null) as Record<string, unknown> | null;
+      if (retryResult && Array.isArray(retryResult.items)) {
+        items = retryResult.items as Record<string, unknown>[];
+        matched = items.find((item) => isRecord(item) && isRecord((item as Record<string, unknown>).message) && ((item as Record<string, unknown>).message as Record<string, unknown>).id === messageId) ?? null;
+      }
+    }
+
     if (messageId && !matched) {
       untrackId(messageId);
       await appendBridgeEvent({
@@ -892,7 +907,7 @@ const main = async (): Promise<void> => {
         topic,
         messageId,
         message:
-          "message.created event did not resolve to list_messages payload; skipping confirm",
+          "message.created event did not resolve to list_messages payload after retry; skipping confirm",
       }).catch(() => undefined);
       return;
     }

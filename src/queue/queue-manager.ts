@@ -43,7 +43,7 @@ export interface QueueManagerContext {
   /** External hook: process a command file from the inbox dir. */
   processCommandFile: (
     inboxFile: string,
-    opts?: { interactiveRl?: unknown },
+    opts?: { interactiveRl?: unknown; attempts?: number; maxAttempts?: number },
   ) => Promise<boolean>;
   /** External hook: run a memory checkpoint before execution. */
   runMemoryCheckpoint: (opts: {
@@ -79,6 +79,7 @@ const parseIsoToMs = (value: unknown): number | null => {
 
 const NOT_READY_MIN_REQUEUE_DELAY_SECONDS = 2;
 const NOT_READY_MAX_REQUEUE_DELAY_SECONDS = 300;
+const NOT_READY_MAX_ATTEMPTS = 30;
 const RUNNING_RECOVERY_MIN_AGE_MS = 60_000;
 
 const computeNotReadyRequeueDelaySeconds = (attempts: number): number => {
@@ -328,7 +329,18 @@ export class QueueManager implements QueueManagerLike {
 
         this.activeExecutions.add(candidate.item.id);
         void this.executeCandidate(candidate.item)
-          .catch(() => undefined)
+          .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn(
+              "[agent-runtime] executeCandidate unhandled error (non-fatal)",
+              msg,
+            );
+            void this.markCompleted(
+              candidate.item.inboxFile,
+              "failed",
+              `unhandled_execution_error: ${msg}`,
+            ).catch(() => undefined);
+          })
           .finally(() => {
             this.activeExecutions.delete(candidate.item.id);
             void this.runnerTick().catch(() => undefined);
@@ -350,6 +362,7 @@ export class QueueManager implements QueueManagerLike {
   private async recoverAbandonedRunningItems(): Promise<void> {
     const nowMs = Date.now();
     let recovered = 0;
+    let failedTerminal = 0;
     await this.mutateQueueState((current) => {
       const nextItems = current.items.map((item) => {
         if (item.status !== "running") return item;
@@ -369,13 +382,23 @@ export class QueueManager implements QueueManagerLike {
         ) {
           return item;
         }
-        recovered += 1;
         const attempts =
           typeof item.attempts === "number" &&
           Number.isFinite(item.attempts) &&
           item.attempts > 0
             ? Math.trunc(item.attempts)
             : 1;
+        if (attempts >= NOT_READY_MAX_ATTEMPTS) {
+          failedTerminal += 1;
+          return {
+            ...item,
+            status: "failed" as QueueItem["status"],
+            completedAt: nowIso(),
+            startedAt: null,
+            lastError: `max_retry_exceeded_during_recovery (${attempts} attempts): ${item.lastError ?? "running_item_abandoned"}`,
+          };
+        }
+        recovered += 1;
         const retryDelaySeconds = computeNotReadyRequeueDelaySeconds(attempts);
         return {
           ...item,
@@ -386,17 +409,18 @@ export class QueueManager implements QueueManagerLike {
           lastError: item.lastError ?? "running_item_recovered",
         };
       });
-      if (recovered === 0) return current;
+      if (recovered === 0 && failedTerminal === 0) return current;
       return {
         ...current,
         items: nextItems,
       };
     });
-    if (recovered > 0) {
+    if (recovered > 0 || failedTerminal > 0) {
       await this.ctx.memory.recordWrite({
         type: "directive_queue_running_recovered",
         at: nowIso(),
         recovered,
+        failedTerminal,
       });
     }
   }
@@ -411,11 +435,15 @@ export class QueueManager implements QueueManagerLike {
         })
         .catch(() => undefined);
 
-      const processed = await this.ctx.processCommandFile(item.inboxFile);
+      const processed = await this.ctx.processCommandFile(item.inboxFile, {
+        attempts: item.attempts,
+        maxAttempts: NOT_READY_MAX_ATTEMPTS,
+      });
       if (!processed) {
         let nextAttemptCount = 1;
         let nextDueAt = new Date(Date.now() + 5_000).toISOString();
         let preservedError = "not_ready";
+        let exceededMaxAttempts = false;
         await this.mutateQueueState((current) => {
           const next = { ...current };
           next.items = current.items.map((qi) => {
@@ -431,6 +459,15 @@ export class QueueManager implements QueueManagerLike {
               qi.attempts > 0
                 ? Math.trunc(qi.attempts)
                 : 1;
+            if (nextAttemptCount >= NOT_READY_MAX_ATTEMPTS) {
+              exceededMaxAttempts = true;
+              return {
+                ...qi,
+                status: "failed" as QueueItem["status"],
+                completedAt: nowIso(),
+                lastError: `max_retry_exceeded (${nextAttemptCount} attempts): ${preservedError}`,
+              };
+            }
             const retryDelaySeconds = computeNotReadyRequeueDelaySeconds(
               nextAttemptCount,
             );
@@ -447,6 +484,18 @@ export class QueueManager implements QueueManagerLike {
           });
           return next;
         });
+        if (exceededMaxAttempts) {
+          await this.ctx.memory.recordWrite({
+            type: "directive_queue_max_retry_exceeded",
+            at: nowIso(),
+            source: "queue_runner",
+            directiveId: item.directiveId,
+            inboxFile: item.inboxFile,
+            error: preservedError,
+            attempts: nextAttemptCount,
+          });
+          return;
+        }
         const nextDueAtMs = parseIsoToMs(nextDueAt);
         const retryInSeconds =
           typeof nextDueAtMs === "number" && Number.isFinite(nextDueAtMs)
@@ -506,6 +555,7 @@ export class QueueManager implements QueueManagerLike {
     mutate: (current: QueueState) => QueueState | Promise<QueueState>,
   ): Promise<QueueState> {
     let resolvedState: QueueState | null = null;
+    let mutationError: Error | null = null;
     this.ctx.queue.queueStateMutation = this.ctx.queue.queueStateMutation
       .then(async () => {
         const current = await this.readQueueState();
@@ -518,12 +568,23 @@ export class QueueManager implements QueueManagerLike {
         resolvedState = await this.writeQueueState(next);
       })
       .catch((error: unknown) => {
+        mutationError =
+          error instanceof Error ? error : new Error(String(error));
         console.warn(
           "[agent-runtime] queue state mutation failed (non-fatal)",
-          error instanceof Error ? error.message : error,
+          mutationError.message,
         );
       });
     await this.ctx.queue.queueStateMutation;
+    if (mutationError) {
+      void this.ctx.memory
+        .recordWrite({
+          type: "queue_state_mutation_error",
+          at: nowIso(),
+          error: mutationError.message,
+        })
+        .catch(() => undefined);
+    }
     return resolvedState ?? (await this.readQueueState());
   }
 
