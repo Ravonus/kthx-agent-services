@@ -2276,6 +2276,12 @@ const buildPublicProjection = (
       openClawBinaryVersion: str(agent.openClawBinaryVersion),
       openClawBinaryError: str(agent.openClawBinaryError),
       identityUpdatedAt: iso(agent.identityUpdatedAt),
+      visualSetupReady: bool(agent.visualSetupReady),
+      visualSetupNotificationState: str(agent.visualSetupNotificationState),
+      visualSetupUpdatedAt: iso(agent.visualSetupUpdatedAt),
+      visualSetupMissingItems: Array.isArray(agent.visualSetupMissingItems)
+        ? (agent.visualSetupMissingItems as unknown[])
+        : [],
     },
     memory: {
       moodPrimary: str(memory.moodPrimary),
@@ -2345,6 +2351,7 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
     writes: path.join(stateDir, "writes.jsonl"),
     chatInbox: path.join(chatDir, "inbox.jsonl"),
     kthxConfig: resolveKthxConfigPath(stateDir),
+    visualSetupStatus: path.join(ipcDir, "auth", "visual-setup-status.json"),
   };
 
   const [
@@ -2357,6 +2364,7 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
     keywordIndexRaw,
     longTermArchiveRaw,
     kthxConfigRaw,
+    visualSetupStatusRaw,
     writes,
     inbox,
   ] = await Promise.all([
@@ -2369,12 +2377,14 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
     readJsonRecord(files.keywordIndex),
     readJsonRecord(files.longTermArchiveIndex),
     readJsonRecord(files.kthxConfig),
+    readJsonRecord(files.visualSetupStatus),
     readTailLines(files.writes, TAIL_MAX_BYTES, TAIL_MAX_LINES),
     readTailLines(files.chatInbox, TAIL_MAX_BYTES, TAIL_MAX_LINES),
   ]);
   const keywordIndex = normalizeKeywordIndex(keywordIndexRaw);
   const longTermArchive = normalizeLongTermArchiveIndex(longTermArchiveRaw);
   const retentionPolicy = normalizeRetentionPolicy(kthxConfigRaw);
+  const visualSetupStatus = isRecord(visualSetupStatusRaw) ? visualSetupStatusRaw : null;
 
   const writeRecords = parseJsonLines(writes);
   const inboxRecords = parseJsonLines(inbox);
@@ -2434,6 +2444,12 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
   const t7d = tiers && isRecord(tiers["7d"]) ? tiers["7d"] : null;
   const t30d = tiers && isRecord(tiers["30d"]) ? tiers["30d"] : null;
   const t365d = tiers && isRecord(tiers["365d"]) ? tiers["365d"] : null;
+  const visualSetupMissingItems = Array.isArray(visualSetupStatus?.setupGaps)
+    ? visualSetupStatus.setupGaps
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0)
+    : [];
 
   const available = [latestDebug, chatStatus, mood, temporal].some(
     (item) => item !== null && item !== undefined,
@@ -2501,6 +2517,10 @@ const buildSnapshot = async (): Promise<Record<string, unknown>> => {
       openClawBinaryOk: bool(lastOpenClawProbe?.probeOk),
       openClawBinaryVersion: str(lastOpenClawProbe?.probeVersion),
       openClawBinaryError: str(lastOpenClawProbe?.probeError),
+      visualSetupReady: bool(visualSetupStatus?.ready),
+      visualSetupNotificationState: str(visualSetupStatus?.notificationState),
+      visualSetupUpdatedAt: iso(visualSetupStatus?.checkedAt),
+      visualSetupMissingItems,
     },
     memory: {
       moodPrimary: str(mood?.primary), moodScore: num(mood?.score), moodUpdatedAt: iso(mood?.updatedAt),
@@ -2611,7 +2631,7 @@ const healthUrl='/api/health/private';
 const render=snap=>{if(!snap)return;document.getElementById('ts').textContent='updated '+fmt(snap.generatedAt)+(snap.available===false&&snap.reason?' · '+snap.reason:'');
 const[rC,rT]=badge(snap.runtime?.wsState);document.getElementById('rt').innerHTML='<div class="badge '+esc(rC)+'">'+esc(rT)+'</div><div class="kv" style="margin-top:8px">'+kv({auth:snap.runtime?.authEffective,permission:snap.runtime?.permissionState,wsTransport:snap.runtime?.wsTransportState,lastEnvelope:fmt(snap.runtime?.lastEnvelopeAt),lastPublish:fmt(snap.runtime?.lastPublishAt),publishError:snap.runtime?.lastPublishError??'none'})+'</div>';
 const[cC,cT]=badge(snap.chatBridge?.connected===true?'ready':(snap.chatBridge?.state??'unknown'));document.getElementById('cb').innerHTML='<div class="badge '+esc(cC)+'">'+esc(cT)+'</div><div class="kv" style="margin-top:8px">'+kv({connected:String(snap.chatBridge?.connected),mode:snap.chatBridge?.subscriptionMode,topics:snap.chatBridge?.subscribedTopics,requested:fmtTopicCounts(snap.chatBridge?.requestedTopicCounts),subscribed:fmtTopicCounts(snap.chatBridge?.subscribedTopicCounts),shell:shellCounts(snap.chatBridge?.lastShellSummary),ticketFailures:snap.chatBridge?.lastTicketFailureCount,lastError:snap.chatBridge?.lastError??'none'})+'</div>';
-document.getElementById('ag').innerHTML='<div class="kv">'+kv({userId:snap.agent?.userId,handle:snap.agent?.handle,name:snap.agent?.name,openclawAgent:snap.agent?.openClawAgentName,openclawBinOk:String(snap.agent?.openClawBinaryOk),openclawBinSource:snap.agent?.openClawBinarySource,openclawBinVersion:snap.agent?.openClawBinaryVersion??'n/a',openclawBinError:snap.agent?.openClawBinaryError??'none',identityUpdated:fmt(snap.agent?.identityUpdatedAt)})+'</div>';
+document.getElementById('ag').innerHTML='<div class="kv">'+kv({userId:snap.agent?.userId,handle:snap.agent?.handle,name:snap.agent?.name,openclawAgent:snap.agent?.openClawAgentName,openclawBinOk:String(snap.agent?.openClawBinaryOk),openclawBinSource:snap.agent?.openClawBinarySource,openclawBinVersion:snap.agent?.openClawBinaryVersion??'n/a',openclawBinError:snap.agent?.openClawBinaryError??'none',identityUpdated:fmt(snap.agent?.identityUpdatedAt),visualSetupReady:String(snap.agent?.visualSetupReady),visualSetupNotification:snap.agent?.visualSetupNotificationState??'unknown',visualSetupUpdated:fmt(snap.agent?.visualSetupUpdatedAt),visualSetupMissing:Array.isArray(snap.agent?.visualSetupMissingItems)?snap.agent.visualSetupMissingItems.join(' | '):'n/a'})+'</div>';
 document.getElementById('mm').innerHTML='<div class="kv">'+kv({mood:snap.memory?.moodPrimary,moodScore:snap.memory?.moodScore,tier24h:snap.memory?.tier24hEvents,tier7d:snap.memory?.tier7dEvents,keywordDocs:snap.memory?.keywordIndexDocs,keywordTerms:snap.memory?.keywordIndexKeywords,longTermCapsules:snap.memory?.longTermArchiveCapsules,longTermLatest:fmt(snap.memory?.longTermArchiveLatestCompactedAt),longTermAgent:snap.memory?.longTermArchiveAgentCompressed,longTermAlgorithm:snap.memory?.longTermArchiveAlgorithmCompressed})+'</div>';
 document.getElementById('rp').innerHTML='<div class="kv">'+kv({enabled:String(snap.retention?.enabled),intervalMin:snap.retention?.intervalMinutes,postsDays:snap.retention?.postsDays,interactionsDays:snap.retention?.interactionsDays,notificationsDays:snap.retention?.notificationsDays,longTermEnabled:String(snap.retention?.longTermEnabled),longTermMaxCapsules:snap.retention?.longTermMaxCapsules,longTermCompactionsPerRun:snap.retention?.longTermMaxCompactionsPerRun})+'</div>';
 document.getElementById('ac').innerHTML='<div class="kv">'+kv({publishOk:snap.activity?.publishSuccess,publishFail:snap.activity?.publishFailed,directives:snap.activity?.directivesExecuted,messages:snap.activity?.chatMessagesReceived,autoReplies:snap.activity?.chatAutoRepliesSent})+'</div>';

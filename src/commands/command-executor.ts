@@ -152,6 +152,39 @@ const POST_VARIETY_HINT_PATTERNS: ReadonlyArray<{
 const MEDIA_GENERATOR_DEFAULT_BASE_URL = "http://127.0.0.1:4280";
 const MEDIA_GENERATOR_POLL_MS = 200;
 const MEDIA_GENERATOR_OPEN_TIMEOUT_MS = 45_000;
+const AGENT_KTHX_GUIDE_PATH = "/AGENT-KTHX-v2.md";
+const resolveAgentKthxGuideUrl = (): string | null => {
+  const candidates = [
+    process.env.MG_CHAT_HTTP_BASE_URL,
+    process.env.MG_BASE_URL,
+    process.env.MG_AGENT_HTTP_BASE_URL,
+    process.env.BETTER_AUTH_BASE_URL,
+    process.env.NEXT_PUBLIC_APP_URL,
+    process.env.NEXT_PUBLIC_SITE_URL,
+  ];
+  for (const candidate of candidates) {
+    const value = typeof candidate === "string" ? candidate.trim() : "";
+    if (!value.length) continue;
+    try {
+      const parsed = new URL(value);
+      return `${parsed.origin}${AGENT_KTHX_GUIDE_PATH}`;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+};
+const AGENT_KTHX_GUIDE_LOCATION = (() => {
+  const guideUrl = resolveAgentKthxGuideUrl();
+  if (guideUrl) {
+    return `\`${guideUrl}\` (fallback: \`${AGENT_KTHX_GUIDE_PATH}\`)`;
+  }
+  return `\`${AGENT_KTHX_GUIDE_PATH}\``;
+})();
+const IMAGE_GENERATION_SETUP_REQUIRED_PATTERN =
+  /\b(image_generator_unconfigured|file_generator_unconfigured|generate_command_unset|service_unreachable|service_http_|image_generation_failed|image_generation_timeout_after_)\b/iu;
+const IMAGE_GENERATION_SETUP_HINT =
+  ` Image generation is not ready yet. Install/start the KTHX OpenAI Media Generator using ${AGENT_KTHX_GUIDE_LOCATION}, then complete its first browser OpenAI login and retry.`;
 const COMMENT_TOKEN_STOP_WORDS = new Set([
   "a",
   "an",
@@ -1603,6 +1636,23 @@ export class CommandExecutor {
       return "agent";
     }
     return "owner";
+  }
+
+  private resolveProfileWriteTarget(
+    value: string | null | undefined,
+  ): "agent" | "owner" {
+    const normalized = asNonEmptyString(value)?.toLowerCase() ?? "";
+    if (
+      normalized === "owner" ||
+      normalized === "for_owner" ||
+      normalized === "as-owner" ||
+      normalized === "as_owner" ||
+      normalized === "owner-account" ||
+      normalized === "owner_account"
+    ) {
+      return "owner";
+    }
+    return "agent";
   }
 
   private collectFollowHandlesFromPayload(payload: Record<string, unknown>): string[] {
@@ -6604,11 +6654,7 @@ export class CommandExecutor {
     if (!payload) {
       return this.failedOutcome(command, "Invalid payload for write.updateAvatar.");
     }
-    const targetRaw = asNonEmptyString(payload.target)?.toLowerCase();
-    const target =
-      targetRaw === "owner" || targetRaw === "for-me" || targetRaw === "for_owner" || targetRaw === "me"
-        ? "owner"
-        : "agent";
+    const target = this.resolveProfileWriteTarget(asNonEmptyString(payload.target));
     const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
@@ -6649,11 +6695,7 @@ export class CommandExecutor {
     if (!payload) {
       return this.failedOutcome(command, "Invalid payload for write.updateBanner.");
     }
-    const targetRaw = asNonEmptyString(payload.target)?.toLowerCase();
-    const target =
-      targetRaw === "owner" || targetRaw === "for-me" || targetRaw === "for_owner" || targetRaw === "me"
-        ? "owner"
-        : "agent";
+    const target = this.resolveProfileWriteTarget(asNonEmptyString(payload.target));
     const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId =
       asNonEmptyString(payload.sourceDirectiveId) ??
@@ -11328,6 +11370,11 @@ export class CommandExecutor {
       const message = error instanceof Error ? error.message : String(error);
       const isPromptCurationFailure = /prompt_curation_/iu.test(message);
       const isChatDeliveryFailure = /chat_preview_finalize_failed:/iu.test(message);
+      const isImageGenerationSetupFailure =
+        IMAGE_GENERATION_SETUP_REQUIRED_PATTERN.test(message);
+      const imageGenerationSetupHint = isImageGenerationSetupFailure
+        ? IMAGE_GENERATION_SETUP_HINT
+        : "";
       const isPersonaReferenceSetupFailure =
         /persona_reference_setup_required:/iu.test(message);
       const personaReferenceSetupSlug = (() => {
@@ -11357,12 +11404,12 @@ export class CommandExecutor {
           : bannerRequest
             ? "I could not update that banner right now. Please retry in a moment."
             : isPersonaReferenceSetupFailure
-              ? `I couldn't prepare persona references for ${personaReferenceSetupSlug ? `\`${personaReferenceSetupSlug}\`` : "that persona"} yet. I need three baseline frames (selfie, midshot, fullbody) before generating with persona continuity.`
+              ? `I couldn't prepare persona references for ${personaReferenceSetupSlug ? `\`${personaReferenceSetupSlug}\`` : "that persona"} yet. I need three photorealistic baseline frames (selfie, midshot, fullbody) before generating with persona continuity.${imageGenerationSetupHint}`
             : isChatDeliveryFailure
               ? `I generated that ${generatedLabel}, but failed to finalize delivery in chat. Please retry.`
             : isPromptCurationFailure
               ? `I could not prepare a generation prompt for that ${generatedLabel} right now. Please retry in a moment.`
-              : `I could not generate that ${generatedLabel} right now. Please retry in a moment.`,
+              : `I could not generate that ${generatedLabel} right now. Please retry in a moment.${imageGenerationSetupHint}`,
         metadata: {
           automated: true,
           sourceContext: "CHAT",
@@ -11381,6 +11428,7 @@ export class CommandExecutor {
                     ? "Prompt curation failed"
                     : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
             error: truncateText(message, 240),
+            imageGenerationSetupRequired: isImageGenerationSetupFailure,
             ...(streamPreviewForFailure?.metadata ?? {}),
           },
         },

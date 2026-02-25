@@ -6,6 +6,8 @@
  */
 
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { RuntimeContext, ConsoleManagerLike } from "../runtime-context.js";
 import { isRecord } from "../lib/guards.js";
 import { nowIso } from "../lib/text.js";
@@ -354,6 +356,43 @@ export class ConsoleManager implements ConsoleManagerLike {
         `openclawBinError=${ctx.openclaw.openClawBinLastError}`,
       );
     }
+
+    const visualSetupStatusPath = path.join(
+      ctx.config.stateDir,
+      "ipc",
+      "auth",
+      "visual-setup-status.json",
+    );
+    const visualSetupStatus = await fs
+      .readFile(visualSetupStatusPath, "utf8")
+      .then((raw) => JSON.parse(raw) as unknown)
+      .catch(() => null);
+    if (isRecord(visualSetupStatus)) {
+      const ready = visualSetupStatus.ready === true;
+      const notificationState =
+        typeof visualSetupStatus.notificationState === "string"
+          ? visualSetupStatus.notificationState
+          : "unknown";
+      const missing = Array.isArray(visualSetupStatus.setupGaps)
+        ? visualSetupStatus.setupGaps
+            .filter((entry): entry is string => typeof entry === "string")
+            .map((entry) => entry.trim())
+            .filter((entry) => entry.length > 0)
+        : [];
+      const updatedAt =
+        typeof visualSetupStatus.checkedAt === "string" &&
+        visualSetupStatus.checkedAt.trim().length > 0
+          ? visualSetupStatus.checkedAt.trim()
+          : "n/a";
+      consoleWriteLine(
+        `visualSetupReady=${ready ? "yes" : "no"} notification=${notificationState}`,
+      );
+      consoleWriteLine(
+        `visualSetupMissing=${missing.length > 0 ? missing.join("; ") : "none"} updatedAt=${updatedAt}`,
+      );
+    } else {
+      consoleWriteLine("visualSetupReady=unknown statusFile=missing");
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -413,8 +452,18 @@ export class ConsoleManager implements ConsoleManagerLike {
     );
     items.slice(0, 20).forEach((item: unknown) => {
       if (!isRecord(item)) return;
+      const status =
+        typeof item.status === "string" && item.status.trim().length > 0
+          ? item.status.trim()
+          : "unknown";
+      const inboxFile =
+        typeof item.inboxFile === "string" ? item.inboxFile : "";
+      const queueClass =
+        typeof item.queueClass === "string" && item.queueClass.trim().length > 0
+          ? item.queueClass.trim()
+          : "general";
       consoleWriteLine(
-        `- ${String(item.status ?? "unknown")} ${String(item.inboxFile ?? "")} class=${String(item.queueClass ?? "general")}`,
+        `- ${status} ${inboxFile} class=${queueClass}`,
       );
     });
   }

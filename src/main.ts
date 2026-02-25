@@ -170,6 +170,139 @@ const parseSupervisorPid = (value: string | null): number | null => {
   return parsed;
 };
 
+const AGENT_KTHX_GUIDE_PATH = "/AGENT-KTHX-v2.md";
+const MEDIA_GENERATOR_DEFAULT_BASE_URL = "http://127.0.0.1:4280";
+const REQUIRED_PERSONA_FRAME_ROLES = ["selfie", "midshot", "fullbody"] as const;
+const VISUAL_SETUP_CHECK_INTERVAL_MS = 60_000;
+const VISUAL_SETUP_STATUS_FILE = "visual-setup-status.json";
+
+type VisualSetupNotificationState =
+  | "disabled"
+  | "not_required"
+  | "cooldown"
+  | "sent"
+  | "delivery_failed"
+  | "conversation_unavailable"
+  | "owner_missing"
+  | "profile_unavailable";
+
+type VisualSetupCheckState = {
+  checkedAt: string;
+  ready: boolean;
+  ownerMainUserId: string | null;
+  ownerHandle: string | null;
+  hasImage: boolean;
+  hasBanner: boolean;
+  missingPersonaRoles: string[];
+  setupGaps: string[];
+  serviceReachable: boolean;
+  commandAvailable: boolean;
+  notificationState: VisualSetupNotificationState;
+};
+
+const parseFirstCommandToken = (command: string): string | null => {
+  const match = /^\s*(?:"([^"]+)"|'([^']+)'|(\S+))/u.exec(command);
+  const token = (match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim();
+  return token.length > 0 ? token : null;
+};
+
+const looksPathLike = (value: string): boolean =>
+  value.includes("/") || value.includes("\\") || value.startsWith(".");
+
+const splitPathEntries = (value: string | null | undefined): string[] => {
+  if (typeof value !== "string" || value.trim().length === 0) return [];
+  return value
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+};
+
+const commandCandidates = (token: string): string[] => {
+  if (process.platform !== "win32") return [token];
+  const lower = token.toLowerCase();
+  if (/\.(?:exe|cmd|bat|com|ps1)$/u.test(lower)) return [token];
+  const pathExt = process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD;.PS1";
+  const extensions = pathExt
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  if (!extensions.length) return [token];
+  return extensions.map((ext) => `${token}${ext.toLowerCase()}`);
+};
+
+const isExecutableFile = async (candidatePath: string): Promise<boolean> => {
+  try {
+    const stat = await fs.stat(candidatePath);
+    if (!stat.isFile()) return false;
+    if (process.platform === "win32") return true;
+    await fs.access(candidatePath, 0o1);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const resolveCommandOnPath = async (token: string): Promise<string | null> => {
+  const entries = splitPathEntries(process.env.PATH);
+  if (!entries.length) return null;
+  const candidates = commandCandidates(token);
+  for (const dir of entries) {
+    for (const candidate of candidates) {
+      const fullPath = path.resolve(dir, candidate);
+      if (await isExecutableFile(fullPath)) return fullPath;
+    }
+  }
+  return null;
+};
+
+const isCommandLikelyAvailable = async (
+  commandTemplate: string | null | undefined,
+): Promise<boolean> => {
+  const template = typeof commandTemplate === "string" ? commandTemplate.trim() : "";
+  if (!template.length) return false;
+  const token = parseFirstCommandToken(template);
+  if (!token) return false;
+  if (looksPathLike(token)) {
+    return isExecutableFile(path.resolve(token));
+  }
+  const resolved = await resolveCommandOnPath(token);
+  return typeof resolved === "string" && resolved.length > 0;
+};
+
+const resolveMediaGeneratorBaseUrlForStartup = (): string => {
+  const explicit = trimEnv("MG_AGENT_MEDIA_GENERATOR_BASE_URL");
+  if (explicit) {
+    return explicit.replace(/\/+$/u, "");
+  }
+  const portRaw = trimEnv("PW_PORT");
+  if (portRaw) {
+    const port = Number.parseInt(portRaw, 10);
+    if (Number.isFinite(port) && port > 0 && port <= 65535) {
+      return `http://127.0.0.1:${port}`;
+    }
+  }
+  return MEDIA_GENERATOR_DEFAULT_BASE_URL;
+};
+
+const probeHttpEndpoint = async (
+  baseUrl: string,
+  timeoutMs = 1500,
+): Promise<boolean> => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(baseUrl, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    return response.status > 0;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -271,6 +404,13 @@ const main = async (): Promise<void> => {
   // -- Config
   const config = createRuntimeConfig();
   const chatApiBaseUrl = resolveChatApiBaseUrl(config.realtimeWsUrl);
+  const agentGuideSourceUrl = `${chatApiBaseUrl}${AGENT_KTHX_GUIDE_PATH}`;
+  const agentGuideLocalPath = path.resolve(process.cwd(), "AGENT-KTHX.md");
+  console.log(`[agent-runtime] Agent guide source: ${agentGuideSourceUrl}`);
+  console.log(`[agent-runtime] Agent guide local target: ${agentGuideLocalPath}`);
+  console.log(
+    `[agent-runtime] Fetch/update command: curl -fsSL "${agentGuideSourceUrl}" -o "${agentGuideLocalPath}"`,
+  );
   const supervisorPid = parseSupervisorPid(trimEnv("MG_AGENT_SUPERVISOR_PID"));
   const supervisorConnectionId =
     trimEnv("MG_REALTIME_CONNECTION_ID")?.trim() ?? null;
@@ -1440,6 +1580,321 @@ const main = async (): Promise<void> => {
     }
   };
 
+  const notifyOwnerImageGeneratorSetupIfNeeded = async (): Promise<VisualSetupCheckState> => {
+    const checkedAt = nowIso();
+    const notifyEnabled = (trimEnv("MG_AGENT_NOTIFY_IMAGE_SETUP") ?? "1") !== "0";
+    const authStateDir = path.join(config.stateDir, "ipc", "auth");
+    const noticePath = path.join(authStateDir, "image-generator-setup-notice.json");
+    const visualSetupStatusPath = path.join(authStateDir, VISUAL_SETUP_STATUS_FILE);
+    const persistVisualSetupStatus = async (
+      state: VisualSetupCheckState,
+    ): Promise<void> => {
+      await fs.mkdir(authStateDir, { recursive: true }).catch(() => {});
+      await fs
+        .writeFile(
+          visualSetupStatusPath,
+          `${JSON.stringify(state, null, 2)}\n`,
+          "utf8",
+        )
+        .catch(() => {});
+    };
+
+    const imageGenerateCmd = config.imageGenerateCmd ?? ctx.kthxConfig.image.commandTemplate;
+    const serviceBaseUrl = resolveMediaGeneratorBaseUrlForStartup();
+    const [serviceReachable, commandAvailable] = await Promise.all([
+      probeHttpEndpoint(serviceBaseUrl, 1600),
+      isCommandLikelyAvailable(imageGenerateCmd),
+    ]);
+
+    const profileData = await callAgentChatBridge({ action: "agent_profile" }).catch(
+      () => null,
+    );
+    const agentRecord = isRecord(profileData) && isRecord(profileData.agent)
+      ? profileData.agent
+      : null;
+    const owner = isRecord(profileData) && isRecord(profileData.owner)
+      ? profileData.owner
+      : null;
+    const ownerMainUserId =
+      owner && typeof owner.mainUserId === "string"
+        ? owner.mainUserId.trim()
+        : "";
+    const ownerHandle =
+      owner && typeof owner.handle === "string"
+        ? owner.handle.trim().replace(/^@+/u, "").toLowerCase()
+        : null;
+
+    if (!agentRecord) {
+      const state: VisualSetupCheckState = {
+        checkedAt,
+        ready: false,
+        ownerMainUserId: ownerMainUserId.length > 0 ? ownerMainUserId : null,
+        ownerHandle,
+        hasImage: false,
+        hasBanner: false,
+        missingPersonaRoles: [...REQUIRED_PERSONA_FRAME_ROLES],
+        setupGaps: ["agent profile unavailable"],
+        serviceReachable,
+        commandAvailable,
+        notificationState: "profile_unavailable",
+      };
+      await persistVisualSetupStatus(state);
+      return state;
+    }
+
+    const hasImage =
+      typeof agentRecord.image === "string" &&
+      agentRecord.image.trim().length > 0;
+    const hasBanner =
+      typeof agentRecord.banner === "string" &&
+      agentRecord.banner.trim().length > 0;
+    const requiredRoleSet = new Set<string>(REQUIRED_PERSONA_FRAME_ROLES);
+    const missingPersonaRoles = (() => {
+      const personaSetup = isRecord(agentRecord.personaSetup)
+        ? agentRecord.personaSetup
+        : null;
+      const rawMissingRoles = personaSetup && Array.isArray(personaSetup.missingRoles)
+        ? personaSetup.missingRoles
+        : [];
+      return rawMissingRoles
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim().toLowerCase())
+        .filter((value) => requiredRoleSet.has(value));
+    })();
+    const setupGaps: string[] = [];
+    if (!hasImage) setupGaps.push("avatar image missing");
+    if (!hasBanner) setupGaps.push("banner image missing");
+    if (missingPersonaRoles.length > 0) {
+      setupGaps.push(`persona frames missing (${missingPersonaRoles.join(", ")})`);
+    }
+    if (!serviceReachable && !commandAvailable) {
+      setupGaps.push("image generator unavailable / browser login not completed");
+    }
+
+    const pendingStateBase: Omit<VisualSetupCheckState, "notificationState"> = {
+      checkedAt,
+      ready: setupGaps.length === 0,
+      ownerMainUserId: ownerMainUserId.length > 0 ? ownerMainUserId : null,
+      ownerHandle,
+      hasImage,
+      hasBanner,
+      missingPersonaRoles,
+      setupGaps,
+      serviceReachable,
+      commandAvailable,
+    };
+
+    if (pendingStateBase.ready) {
+      await fs.rm(noticePath, { force: true }).catch(() => {});
+      await memory
+        .recordWrite({
+          type: "image_generator_setup_complete",
+          at: checkedAt,
+          ownerMainUserId: pendingStateBase.ownerMainUserId,
+          ownerHandle,
+          serviceReachable,
+          commandAvailable,
+        })
+        .catch(() => {});
+      const state: VisualSetupCheckState = {
+        ...pendingStateBase,
+        notificationState: "not_required",
+      };
+      await persistVisualSetupStatus(state);
+      return state;
+    }
+
+    if (!notifyEnabled) {
+      const state: VisualSetupCheckState = {
+        ...pendingStateBase,
+        notificationState: "disabled",
+      };
+      await persistVisualSetupStatus(state);
+      return state;
+    }
+
+    if (!ownerMainUserId.length) {
+      const state: VisualSetupCheckState = {
+        ...pendingStateBase,
+        notificationState: "owner_missing",
+      };
+      await persistVisualSetupStatus(state);
+      return state;
+    }
+
+    const reminderIntervalMs = (() => {
+      const raw = trimEnv("MG_AGENT_SETUP_REMINDER_INTERVAL_MS");
+      if (!raw) return 15 * 60_000;
+      const parsed = Number.parseInt(raw, 10);
+      if (!Number.isFinite(parsed)) return 15 * 60_000;
+      return Math.max(60_000, Math.min(24 * 60 * 60 * 1000, parsed));
+    })();
+    const existingNotice = await fs
+      .readFile(noticePath, "utf8")
+      .then((raw) => JSON.parse(raw) as unknown)
+      .catch(() => null);
+    const previousSignature =
+      isRecord(existingNotice) && typeof existingNotice.missingSignature === "string"
+        ? existingNotice.missingSignature
+        : "";
+    const lastNotifiedAtRaw =
+      isRecord(existingNotice) && typeof existingNotice.lastNotifiedAt === "string"
+        ? existingNotice.lastNotifiedAt
+        : isRecord(existingNotice) && typeof existingNotice.sentAt === "string"
+          ? existingNotice.sentAt
+          : "";
+    const lastNotifiedAtMs = (() => {
+      if (!lastNotifiedAtRaw.trim().length) return null;
+      const parsed = Date.parse(lastNotifiedAtRaw);
+      return Number.isFinite(parsed) ? parsed : null;
+    })();
+    const missingSignature = [
+      hasImage ? "image:ok" : "image:missing",
+      hasBanner ? "banner:ok" : "banner:missing",
+      `persona_missing:${missingPersonaRoles.join(",") || "none"}`,
+      serviceReachable ? "service:http_ok" : "service:http_missing",
+      commandAvailable ? "service:cmd_ok" : "service:cmd_missing",
+    ].join("|");
+    const shouldNotifyByTime =
+      lastNotifiedAtMs === null || Date.now() - lastNotifiedAtMs >= reminderIntervalMs;
+    const shouldNotifyByChange = missingSignature !== previousSignature;
+    if (!shouldNotifyByTime && !shouldNotifyByChange) {
+      const state: VisualSetupCheckState = {
+        ...pendingStateBase,
+        notificationState: "cooldown",
+      };
+      await persistVisualSetupStatus(state);
+      return state;
+    }
+
+    const openDmData = await callAgentChatBridge({
+      action: "open_dm",
+      otherMainUserId: ownerMainUserId,
+    }).catch(() => null);
+    const conversationId = (() => {
+      if (!isRecord(openDmData)) return null;
+      const directId =
+        typeof openDmData.id === "string" ? openDmData.id.trim() : "";
+      if (directId.length > 0) return directId;
+      const directConversationId =
+        typeof openDmData.conversationId === "string"
+          ? openDmData.conversationId.trim()
+          : "";
+      if (directConversationId.length > 0) return directConversationId;
+      const nestedConversation =
+        isRecord(openDmData.conversation) ? openDmData.conversation : null;
+      if (
+        nestedConversation &&
+        typeof nestedConversation.id === "string" &&
+        nestedConversation.id.trim().length > 0
+      ) {
+        return nestedConversation.id.trim();
+      }
+      return null;
+    })();
+    if (!conversationId) {
+      const state: VisualSetupCheckState = {
+        ...pendingStateBase,
+        notificationState: "conversation_unavailable",
+      };
+      await persistVisualSetupStatus(state);
+      return state;
+    }
+
+    const guideUrl = `${chatApiBaseUrl}${AGENT_KTHX_GUIDE_PATH}`;
+    const setupMessage = [
+      `Heads up${ownerHandle ? ` @${ownerHandle}` : ""}: required visual setup is still incomplete.`,
+      `Missing right now: ${setupGaps.join("; ")}.`,
+      `Guide source (AGENT-KTHX markdown): ${guideUrl}.`,
+      `Store/update it at: \`${agentGuideLocalPath}\`.`,
+      `Quick fetch command: \`curl -fsSL ${guideUrl} -o ${agentGuideLocalPath}\`.`,
+      !serviceReachable && !commandAvailable
+        ? "Image generator is not ready yet. Install/start it from the guide, then complete the first browser OpenAI login."
+        : "Image generator looks reachable. Next step: generate avatar, banner, and persona reference frames (selfie, midshot, fullbody).",
+      "This reminder will continue until avatar, banner, and persona setup are complete.",
+    ].join(" ");
+
+    const delivered = await callAgentChatBridge({
+      action: "send_message",
+      conversationId,
+      body: setupMessage,
+      format: "markdown",
+      metadata: {
+        automated: true,
+        sourceContext: "SYSTEM",
+        setupEvent: "image_persona_setup_required",
+        requiredPersonaFrameRoles: REQUIRED_PERSONA_FRAME_ROLES,
+        missingPersonaFrameRoles: missingPersonaRoles,
+        hasImage,
+        hasBanner,
+        serviceReachable,
+        commandAvailable,
+      },
+    })
+      .then(() => true)
+      .catch(() => false);
+    if (!delivered) {
+      const state: VisualSetupCheckState = {
+        ...pendingStateBase,
+        notificationState: "delivery_failed",
+      };
+      await persistVisualSetupStatus(state);
+      return state;
+    }
+
+    await fs.mkdir(path.dirname(noticePath), { recursive: true }).catch(() => {});
+    await fs
+      .writeFile(
+        noticePath,
+        `${JSON.stringify(
+          {
+            lastNotifiedAt: checkedAt,
+            missingSignature,
+            setupGaps,
+            ownerMainUserId,
+            ownerHandle,
+            conversationId,
+            serviceBaseUrl,
+            imageGenerateCmdPreview: imageGenerateCmd?.slice(0, 220) ?? null,
+            hasImage,
+            hasBanner,
+            missingPersonaRoles,
+            requiredPersonaFrameRoles: REQUIRED_PERSONA_FRAME_ROLES,
+            serviceReachable,
+            commandAvailable,
+            notificationState: "sent",
+          },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      )
+      .catch(() => {});
+
+    await memory
+      .recordWrite({
+        type: "image_generator_setup_owner_notified",
+        at: checkedAt,
+        ownerMainUserId,
+        ownerHandle,
+        conversationId,
+        serviceBaseUrl,
+        hasImage,
+        hasBanner,
+        missingPersonaRoles,
+        serviceReachable,
+        commandAvailable,
+      })
+      .catch(() => {});
+
+    const state: VisualSetupCheckState = {
+      ...pendingStateBase,
+      notificationState: "sent",
+    };
+    await persistVisualSetupStatus(state);
+    return state;
+  };
+
   const resolveGrantCandidates = (permissionState: unknown): GrantState[] => {
     const now = Date.now();
     const candidates = parseGrantCandidatesFromPermissionState(permissionState);
@@ -2401,8 +2856,10 @@ const main = async (): Promise<void> => {
     touchWake,
   });
   ctx.directiveManager = directiveManager;
-  triggerAutoCreditPlanner?.({ trigger: "runtime_startup" });
-  triggerAutoPostingPlanner?.({ trigger: "runtime_startup" });
+  const triggerStartupAutoPlanners = (): void => {
+    triggerAutoCreditPlanner?.({ trigger: "runtime_startup" });
+    triggerAutoPostingPlanner?.({ trigger: "runtime_startup" });
+  };
 
   // -- ChatManager
   const chatManager = new ChatManager({
@@ -2496,6 +2953,66 @@ const main = async (): Promise<void> => {
         error: msg,
       });
     });
+  }
+
+  const visualSetupEnforcementEnabled =
+    (trimEnv("MG_AGENT_ENFORCE_VISUAL_SETUP") ?? "1") !== "0";
+  let startupAutoPlannersTriggered = false;
+  const runStartupAutoPlannersOnce = (reason: string): void => {
+    if (startupAutoPlannersTriggered) return;
+    startupAutoPlannersTriggered = true;
+    triggerStartupAutoPlanners();
+    void memory
+      .recordWrite({
+        type: "runtime_startup_auto_planners_triggered",
+        at: nowIso(),
+        reason,
+      })
+      .catch(() => {});
+  };
+  if (visualSetupEnforcementEnabled) {
+    const initialVisualSetupState = await notifyOwnerImageGeneratorSetupIfNeeded().catch(
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        void memory.recordWrite({
+          type: "image_generator_setup_owner_notify_failed",
+          at: nowIso(),
+          error: message,
+        });
+        return null;
+      },
+    );
+    if (initialVisualSetupState?.ready) {
+      runStartupAutoPlannersOnce("visual_setup_ready");
+    } else {
+      void memory
+        .recordWrite({
+          type: "visual_setup_pending_runtime_startup",
+          at: nowIso(),
+          visualSetupReady: false,
+          notificationState: initialVisualSetupState?.notificationState ?? "profile_unavailable",
+          setupGaps: initialVisualSetupState?.setupGaps ?? ["agent profile unavailable"],
+        })
+        .catch(() => {});
+    }
+    setInterval(() => {
+      void notifyOwnerImageGeneratorSetupIfNeeded()
+        .then((state) => {
+          if (state.ready) {
+            runStartupAutoPlannersOnce("visual_setup_ready_after_reminder");
+          }
+        })
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          void memory.recordWrite({
+            type: "image_generator_setup_owner_notify_failed",
+            at: nowIso(),
+            error: message,
+          });
+        });
+    }, VISUAL_SETUP_CHECK_INTERVAL_MS);
+  } else {
+    runStartupAutoPlannersOnce("visual_setup_enforcement_disabled");
   }
 
   // -- Start
