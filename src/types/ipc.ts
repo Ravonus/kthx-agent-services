@@ -100,6 +100,7 @@ export type Command = {
   grantId: string | null;
   payload: Record<string, unknown> | null;
   sig: string | null;
+  targetAgentId?: string | null;
   sourceDirectiveId: string | null;
   pendingDirectiveId: string | null;
   actionNonce: string | null;

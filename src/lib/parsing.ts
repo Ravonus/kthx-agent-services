@@ -178,6 +178,11 @@ export const parseCommand = (value: unknown): Command | null => {
     typeof value.sig === "string" && value.sig.trim().length
       ? value.sig.trim()
       : null;
+  const targetAgentId =
+    typeof value.targetAgentId === "string" &&
+    value.targetAgentId.trim().length
+      ? value.targetAgentId.trim()
+      : null;
   const sourceDirectiveId =
     typeof value.sourceDirectiveId === "string" &&
     value.sourceDirectiveId.trim().length
@@ -216,6 +221,7 @@ export const parseCommand = (value: unknown): Command | null => {
     grantId,
     payload: isRecord(value.payload) ? value.payload : null,
     sig,
+    targetAgentId,
     sourceDirectiveId,
     pendingDirectiveId,
     actionNonce,

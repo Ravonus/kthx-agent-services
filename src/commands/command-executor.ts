@@ -113,6 +113,8 @@ const POST_VARIETY_HISTORY_MAX_ITEMS = 80;
 const POST_VARIETY_RECENT_COOLDOWN_COUNT = 2;
 const POST_DISCOVERY_SIGNAL_MAX_LINES = 8;
 const POST_DISCOVERY_SIGNAL_MAX_LENGTH = 1200;
+const ENFORCE_PERMISSION_HINT_FILTERS =
+  (process.env.MG_AGENT_ENFORCE_PERMISSION_HINT_FILTERS ?? "0") === "1";
 const POST_VARIETY_HINT_PATTERNS: ReadonlyArray<{
   mode: PostVarietyMode;
   weight: number;
@@ -1329,9 +1331,34 @@ export class CommandExecutor {
     string,
     { expiresAtMs: number; candidate: EngagementTargetCandidate }
   >();
+  private runtimeAgentIdCache: string | null = null;
+  private runtimeAgentIdCheckedAtMs = 0;
 
   constructor(ctx: CommandExecutorContext) {
     this.ctx = ctx;
+  }
+
+  private async resolveRuntimeAgentId(): Promise<string | null> {
+    const nowMs = Date.now();
+    if (nowMs - this.runtimeAgentIdCheckedAtMs < 60_000) {
+      return this.runtimeAgentIdCache;
+    }
+    this.runtimeAgentIdCheckedAtMs = nowMs;
+    const queryFn = this.ctx.trpc?.realtime?.authState?.query;
+    if (typeof queryFn !== "function") {
+      return this.runtimeAgentIdCache;
+    }
+    try {
+      const authState = await queryFn();
+      const userId =
+        isRecord(authState) && typeof authState.userId === "string"
+          ? authState.userId.trim()
+          : "";
+      this.runtimeAgentIdCache = userId.length > 0 ? userId : null;
+    } catch {
+      // best-effort cache refresh
+    }
+    return this.runtimeAgentIdCache;
   }
 
   private async recordCommandLifecycleCheckpoint(input: {
@@ -2114,7 +2141,10 @@ export class CommandExecutor {
     return null;
   }
 
-  private resolvePersonaReferencePlan(payload: Record<string, unknown>): PersonaReferencePlan {
+  private resolvePersonaReferencePlan(
+    payload: Record<string, unknown>,
+    mainPersonaSlugRaw: string | null = null,
+  ): PersonaReferencePlan {
     const context = isRecord(payload.context) ? payload.context : null;
     const explicitCandidates: unknown[] = [
       payload.mediaPersona,
@@ -2145,7 +2175,8 @@ export class CommandExecutor {
     const selfIntent = PERSONA_SELF_REFERENCE_PROMPT_PATTERN.test(promptText);
     const personaIntent = selfIntent || PERSONA_REQUEST_PROMPT_PATTERN.test(promptText);
     const variantKey = this.resolvePersonaVariantKeyFromPrompt(promptText);
-    const mainPersonaSlug = DEFAULT_MAIN_PERSONA_SLUG;
+    const mainPersonaSlug =
+      this.normalizePersonaSlug(mainPersonaSlugRaw) ?? DEFAULT_MAIN_PERSONA_SLUG;
 
     if (nonGenericExplicitSlug) {
       return {
@@ -2186,6 +2217,31 @@ export class CommandExecutor {
   private shouldUsePersonaFrameReferences(plan: PersonaReferencePlan): boolean {
     if (!plan.enabled) return false;
     return !this.isGenericPersonaSlug(plan.targetPersonaSlug);
+  }
+
+  private async resolveMainPersonaSlugFromBridge(): Promise<string | null> {
+    if (!this.ctx.callAgentChatBridge) return null;
+    try {
+      const profileResult = await this.callAgentBridgeLookupCached({
+        action: "agent_profile",
+      });
+      const profileRecord = isRecord(profileResult.value) ? profileResult.value : null;
+      const agentRecord =
+        profileRecord && isRecord(profileRecord.agent) ? profileRecord.agent : null;
+      const candidateValues: unknown[] = [
+        agentRecord?.mainPersonaSlug,
+        agentRecord?.mainRealismPersonaSlug,
+        profileRecord?.mainPersonaSlug,
+        profileRecord?.mainRealismPersonaSlug,
+      ];
+      for (const candidate of candidateValues) {
+        const normalized = this.normalizePersonaSlug(candidate);
+        if (normalized) return normalized;
+      }
+    } catch {
+      // best-effort lookup only
+    }
+    return null;
   }
 
   private collectPersonaSeedReferenceInputs(input: {
@@ -2732,7 +2788,11 @@ export class CommandExecutor {
     command: Command;
     fallbackReferenceInputs: string[];
   }): Promise<PersonaReferenceResolution> {
-    const plan = this.resolvePersonaReferencePlan(input.payload);
+    const resolvedMainPersonaSlug = await this.resolveMainPersonaSlugFromBridge();
+    const plan = this.resolvePersonaReferencePlan(
+      input.payload,
+      resolvedMainPersonaSlug,
+    );
     if (!this.shouldUsePersonaFrameReferences(plan)) {
       return {
         personaSlug: null,
@@ -2882,6 +2942,33 @@ export class CommandExecutor {
         inboxFile,
       },
     });
+    const targetAgentId = asNonEmptyString(command.targetAgentId);
+    if (targetAgentId) {
+      const runtimeAgentId = await this.resolveRuntimeAgentId();
+      if (
+        runtimeAgentId &&
+        runtimeAgentId.length > 0 &&
+        runtimeAgentId !== targetAgentId
+      ) {
+        const mismatchReason = `target_agent_mismatch:${targetAgentId}:${runtimeAgentId}`;
+        await this.ctx.memory
+          .recordWrite({
+            type: "inbox_command_target_agent_mismatch",
+            at: nowIso(),
+            inboxFile,
+            commandId: command.id,
+            kind: command.kind,
+            targetAgentId,
+            runtimeAgentId,
+            reason: mismatchReason,
+          })
+          .catch(() => undefined);
+        await this.markQueueItemNotReadyByInbox(inboxFile, mismatchReason).catch(
+          () => undefined,
+        );
+        return false;
+      }
+    }
 
     let commandSigVerified = false;
     if (this.ctx.controlKey) {
@@ -3141,7 +3228,7 @@ export class CommandExecutor {
     if (pendingRaw.status !== "ok" || !isRecord(pendingRaw.value)) return;
 
     const pendingDoc: Record<string, unknown> = {
-      ...(pendingRaw.value as Record<string, unknown>),
+      ...pendingRaw.value,
     };
     const status = this.resolvePendingDirectiveTerminalStatus(outcome);
     const updatedAt = nowIso();
@@ -9207,13 +9294,16 @@ export class CommandExecutor {
         ? null
         : await this.buildGenerateInputWithRuntimeContext(payload, command);
     const generateInput =
-      generateInputRaw && inlineDrafts.length === 0
+      ENFORCE_PERMISSION_HINT_FILTERS &&
+      generateInputRaw &&
+      inlineDrafts.length === 0
         ? this.applyPermissionGenerateInputConstraints(
             generateInputRaw,
             payload.permissionState,
           )
         : generateInputRaw;
     if (
+      ENFORCE_PERMISSION_HINT_FILTERS &&
       generateInputRaw &&
       generateInput &&
       generateInput !== generateInputRaw
@@ -9234,6 +9324,38 @@ export class CommandExecutor {
           constrainedKind: asNonEmptyString(generateInput.kind),
         })
         .catch(() => undefined);
+    }
+    const constrainedGenerateKinds =
+      generateInput && Array.isArray(generateInput.kinds)
+        ? generateInput.kinds
+            .map((entry) => asNonEmptyString(entry)?.trim().toLowerCase() ?? "")
+            .filter((entry) => entry.length > 0)
+        : null;
+    if (
+      ENFORCE_PERMISSION_HINT_FILTERS &&
+      !inlineDrafts.length &&
+      generateInputRaw &&
+      generateInput &&
+      generateInput !== generateInputRaw &&
+      constrainedGenerateKinds !== null &&
+      constrainedGenerateKinds.length === 0
+    ) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "generate_blocked_by_permissions",
+          at: nowIso(),
+          commandId: command.id,
+          sourceDirectiveId: command.sourceDirectiveId ?? null,
+          originalKinds: Array.isArray(generateInputRaw.kinds)
+            ? generateInputRaw.kinds
+            : [],
+        })
+        .catch(() => undefined);
+      return this.failedOutcome(
+        command,
+        "No permission-allowed generation actions are available right now.",
+        "no_permitted_generate_kind",
+      );
     }
     let generatedResult: unknown = null;
     if (!inlineDrafts.length) {
@@ -9269,13 +9391,16 @@ export class CommandExecutor {
         : drafts.filter(
             (draft) => draft.action.trim().toLowerCase() === enforcedDraftAction,
           );
-    const permissionFilteredDrafts = executableDrafts.filter((draft) =>
-      this.isGeneratedDraftAllowedByPermissionState(
-        draft,
-        payload.permissionState,
-      ),
-    );
+    const permissionFilteredDrafts = ENFORCE_PERMISSION_HINT_FILTERS
+      ? executableDrafts.filter((draft) =>
+          this.isGeneratedDraftAllowedByPermissionState(
+            draft,
+            payload.permissionState,
+          ),
+        )
+      : executableDrafts;
     if (
+      ENFORCE_PERMISSION_HINT_FILTERS &&
       executableDrafts.length > 0 &&
       permissionFilteredDrafts.length !== executableDrafts.length
     ) {
@@ -13407,6 +13532,8 @@ export class CommandExecutor {
       comment: boolean;
       like: boolean;
       repost: boolean;
+      imageGenerate: boolean;
+      textGenerate: boolean;
     };
   } {
     const canState = isRecord(permissionState)
@@ -13416,6 +13543,13 @@ export class CommandExecutor {
       if (!canState || typeof canState[key] !== "boolean") return null;
       return canState[key] === true;
     };
+    const readBooleanAlias = (keys: string[]): boolean | null => {
+      for (const key of keys) {
+        const value = readBoolean(key);
+        if (typeof value === "boolean") return value;
+      }
+      return null;
+    };
     const values = {
       postMedia: readBoolean("postMedia"),
       postText: readBoolean("postText"),
@@ -13423,6 +13557,18 @@ export class CommandExecutor {
       comment: readBoolean("comment"),
       like: readBoolean("like"),
       repost: readBoolean("repost"),
+      imageGenerate: readBooleanAlias([
+        "imageGenerate",
+        "generateImage",
+        "image_generate",
+        "generate_image",
+      ]),
+      textGenerate: readBooleanAlias([
+        "textGenerate",
+        "generateText",
+        "text_generate",
+        "generate_text",
+      ]),
     };
     return {
       hasHints: Object.values(values).some(
@@ -13435,6 +13581,8 @@ export class CommandExecutor {
         comment: values.comment === true,
         like: values.like === true,
         repost: values.repost === true,
+        imageGenerate: values.imageGenerate !== false,
+        textGenerate: values.textGenerate !== false,
       },
     };
   }
@@ -13447,15 +13595,19 @@ export class CommandExecutor {
     if (!permission.hasHints || kinds.length === 0) return kinds;
     const allowed = new Set<string>();
     if (permission.can.postMedia || permission.can.postText) {
-      allowed.add("thread");
-      allowed.add("media");
-      allowed.add("multi_media");
+      if (permission.can.textGenerate) {
+        allowed.add("thread");
+      }
+      if (permission.can.imageGenerate) {
+        allowed.add("media");
+        allowed.add("multi_media");
+      }
     }
-    if (permission.can.story) allowed.add("story");
-    if (permission.can.comment) allowed.add("comment");
-    if (permission.can.like) allowed.add("like");
+    if (permission.can.story && permission.can.imageGenerate) allowed.add("story");
+    if (permission.can.comment && permission.can.textGenerate) allowed.add("comment");
+    if (permission.can.like && permission.can.textGenerate) allowed.add("like");
     if (permission.can.repost) allowed.add("repost");
-    if (allowed.size === 0) return kinds;
+    if (allowed.size === 0) return [];
 
     const filtered = kinds.filter((kind) => allowed.has(kind));
     if (filtered.length > 0) return filtered.slice(0, 6);
@@ -14027,7 +14179,7 @@ export class CommandExecutor {
                 headerMime && headerMime.trim().length > 0
                   ? headerMime
                   : inferMimeTypeFromUrl(trimmed) ?? "application/octet-stream";
-              const mime = mimeRaw.split(";", 1)[0]?.trim() || "application/octet-stream";
+              const mime = mimeRaw.split(";", 1)[0]?.trim() ?? "application/octet-stream";
               const parsedUrl = new URL(trimmed);
               const baseName = path.basename(parsedUrl.pathname).trim();
               const filename =

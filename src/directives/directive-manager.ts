@@ -315,6 +315,11 @@ export class DirectiveManager implements DirectiveManagerLike {
 
     const createdAt = typeof directive.createdAt === "string" && directive.createdAt.trim().length
       ? (directive.createdAt as string).trim() : nowIso();
+    const targetAgentId =
+      typeof directive.agentId === "string" &&
+      directive.agentId.trim().length > 0
+        ? directive.agentId.trim()
+        : null;
     const directiveGrantId = typeof directive.grantId === "string" && directive.grantId.trim().length
       ? (directive.grantId as string).trim() : null;
     const commandPayload = isRecord(directive.payload)
@@ -332,6 +337,7 @@ export class DirectiveManager implements DirectiveManagerLike {
       grantId: directiveGrantId,
       payload: commandPayload,
       sig: null,
+      targetAgentId,
       sourceDirectiveId: id,
       pendingDirectiveId: null,
       actionNonce,
@@ -494,9 +500,14 @@ export class DirectiveManager implements DirectiveManagerLike {
       const forceNow = resolveForceNowFromPayload(sourcePayload);
       const createdAt = typeof pendingDoc.createdAt === "string" && pendingDoc.createdAt.trim().length > 0
         ? pendingDoc.createdAt.trim() : nowIso();
+      const pendingTargetAgentId =
+        typeof pendingDoc.agentId === "string" && pendingDoc.agentId.trim().length > 0
+          ? pendingDoc.agentId.trim()
+          : null;
       const baseCommand: Command = {
         id: pendingId, createdAt, kind: sourceKind, grantId: null,
         payload: sourcePayload as Record<string, unknown>, sig: null,
+        targetAgentId: pendingTargetAgentId,
         sourceDirectiveId: pendingId, pendingDirectiveId: pendingId,
         actionNonce: null, challenge: null, forceNow,
         runtimeSessionId: null, runtimeOrigin: null, runtimeSig: null,

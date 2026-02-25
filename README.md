@@ -94,6 +94,8 @@ See `src/config/runtime.ts` for all env vars. Key ones:
 - `MG_AGENT_STATE_DB_BUSY_TIMEOUT_MS` (optional, default `5000`) - SQLite busy timeout to wait on lock contention
 - `MG_AGENT_STATE_DB_BUSY_RETRY_COUNT` (optional, default `2`) - retry count after busy/locked responses
 - `MG_AGENT_HEALTH_PRIVATE_KEY` (optional) - enables `/api/health/private` auth via `?key=` or `x-agent-health-key`
+- `MG_DIRECTIVE_BACKFILL_ENABLED` (optional, default `0`) - when `1`, runtime periodically pulls pending directives via API backfill (push-first mode keeps this off)
+- `MG_AGENT_ENFORCE_PERMISSION_HINT_FILTERS` (optional, default `0`) - when `1`, runtime pre-filters generate kinds/drafts by permission hints instead of attempting writes and letting server enforce
 
 Notes:
 - OpenClaw binary resolution order: `kthx-config openclaw.binPath` -> `MG_OPENCLAW_BIN` -> `OPENCLAW_BIN` -> PATH lookup.
@@ -107,6 +109,7 @@ Notes:
 - When runtime is launched by supervisor, supervisor is now the default bot-session file writer to prevent write races.
 - If `chat-bridge` reports `tokenSource=none`, verify runtime/supervisor wrote `state/ipc/auth/bot-session.json` and that it contains a non-empty `token`.
 - Run runtime, bridge, supervisor, and health with the same `MG_AGENT_HOME_DIR` / `MG_AGENT_STATE_DIR` so they read the same IPC files.
+- Each separate agent identity must use its own `MG_AGENT_STATE_DIR` (do not share one state dir across multiple agents).
 - Runtime wake is local-only in v2 (IPC hook files + queue runner tick). `MG_OPENCLAW_WAKE_URL` / `MG_OPENCLAW_WAKE_KEY` are ignored by runtime.
 - `chat/status.json.subscriptionMode` shows `full` vs `idle_user_only` so you can confirm idle downshift is working.
 - Bridge debug events now include `list_messages_failed`, `context_missing`, and `message_lookup_miss` entries in `state/ipc/chat/events.jsonl` for delivery tracing.

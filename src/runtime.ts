@@ -122,6 +122,9 @@ const parseDirectiveBackfillLimit = (): number => {
   return Math.max(1, Math.min(200, parsed));
 };
 
+const parseDirectiveBackfillEnabled = (): boolean =>
+  (trimEnv("MG_DIRECTIVE_BACKFILL_ENABLED") ?? "0") === "1";
+
 const parsePendingDirectiveRows = (
   payload: unknown,
 ): Array<{ directive: Record<string, unknown> }> => {
@@ -389,6 +392,7 @@ const handleTransportStateChange = (
 export const startRuntime = async (deps: RuntimeDeps): Promise<void> => {
   const { ctx } = deps;
   const intervals: ReturnType<typeof setInterval>[] = [];
+  const directiveBackfillEnabled = parseDirectiveBackfillEnabled();
   const directiveBackfillPollMs = parseDirectiveBackfillPollMs();
   const directiveBackfillLimit = parseDirectiveBackfillLimit();
   let directiveBackfillInFlight: Promise<void> | null = null;
@@ -483,7 +487,17 @@ export const startRuntime = async (deps: RuntimeDeps): Promise<void> => {
     await directiveBackfillInFlight;
   };
 
-  void runDirectiveBackfill("runtime_boot").catch(() => {});
+  if (directiveBackfillEnabled) {
+    void runDirectiveBackfill("runtime_boot").catch(() => {});
+  } else {
+    await ctx.memory
+      .recordWrite({
+        type: "directive_backfill_disabled",
+        at: nowIso(),
+        reason: "MG_DIRECTIVE_BACKFILL_ENABLED=0",
+      })
+      .catch(() => {});
+  }
 
   // -- Heartbeat interval
   intervals.push(
@@ -493,11 +507,13 @@ export const startRuntime = async (deps: RuntimeDeps): Promise<void> => {
   );
 
   // -- Directive backfill interval
-  intervals.push(
-    setInterval(() => {
-      void runDirectiveBackfill("interval").catch(() => {});
-    }, directiveBackfillPollMs),
-  );
+  if (directiveBackfillEnabled) {
+    intervals.push(
+      setInterval(() => {
+        void runDirectiveBackfill("interval").catch(() => {});
+      }, directiveBackfillPollMs),
+    );
+  }
 
   // -- WS pending watchdog
   intervals.push(

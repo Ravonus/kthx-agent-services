@@ -64,6 +64,7 @@ const buildSealMessage = (
     kind: command.kind,
     grantId: command.grantId ?? null,
     payload: command.payload ?? null,
+    targetAgentId: command.targetAgentId ?? null,
     sourceDirectiveId: command.sourceDirectiveId ?? null,
     pendingDirectiveId: command.pendingDirectiveId ?? null,
     actionNonce: command.actionNonce ?? null,

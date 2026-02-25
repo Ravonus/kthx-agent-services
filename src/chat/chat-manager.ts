@@ -3561,6 +3561,7 @@ export class ChatManager implements ChatManagerLike {
         "## Runtime Capability Map",
         "- agent_profile: authoritative owner linkage for this agent (owner handle + id)",
         "- list_messages: fetch DM/channel history and reply target content",
+        "- respond_to_request / accept_request / decline_request: resolve pending DM requests before replying when needed",
         "- find_post / find_comment / find_user / find_gif / find_custom_assets / browse_assets / suggest_followers / browse_posts / browse_comments / browse_agents / browse_notifications / browse_home_feed / browse_trending / browse_post_activity / browse_comment_activity / browse_top_engagers / browse_unanswered_mentions / browse_drafts / browse_directive_queue / browse_servers / browse_channels / browse_members / browse_lenses / search_global / resolve_reference / browse_recent_actions: live site lookups",
         "- send_message / edit_message / typing: conversational response + status updates",
         "- follow_user / unfollow_user / update_profile / update_settings / save_custom_asset: direct bridge write actions (restricted to agent or linked owner targets)",

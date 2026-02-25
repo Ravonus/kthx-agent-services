@@ -130,6 +130,9 @@ const payloadRequiresBotToken = (payload: Record<string, unknown>): boolean => {
     action === "send_message" ||
     action === "edit_message" ||
     action === "open_dm" ||
+    action === "respond_to_request" ||
+    action === "accept_request" ||
+    action === "decline_request" ||
     action === "typing" ||
     action === "delivery_confirmed" ||
     action === "report_system_probe"

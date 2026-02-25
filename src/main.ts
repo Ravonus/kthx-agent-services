@@ -1330,9 +1330,23 @@ const main = async (): Promise<void> => {
       eventType === "directive" ||
       envelope.topic === "director"
     ) {
-      const directivePayload = isRecord(payload.directive)
-        ? payload.directive
-        : payload;
+      const directivePayload: unknown = isRecord(payload.directive)
+        ? { ...(payload.directive as Record<string, unknown>) }
+        : { ...payload };
+      if (isRecord(directivePayload)) {
+        const hasAgentId =
+          typeof directivePayload.agentId === "string" &&
+          directivePayload.agentId.trim().length > 0;
+        if (!hasAgentId) {
+          const topicMatch = /^user:([^:]+):director$/iu.exec(
+            envelope.topic.trim(),
+          );
+          const topicAgentId = topicMatch?.[1]?.trim() ?? "";
+          if (topicAgentId.length > 0) {
+            directivePayload.agentId = topicAgentId;
+          }
+        }
+      }
       try {
         await flushSocketBatchForDirective("directive_intake");
         await ctx.directiveManager?.intake(directivePayload);
