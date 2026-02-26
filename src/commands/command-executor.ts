@@ -48,8 +48,7 @@ import type { QueueState } from "../types/ipc.js";
 import type { Command } from "../types/ipc.js";
 import type { ContextBundle, ContextRequest } from "../types/memory.js";
 
-const MEDIA_FILE_RE =
-  /\.(png|jpe?g|webp|gif|svg|mp4|mov|webm|pdf|csv|txt|md|json|js)$/iu;
+const MEDIA_FILE_RE = /\.(png|jpe?g|webp|gif|svg|mp4|mov|webm|avif)$/iu;
 const MAX_MEDIA_REFERENCE_INPUTS = 8;
 const MAX_COLLECTED_REFERENCE_INPUTS = 12;
 const PERSONA_REFERENCE_FRAME_ROLES = ["selfie", "midshot", "fullbody"] as const;
@@ -952,11 +951,22 @@ const parseDataUriPayload = (
   value: string,
 ): { mime: string; data: string } | null => {
   const trimmed = value.trim();
-  const match = /^data:([^;]+);base64,(.+)$/iu.exec(trimmed);
-  if (!match) return null;
-  const mime = match[1]?.trim().toLowerCase() ?? "";
-  const data = match[2]?.trim() ?? "";
-  if (!mime.length || !data.length) return null;
+  if (!trimmed.startsWith("data:")) return null;
+  const commaIndex = trimmed.indexOf(",");
+  if (commaIndex <= "data:".length) return null;
+  const metadataRaw = trimmed.slice("data:".length, commaIndex).trim();
+  const data = trimmed.slice(commaIndex + 1).trim();
+  if (!metadataRaw.length || !data.length) return null;
+  const metadataParts = metadataRaw
+    .split(";")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  const mime = metadataParts[0]?.toLowerCase() ?? "";
+  if (!mime.length || !/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/u.test(mime)) return null;
+  const hasBase64 = metadataParts
+    .slice(1)
+    .some((part) => part.toLowerCase() === "base64");
+  if (!hasBase64) return null;
   return { mime, data };
 };
 
@@ -1391,6 +1401,37 @@ export class CommandExecutor {
     return "unknown";
   }
 
+  private resolveCommandSourceDirectiveId(input: {
+    command: Command;
+    payload?: Record<string, unknown> | null;
+  }): string | null {
+    const explicitSourceDirectiveId =
+      asNonEmptyString(input.payload?.sourceDirectiveId) ??
+      asNonEmptyString(input.command.sourceDirectiveId) ??
+      asNonEmptyString(input.command.pendingDirectiveId);
+    if (explicitSourceDirectiveId) return explicitSourceDirectiveId;
+
+    const runtimeOrigin =
+      asNonEmptyString(input.command.runtimeOrigin)?.trim().toLowerCase() ?? "";
+    const isDirectiveRuntimeOrigin =
+      runtimeOrigin === "director_directive" ||
+      runtimeOrigin === "pending_promotion" ||
+      runtimeOrigin === "runtime_resealed";
+    if (!isDirectiveRuntimeOrigin) return null;
+    return asNonEmptyString(input.command.id) ?? null;
+  }
+
+  private resolveCommandSourceDirectiveActionNonce(input: {
+    command: Command;
+    payload?: Record<string, unknown> | null;
+  }): string | null {
+    return (
+      asNonEmptyString(input.payload?.sourceDirectiveActionNonce) ??
+      asNonEmptyString(input.command.actionNonce) ??
+      null
+    );
+  }
+
   private async recordCommandLifecycleCheckpoint(input: {
     command: Command;
     stage: CommandLifecycleCheckpointStage;
@@ -1400,13 +1441,15 @@ export class CommandExecutor {
   }): Promise<void> {
     const payload = isRecord(input.command.payload) ? input.command.payload : null;
     const chatContext = isRecord(payload?.chatContext) ? payload.chatContext : null;
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command: input.command,
+      payload,
+    });
     const runtimeAgentId = await this.resolveRuntimeAgentId().catch(() => null);
     const agentId =
       asNonEmptyString(input.command.targetAgentId) ?? runtimeAgentId ?? null;
     const directiveId =
-      asNonEmptyString(input.command.sourceDirectiveId) ??
-      asNonEmptyString(input.command.pendingDirectiveId) ??
-      null;
+      sourceDirectiveId ?? asNonEmptyString(input.command.pendingDirectiveId) ?? null;
     const conversationId =
       asNonEmptyString(chatContext?.conversationId) ??
       asNonEmptyString(payload?.conversationId) ??
@@ -1432,7 +1475,7 @@ export class CommandExecutor {
         directiveId,
         commandId: input.command.id,
         commandKind: input.command.kind,
-        sourceDirectiveId: input.command.sourceDirectiveId ?? null,
+        sourceDirectiveId,
         pendingDirectiveId: input.command.pendingDirectiveId ?? null,
         actionNonce: input.command.actionNonce ?? null,
         requestOrigin: this.resolveCommandRequestOrigin(input.command, payload),
@@ -2413,6 +2456,11 @@ export class CommandExecutor {
   private isImageMimeType(value: string | null | undefined): boolean {
     const normalized = asNonEmptyString(value)?.trim().toLowerCase() ?? "";
     return normalized.startsWith("image/");
+  }
+
+  private isUploadableMediaMimeType(value: string | null | undefined): boolean {
+    const normalized = asNonEmptyString(value)?.trim().toLowerCase() ?? "";
+    return normalized.startsWith("image/") || normalized.startsWith("video/");
   }
 
   private isLikelyImageReference(
@@ -3509,6 +3557,11 @@ export class CommandExecutor {
     const pendingDoc: Record<string, unknown> = {
       ...pendingRaw.value,
     };
+    const payload = isRecord(command.payload) ? command.payload : null;
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command,
+      payload,
+    });
     const status = this.resolvePendingDirectiveTerminalStatus(outcome);
     const updatedAt = nowIso();
     pendingDoc.status = status;
@@ -3516,7 +3569,7 @@ export class CommandExecutor {
     pendingDoc.lastRuntimeOutcome = {
       at: updatedAt,
       commandId: command.id,
-      sourceDirectiveId: command.sourceDirectiveId ?? null,
+      sourceDirectiveId,
       pendingDirectiveId,
       ok: !outcome || outcome.ok,
       error: outcome && !outcome.ok ? outcome.error?.message ?? null : null,
@@ -3617,7 +3670,10 @@ export class CommandExecutor {
 
     const commandId = asNonEmptyString(input.command.id);
     if (!commandId) return null;
-    const sourceDirectiveId = asNonEmptyString(input.command.sourceDirectiveId);
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command: input.command,
+      payload: isRecord(input.command.payload) ? input.command.payload : null,
+    });
     const pendingDirectiveId = asNonEmptyString(input.command.pendingDirectiveId);
     const runtimeOrigin = asNonEmptyString(input.command.runtimeOrigin)?.toLowerCase() ?? "";
     const trustedDirectiveOrigin =
@@ -3687,7 +3743,10 @@ export class CommandExecutor {
       runtimeOrigin === "pending_promotion" ||
       runtimeOrigin === "runtime_resealed";
     if (!trustedOrigin) return false;
-    const sourceDirectiveId = asNonEmptyString(command.sourceDirectiveId);
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command,
+      payload: isRecord(command.payload) ? command.payload : null,
+    });
     const pendingDirectiveId = asNonEmptyString(command.pendingDirectiveId);
     const directiveLinked =
       sourceDirectiveId === commandId || pendingDirectiveId === commandId;
@@ -3745,7 +3804,11 @@ export class CommandExecutor {
     commentId: number | null;
     commentBody?: string | null;
   }): string {
-    const directiveId = input.command.sourceDirectiveId ?? input.command.id;
+    const directiveId =
+      this.resolveCommandSourceDirectiveId({
+        command: input.command,
+        payload: isRecord(input.command.payload) ? input.command.payload : null,
+      }) ?? input.command.id;
     const targetHash = buildTargetHash({
       postId: input.postId,
       commentId: input.commentId,
@@ -3826,7 +3889,11 @@ export class CommandExecutor {
     }
     stateDb.upsertCommandLifecycle({
       commandId: input.command.id,
-      directiveId: input.command.sourceDirectiveId ?? input.command.id,
+      directiveId:
+        this.resolveCommandSourceDirectiveId({
+          command: input.command,
+          payload: isRecord(input.command.payload) ? input.command.payload : null,
+        }) ?? input.command.id,
       action: input.action,
       targetPostId: input.target.postId,
       targetCommentId: input.target.commentId,
@@ -3857,7 +3924,11 @@ export class CommandExecutor {
     if (!stateDb?.enabled) return;
     stateDb.upsertCommandLifecycle({
       commandId: input.command.id,
-      directiveId: input.command.sourceDirectiveId ?? input.command.id,
+      directiveId:
+        this.resolveCommandSourceDirectiveId({
+          command: input.command,
+          payload: isRecord(input.command.payload) ? input.command.payload : null,
+        }) ?? input.command.id,
       action: input.action,
       targetPostId: input.target.postId,
       targetCommentId: input.target.commentId,
@@ -4098,6 +4169,11 @@ export class CommandExecutor {
         };
       };
   }): Promise<string | null> {
+    const directiveId =
+      this.resolveCommandSourceDirectiveId({
+        command: input.command,
+        payload: input.payload,
+      }) ?? input.command.id;
     const ownerCooldown = this.resolveOwnerCapabilityCooldown({
       action: input.action,
       targetHash: input.lifecycle.target.targetHash,
@@ -4131,7 +4207,7 @@ export class CommandExecutor {
           type: "directive_preflight_grant_inferred",
           at: nowIso(),
           commandId: input.command.id,
-          directiveId: input.command.sourceDirectiveId ?? input.command.id,
+          directiveId,
           action: input.action,
           grantId: inferredGrantId,
         })
@@ -4145,7 +4221,7 @@ export class CommandExecutor {
           type: "directive_preflight_grant_bypassed",
           at: nowIso(),
           commandId: input.command.id,
-          directiveId: input.command.sourceDirectiveId ?? input.command.id,
+          directiveId,
           action: input.action,
           reason: "directive_context",
         })
@@ -4174,7 +4250,7 @@ export class CommandExecutor {
         type: "directive_preflight_grant_failed",
         at: nowIso(),
         commandId: input.command.id,
-        directiveId: input.command.sourceDirectiveId ?? input.command.id,
+        directiveId,
         action: input.action,
         reason,
         hasUsableWindow,
@@ -4184,7 +4260,14 @@ export class CommandExecutor {
   }
 
   private isDirectiveContextLinkedCommand(command: Command): boolean {
-    if (asNonEmptyString(command.sourceDirectiveId)) return true;
+    if (
+      this.resolveCommandSourceDirectiveId({
+        command,
+        payload: isRecord(command.payload) ? command.payload : null,
+      })
+    ) {
+      return true;
+    }
     if (asNonEmptyString(command.pendingDirectiveId)) return true;
     const runtimeOrigin =
       asNonEmptyString(command.runtimeOrigin)?.toLowerCase() ?? "";
@@ -4293,10 +4376,10 @@ export class CommandExecutor {
     const kindRaw = asNonEmptyString(payload.kind)?.toLowerCase();
     const postKind = kindRaw === "thread" ? "thread" : "post";
     const provenance = normalizeAgentProvenanceValue(payload.provenance);
-    const sourceDirectiveId =
-      asNonEmptyString(payload.sourceDirectiveId) ??
-      command.sourceDirectiveId ??
-      null;
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command,
+      payload,
+    });
     const sourceDirectiveActionNonce =
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
@@ -6884,6 +6967,10 @@ export class CommandExecutor {
     if (!payload) {
       return this.failedOutcome(command, "Invalid payload for write.createStory.");
     }
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command,
+      payload,
+    });
     if (this.isChatOriginCommand(command, payload)) {
       const explicitStoryRequest = this.didChatMessageExplicitlyRequestStory(payload);
       if (!explicitStoryRequest) {
@@ -6893,7 +6980,7 @@ export class CommandExecutor {
             at: nowIso(),
             commandId: command.id,
             commandKind: command.kind,
-            sourceDirectiveId: command.sourceDirectiveId ?? null,
+            sourceDirectiveId,
           })
           .catch(() => undefined);
         const fallbackPayload = this.buildChatLiteralFallbackPayloadFromStory({
@@ -6902,14 +6989,14 @@ export class CommandExecutor {
         return this.executeChatLiteralGenerate(command, fallbackPayload);
       }
       await this.ctx.memory
-        .recordWrite({
-          type: "story_write_blocked_chat_request",
-          at: nowIso(),
-          commandId: command.id,
-          commandKind: command.kind,
-          sourceDirectiveId: command.sourceDirectiveId ?? null,
-        })
-        .catch(() => undefined);
+          .recordWrite({
+            type: "story_write_blocked_chat_request",
+            at: nowIso(),
+            commandId: command.id,
+            commandKind: command.kind,
+            sourceDirectiveId,
+          })
+          .catch(() => undefined);
       return this.failedOutcome(
         command,
         "Story creation is directive-only. Chat requests can create posts, but not stories.",
@@ -6917,10 +7004,6 @@ export class CommandExecutor {
       );
     }
     const provenance = normalizeAgentProvenanceValue(payload.provenance);
-    const sourceDirectiveId =
-      asNonEmptyString(payload.sourceDirectiveId) ??
-      command.sourceDirectiveId ??
-      null;
     const sourceDirectiveActionNonce =
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
@@ -7022,10 +7105,10 @@ export class CommandExecutor {
     }
     const target = this.resolveProfileWriteTarget(asNonEmptyString(payload.target));
     const provenance = normalizeAgentProvenanceValue(payload.provenance);
-    const sourceDirectiveId =
-      asNonEmptyString(payload.sourceDirectiveId) ??
-      command.sourceDirectiveId ??
-      null;
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command,
+      payload,
+    });
     const sourceDirectiveActionNonce =
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
@@ -7063,10 +7146,10 @@ export class CommandExecutor {
     }
     const target = this.resolveProfileWriteTarget(asNonEmptyString(payload.target));
     const provenance = normalizeAgentProvenanceValue(payload.provenance);
-    const sourceDirectiveId =
-      asNonEmptyString(payload.sourceDirectiveId) ??
-      command.sourceDirectiveId ??
-      null;
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command,
+      payload,
+    });
     const sourceDirectiveActionNonce =
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
@@ -7208,10 +7291,10 @@ export class CommandExecutor {
         },
       });
       const provenance = normalizeAgentProvenanceValue(payload.provenance);
-      const sourceDirectiveId =
-        asNonEmptyString(payload.sourceDirectiveId) ??
-        command.sourceDirectiveId ??
-        null;
+      const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+        command,
+        payload,
+      });
       const sourceDirectiveActionNonce =
         asNonEmptyString(payload.sourceDirectiveActionNonce) ??
         command.actionNonce ??
@@ -8419,10 +8502,10 @@ export class CommandExecutor {
         decision: dedupe.reason,
       });
     }
-    const sourceDirectiveId =
-      asNonEmptyString(payload.sourceDirectiveId) ??
-      command.sourceDirectiveId ??
-      null;
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command,
+      payload,
+    });
     const sourceDirectiveActionNonce =
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
@@ -8664,10 +8747,10 @@ export class CommandExecutor {
         decision: dedupe.reason,
       });
     }
-    const sourceDirectiveId =
-      asNonEmptyString(payload.sourceDirectiveId) ??
-      command.sourceDirectiveId ??
-      null;
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command,
+      payload,
+    });
     const sourceDirectiveActionNonce =
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
@@ -9368,6 +9451,10 @@ export class CommandExecutor {
     const payload = isRecord(command.payload)
       ? command.payload
       : ({} as Record<string, unknown>);
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command,
+      payload,
+    });
     const requestedLimit = asPositiveInt(payload.limit);
     const limit = Math.max(1, Math.min(100, requestedLimit ?? 20));
     const retryPermissionDenied =
@@ -9425,7 +9512,7 @@ export class CommandExecutor {
         type: "retry_pending_command_completed",
         at: nowIso(),
         commandId: command.id,
-        sourceDirectiveId: command.sourceDirectiveId ?? null,
+        sourceDirectiveId,
         retryPermissionDenied,
         ...summary,
       })
@@ -9454,6 +9541,10 @@ export class CommandExecutor {
     if (!payload) {
       return this.failedOutcome(command, "Invalid payload for generate-and-queue command.");
     }
+    const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+      command,
+      payload,
+    });
 
     const delegatedFollowAction = this.resolveDelegatedFollowAction(payload);
     if (delegatedFollowAction) {
@@ -9482,7 +9573,7 @@ export class CommandExecutor {
           at: nowIso(),
           commandId: command.id,
           commandKind: command.kind,
-          sourceDirectiveId: command.sourceDirectiveId ?? null,
+          sourceDirectiveId,
         })
         .catch(() => undefined);
       return this.failedOutcome(
@@ -9495,14 +9586,8 @@ export class CommandExecutor {
       return this.executeChatLiteralGenerate(command, payload);
     }
 
-    const sourceDirectiveId =
-      asNonEmptyString(payload.sourceDirectiveId) ??
-      command.sourceDirectiveId ??
-      command.id;
     const sourceDirectiveActionNonce =
-      asNonEmptyString(payload.sourceDirectiveActionNonce) ??
-      command.actionNonce ??
-      null;
+      this.resolveCommandSourceDirectiveActionNonce({ command, payload });
     const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const enforcedDraftAction = this.resolveEnforcedDraftAction(payload);
     if (enforcedDraftAction) {
@@ -9599,7 +9684,7 @@ export class CommandExecutor {
           type: "generate_input_constrained_by_permissions",
           at: nowIso(),
           commandId: command.id,
-          sourceDirectiveId: command.sourceDirectiveId ?? null,
+          sourceDirectiveId,
           originalKinds: Array.isArray(generateInputRaw.kinds)
             ? generateInputRaw.kinds
             : [],
@@ -9631,7 +9716,7 @@ export class CommandExecutor {
           type: "generate_blocked_by_permissions",
           at: nowIso(),
           commandId: command.id,
-          sourceDirectiveId: command.sourceDirectiveId ?? null,
+          sourceDirectiveId,
           originalKinds: Array.isArray(generateInputRaw.kinds)
             ? generateInputRaw.kinds
             : [],
@@ -9705,7 +9790,7 @@ export class CommandExecutor {
           type: "generate_draft_filtered_by_permissions",
           at: nowIso(),
           commandId: command.id,
-          sourceDirectiveId: command.sourceDirectiveId ?? null,
+          sourceDirectiveId,
           beforeCount: executableDrafts.length,
           afterCount: permissionFilteredDrafts.length,
           droppedActions,
@@ -9734,7 +9819,7 @@ export class CommandExecutor {
             at: nowIso(),
             commandId: command.id,
             commandKind: command.kind,
-            sourceDirectiveId: command.sourceDirectiveId ?? null,
+            sourceDirectiveId,
             blockedStoryDraftCount,
             retainedDraftCount: executionDrafts.length,
           })
@@ -9748,7 +9833,7 @@ export class CommandExecutor {
               at: nowIso(),
               commandId: command.id,
               commandKind: command.kind,
-              sourceDirectiveId: command.sourceDirectiveId ?? null,
+              sourceDirectiveId,
               blockedStoryDraftCount,
             })
             .catch(() => undefined);
@@ -9766,7 +9851,7 @@ export class CommandExecutor {
               at: nowIso(),
               commandId: command.id,
               commandKind: command.kind,
-              sourceDirectiveId: command.sourceDirectiveId ?? null,
+              sourceDirectiveId,
               blockedStoryDraftCount,
             })
             .catch(() => undefined);
@@ -9811,7 +9896,7 @@ export class CommandExecutor {
               type: "persona_media_lock_fallback_draft",
               at: nowIso(),
               commandId: command.id,
-              sourceDirectiveId: command.sourceDirectiveId ?? null,
+              sourceDirectiveId,
               reason: "no_persona_compatible_generated_draft",
             })
             .catch(() => undefined);
@@ -9832,7 +9917,7 @@ export class CommandExecutor {
             .map((draft) => draft.action.trim().toLowerCase())
             .filter((action) => action.length > 0)
             .slice(0, 12),
-          sourceDirectiveId: command.sourceDirectiveId ?? null,
+          sourceDirectiveId,
         })
         .catch(() => undefined);
       return this.failedOutcome(
@@ -9931,7 +10016,7 @@ export class CommandExecutor {
           commandId: command.id,
           commandKind: command.kind,
           blockedDraftCount,
-          sourceDirectiveId: command.sourceDirectiveId ?? null,
+          sourceDirectiveId,
         }).catch(() => undefined);
         return this.failedOutcome(
           command,
@@ -9982,7 +10067,7 @@ export class CommandExecutor {
               draftKind: normalizedDraftKind,
               reason: failureReason,
               code: asNonEmptyString(outcome.error?.code) ?? null,
-              sourceDirectiveId: command.sourceDirectiveId ?? null,
+              sourceDirectiveId,
             })
             .catch(() => undefined);
           if (this.isRecoverableDraftGrantErrorMessage(failureReason)) {
@@ -10029,7 +10114,7 @@ export class CommandExecutor {
               commandId: command.id,
               draftKind: normalizedDraftKind,
               reason,
-              sourceDirectiveId: command.sourceDirectiveId ?? null,
+              sourceDirectiveId,
             })
             .catch(() => undefined);
           continue;
@@ -10046,7 +10131,7 @@ export class CommandExecutor {
             commandId: command.id,
             draftKind: normalizedDraftKind,
             reason,
-            sourceDirectiveId: command.sourceDirectiveId ?? null,
+            sourceDirectiveId,
           })
           .catch(() => undefined);
         if (this.isRecoverableDraftGrantErrorMessage(reason)) {
@@ -10229,7 +10314,12 @@ export class CommandExecutor {
     }
     if (runtimeOrigin === "runtime_resealed") {
       const commandId = asNonEmptyString(command.id);
-      const sourceDirectiveId = asNonEmptyString(command.sourceDirectiveId);
+      const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
+        command,
+        payload:
+          payloadOverride ??
+          (isRecord(command.payload) ? command.payload : null),
+      });
       const pendingDirectiveId = asNonEmptyString(command.pendingDirectiveId);
       if (
         commandId &&
@@ -10810,13 +10900,9 @@ export class CommandExecutor {
       : promptBase;
     const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId =
-      asNonEmptyString(payload.sourceDirectiveId) ??
-      command.sourceDirectiveId ??
-      command.id;
+      this.resolveCommandSourceDirectiveId({ command, payload });
     const sourceDirectiveActionNonce =
-      asNonEmptyString(payload.sourceDirectiveActionNonce) ??
-      command.actionNonce ??
-      null;
+      this.resolveCommandSourceDirectiveActionNonce({ command, payload });
 
     const generatedAssetType = this.resolveGeneratedAssetType(payload.generatedAssetType);
     const fallbackReferenceInputs = this.collectMediaReferenceInputs(payload);
@@ -12126,12 +12212,9 @@ export class CommandExecutor {
         : `${Date.now().toString(36)}_${crypto.randomUUID().replaceAll("-", "").slice(0, 10)}`);
     const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId =
-      asNonEmptyString(payload.sourceDirectiveId) ??
-      command.sourceDirectiveId ??
-      command.id;
+      this.resolveCommandSourceDirectiveId({ command, payload });
     const sourceDirectiveActionNonce =
-      asNonEmptyString(payload.sourceDirectiveActionNonce) ??
-      command.actionNonce;
+      this.resolveCommandSourceDirectiveActionNonce({ command, payload });
     return {
       kind: primaryKind,
       ...(resolvedKinds.length > 0 ? { kinds: resolvedKinds } : {}),
@@ -14537,6 +14620,43 @@ export class CommandExecutor {
     promptFallbacks: Array<string | null>;
     command?: Command;
   }): Promise<ResolvedMediaUpload> {
+    const isRecoverableMediaSourceFailure = (error: unknown): boolean => {
+      if (!(error instanceof Error)) return false;
+      const message = error.message.trim().toLowerCase();
+      return (
+        message.includes("only image and video uploads are supported") ||
+        message.includes("unsupported_media_payload_mime:") ||
+        message.includes("invalid data uri") ||
+        message.includes("invalid_data_uri") ||
+        message.includes("empty media data") ||
+        message.includes("media_source_empty") ||
+        message.includes("no_media_url")
+      );
+    };
+    const tryUploadSource = async (
+      source: string,
+      sourceKey: string,
+    ): Promise<ResolvedMediaUpload | null> => {
+      try {
+        return await this.uploadResolvedMediaSource(source, { keepOriginal });
+      } catch (error: unknown) {
+        if (!isRecoverableMediaSourceFailure(error)) {
+          throw error;
+        }
+        if (input.command) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "media_source_skipped",
+              at: nowIso(),
+              commandId: input.command.id,
+              source: sourceKey,
+              error: error instanceof Error ? error.message : String(error),
+            })
+            .catch(() => undefined);
+        }
+        return null;
+      }
+    };
     const payload = input.payload;
     const keepOriginal = input.keepOriginal === true;
     const markUploaded = async (
@@ -14559,17 +14679,21 @@ export class CommandExecutor {
     };
     const existingMediaUrl = asNonEmptyString(payload.mediaUrl);
     if (existingMediaUrl) {
-      const resolved = await this.uploadResolvedMediaSource(existingMediaUrl, { keepOriginal });
-      return markUploaded(resolved, "payload.mediaUrl");
+      const resolved = await tryUploadSource(existingMediaUrl, "payload.mediaUrl");
+      if (resolved) return markUploaded(resolved, "payload.mediaUrl");
     }
 
     const mediaItems = Array.isArray(payload.mediaItems) ? payload.mediaItems : [];
-    for (const mediaItem of mediaItems) {
+    for (let index = 0; index < mediaItems.length; index += 1) {
+      const mediaItem = mediaItems[index];
       if (!isRecord(mediaItem)) continue;
       const mediaUrl = asNonEmptyString(mediaItem.mediaUrl);
       if (mediaUrl) {
-        const resolved = await this.uploadResolvedMediaSource(mediaUrl, { keepOriginal });
-        return markUploaded(resolved, "payload.mediaItems");
+        const resolved = await tryUploadSource(
+          mediaUrl,
+          `payload.mediaItems[${index}].mediaUrl`,
+        );
+        if (resolved) return markUploaded(resolved, "payload.mediaItems");
       }
     }
 
@@ -14600,8 +14724,13 @@ export class CommandExecutor {
           ? personaReferences.frameReferences
           : fallbackReferenceInputs;
     }
+    const requestedGeneratedAssetType = this.resolveGeneratedAssetType(
+      payload.generatedAssetType,
+    );
+    const generatedAssetType =
+      requestedGeneratedAssetType === "gif" ? "gif" : "image";
     const generated = await this.generateAndUploadMediaFromPrompt(prompt, {
-      generatedAssetType: this.resolveGeneratedAssetType(payload.generatedAssetType),
+      generatedAssetType,
       mode: "write_media_generate",
       referenceInputs,
       keepOriginal,
@@ -14617,25 +14746,50 @@ export class CommandExecutor {
     const trimmed = source.trim();
     if (isDataUri(trimmed)) {
       const parsed = parseDataUriPayload(trimmed);
-      if (parsed) {
-        const bytes = Buffer.from(parsed.data, "base64");
-        if (bytes.byteLength > 0) {
-          const uploadedByChunk = await this.uploadBytesViaChunkRoute({
-            bytes,
-            mimeType: parsed.mime,
-            filename: `upload-${Date.now()}.${mimeToExt(parsed.mime)}`,
-            keepOriginal,
-          });
-          if (uploadedByChunk) return uploadedByChunk;
-        }
+      if (!parsed) {
+        throw new Error("invalid_data_uri");
       }
+      const bytes = Buffer.from(parsed.data, "base64");
+      if (!bytes.byteLength) {
+        throw new Error("media_source_empty");
+      }
+      const parsedMime = parsed.mime.trim().toLowerCase();
+      const sniffedMime = sniffMimeTypeFromBytes(bytes);
+      const resolvedMime =
+        this.isUploadableMediaMimeType(parsedMime)
+          ? parsedMime
+          : this.isUploadableMediaMimeType(sniffedMime)
+            ? sniffedMime!
+            : parsedMime;
+      if (!this.isUploadableMediaMimeType(resolvedMime)) {
+        throw new Error(`unsupported_media_payload_mime:${parsedMime}`);
+      }
+      const normalizedDataUri =
+        resolvedMime === parsedMime
+          ? trimmed
+          : `data:${resolvedMime};base64,${bytes.toString("base64")}`;
+      const uploadedByChunk = await this.uploadBytesViaChunkRoute({
+        bytes,
+        mimeType: resolvedMime,
+        filename: `upload-${Date.now()}.${mimeToExt(resolvedMime)}`,
+        keepOriginal,
+      });
+      if (uploadedByChunk) return uploadedByChunk;
       const uploaded = await this.agent().uploadDataUri.mutate({
-        dataUri: trimmed,
+        dataUri: normalizedDataUri,
         keepOriginal,
       });
       return this.mapUploadResult(uploaded);
     }
     if (isHttpUrl(trimmed)) {
+      const inferredMime = inferMimeTypeFromUrl(trimmed);
+      if (
+        inferredMime &&
+        inferredMime !== "application/octet-stream" &&
+        !this.isUploadableMediaMimeType(inferredMime)
+      ) {
+        throw new Error(`unsupported_media_payload_mime:${inferredMime}`);
+      }
       try {
         const uploaded = await this.agent().uploadRemote.mutate({
           url: trimmed,
@@ -14663,6 +14817,9 @@ export class CommandExecutor {
                   ? headerMime
                   : inferMimeTypeFromUrl(trimmed) ?? "application/octet-stream";
               const mime = mimeRaw.split(";", 1)[0]?.trim() ?? "application/octet-stream";
+              if (!this.isUploadableMediaMimeType(mime)) {
+                throw new Error(`unsupported_media_payload_mime:${mime}`);
+              }
               const parsedUrl = new URL(trimmed);
               const baseName = path.basename(parsedUrl.pathname).trim();
               const filename =
@@ -14729,6 +14886,9 @@ export class CommandExecutor {
       mimeByExt === "application/octet-stream"
         ? sniffMimeTypeFromBytes(bytes) ?? mimeByExt
         : mimeByExt;
+    if (!this.isUploadableMediaMimeType(mime)) {
+      throw new Error(`unsupported_media_payload_mime:${mime}`);
+    }
     const uploadedByChunk = await this.uploadBytesViaChunkRoute({
       bytes,
       mimeType: mime,
@@ -15752,10 +15912,34 @@ export class CommandExecutor {
       const candidate = asNonEmptyString(value);
       if (!candidate) return null;
       if (this.isStreamPartArtifactReference(candidate)) return null;
-      if (isHttpUrl(candidate) || isDataUri(candidate)) return candidate;
+      if (isDataUri(candidate)) {
+        const parsed = parseDataUriPayload(candidate);
+        if (!parsed || !this.isUploadableMediaMimeType(parsed.mime)) {
+          return null;
+        }
+        return candidate;
+      }
+      if (isHttpUrl(candidate)) {
+        const inferredMime = inferMimeTypeFromUrl(candidate);
+        if (
+          inferredMime &&
+          inferredMime !== "application/octet-stream" &&
+          !this.isUploadableMediaMimeType(inferredMime)
+        ) {
+          return null;
+        }
+        return candidate;
+      }
       const absolute = path.isAbsolute(candidate)
         ? candidate
         : path.resolve(requestDir, candidate);
+      const inferredMime = extToMime(absolute);
+      if (
+        inferredMime !== "application/octet-stream" &&
+        !this.isUploadableMediaMimeType(inferredMime)
+      ) {
+        return null;
+      }
       if (this.isStreamPartArtifactReference(absolute)) return null;
       return absolute;
     };
@@ -17118,7 +17302,12 @@ export class CommandExecutor {
     command: Command,
     outcome: CommandOutcome,
   ): Promise<void> {
-    const directiveId = command.sourceDirectiveId ?? command.id;
+    const directiveId =
+      this.resolveCommandSourceDirectiveId({
+        command,
+        payload: isRecord(command.payload) ? command.payload : null,
+      }) ??
+      asNonEmptyString(command.pendingDirectiveId);
     if (!directiveId?.trim().length) return;
     const executionDigest = buildExecutionDigest(
       command,

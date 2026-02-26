@@ -215,5 +215,93 @@ describe("command executor terminal lifecycle", () => {
     expect(ackTerminalCheckpoint.status).toBe("ok");
     expect(ackDirectiveMutate).toHaveBeenCalledTimes(1);
   });
-});
 
+  it("does not ack directives for non-directive commands", async () => {
+    const recordWrite = vi.fn(async () => undefined);
+    const ackDirectiveMutate = vi.fn(async () => ({ stored: true }));
+    const executor = createExecutor({
+      callAgentChatBridge: async () => ({ ok: true }),
+      recordWrite,
+      ackDirectiveMutate,
+    });
+    const invoker = executor as unknown as TerminalLifecycleInvoker;
+    const command = {
+      ...baseCommand(),
+      sourceDirectiveId: null,
+      pendingDirectiveId: null,
+      actionNonce: null,
+      payload: {
+        sourceContext: "CHAT",
+      },
+    } satisfies Command;
+    await invoker.finalizeCommandOutcome({
+      command,
+      outcome: {
+        at: new Date().toISOString(),
+        commandId: command.id,
+        kind: command.kind,
+        grantId: command.grantId,
+        ok: true,
+        data: {
+          mode: "chat",
+        },
+      },
+    });
+
+    expect(ackDirectiveMutate).not.toHaveBeenCalled();
+  });
+
+  it("acks directive runtime commands by falling back to command id when sourceDirectiveId is missing", async () => {
+    const writes: unknown[] = [];
+    const recordWrite = vi.fn(async (payload: unknown) => {
+      writes.push(payload);
+    });
+    const ackDirectiveMutate = vi.fn(async () => ({ stored: true }));
+    const executor = createExecutor({
+      callAgentChatBridge: async () => ({ ok: true }),
+      recordWrite,
+      ackDirectiveMutate,
+    });
+    const invoker = executor as unknown as TerminalLifecycleInvoker;
+    const command = {
+      ...baseCommand(),
+      id: "directive-fallback-ack-1",
+      sourceDirectiveId: null,
+      pendingDirectiveId: null,
+      runtimeOrigin: "director_directive",
+      payload: {
+        sourceContext: "DIRECTIVE",
+      },
+    } satisfies Command;
+
+    await invoker.finalizeCommandOutcome({
+      command,
+      outcome: {
+        at: new Date().toISOString(),
+        commandId: command.id,
+        kind: command.kind,
+        grantId: command.grantId,
+        ok: true,
+      },
+    });
+
+    expect(ackDirectiveMutate).toHaveBeenCalledTimes(1);
+    expect(ackDirectiveMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        directiveId: command.id,
+        status: "executed",
+      }),
+    );
+    const checkpoints = writes.filter(
+      (entry): entry is Record<string, unknown> =>
+        isRecord(entry) && entry.type === "command_execution_checkpoint",
+    );
+    const ackTerminalCheckpoint = checkpoints.find(
+      (entry) => entry.stage === "ack_terminal",
+    );
+    expect(ackTerminalCheckpoint).toBeTruthy();
+    if (!ackTerminalCheckpoint) return;
+    expect(ackTerminalCheckpoint.directiveId).toBe(command.id);
+    expect(ackTerminalCheckpoint.sourceDirectiveId).toBe(command.id);
+  });
+});

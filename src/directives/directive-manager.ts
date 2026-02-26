@@ -130,6 +130,12 @@ const asPositiveInt = (value: unknown): number | null => {
   return null;
 };
 
+const asNonEmptyString = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
 const QUEUED_PENDING_STATUSES = new Set([
   "queued_for_execution",
   "draft_waiting_execution",
@@ -498,7 +504,36 @@ export class DirectiveManager implements DirectiveManagerLike {
       }
       const sourceKind = typeof pendingDoc.sourceKind === "string" && pendingDoc.sourceKind.trim().length > 0
         ? pendingDoc.sourceKind.trim() : "brain.retryPending";
-      const sourcePayload = isRecord(pendingDoc.intent) ? pendingDoc.intent : {};
+      const sourcePayload = isRecord(pendingDoc.intent)
+        ? ({ ...pendingDoc.intent } as Record<string, unknown>)
+        : ({} as Record<string, unknown>);
+      const pendingSourceDirectiveId =
+        asNonEmptyString(pendingDoc.sourceDirectiveId) ??
+        asNonEmptyString(sourcePayload.sourceDirectiveId) ??
+        pendingId;
+      const pendingSourceDirectiveActionNonce =
+        asNonEmptyString(pendingDoc.sourceDirectiveActionNonce) ??
+        asNonEmptyString(sourcePayload.sourceDirectiveActionNonce) ??
+        null;
+      const pendingGrantId =
+        asNonEmptyString(pendingDoc.grantId) ??
+        asNonEmptyString(sourcePayload.grantId) ??
+        null;
+      if (
+        pendingSourceDirectiveId &&
+        asNonEmptyString(sourcePayload.sourceDirectiveId) === null
+      ) {
+        sourcePayload.sourceDirectiveId = pendingSourceDirectiveId;
+      }
+      if (
+        pendingSourceDirectiveActionNonce &&
+        asNonEmptyString(sourcePayload.sourceDirectiveActionNonce) === null
+      ) {
+        sourcePayload.sourceDirectiveActionNonce = pendingSourceDirectiveActionNonce;
+      }
+      if (pendingGrantId && asNonEmptyString(sourcePayload.grantId) === null) {
+        sourcePayload.grantId = pendingGrantId;
+      }
       const queueClass = resolveQueueClass({ kind: sourceKind, payload: sourcePayload });
       const forceNow = resolveForceNowFromPayload(sourcePayload);
       const createdAt = typeof pendingDoc.createdAt === "string" && pendingDoc.createdAt.trim().length > 0
@@ -508,11 +543,11 @@ export class DirectiveManager implements DirectiveManagerLike {
           ? pendingDoc.agentId.trim()
           : null;
       const baseCommand: Command = {
-        id: pendingId, createdAt, kind: sourceKind, grantId: null,
+        id: pendingId, createdAt, kind: sourceKind, grantId: pendingGrantId,
         payload: sourcePayload as Record<string, unknown>, sig: null,
         targetAgentId: pendingTargetAgentId,
-        sourceDirectiveId: pendingId, pendingDirectiveId: pendingId,
-        actionNonce: null, challenge: null, forceNow,
+        sourceDirectiveId: pendingSourceDirectiveId, pendingDirectiveId: pendingId,
+        actionNonce: pendingSourceDirectiveActionNonce, challenge: null, forceNow,
         runtimeSessionId: null, runtimeOrigin: null, runtimeSig: null,
       };
       if (this.ctx.misc.controlKey) {

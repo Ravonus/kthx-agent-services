@@ -27,6 +27,40 @@ const baseCommand = (): Command => ({
   runtimeSig: null,
 });
 
+const chatCommand = (): Command => ({
+  id: "test-generate-input-chat",
+  createdAt: new Date().toISOString(),
+  kind: "brain.generateAndQueue",
+  grantId: null,
+  payload: {},
+  sig: null,
+  sourceDirectiveId: null,
+  pendingDirectiveId: null,
+  actionNonce: null,
+  challenge: null,
+  forceNow: true,
+  runtimeSessionId: null,
+  runtimeOrigin: "chat_command",
+  runtimeSig: null,
+});
+
+const directiveCommandWithoutSourceId = (): Command => ({
+  id: "test-generate-input-directive-fallback",
+  createdAt: new Date().toISOString(),
+  kind: "brain.generateAndQueue",
+  grantId: "directive:test-generate-input-directive-fallback",
+  payload: {},
+  sig: null,
+  sourceDirectiveId: null,
+  pendingDirectiveId: null,
+  actionNonce: "nonce-test-generate-input-directive-fallback",
+  challenge: null,
+  forceNow: true,
+  runtimeSessionId: null,
+  runtimeOrigin: "director_directive",
+  runtimeSig: null,
+});
+
 const createExecutor = (options?: { personaFrames?: unknown[] }) => {
   const root = path.join(
     os.tmpdir(),
@@ -181,6 +215,44 @@ describe("command executor generate input", () => {
       expect.arrayContaining(["https://cdn.example.com/reference-c.png"]),
     );
     expect(isRecord(result)).toBe(true);
+  });
+
+  it("does not inject synthetic sourceDirectiveId for chat-origin generate input", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      buildGenerateInput(payload: Record<string, unknown>, command: Command): Record<string, unknown>;
+    };
+
+    const result = invoker.buildGenerateInput(
+      {
+        goal: "media",
+        prompt: "Create a reaction image for chat.",
+      },
+      chatCommand(),
+    );
+
+    expect("sourceDirectiveId" in result).toBe(false);
+    expect("sourceDirectiveActionNonce" in result).toBe(false);
+  });
+
+  it("falls back to command id as sourceDirectiveId for directive runtime commands", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      buildGenerateInput(payload: Record<string, unknown>, command: Command): Record<string, unknown>;
+    };
+    const command = directiveCommandWithoutSourceId();
+
+    const result = invoker.buildGenerateInput(
+      {
+        goal: "media",
+        prompt: "Create a directive-origin image.",
+      },
+      command,
+    );
+
+    expect(result.sourceDirectiveId).toBe(command.id);
+    expect(result.sourceDirectiveActionNonce).toBe(command.actionNonce);
+    expect(result.grantId).toBe(command.grantId);
   });
 
   it("overrides persona media references with tracked persona frames", async () => {

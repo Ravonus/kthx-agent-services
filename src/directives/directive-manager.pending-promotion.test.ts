@@ -67,6 +67,7 @@ const createHarness = async () => {
 
   return {
     manager,
+    inboxDir,
     pendingDir,
     ensureDirectiveInQueue,
   };
@@ -80,13 +81,16 @@ describe("directive manager pending promotion", () => {
   });
 
   it("re-promotes permission-denied pending directives when retry is requested", async () => {
-    const { manager, pendingDir, ensureDirectiveInQueue } = await createHarness();
+    const { manager, inboxDir, pendingDir, ensureDirectiveInQueue } = await createHarness();
     const pendingPath = path.join(pendingDir, "pending-1.json");
     const basePendingDoc = {
       id: "pending-1",
       sourceKind: "brain.generateAndQueue",
       createdAt: new Date().toISOString(),
       status: "permission_denied",
+      sourceDirectiveId: "directive-1",
+      sourceDirectiveActionNonce: "nonce-1",
+      grantId: "directive:directive-1",
       intent: {
         goal: "comment",
         postId: 42,
@@ -103,6 +107,26 @@ describe("directive manager pending promotion", () => {
     expect(first.promoted).toBe(1);
     expect(first.skippedAlreadySeen).toBe(0);
     expect(ensureDirectiveInQueue).toHaveBeenCalledTimes(1);
+    const stagedFilesAfterFirst = (await fs.readdir(inboxDir))
+      .filter((entry) => entry.endsWith(".json"))
+      .sort();
+    expect(stagedFilesAfterFirst.length).toBe(1);
+    const firstCommandRaw = await fs.readFile(
+      path.join(inboxDir, stagedFilesAfterFirst[0]!),
+      "utf8",
+    );
+    const firstCommand = JSON.parse(firstCommandRaw) as Record<string, unknown>;
+    expect(firstCommand.sourceDirectiveId).toBe("directive-1");
+    expect(firstCommand.pendingDirectiveId).toBe("pending-1");
+    expect(firstCommand.actionNonce).toBe("nonce-1");
+    expect(firstCommand.grantId).toBe("directive:directive-1");
+    const firstPayload =
+      firstCommand.payload && typeof firstCommand.payload === "object"
+        ? (firstCommand.payload as Record<string, unknown>)
+        : {};
+    expect(firstPayload.sourceDirectiveId).toBe("directive-1");
+    expect(firstPayload.sourceDirectiveActionNonce).toBe("nonce-1");
+    expect(firstPayload.grantId).toBe("directive:directive-1");
 
     await fs.writeFile(
       pendingPath,
@@ -127,5 +151,9 @@ describe("directive manager pending promotion", () => {
     expect(second.promoted).toBe(1);
     expect(second.skippedAlreadySeen).toBe(0);
     expect(ensureDirectiveInQueue).toHaveBeenCalledTimes(2);
+    const stagedFilesAfterSecond = (await fs.readdir(inboxDir))
+      .filter((entry) => entry.endsWith(".json"))
+      .sort();
+    expect(stagedFilesAfterSecond.length).toBe(2);
   });
 });

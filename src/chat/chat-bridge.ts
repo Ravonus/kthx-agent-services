@@ -42,6 +42,7 @@ type ShellSummary = {
   at: string;
   mode: SubscriptionMode;
   viewerMainUserId: string | null;
+  viewerChatUserId: string | null;
   counts: {
     dms: number;
     agentDms: number;
@@ -68,6 +69,7 @@ type BridgeStatus = {
   subscribedTopics: string[];
   lastError: string | null;
   viewerMainUserId: string | null;
+  viewerChatUserId: string | null;
   subscriptionMode: SubscriptionMode;
   idleEnabled: boolean;
   idleTimeoutMs: number;
@@ -258,6 +260,9 @@ const parseWsFrame = (raw: unknown): Record<string, unknown> | null => {
   }
 };
 
+const toTrimmedString = (value: unknown): string | null =>
+  typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+
 const extractContext = (topic: unknown, event: unknown): Record<string, string> | null => {
   if (typeof topic === "string") {
     if (topic.startsWith("chat:conversation:")) return { conversationId: topic.slice("chat:conversation:".length) };
@@ -291,6 +296,22 @@ const extractAuthorMainUserId = (event: Record<string, unknown>): string | null 
   return typeof payload.authorMainUserId === "string" && (payload.authorMainUserId as string).trim().length
     ? (payload.authorMainUserId as string).trim()
     : null;
+};
+
+const extractAuthorChatUserId = (event: Record<string, unknown>): string | null => {
+  const payload = isRecord(event.payload) ? event.payload as Record<string, unknown> : null;
+  if (!payload) return null;
+  const directPayloadAuthorId = toTrimmedString(payload.authorChatUserId);
+  if (directPayloadAuthorId) return directPayloadAuthorId;
+  const payloadAuthor = isRecord(payload.author) ? payload.author as Record<string, unknown> : null;
+  const payloadAuthorId = toTrimmedString(payloadAuthor?.id) ?? toTrimmedString(payloadAuthor?.chatUserId);
+  if (payloadAuthorId) return payloadAuthorId;
+  const msg = isRecord(payload.message) ? payload.message as Record<string, unknown> : null;
+  if (!msg) return null;
+  const directMessageAuthorId = toTrimmedString(msg.authorChatUserId);
+  if (directMessageAuthorId) return directMessageAuthorId;
+  const messageAuthor = isRecord(msg.author) ? msg.author as Record<string, unknown> : null;
+  return toTrimmedString(messageAuthor?.id) ?? toTrimmedString(messageAuthor?.chatUserId);
 };
 
 const parseConfiguredTopics = (value: string | null): TopicRequest[] => {
@@ -436,6 +457,10 @@ const main = async (): Promise<void> => {
 
   const maxTrackedIds = Math.max(100, parseIntEnv("MG_CHAT_AGENT_TRACKED_MESSAGE_IDS", 1200));
   const maxTopics = Math.max(5, parseIntEnv("MG_CHAT_AGENT_MAX_TOPICS", 180));
+  const reconnectCatchupLimit = Math.max(
+    1,
+    Math.min(50, parseIntEnv("MG_CHAT_AGENT_RECONNECT_CATCHUP_LIMIT", 20)),
+  );
   const pingMs = Math.max(5_000, parseIntEnv("MG_CHAT_AGENT_PING_MS", 25_000));
   const tokenPollMs = Math.max(
     250,
@@ -677,6 +702,7 @@ const main = async (): Promise<void> => {
     subscribedTopics: [],
     lastError: null,
     viewerMainUserId: null,
+    viewerChatUserId: null,
     subscriptionMode: "full",
     idleEnabled,
     idleTimeoutMs,
@@ -708,6 +734,7 @@ const main = async (): Promise<void> => {
   let lastObservedTokenValue: string | null = null;
   let stopping = false;
   let viewerMainUserId: string | null = null;
+  let viewerChatUserId: string | null = null;
   let desiredMode: SubscriptionMode = "full";
   let lastActivityAtMs = Date.now();
   let lastShellSummary: ShellSummary | null = null;
@@ -735,7 +762,8 @@ const main = async (): Promise<void> => {
     if (autoSubDms || autoSubGroups || autoSubServers || autoSubChannels) {
       const shell = await callBridge({ action: "shell" }) as Record<string, unknown> | null;
       const viewer = shell && isRecord(shell.viewer) ? shell.viewer as Record<string, unknown> : null;
-      viewerMainUserId = viewer && typeof viewer.mainUserId === "string" ? viewer.mainUserId as string : null;
+      viewerMainUserId = toTrimmedString(viewer?.mainUserId);
+      viewerChatUserId = toTrimmedString(viewer?.id);
       const dmCount = Array.isArray(shell?.dms) ? shell.dms.length : 0;
       const agentDmCount = Array.isArray(shell?.agentChats) ? shell.agentChats.length : 0;
       const groupCount = Array.isArray(shell?.groups) ? shell.groups.length : 0;
@@ -756,6 +784,7 @@ const main = async (): Promise<void> => {
         at: shellAt,
         mode,
         viewerMainUserId,
+        viewerChatUserId,
         counts: {
           dms: dmCount,
           agentDms: agentDmCount,
@@ -769,6 +798,7 @@ const main = async (): Promise<void> => {
         type: "shell_summary",
         mode,
         viewerMainUserId,
+        viewerChatUserId,
         counts: lastShellSummary.counts,
       });
 
@@ -853,10 +883,12 @@ const main = async (): Promise<void> => {
     }
 
     const messageId = extractMessageId(event);
-    const authorId = extractAuthorMainUserId(event);
+    const authorMainUserId = extractAuthorMainUserId(event);
+    const authorChatUserId = extractAuthorChatUserId(event);
     if (messageId && trackedIds.has(messageId)) return;
     if (messageId) trackId(messageId);
-    if (viewerMainUserId && authorId === viewerMainUserId) return;
+    if (viewerMainUserId && authorMainUserId === viewerMainUserId) return;
+    if (viewerChatUserId && authorChatUserId === viewerChatUserId) return;
 
     let listError: string | null = null;
     const latest = await callBridge({
@@ -916,7 +948,16 @@ const main = async (): Promise<void> => {
 
     // Self-message filter
     const author = isRecord((firstItem as Record<string, unknown>).author) ? (firstItem as Record<string, unknown>).author as Record<string, unknown> : null;
-    if (!authorId && viewerMainUserId && author && author.mainUserId === viewerMainUserId) return;
+    const msgRecord = isRecord((firstItem as Record<string, unknown>).message)
+      ? (firstItem as Record<string, unknown>).message as Record<string, unknown>
+      : null;
+    const listedAuthorMainUserId = toTrimmedString(author?.mainUserId);
+    const listedAuthorChatUserId =
+      toTrimmedString(msgRecord?.authorChatUserId) ??
+      toTrimmedString(author?.id) ??
+      toTrimmedString(author?.chatUserId);
+    if (!authorMainUserId && viewerMainUserId && listedAuthorMainUserId === viewerMainUserId) return;
+    if (!authorChatUserId && viewerChatUserId && listedAuthorChatUserId === viewerChatUserId) return;
 
     await appendInboxEvent({
       at: nowIso(),
@@ -928,7 +969,6 @@ const main = async (): Promise<void> => {
     });
 
     // Delivery confirmation
-    const msgRecord = isRecord((firstItem as Record<string, unknown>).message) ? (firstItem as Record<string, unknown>).message as Record<string, unknown> : null;
     const confirmedId = msgRecord && typeof msgRecord.id === "string" ? (msgRecord.id as string).trim() : "";
     if (confirmedId) {
       const clientMsgId = msgRecord && typeof msgRecord.clientMessageId === "string" ? (msgRecord.clientMessageId as string).trim() : "";
@@ -1305,6 +1345,101 @@ const main = async (): Promise<void> => {
         }
       })();
     };
+    const catchupTopicMessages = async (topic: string): Promise<number> => {
+      const context = extractContext(topic, null);
+      if (!context) return 0;
+      let lookupError: string | null = null;
+      const latest = await callBridge({
+        action: "list_messages",
+        ...context,
+        limit: reconnectCatchupLimit,
+      }).catch((error) => {
+        lookupError = error instanceof Error ? error.message : String(error);
+        return null;
+      }) as Record<string, unknown> | null;
+      if (!latest || !Array.isArray(latest.items)) {
+        if (lookupError) {
+          await appendBridgeEvent({
+            at: nowIso(),
+            level: "warn",
+            type: "reconnect_catchup_failed",
+            topic,
+            context,
+            message: lookupError,
+          }).catch(() => undefined);
+        }
+        return 0;
+      }
+
+      let importedCount = 0;
+      const rows = latest.items.filter((entry): entry is Record<string, unknown> => isRecord(entry));
+      for (const row of rows.reverse()) {
+        const msg = isRecord(row.message) ? row.message as Record<string, unknown> : null;
+        const messageId = toTrimmedString(msg?.id);
+        if (!messageId || trackedIds.has(messageId)) continue;
+        trackId(messageId);
+
+        const author = isRecord(row.author) ? row.author as Record<string, unknown> : null;
+        const authorMainUserId = toTrimmedString(author?.mainUserId);
+        const authorChatUserId =
+          toTrimmedString(msg?.authorChatUserId) ??
+          toTrimmedString(author?.id) ??
+          toTrimmedString(author?.chatUserId);
+        if (viewerMainUserId && authorMainUserId === viewerMainUserId) continue;
+        if (viewerChatUserId && authorChatUserId === viewerChatUserId) continue;
+
+        await appendInboxEvent({
+          at: nowIso(),
+          sourceContext: "CHAT",
+          topic,
+          eventType: "message.catchup",
+          context,
+          message: row,
+        });
+        importedCount += 1;
+
+        const clientMsgId = toTrimmedString(msg?.clientMessageId);
+        await callBridge({
+          action: "delivery_confirmed",
+          ...context,
+          messageId,
+          ...(clientMsgId ? { clientMessageId: clientMsgId } : {}),
+        }).catch(async (error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          await appendBridgeEvent({
+            at: nowIso(),
+            level: "warn",
+            source: "delivery_confirm_failed",
+            topic,
+            messageId,
+            message,
+          }).catch(() => undefined);
+        });
+      }
+      return importedCount;
+    };
+    const runReconnectCatchup = async (): Promise<void> => {
+      const topics = Array.from(ticketMap.keys());
+      let importedCount = 0;
+      let scannedCount = 0;
+      for (const topic of topics) {
+        if (!topic.startsWith("chat:conversation:") && !topic.startsWith("chat:channel:")) {
+          continue;
+        }
+        scannedCount += 1;
+        importedCount += await catchupTopicMessages(topic);
+      }
+      await appendBridgeEvent({
+        at: nowIso(),
+        type: "reconnect_catchup_complete",
+        scannedCount,
+        importedCount,
+        limit: reconnectCatchupLimit,
+      }).catch(() => undefined);
+      if (importedCount > 0) {
+        await touchWake("chat_reconnect_catchup");
+      }
+    };
 
     const socket = new WebSocket(`${wsUrl}?token=${encodeURIComponent(authToken)}`);
     activeSocket = socket;
@@ -1323,6 +1458,7 @@ const main = async (): Promise<void> => {
         reconnectAttempt,
         lastError: null,
         viewerMainUserId,
+        viewerChatUserId,
         subscribedTopics: Array.from(ticketMap.keys()),
         subscriptionMode: connectMode,
         lastActivityAt: getLastActivityAtIso(),
@@ -1336,6 +1472,7 @@ const main = async (): Promise<void> => {
       for (const ticket of ticketMap.values()) socket.send(JSON.stringify({ type: "subscribe", ticket }));
       if (pingTimer) clearInterval(pingTimer);
       pingTimer = setInterval(() => { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "ping" })); }, pingMs);
+      void runReconnectCatchup().catch(() => undefined);
     });
 
     socket.on("message", (rawFrame) => {
