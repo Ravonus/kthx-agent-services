@@ -4792,9 +4792,14 @@ export class CommandExecutor {
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
       null;
+    const explicitSaveAsProfileMemory =
+      typeof payload.saveAsProfileMemory === "boolean"
+        ? payload.saveAsProfileMemory
+        : null;
     const runtimeOrigin = asNonEmptyString(command.runtimeOrigin)?.toLowerCase() ?? "";
     const isDirectiveRuntimeOrigin =
       runtimeOrigin === "director_directive" || runtimeOrigin === "pending_promotion";
+    let saveAsProfileMemoryForMedia = explicitSaveAsProfileMemory === true;
     const buildBase = (
       caption: string | null,
       basePostType: "text" | "media" = postType,
@@ -4802,6 +4807,9 @@ export class CommandExecutor {
       kind: postKind,
       postType: basePostType,
       ...(caption ? { caption } : {}),
+      ...(basePostType === "media" && saveAsProfileMemoryForMedia
+        ? { saveAsProfileMemory: true }
+        : {}),
       ...(provenance ? { provenance } : {}),
       ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
       ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
@@ -5522,6 +5530,9 @@ export class CommandExecutor {
     const mediaSeedText = mediaPromptForWrite ?? captionForWrite ?? mediaCandidate;
     const personaReferencePlan = this.resolvePersonaReferencePlan(payload, null, command);
     const personaDrivenMediaGeneration = this.shouldUsePersonaFrameReferences(personaReferencePlan);
+    if (explicitSaveAsProfileMemory === null && personaDrivenMediaGeneration) {
+      saveAsProfileMemoryForMedia = true;
+    }
     const carriedMediaPresent =
       asNonEmptyString(payload.mediaUrl) !== null ||
       (Array.isArray(payload.mediaItems) && payload.mediaItems.length > 0) ||
@@ -7540,6 +7551,10 @@ export class CommandExecutor {
       asNonEmptyString(payload.sourceDirectiveActionNonce) ??
       command.actionNonce ??
       null;
+    const explicitSaveAsProfileMemory =
+      typeof payload.saveAsProfileMemory === "boolean"
+        ? payload.saveAsProfileMemory
+        : null;
     const caption = asNonEmptyString(payload.caption);
     const baseStoryPrompt =
       asNonEmptyString(payload.mediaPrompt) ??
@@ -7572,6 +7587,15 @@ export class CommandExecutor {
     const storyPayload: Record<string, unknown> = {
       ...payload,
     };
+    const personaReferencePlan = this.resolvePersonaReferencePlan(
+      payload,
+      null,
+      command,
+    );
+    const personaDrivenStoryGeneration =
+      this.shouldUsePersonaFrameReferences(personaReferencePlan);
+    const saveAsProfileMemory =
+      explicitSaveAsProfileMemory ?? personaDrivenStoryGeneration;
     const carriedMediaPresent =
       asNonEmptyString(payload.mediaUrl) !== null ||
       (Array.isArray(payload.mediaItems) && payload.mediaItems.length > 0) ||
@@ -7617,6 +7641,7 @@ export class CommandExecutor {
       ...(media.mediaIpfsCid ? { ipfsCid: media.mediaIpfsCid } : {}),
       ...(media.mediaType ? { mediaType: media.mediaType } : {}),
       ...(caption ? { caption } : {}),
+      ...(saveAsProfileMemory ? { saveAsProfileMemory: true } : {}),
       ...(captionPositionForWrite ? { captionPosition: captionPositionForWrite } : {}),
       ...(asNonEmptyString(payload.mediaFit) ? { mediaFit: asNonEmptyString(payload.mediaFit) } : {}),
       ...(asPositiveInt(payload.expiresInSeconds)
@@ -15810,7 +15835,17 @@ export class CommandExecutor {
           })
           .catch(() => undefined);
         try {
-          const response = await fetch(trimmed);
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 20_000);
+          const response = await fetch(trimmed, {
+            signal: controller.signal,
+            headers: {
+              accept: "image/*,video/*;q=0.9,*/*;q=0.1",
+              "user-agent": "MoltgramMediaFetcher/1.0",
+            },
+          }).finally(() => {
+            clearTimeout(timeout);
+          });
           if (response.ok) {
             const bytes = Buffer.from(await response.arrayBuffer());
             if (bytes.byteLength > 0) {
@@ -17570,6 +17605,62 @@ export class CommandExecutor {
     }
   }
 
+  private sanitizeUserFacingCommandErrorMessage(input: {
+    errorMessage: string;
+  }): string {
+    const raw = input.errorMessage.trim();
+    if (!raw.length) return "";
+    const lowered = raw.toLowerCase();
+
+    if (
+      lowered.includes("no_media_url") ||
+      lowered.includes("media_generation_waiting_for_output")
+    ) {
+      return "I did not receive a final media asset yet.";
+    }
+    if (
+      lowered.includes("prompt_curation_failed") ||
+      lowered.includes("prompt_curation_unavailable") ||
+      lowered.includes("openclaw_no_usable_prompt") ||
+      lowered.includes("invalid json") ||
+      lowered.includes("json parse")
+    ) {
+      return "I could not produce a valid generation draft for that request.";
+    }
+    if (lowered.includes("persona_reference_setup_required")) {
+      return "Persona reference setup is incomplete (selfie, midshot, fullbody).";
+    }
+    if (
+      lowered.includes("image_generation_setup_required") ||
+      lowered.includes("image_generator_unconfigured") ||
+      lowered.includes("file_generator_unconfigured")
+    ) {
+      return "Image generation is not ready yet.";
+    }
+    if (
+      lowered.includes("owner capability denied") ||
+      lowered.includes("permission denied") ||
+      lowered.includes("not_granted") ||
+      lowered.includes("no_grant")
+    ) {
+      return "I do not currently have permission for that action.";
+    }
+    if (
+      lowered.includes("only image and video uploads are supported") ||
+      lowered.includes("unsupported_media_payload_mime")
+    ) {
+      return "The generated media format was not uploadable.";
+    }
+    if (
+      /\b(runtime|bridge|directive|queue|openclaw|edenai|playwright|chatgpt|api|session token|agent key)\b/iu.test(
+        raw,
+      )
+    ) {
+      return "I hit an internal processing issue while handling that request.";
+    }
+    return raw;
+  }
+
   private buildNonWriteChatCompletion(input: {
     command: Command;
     outcome: CommandOutcome;
@@ -17605,7 +17696,10 @@ export class CommandExecutor {
     }
 
     if (!payload) return null;
-    const errorMessage = input.outcome.error?.message?.trim() ?? "";
+    const errorMessageRaw = input.outcome.error?.message?.trim() ?? "";
+    const errorMessage = this.sanitizeUserFacingCommandErrorMessage({
+      errorMessage: errorMessageRaw,
+    });
     if (!input.outcome.ok) {
       return {
         body: errorMessage.length > 0

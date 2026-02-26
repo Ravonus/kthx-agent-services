@@ -53,6 +53,7 @@ export interface SubscriptionManagerContext {
   handleEnvelope(e: { receivedAt: string; source: string; topic: string; payload: unknown }): Promise<void>;
   authManager: AuthManagerLike | null;
   runBackendCall<T>(label: string, fn: () => Promise<T>): Promise<T>;
+  resetLocalStateOnReconnect?: (reason: string) => Promise<unknown>;
 }
 
 interface SubOpts { onStarted?(): void; onData?(e: unknown): void; onError?(e: unknown): void }
@@ -256,11 +257,23 @@ export class SubscriptionManager implements SubscriptionManagerLike {
     this.ctx.misc.subscriptionResyncReason = null;
     this.ctx.misc.lastSubscriptionResyncAtMs = now;
     this.teardownAll();
+    let reconnectResetResult: unknown = null;
+    let reconnectResetError: string | null = null;
+    if (typeof this.ctx.resetLocalStateOnReconnect === "function") {
+      try {
+        reconnectResetResult = await this.ctx.resetLocalStateOnReconnect(reason);
+      } catch (error: unknown) {
+        reconnectResetError =
+          error instanceof Error ? error.message : String(error);
+      }
+    }
     await this.ctx.memory.recordWrite({
       type: "socket_subscription_resync", at: nowIso(), reason,
       wsState: this.ctx.ws.lastWsState, transportState: this.ctx.ws.lastWsTransportState,
       wsOpenTransitionAt: this.ctx.misc.lastWsOpenTransitionAtMs
         ? new Date(this.ctx.misc.lastWsOpenTransitionAtMs).toISOString() : null,
+      reconnectResetResult,
+      reconnectResetError,
     });
     await this.refreshLens("resync");
     this.subHeartbeat();

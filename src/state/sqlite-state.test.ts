@@ -104,6 +104,33 @@ describe("StateSqliteStore schema migration", () => {
     expect(storedRow?.source_kind).toBe("chat");
     expect(storedRow?.grant_id).toBe("grant-1");
     expect(storedRow?.payload_json).toBe(JSON.stringify({ source: "test" }));
+
+    const appliedMigrations = migratedDb.prepare(
+      "SELECT id, name FROM state_schema_migrations ORDER BY id ASC",
+    ).all() as Array<{ id: number; name: string }>;
+    expect(appliedMigrations).toEqual([
+      {
+        id: 1,
+        name: "runtime_command_lifecycle_add_source_kind_grant_id_payload_json",
+      },
+    ]);
+
     migratedDb.close();
+
+    const secondStore = new StateSqliteStore({
+      enabled: true,
+      dbPath,
+      busyTimeoutMs: 50,
+      busyRetryCount: 0,
+    });
+    secondStore.init();
+    secondStore.close();
+
+    const reopenedDb = new sqliteModule.DatabaseSync(dbPath);
+    const migrationCountRow = reopenedDb.prepare(
+      "SELECT COUNT(*) AS total FROM state_schema_migrations WHERE id = 1",
+    ).get() as { total: number } | undefined;
+    expect(migrationCountRow?.total).toBe(1);
+    reopenedDb.close();
   });
 });

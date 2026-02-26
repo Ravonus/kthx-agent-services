@@ -1465,6 +1465,40 @@ const main = async (): Promise<void> => {
     authManager,
     runBackendCall: <T>(label: string, fn: () => Promise<T>) =>
       runBackendCall(label, fn, ctx),
+    resetLocalStateOnReconnect: async (reason: string) => {
+      const directiveReset = ctx.directiveManager
+        ? await ctx.directiveManager.resetPendingOnReconnect(reason)
+        : {
+            scanned: 0,
+            cancelled: 0,
+            skippedTerminal: 0,
+            skippedInvalid: 0,
+          };
+      const queueReset = ctx.queueManager
+        ? await ctx.queueManager.resetQueueOnReconnect(reason)
+        : {
+            scanned: 0,
+            cancelled: 0,
+            cancelledQueued: 0,
+            cancelledScheduled: 0,
+            cancelledRunning: 0,
+            skippedTerminal: 0,
+            removedInboxFiles: 0,
+          };
+      const summary = {
+        reason,
+        directive: directiveReset,
+        queue: queueReset,
+      };
+      await memory
+        .recordWrite({
+          type: "runtime_reconnect_local_state_reset",
+          at: nowIso(),
+          ...summary,
+        })
+        .catch(() => {});
+      return summary;
+    },
   });
   subscriptionManager.startHealLoop();
   ctx.subscriptionManager = subscriptionManager;

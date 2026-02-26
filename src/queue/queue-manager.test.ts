@@ -328,4 +328,144 @@ describe("queue manager planning", () => {
     expect(secondState.items[0]?.directiveId).toBe("directive-second");
     expect(secondState.items[0]?.inboxFile).toBe("second.json");
   });
+
+  it("cancels queued/scheduled/running items and removes queued inbox files on reconnect reset", async () => {
+    const { queueStatePath, manager, inboxDir } = await createQueueManagerHarness();
+    const queueState: QueueState = {
+      updatedAt: "2026-02-24T00:00:00.000Z",
+      runnerEnabled: true,
+      lastPlanAt: null,
+      lastPlanSource: null,
+      items: [
+        {
+          id: "item-queued",
+          directiveId: "directive-queued",
+          inboxFile: "queued.json",
+          queueClass: "post",
+          forceNow: false,
+          commandFingerprint: null,
+          status: "queued",
+          createdAt: "2026-02-24T00:00:00.000Z",
+          dueAt: null,
+          attempts: 0,
+          startedAt: null,
+          completedAt: null,
+          lastAttemptAt: null,
+          lastError: null,
+          scheduledBy: null,
+        },
+        {
+          id: "item-scheduled",
+          directiveId: "directive-scheduled",
+          inboxFile: "scheduled.json",
+          queueClass: "media",
+          forceNow: false,
+          commandFingerprint: null,
+          status: "scheduled",
+          createdAt: "2026-02-24T00:00:01.000Z",
+          dueAt: new Date(Date.now() + 60_000).toISOString(),
+          attempts: 1,
+          startedAt: null,
+          completedAt: null,
+          lastAttemptAt: "2026-02-24T00:00:10.000Z",
+          lastError: "waiting_for_context",
+          scheduledBy: "queue_runner_tick",
+        },
+        {
+          id: "item-running",
+          directiveId: "directive-running",
+          inboxFile: "running.json",
+          queueClass: "comment",
+          forceNow: true,
+          commandFingerprint: null,
+          status: "running",
+          createdAt: "2026-02-24T00:00:02.000Z",
+          dueAt: null,
+          attempts: 2,
+          startedAt: "2026-02-24T00:00:20.000Z",
+          completedAt: null,
+          lastAttemptAt: "2026-02-24T00:00:20.000Z",
+          lastError: null,
+          scheduledBy: null,
+        },
+        {
+          id: "item-done",
+          directiveId: "directive-done",
+          inboxFile: "done.json",
+          queueClass: "post",
+          forceNow: false,
+          commandFingerprint: null,
+          status: "done",
+          createdAt: "2026-02-24T00:00:03.000Z",
+          dueAt: null,
+          attempts: 1,
+          startedAt: "2026-02-24T00:00:30.000Z",
+          completedAt: "2026-02-24T00:00:40.000Z",
+          lastAttemptAt: "2026-02-24T00:00:30.000Z",
+          lastError: null,
+          scheduledBy: null,
+        },
+        {
+          id: "item-cancelled",
+          directiveId: "directive-cancelled",
+          inboxFile: "cancelled.json",
+          queueClass: "post",
+          forceNow: false,
+          commandFingerprint: null,
+          status: "cancelled",
+          createdAt: "2026-02-24T00:00:04.000Z",
+          dueAt: null,
+          attempts: 1,
+          startedAt: null,
+          completedAt: "2026-02-24T00:00:45.000Z",
+          lastAttemptAt: null,
+          lastError: "cancelled",
+          scheduledBy: null,
+        },
+      ],
+    };
+    await fs.writeFile(queueStatePath, JSON.stringify(queueState, null, 2), "utf8");
+    await fs.writeFile(path.join(inboxDir, "queued.json"), "{}", "utf8");
+    await fs.writeFile(path.join(inboxDir, "scheduled.json"), "{}", "utf8");
+    await fs.writeFile(path.join(inboxDir, "running.json"), "{}", "utf8");
+
+    const result = await manager.resetQueueOnReconnect("socket_reconnect");
+    expect(result.scanned).toBe(5);
+    expect(result.cancelled).toBe(3);
+    expect(result.cancelledQueued).toBe(1);
+    expect(result.cancelledScheduled).toBe(1);
+    expect(result.cancelledRunning).toBe(1);
+    expect(result.skippedTerminal).toBe(2);
+    expect(result.removedInboxFiles).toBe(2);
+
+    const nextRaw = JSON.parse(await fs.readFile(queueStatePath, "utf8")) as QueueState;
+    const queued = nextRaw.items.find((item) => item.id === "item-queued");
+    const scheduled = nextRaw.items.find((item) => item.id === "item-scheduled");
+    const running = nextRaw.items.find((item) => item.id === "item-running");
+    expect(queued?.status).toBe("cancelled");
+    expect(scheduled?.status).toBe("cancelled");
+    expect(running?.status).toBe("cancelled");
+    expect(queued?.scheduledBy).toBe("reconnect_reset");
+    expect(scheduled?.scheduledBy).toBe("reconnect_reset");
+    expect(running?.scheduledBy).toBe("reconnect_reset");
+    expect(typeof queued?.completedAt).toBe("string");
+    expect(typeof scheduled?.completedAt).toBe("string");
+    expect(typeof running?.completedAt).toBe("string");
+
+    const queuedExists = await fs
+      .access(path.join(inboxDir, "queued.json"))
+      .then(() => true)
+      .catch(() => false);
+    const scheduledExists = await fs
+      .access(path.join(inboxDir, "scheduled.json"))
+      .then(() => true)
+      .catch(() => false);
+    const runningExists = await fs
+      .access(path.join(inboxDir, "running.json"))
+      .then(() => true)
+      .catch(() => false);
+    expect(queuedExists).toBe(false);
+    expect(scheduledExists).toBe(false);
+    expect(runningExists).toBe(true);
+  });
 });

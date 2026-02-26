@@ -97,6 +97,14 @@ const safeJsonParse = (raw: string): unknown => {
   }
 };
 
+type StateDbMigration = {
+  id: number;
+  name: string;
+  apply(db: DatabaseSync): void;
+};
+
+const STATE_SCHEMA_MIGRATIONS_TABLE = "state_schema_migrations";
+
 const listSqliteTableColumns = (db: DatabaseSync, tableName: string): Set<string> => {
   const normalizedTable = tableName.trim();
   if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/u.test(normalizedTable)) return new Set();
@@ -113,7 +121,7 @@ const listSqliteTableColumns = (db: DatabaseSync, tableName: string): Set<string
   return columns;
 };
 
-const ensureRuntimeCommandLifecycleSchema = (db: DatabaseSync): void => {
+const ensureRuntimeCommandLifecycleCoreColumns = (db: DatabaseSync): void => {
   const tableName = "runtime_command_lifecycle";
   const columns = listSqliteTableColumns(db, tableName);
   const requiredColumns: Array<{ name: string; sqlType: string }> = [
@@ -127,6 +135,70 @@ const ensureRuntimeCommandLifecycleSchema = (db: DatabaseSync): void => {
       `ALTER TABLE ${tableName} ADD COLUMN ${column.name} ${column.sqlType};`,
     );
     columns.add(column.name);
+  }
+};
+
+const ensureStateSchemaMigrationsTable = (db: DatabaseSync): void => {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ${STATE_SCHEMA_MIGRATIONS_TABLE} (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      applied_at TEXT NOT NULL
+    );
+  `);
+};
+
+const listAppliedStateMigrationIds = (db: DatabaseSync): Set<number> => {
+  const stmt = db.prepare(
+    `SELECT id FROM ${STATE_SCHEMA_MIGRATIONS_TABLE} ORDER BY id ASC`,
+  );
+  const rows = stmt.all() as unknown[];
+  const applied = new Set<number>();
+  for (const row of rows) {
+    if (!isRecord(row)) continue;
+    const rawId = row.id;
+    if (typeof rawId === "number" && Number.isFinite(rawId) && rawId > 0) {
+      applied.add(Math.floor(rawId));
+      continue;
+    }
+    if (typeof rawId === "string") {
+      const parsed = Number.parseInt(rawId.trim(), 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        applied.add(parsed);
+      }
+    }
+  }
+  return applied;
+};
+
+const STATE_DB_MIGRATIONS: ReadonlyArray<StateDbMigration> = [
+  {
+    id: 1,
+    name: "runtime_command_lifecycle_add_source_kind_grant_id_payload_json",
+    apply: (db) => {
+      ensureRuntimeCommandLifecycleCoreColumns(db);
+    },
+  },
+];
+
+const applyStateDbMigrations = (db: DatabaseSync): void => {
+  ensureStateSchemaMigrationsTable(db);
+  const appliedMigrationIds = listAppliedStateMigrationIds(db);
+  const insertStmt = db.prepare(
+    `INSERT INTO ${STATE_SCHEMA_MIGRATIONS_TABLE} (id, name, applied_at) VALUES (?, ?, ?)`,
+  );
+  for (const migration of STATE_DB_MIGRATIONS) {
+    if (appliedMigrationIds.has(migration.id)) continue;
+    db.exec("BEGIN");
+    try {
+      migration.apply(db);
+      insertStmt.run(migration.id, migration.name, nowIso());
+      db.exec("COMMIT");
+      appliedMigrationIds.add(migration.id);
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
   }
 };
 
@@ -228,7 +300,7 @@ export class StateSqliteStore {
       CREATE INDEX IF NOT EXISTS idx_runtime_command_lifecycle_state
         ON runtime_command_lifecycle(state, updated_at DESC);
     `);
-    ensureRuntimeCommandLifecycleSchema(db);
+    applyStateDbMigrations(db);
     this.db = db;
     this.upsertSnapshotStmt = db.prepare(`
       INSERT INTO state_snapshots (scope, visibility, updated_at, json)

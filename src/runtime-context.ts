@@ -70,11 +70,31 @@ export type PendingDirectivePromotionResult = {
   limit: number;
 };
 
+export type PendingDirectiveReconnectResetResult = {
+  scanned: number;
+  cancelled: number;
+  skippedTerminal: number;
+  skippedInvalid: number;
+};
+
+export type QueueReconnectResetResult = {
+  scanned: number;
+  cancelled: number;
+  cancelledQueued: number;
+  cancelledScheduled: number;
+  cancelledRunning: number;
+  skippedTerminal: number;
+  removedInboxFiles: number;
+};
+
 export interface DirectiveManagerLike {
   intake(payload: unknown): Promise<void>;
   promoteFromPending(
     input?: PendingDirectivePromotionInput,
   ): Promise<PendingDirectivePromotionResult>;
+  resetPendingOnReconnect(
+    reason: string,
+  ): Promise<PendingDirectiveReconnectResetResult>;
   handleDirective: ((payload: unknown) => Promise<void>) | null;
   dispose(): void;
 }
@@ -82,6 +102,7 @@ export interface DirectiveManagerLike {
 export interface QueueManagerLike {
   enqueue(item: unknown): Promise<void>;
   runnerTick(): Promise<void>;
+  resetQueueOnReconnect(reason: string): Promise<QueueReconnectResetResult>;
   setRunnerEnabled(enabled: boolean): void;
   isRunnerEnabled(): boolean;
   dispose(): void;

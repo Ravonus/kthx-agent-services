@@ -19,6 +19,7 @@ import { applyTargetLock } from "../lib/command-target.js";
 import type { Command } from "../types/ipc.js";
 import type {
   DirectiveManagerLike,
+  PendingDirectiveReconnectResetResult,
   PendingDirectivePromotionInput,
   PendingDirectivePromotionResult,
 } from "../runtime-context.js";
@@ -146,6 +147,9 @@ const TERMINAL_PENDING_STATUSES = new Set([
   "permission_denied",
   "no_executable_draft",
   "max_retry_exceeded",
+  "failed",
+  "cancelled",
+  "cancelled_reconnect_reset",
 ]);
 
 const normalizePendingPromotionLimit = (value: unknown): number => {
@@ -445,6 +449,82 @@ export class DirectiveManager implements DirectiveManagerLike {
       this.ctx.directive.pendingPromotionPromise = null;
     });
     return this.ctx.directive.pendingPromotionPromise;
+  }
+
+  async resetPendingOnReconnect(
+    reason: string,
+  ): Promise<PendingDirectiveReconnectResetResult> {
+    const normalizedReason =
+      typeof reason === "string" && reason.trim().length > 0
+        ? reason.trim()
+        : "reconnect_reset";
+    const entries = await fs.readdir(this.ctx.ipcPaths.pendingDir).catch(() => []);
+    const jsonEntries = entries.filter((entry) => entry.endsWith(".json")).sort();
+    if (!jsonEntries.length) {
+      return {
+        scanned: 0,
+        cancelled: 0,
+        skippedTerminal: 0,
+        skippedInvalid: 0,
+      };
+    }
+
+    let scanned = 0;
+    let cancelled = 0;
+    let skippedTerminal = 0;
+    let skippedInvalid = 0;
+
+    for (const entry of jsonEntries) {
+      const pendingPath = path.join(this.ctx.ipcPaths.pendingDir, entry);
+      const raw = await readJsonMaybeIncomplete(pendingPath);
+      if (raw.status !== "ok" || !isRecord(raw.value)) {
+        skippedInvalid += 1;
+        continue;
+      }
+      scanned += 1;
+      const pendingDoc = { ...(raw.value as Record<string, unknown>) };
+      const pendingStatus =
+        typeof pendingDoc.status === "string"
+          ? pendingDoc.status.trim().toLowerCase()
+          : "";
+      if (pendingStatus.length > 0 && TERMINAL_PENDING_STATUSES.has(pendingStatus)) {
+        skippedTerminal += 1;
+        continue;
+      }
+      const updatedAt = nowIso();
+      pendingDoc.status = "cancelled";
+      pendingDoc.error = `cancelled_on_reconnect:${normalizedReason}`;
+      pendingDoc.updatedAt = updatedAt;
+      pendingDoc.lastAutoEnqueueReason = "reconnect_reset";
+      pendingDoc.reconnectReset = {
+        at: updatedAt,
+        reason: normalizedReason,
+      };
+      const wrote = await writeJsonFile(pendingPath, pendingDoc)
+        .then(() => true)
+        .catch(() => false);
+      if (!wrote) {
+        skippedInvalid += 1;
+        continue;
+      }
+      cancelled += 1;
+    }
+
+    const result: PendingDirectiveReconnectResetResult = {
+      scanned,
+      cancelled,
+      skippedTerminal,
+      skippedInvalid,
+    };
+    await this.ctx.memory
+      .recordWrite({
+        type: "pending_reconnect_reset",
+        at: nowIso(),
+        reason: normalizedReason,
+        ...result,
+      })
+      .catch(() => {});
+    return result;
   }
 
   dispose(): void { /* No timers to clear. */ }

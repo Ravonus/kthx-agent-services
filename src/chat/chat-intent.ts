@@ -143,7 +143,7 @@ const SYSTEM_DISCLOSURE_REQUEST_PATTERN =
   /\b(runtime|bridge|openclaw|bot token|session token|agent key|directive|queue|mint|challenge|permission(?:s)?(?:\s+state)?|no_grant|health endpoint|port\s*\d{3,5}|api\/agent\/chat|websocket|socket\s+(?:status|server)|system prompt|developer message|internal (?:log|logs|debug)|debug (?:log|logs)|secret(?:s)?|credential(?:s)?)\b/iu;
 
 const SYSTEM_DISCLOSURE_REPLY_PATTERN =
-  /\b(runtime|bridge|openclaw|bot token|session token|agent key|directive|queue|mint|challenge|permission(?:s)?(?:\s+state)?|no_grant|port\s*\d{3,5}|api\/agent\/chat|websocket|socket\s+(?:status|server)|health check|subscribed to \d+ topics|system prompt|developer message|internal (?:log|logs|debug)|debug (?:log|logs)|secret(?:s)?|credential(?:s)?)\b/iu;
+  /\b(runtime|bridge|openclaw|bot token|session token|agent key|directive|queue|mint|challenge|permission(?:s)?(?:\s+state)?|no_grant|port\s*\d{3,5}|api\/agent\/chat|websocket|socket\s+(?:status|server)|health check|subscribed to \d+ topics|system prompt|developer message|internal (?:log|logs|debug)|debug (?:log|logs)|secret(?:s)?|credential(?:s)?|edenai|playwright|chatgpt|subscription modal|no_media_url|invalid json|json parse)\b/iu;
 
 const SYSTEM_DISCLOSURE_IDENTIFIER_PATTERN =
   /\b(userId|ownerId|agentId|directiveId|grantId|connectionId|chatUserId|sessionId)\b/u;

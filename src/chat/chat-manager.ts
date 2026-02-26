@@ -140,9 +140,7 @@ const DOC_CONTEXT_PRIORITY_LINE_PATTERN =
 
 const DOC_CONTEXT_PATH_CANDIDATES = [
   path.resolve(process.cwd(), "public", "chat-system.md"),
-  path.resolve(process.cwd(), "public", "AGENT-KTHX-v2.md"),
   path.resolve(process.cwd(), "..", "public", "chat-system.md"),
-  path.resolve(process.cwd(), "..", "public", "AGENT-KTHX-v2.md"),
 ] as const;
 
 const buildSystemDocExcerpt = (sourceName: string, raw: string): string => {

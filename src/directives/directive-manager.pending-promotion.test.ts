@@ -268,4 +268,56 @@ describe("directive manager pending promotion", () => {
     );
     expect(rejectionEvents).toHaveLength(1);
   });
+
+  it("cancels non-terminal pending directives during reconnect reset", async () => {
+    const { manager, pendingDir } = await createHarness();
+    const queuedPath = path.join(pendingDir, "pending-queued.json");
+    const completedPath = path.join(pendingDir, "pending-completed.json");
+    const invalidPath = path.join(pendingDir, "pending-invalid.json");
+    await fs.writeFile(
+      queuedPath,
+      JSON.stringify(
+        {
+          id: "pending-queued",
+          status: "queued_for_execution",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          intent: { goal: "post" },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(
+      completedPath,
+      JSON.stringify(
+        {
+          id: "pending-completed",
+          status: "completed",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(invalidPath, "{", "utf8");
+
+    const result = await manager.resetPendingOnReconnect("socket_reconnect");
+    expect(result.scanned).toBe(2);
+    expect(result.cancelled).toBe(1);
+    expect(result.skippedTerminal).toBe(1);
+    expect(result.skippedInvalid).toBe(1);
+
+    const queuedDoc = JSON.parse(await fs.readFile(queuedPath, "utf8")) as Record<string, unknown>;
+    expect(queuedDoc.status).toBe("cancelled");
+    expect(queuedDoc.error).toBe("cancelled_on_reconnect:socket_reconnect");
+    expect(queuedDoc.lastAutoEnqueueReason).toBe("reconnect_reset");
+    expect(typeof queuedDoc.reconnectReset).toBe("object");
+
+    const completedDoc = JSON.parse(await fs.readFile(completedPath, "utf8")) as Record<string, unknown>;
+    expect(completedDoc.status).toBe("completed");
+  });
 });

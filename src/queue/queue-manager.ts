@@ -14,7 +14,10 @@ import { isRecord } from "../lib/guards.js";
 import { nowIso } from "../lib/text.js";
 import { readJsonFile, writeJsonFile } from "../lib/fs.js";
 import type { QueueItem, QueueState } from "../types/ipc.js";
-import type { QueueManagerLike } from "../runtime-context.js";
+import type {
+  QueueManagerLike,
+  QueueReconnectResetResult,
+} from "../runtime-context.js";
 import {
   normalizeQueueClass,
   normalizeQueueState,
@@ -81,6 +84,12 @@ const NOT_READY_MIN_REQUEUE_DELAY_SECONDS = 2;
 const NOT_READY_MAX_REQUEUE_DELAY_SECONDS = 300;
 const NOT_READY_MAX_ATTEMPTS = 30;
 const RUNNING_RECOVERY_MIN_AGE_MS = 60_000;
+const TERMINAL_QUEUE_STATUSES = new Set<QueueItem["status"]>([
+  "done",
+  "failed",
+  "missing",
+  "cancelled",
+]);
 const MEDIA_GENERATION_FAST_REQUEUE_PATTERN =
   /\b(image_generation_setup_required|media_generation_waiting_for_output|no_media_url|chat_delivery_media_url_invalid|unsupported_media_payload_mime|invalid_data_uri|media_source_empty|upload_only_image_video)\b/iu;
 const PERSONA_SETUP_REQUEUE_PATTERN = /\bpersona_reference_setup_required:/iu;
@@ -403,6 +412,92 @@ export class QueueManager implements QueueManagerLike {
     } finally {
       this.ctx.queue.queueRunnerTickInFlight = false;
     }
+  }
+
+  async resetQueueOnReconnect(reason: string): Promise<QueueReconnectResetResult> {
+    const normalizedReason =
+      typeof reason === "string" && reason.trim().length > 0
+        ? reason.trim()
+        : "reconnect_reset";
+    let scanned = 0;
+    let cancelled = 0;
+    let cancelledQueued = 0;
+    let cancelledScheduled = 0;
+    let cancelledRunning = 0;
+    let skippedTerminal = 0;
+    const cancelledInboxFiles = new Set<string>();
+    const cancelledAt = nowIso();
+
+    await this.mutateQueueState((current) => {
+      const nextItems = current.items.map((item) => {
+        scanned += 1;
+        const hasCompletedAt =
+          typeof item.completedAt === "string" && item.completedAt.trim().length > 0;
+        if (hasCompletedAt || TERMINAL_QUEUE_STATUSES.has(item.status)) {
+          skippedTerminal += 1;
+          return item;
+        }
+        cancelled += 1;
+        if (item.status === "queued") {
+          cancelledQueued += 1;
+          if (item.inboxFile.trim().length > 0) {
+            cancelledInboxFiles.add(item.inboxFile.trim());
+          }
+        } else if (item.status === "scheduled") {
+          cancelledScheduled += 1;
+          if (item.inboxFile.trim().length > 0) {
+            cancelledInboxFiles.add(item.inboxFile.trim());
+          }
+        } else if (item.status === "running") {
+          cancelledRunning += 1;
+        }
+        return {
+          ...item,
+          status: "cancelled" as QueueItem["status"],
+          forceNow: false,
+          dueAt: null,
+          startedAt: null,
+          completedAt: cancelledAt,
+          lastError: `cancelled_on_reconnect:${normalizedReason}`,
+          scheduledBy: "reconnect_reset",
+        };
+      });
+      if (cancelled === 0) return current;
+      return {
+        ...current,
+        items: nextItems,
+      };
+    });
+
+    let removedInboxFiles = 0;
+    for (const inboxFile of cancelledInboxFiles) {
+      if (path.basename(inboxFile) !== inboxFile) continue;
+      const inboxPath = path.join(this.ctx.ipcPaths.inboxDir, inboxFile);
+      const removed = await fs
+        .unlink(inboxPath)
+        .then(() => true)
+        .catch(() => false);
+      if (removed) removedInboxFiles += 1;
+    }
+
+    const result: QueueReconnectResetResult = {
+      scanned,
+      cancelled,
+      cancelledQueued,
+      cancelledScheduled,
+      cancelledRunning,
+      skippedTerminal,
+      removedInboxFiles,
+    };
+    await this.ctx.memory
+      .recordWrite({
+        type: "directive_queue_reconnect_reset",
+        at: nowIso(),
+        reason: normalizedReason,
+        ...result,
+      })
+      .catch(() => undefined);
+    return result;
   }
 
   // -----------------------------------------------------------------------
