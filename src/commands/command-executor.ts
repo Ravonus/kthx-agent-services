@@ -9576,8 +9576,11 @@ export class CommandExecutor {
       inlineDrafts.length > 0
         ? null
         : await this.buildGenerateInputWithRuntimeContext(payload, command);
-    const generateInput =
+    const enforcePermissionHintFilters =
       ENFORCE_PERMISSION_HINT_FILTERS &&
+      !this.isDirectiveContextLinkedCommand(command);
+    const generateInput =
+      enforcePermissionHintFilters &&
       generateInputRaw &&
       inlineDrafts.length === 0
         ? this.applyPermissionGenerateInputConstraints(
@@ -9586,7 +9589,7 @@ export class CommandExecutor {
           )
         : generateInputRaw;
     if (
-      ENFORCE_PERMISSION_HINT_FILTERS &&
+      enforcePermissionHintFilters &&
       generateInputRaw &&
       generateInput &&
       generateInput !== generateInputRaw
@@ -9615,7 +9618,7 @@ export class CommandExecutor {
             .filter((entry) => entry.length > 0)
         : null;
     if (
-      ENFORCE_PERMISSION_HINT_FILTERS &&
+      enforcePermissionHintFilters &&
       !inlineDrafts.length &&
       generateInputRaw &&
       generateInput &&
@@ -9680,7 +9683,7 @@ export class CommandExecutor {
         : drafts.filter(
             (draft) => draft.action.trim().toLowerCase() === enforcedDraftAction,
           );
-    const permissionFilteredDrafts = ENFORCE_PERMISSION_HINT_FILTERS
+    const permissionFilteredDrafts = enforcePermissionHintFilters
       ? executableDrafts.filter((draft) =>
           this.isGeneratedDraftAllowedByPermissionState(
             draft,
@@ -9689,7 +9692,7 @@ export class CommandExecutor {
         )
       : executableDrafts;
     if (
-      ENFORCE_PERMISSION_HINT_FILTERS &&
+      enforcePermissionHintFilters &&
       executableDrafts.length > 0 &&
       permissionFilteredDrafts.length !== executableDrafts.length
     ) {
@@ -9796,7 +9799,7 @@ export class CommandExecutor {
         });
         const fallbackAllowed =
           fallbackDraft &&
-          (!ENFORCE_PERMISSION_HINT_FILTERS ||
+          (!enforcePermissionHintFilters ||
             this.isGeneratedDraftAllowedByPermissionState(
               fallbackDraft,
               payload.permissionState,
