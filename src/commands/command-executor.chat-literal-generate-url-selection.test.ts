@@ -283,6 +283,14 @@ describe("command executor chat literal delivery url selection", () => {
     expect(firstAttachment).not.toBeNull();
     if (!firstAttachment) return;
     expect(firstAttachment.url).toBe("https://cdn.example.com/generated/final-sticker.png");
+    const sendPayloads = bridge.mock.calls
+      .map((call) => call[0])
+      .filter(
+        (payload): payload is Record<string, unknown> =>
+          isRecord(payload) && payload.action === "send_message",
+      );
+    expect(sendPayloads).toHaveLength(1);
+    expect(sendPayloads[0]?.clientMessageId).toBe(`runtime_generate_${command.id}`);
 
     const metadata = isRecord(successEdit.metadata) ? successEdit.metadata : null;
     const actionPreview = metadata && isRecord(metadata.actionPreview)

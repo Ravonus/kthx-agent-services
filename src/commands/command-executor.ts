@@ -1318,7 +1318,7 @@ type CommandLifecycleCheckpointStage =
   | "uploaded"
   | "write_mutation"
   | "chat_delivery"
-  | "ack";
+  | "ack_terminal";
 
 type FollowTargetMode = "owner" | "agent";
 
@@ -1333,6 +1333,13 @@ export class CommandExecutor {
     string,
     { expiresAtMs: number; candidate: EngagementTargetCandidate }
   >();
+  /** Cache generated drafts by command ID so requeued commands skip regeneration. */
+  private readonly generatedDraftCache = new Map<
+    string,
+    { drafts: GeneratedDraft[]; cachedAtMs: number }
+  >();
+  private static readonly GENERATED_DRAFT_CACHE_MAX_ENTRIES = 50;
+  private static readonly GENERATED_DRAFT_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
   private runtimeAgentIdCache: string | null = null;
   private runtimeAgentIdCheckedAtMs = 0;
 
@@ -1363,6 +1370,27 @@ export class CommandExecutor {
     return this.runtimeAgentIdCache;
   }
 
+  private resolveCommandRequestOrigin(
+    command: Command,
+    payload: Record<string, unknown> | null,
+  ): string {
+    const runtimeOrigin = asNonEmptyString(command.runtimeOrigin)?.toLowerCase() ?? "";
+    if (runtimeOrigin.includes("chat")) return "chat";
+    if (runtimeOrigin.includes("directive")) return "directive";
+    if (runtimeOrigin.includes("admin")) return "admin";
+    if (runtimeOrigin.includes("autonomous")) return "autonomous";
+
+    const sourceContext = asNonEmptyString(payload?.sourceContext)?.toLowerCase() ?? "";
+    if (sourceContext === "chat") return "chat";
+    if (sourceContext === "directive" || sourceContext === "director") return "directive";
+    if (sourceContext === "admin") return "admin";
+    if (sourceContext === "autonomous") return "autonomous";
+
+    if (runtimeOrigin.length > 0) return runtimeOrigin;
+    if (sourceContext.length > 0) return sourceContext;
+    return "unknown";
+  }
+
   private async recordCommandLifecycleCheckpoint(input: {
     command: Command;
     stage: CommandLifecycleCheckpointStage;
@@ -1370,15 +1398,50 @@ export class CommandExecutor {
     message?: string | null;
     metadata?: Record<string, unknown>;
   }): Promise<void> {
+    const payload = isRecord(input.command.payload) ? input.command.payload : null;
+    const chatContext = isRecord(payload?.chatContext) ? payload.chatContext : null;
+    const runtimeAgentId = await this.resolveRuntimeAgentId().catch(() => null);
+    const agentId =
+      asNonEmptyString(input.command.targetAgentId) ?? runtimeAgentId ?? null;
+    const directiveId =
+      asNonEmptyString(input.command.sourceDirectiveId) ??
+      asNonEmptyString(input.command.pendingDirectiveId) ??
+      null;
+    const conversationId =
+      asNonEmptyString(chatContext?.conversationId) ??
+      asNonEmptyString(payload?.conversationId) ??
+      null;
+    const channelId =
+      asNonEmptyString(chatContext?.channelId) ??
+      asNonEmptyString(payload?.channelId) ??
+      null;
+    const clientMessageId =
+      asNonEmptyString(chatContext?.clientMessageId) ??
+      asNonEmptyString(chatContext?.processingClientMessageId) ??
+      asNonEmptyString(payload?.clientMessageId) ??
+      null;
+    const messageId =
+      asNonEmptyString(chatContext?.messageId) ??
+      asNonEmptyString(payload?.messageId) ??
+      null;
     await this.ctx.memory
       .recordWrite({
         type: "command_execution_checkpoint",
         at: nowIso(),
+        agentId,
+        directiveId,
         commandId: input.command.id,
         commandKind: input.command.kind,
         sourceDirectiveId: input.command.sourceDirectiveId ?? null,
         pendingDirectiveId: input.command.pendingDirectiveId ?? null,
         actionNonce: input.command.actionNonce ?? null,
+        requestOrigin: this.resolveCommandRequestOrigin(input.command, payload),
+        chatContext: {
+          conversationId,
+          channelId,
+        },
+        clientMessageId,
+        messageId,
         stage: input.stage,
         status: input.status ?? "ok",
         ...(input.message && input.message.trim().length > 0
@@ -1393,6 +1456,22 @@ export class CommandExecutor {
     const normalizedCommandId = commandId.trim();
     if (!normalizedCommandId.length) return;
     this.ctx.commandSeal.runtimeConsumedCommandIds.delete(normalizedCommandId);
+  }
+
+  private pruneGeneratedDraftCache(): void {
+    const nowMs = Date.now();
+    for (const [key, cached] of this.generatedDraftCache) {
+      if (nowMs - cached.cachedAtMs < CommandExecutor.GENERATED_DRAFT_CACHE_TTL_MS) continue;
+      this.generatedDraftCache.delete(key);
+    }
+    if (this.generatedDraftCache.size <= CommandExecutor.GENERATED_DRAFT_CACHE_MAX_ENTRIES) return;
+    const overflow = this.generatedDraftCache.size - CommandExecutor.GENERATED_DRAFT_CACHE_MAX_ENTRIES;
+    let removed = 0;
+    for (const key of this.generatedDraftCache.keys()) {
+      this.generatedDraftCache.delete(key);
+      removed += 1;
+      if (removed >= overflow) break;
+    }
   }
 
   private pruneBridgeLookupCache(nowMs: number): void {
@@ -9488,7 +9567,11 @@ export class CommandExecutor {
       }
     }
 
-    const inlineDrafts = this.extractInlineDrafts(payload);
+    // Check for previously-generated drafts cached from a prior attempt (requeue).
+    // This prevents re-calling generate.mutate() when the command is retried.
+    this.pruneGeneratedDraftCache();
+    const cachedEntry = this.generatedDraftCache.get(command.id);
+    const inlineDrafts = cachedEntry ? cachedEntry.drafts : this.extractInlineDrafts(payload);
     const generateInputRaw =
       inlineDrafts.length > 0
         ? null
@@ -9585,6 +9668,12 @@ export class CommandExecutor {
       inlineDrafts.length > 0
         ? inlineDrafts
         : this.extractGeneratedDrafts(generatedResult);
+
+    // Cache generated drafts so requeued commands skip the expensive generate.mutate() call.
+    if (drafts.length > 0 && !cachedEntry) {
+      this.generatedDraftCache.set(command.id, { drafts, cachedAtMs: Date.now() });
+    }
+
     const executableDrafts =
       enforcedDraftAction === null
         ? drafts
@@ -9912,6 +10001,17 @@ export class CommandExecutor {
           }
         }
       } catch (error: unknown) {
+        // If the write executor threw RequeueCommandError and no drafts have applied yet,
+        // propagate it so the command actually gets requeued (with cached drafts).
+        // This prevents burning a generated prompt for nothing.
+        if (error instanceof RequeueCommandError) {
+          const anyApplied = executedOutcomes.some((entry) => entry.ok);
+          if (!anyApplied) {
+            throw error;
+          }
+          // Some drafts already applied — can't requeue without creating duplicates,
+          // so treat this draft as failed and continue.
+        }
         const reason = error instanceof Error ? error.message : String(error);
         if (this.isRecoverableDraftExecutionError(error)) {
           blockedWriteKinds.add(normalizedDraftKind);
@@ -10012,6 +10112,9 @@ export class CommandExecutor {
         },
       });
     }
+
+    // Command completed — clear the draft cache entry.
+    this.generatedDraftCache.delete(command.id);
 
     return this.successOutcome(command, {
       generated: generatedResult,
@@ -13808,10 +13911,60 @@ export class CommandExecutor {
         "generate_text",
       ]),
     };
+
+    // --- Derive capabilities from activeWindows grants ---
+    // The `can` booleans may not be populated even when valid grants exist
+    // in activeWindows. Scan grant action keys to fill in missing capabilities.
+    const grantCandidates = parseGrantCandidatesFromPermissionState(permissionState);
+    const nowMs = Date.now();
+    const hasActiveGrant = (actionKeys: readonly string[]): boolean => {
+      for (const candidate of grantCandidates) {
+        if (candidate.expiresAtMs <= nowMs) continue;
+        for (const key of actionKeys) {
+          const action = candidate.actions.get(key);
+          if (action && action.remainingCount > 0) return true;
+        }
+      }
+      return false;
+    };
+
+    if (values.postMedia !== true) {
+      if (hasActiveGrant(["post:post:media", "post:thread:media"])) {
+        values.postMedia = true;
+      }
+    }
+    if (values.postText !== true) {
+      if (hasActiveGrant(["post:post:text", "post:thread:text"])) {
+        values.postText = true;
+      }
+    }
+    if (values.story !== true) {
+      if (hasActiveGrant(["story", "write.createStory"])) {
+        values.story = true;
+      }
+    }
+    if (values.comment !== true) {
+      if (hasActiveGrant(["comment", "write.commentPost"])) {
+        values.comment = true;
+      }
+    }
+    if (values.like !== true) {
+      if (hasActiveGrant(["like", "write.votePost"])) {
+        values.like = true;
+      }
+    }
+    if (values.repost !== true) {
+      if (hasActiveGrant(["repost", "write.repostPost"])) {
+        values.repost = true;
+      }
+    }
+
+    const hasAnyHints =
+      grantCandidates.length > 0 ||
+      Object.values(values).some((value) => typeof value === "boolean");
+
     return {
-      hasHints: Object.values(values).some(
-        (value) => typeof value === "boolean",
-      ),
+      hasHints: hasAnyHints,
       can: {
         postMedia: values.postMedia === true,
         postText: values.postText === true,
@@ -16516,6 +16669,9 @@ export class CommandExecutor {
       }
       return false;
     }
+    const route = chatTarget.conversationId
+      ? { conversationId: chatTarget.conversationId }
+      : { channelId: chatTarget.channelId };
     const outcomeData = isRecord(outcome.data) ? outcome.data : null;
     const chatDeliveryHandled = outcomeData?.chatDeliveryHandled === true;
     const outcomeMode = asNonEmptyString(outcomeData?.mode)?.toLowerCase() ?? "";
@@ -16536,7 +16692,11 @@ export class CommandExecutor {
         // Try editing the existing preview card first to avoid a stuck "processing" card
         // alongside a separate terminal message.  The preview card clientMessageId is
         // deterministic: `runtime_generate_${command.id}`.
-        const previewClientMessageId = `runtime_generate_${command.id}`;
+        const chatContext = isRecord(payload?.chatContext) ? payload.chatContext : null;
+        const previewClientMessageId =
+          asNonEmptyString(chatContext?.processingClientMessageId) ??
+          asNonEmptyString(chatContext?.previewClientMessageId) ??
+          `runtime_generate_${command.id}`;
         const completion = this.buildNonWriteChatCompletion({ command, outcome });
         if (completion && this.ctx.callAgentChatBridge) {
           try {
@@ -16917,13 +17077,34 @@ export class CommandExecutor {
   }): Promise<void> {
     await this.writeOutcome(input.outcome);
     await this.emitChatOutcome(input.command, input.outcome).catch(async (error: unknown) => {
+      const errorMessage = error instanceof Error ? error.message : String(error);
       await this.recordCommandLifecycleCheckpoint({
         command: input.command,
         stage: "chat_delivery",
         status: "failed",
-        message: error instanceof Error ? error.message : String(error),
+        message: errorMessage,
         metadata: {
           mode: "emit_exception",
+        },
+      });
+      const fallbackCompletion = this.buildNonWriteChatCompletion({
+        command: input.command,
+        outcome: input.outcome,
+      });
+      if (!fallbackCompletion) return;
+      const recovered = await this.sendNonWriteChatCompletion({
+        command: input.command,
+        body: fallbackCompletion.body,
+        metadata: fallbackCompletion.metadata,
+      }).catch(() => false);
+      await this.recordCommandLifecycleCheckpoint({
+        command: input.command,
+        stage: "chat_delivery",
+        status: recovered ? "ok" : "failed",
+        message: recovered ? null : errorMessage,
+        metadata: {
+          mode: "emit_exception_fallback",
+          recovered,
         },
       });
     });
@@ -16952,7 +17133,7 @@ export class CommandExecutor {
       });
       await this.recordCommandLifecycleCheckpoint({
         command,
-        stage: "ack",
+        stage: "ack_terminal",
         status: "ok",
         metadata: {
           directiveId,
@@ -16962,7 +17143,7 @@ export class CommandExecutor {
     } catch (error: unknown) {
       await this.recordCommandLifecycleCheckpoint({
         command,
-        stage: "ack",
+        stage: "ack_terminal",
         status: "failed",
         message: error instanceof Error ? error.message : String(error),
         metadata: {

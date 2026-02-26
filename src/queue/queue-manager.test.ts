@@ -191,4 +191,89 @@ describe("queue manager planning", () => {
     expect(typeof recovered.dueAt).toBe("string");
     expect(recovered.completedAt).toBeNull();
   });
+
+  it("drains multiple force-now directives in created order without collapsing queued items", async () => {
+    let queueStatePathRef = "";
+    const processedOrder: string[] = [];
+    const { queueStatePath, manager, inboxDir } = await createQueueManagerHarness({
+      queueRunnerConcurrency: 1,
+      minSpacingSeconds: 1,
+      maxSpacingSeconds: 1,
+      processCommandFile: async (inboxFile) => {
+        processedOrder.push(inboxFile);
+        const rawState = JSON.parse(await fs.readFile(queueStatePathRef, "utf8")) as QueueState;
+        const nextState: QueueState = {
+          ...rawState,
+          items: rawState.items.map((item) =>
+            item.inboxFile === inboxFile
+              ? {
+                  ...item,
+                  status: "done",
+                  completedAt: new Date().toISOString(),
+                }
+              : item,
+          ),
+        };
+        await fs.writeFile(queueStatePathRef, JSON.stringify(nextState, null, 2), "utf8");
+        return true;
+      },
+    });
+    queueStatePathRef = queueStatePath;
+
+    await fs.writeFile(path.join(inboxDir, "one.json"), "{}", "utf8");
+    await fs.writeFile(path.join(inboxDir, "two.json"), "{}", "utf8");
+
+    await manager.enqueue({
+      directiveId: "directive-one",
+      inboxFile: "one.json",
+      queueClass: "comment",
+      forceNow: true,
+      commandFingerprint: "directive-one:nonce-1",
+    });
+    await manager.enqueue({
+      directiveId: "directive-two",
+      inboxFile: "two.json",
+      queueClass: "comment",
+      forceNow: true,
+      commandFingerprint: "directive-two:nonce-1",
+    });
+
+    await manager.runnerTick();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const state = JSON.parse(await fs.readFile(queueStatePath, "utf8")) as QueueState;
+    expect(state.items).toHaveLength(2);
+    expect(state.items.every((item) => item.completedAt !== null)).toBe(true);
+    expect(processedOrder).toEqual(["one.json", "two.json"]);
+  });
+
+  it("keeps queue state isolated across manager instances", async () => {
+    const first = await createQueueManagerHarness();
+    const second = await createQueueManagerHarness();
+
+    await first.manager.enqueue({
+      directiveId: "directive-first",
+      inboxFile: "first.json",
+      queueClass: "post",
+      forceNow: false,
+      commandFingerprint: "directive-first:nonce-1",
+    });
+    await second.manager.enqueue({
+      directiveId: "directive-second",
+      inboxFile: "second.json",
+      queueClass: "engagement",
+      forceNow: true,
+      commandFingerprint: "directive-second:nonce-1",
+    });
+
+    const firstState = JSON.parse(await fs.readFile(first.queueStatePath, "utf8")) as QueueState;
+    const secondState = JSON.parse(await fs.readFile(second.queueStatePath, "utf8")) as QueueState;
+
+    expect(firstState.items).toHaveLength(1);
+    expect(secondState.items).toHaveLength(1);
+    expect(firstState.items[0]?.directiveId).toBe("directive-first");
+    expect(firstState.items[0]?.inboxFile).toBe("first.json");
+    expect(secondState.items[0]?.directiveId).toBe("directive-second");
+    expect(secondState.items[0]?.inboxFile).toBe("second.json");
+  });
 });

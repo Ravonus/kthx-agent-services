@@ -157,9 +157,46 @@ const parsePendingDirectiveRows = (
 // Backend call serialization gate
 // ---------------------------------------------------------------------------
 
-let backendRequestInFlight = false;
-let backendRequestQueueDepth = 0;
-let lastBackendCallAtMs = 0;
+type BackendRequestGate = {
+  inFlight: boolean;
+  queueDepth: number;
+  lastCallAtMs: number;
+};
+
+const backendRequestGates = new Map<string, BackendRequestGate>();
+const DEFAULT_BACKEND_GATE_KEY = "__default__";
+const BACKEND_GATE_IDLE_TTL_MS = 10 * 60_000;
+
+const resolveBackendGateKey = (ctx?: RuntimeContext): string => {
+  const connectionId = ctx?.config.connectionId;
+  if (typeof connectionId !== "string") return DEFAULT_BACKEND_GATE_KEY;
+  const trimmed = connectionId.trim();
+  return trimmed.length > 0 ? trimmed : DEFAULT_BACKEND_GATE_KEY;
+};
+
+const getBackendRequestGate = (ctx?: RuntimeContext): BackendRequestGate => {
+  const key = resolveBackendGateKey(ctx);
+  const existing = backendRequestGates.get(key);
+  if (existing) return existing;
+  const created: BackendRequestGate = {
+    inFlight: false,
+    queueDepth: 0,
+    lastCallAtMs: 0,
+  };
+  backendRequestGates.set(key, created);
+  return created;
+};
+
+const pruneBackendRequestGates = (): void => {
+  const nowMs = Date.now();
+  for (const [key, gate] of backendRequestGates) {
+    if (key === DEFAULT_BACKEND_GATE_KEY) continue;
+    if (gate.inFlight || gate.queueDepth > 0) continue;
+    if (gate.lastCallAtMs <= 0 || nowMs - gate.lastCallAtMs > BACKEND_GATE_IDLE_TTL_MS) {
+      backendRequestGates.delete(key);
+    }
+  }
+};
 
 export const runBackendCall = async <T>(
   label: string,
@@ -169,29 +206,34 @@ export const runBackendCall = async <T>(
   const serialize = ctx?.config.backendSerializeRequests ?? true;
   const minGapMs = ctx?.config.backendRequestMinGapMs ?? 250;
   const maxQueue = ctx?.config.backendRequestMaxQueue ?? 100;
+  const gate = getBackendRequestGate(ctx);
 
   if (serialize) {
-    if (backendRequestInFlight && backendRequestQueueDepth >= maxQueue) {
+    if (gate.inFlight && gate.queueDepth >= maxQueue) {
       throw new Error(`Backend request queue full (${maxQueue}): ${label}`);
     }
-    while (backendRequestInFlight) {
-      backendRequestQueueDepth += 1;
-      await new Promise<void>((r) => setTimeout(r, 50));
-      backendRequestQueueDepth -= 1;
+    while (gate.inFlight) {
+      gate.queueDepth += 1;
+      try {
+        await new Promise<void>((r) => setTimeout(r, 50));
+      } finally {
+        gate.queueDepth = Math.max(0, gate.queueDepth - 1);
+      }
     }
-    const gap = Date.now() - lastBackendCallAtMs;
+    const gap = Date.now() - gate.lastCallAtMs;
     if (gap < minGapMs) {
       await new Promise<void>((r) => setTimeout(r, minGapMs - gap));
     }
   }
 
-  backendRequestInFlight = true;
+  gate.inFlight = true;
   try {
     const result = await fn();
-    lastBackendCallAtMs = Date.now();
+    gate.lastCallAtMs = Date.now();
     return result;
   } finally {
-    backendRequestInFlight = false;
+    gate.inFlight = false;
+    pruneBackendRequestGates();
   }
 };
 
