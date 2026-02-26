@@ -2613,7 +2613,7 @@ export class CommandExecutor {
       asNonEmptyString(context?.imagePrompt);
     if (mediaPrompt) return true;
 
-    const requestedKinds = this.resolveRequestedGenerateKinds(payload, "media");
+    const requestedKinds = this.resolveRequestedGenerateKinds(payload, "chat");
     return requestedKinds.some(
       (kind) => kind === "media" || kind === "multi_media" || kind === "story",
     );
@@ -3592,12 +3592,71 @@ export class CommandExecutor {
         inboxFile,
       },
     });
+    const runtimeOrigin =
+      asNonEmptyString(command.runtimeOrigin)?.trim().toLowerCase() ?? "";
+    const isDirectiveScopedCommand =
+      runtimeOrigin === "director_directive" ||
+      runtimeOrigin === "pending_promotion" ||
+      runtimeOrigin === "runtime_resealed" ||
+      asNonEmptyString(command.sourceDirectiveId) !== null ||
+      asNonEmptyString(command.pendingDirectiveId) !== null;
     const targetAgentId = asNonEmptyString(command.targetAgentId);
+    if (!targetAgentId && isDirectiveScopedCommand) {
+      const missingReason = "directive_target_agent_missing";
+      await this.ctx.memory
+        .recordWrite({
+          type: "inbox_command_target_agent_missing",
+          at: nowIso(),
+          inboxFile,
+          commandId: command.id,
+          kind: command.kind,
+          runtimeOrigin: command.runtimeOrigin ?? null,
+          sourceDirectiveId: command.sourceDirectiveId ?? null,
+          pendingDirectiveId: command.pendingDirectiveId ?? null,
+          reason: missingReason,
+        })
+        .catch(() => undefined);
+      const outcome: CommandOutcome = {
+        at: nowIso(),
+        commandId: command.id,
+        kind: command.kind,
+        grantId: command.grantId,
+        ok: false,
+        error: {
+          message: "Rejected command: directive target agent id is missing.",
+          code: missingReason,
+        },
+      };
+      await this.finalizeCommandOutcome({ command, outcome });
+      await this.moveInboxFileToProcessed(filePath, "rejected");
+      await this.markQueueItemCompletedByInbox(
+        inboxFile,
+        "failed",
+        "directive target agent id missing",
+      );
+      return true;
+    }
     if (targetAgentId) {
       const runtimeAgentId = await this.resolveRuntimeAgentId();
+      if (!runtimeAgentId || runtimeAgentId.length === 0) {
+        const unresolvedReason = `target_agent_identity_unknown:${targetAgentId}`;
+        await this.ctx.memory
+          .recordWrite({
+            type: "inbox_command_target_agent_identity_unknown",
+            at: nowIso(),
+            inboxFile,
+            commandId: command.id,
+            kind: command.kind,
+            targetAgentId,
+            reason: unresolvedReason,
+          })
+          .catch(() => undefined);
+        await this.markQueueItemNotReadyByInbox(inboxFile, unresolvedReason).catch(
+          () => undefined,
+        );
+        return false;
+      }
       if (
-        runtimeAgentId &&
-        runtimeAgentId.length > 0 &&
         runtimeAgentId !== targetAgentId
       ) {
         const mismatchReason = `target_agent_mismatch:${targetAgentId}:${runtimeAgentId}`;
@@ -10418,6 +10477,68 @@ export class CommandExecutor {
         }
       }
     }
+    if (isChatOrigin && executionDrafts.length > 0) {
+      const allowChatWriteExecution = this.isChatWriteCommandExplicitlyRequested(payload);
+      if (!allowChatWriteExecution) {
+        const blockedWriteDrafts = executionDrafts.filter((draft) =>
+          this.isWriteDraftAction(draft.action),
+        );
+        if (blockedWriteDrafts.length > 0) {
+          executionDrafts = executionDrafts.filter(
+            (draft) => !this.isWriteDraftAction(draft.action),
+          );
+          await this.ctx.memory
+            .recordWrite({
+              type: "chat_write_drafts_blocked_missing_explicit_request",
+              at: nowIso(),
+              commandId: command.id,
+              commandKind: command.kind,
+              sourceDirectiveId,
+              blockedDraftCount: blockedWriteDrafts.length,
+              blockedActions: blockedWriteDrafts
+                .map((draft) => draft.action.trim().toLowerCase())
+                .filter((value) => value.length > 0)
+                .slice(0, 12),
+              retainedDraftCount: executionDrafts.length,
+            })
+            .catch(() => undefined);
+          if (executionDrafts.length === 0) {
+            if (
+              this.shouldRedirectBlockedChatWritesToLiteralGenerate({
+                payload,
+                blockedDrafts: blockedWriteDrafts,
+              })
+            ) {
+              const fallbackPrompt =
+                this.resolveChatLiteralFallbackPromptFromDrafts({
+                  payload,
+                  drafts: blockedWriteDrafts,
+                });
+              await this.ctx.memory
+                .recordWrite({
+                  type: "chat_write_drafts_redirected_chat_literal_generate",
+                  at: nowIso(),
+                  commandId: command.id,
+                  commandKind: command.kind,
+                  sourceDirectiveId,
+                  blockedDraftCount: blockedWriteDrafts.length,
+                })
+                .catch(() => undefined);
+              const fallbackPayload = this.buildChatLiteralFallbackPayloadFromStory({
+                payload,
+                ...(fallbackPrompt ? { fallbackPrompt } : {}),
+              });
+              return this.executeChatLiteralGenerate(command, fallbackPayload);
+            }
+            return this.failedOutcome(
+              command,
+              "Chat write actions require an explicit request to post/comment/reply/like/repost/story.",
+              "chat_write_explicit_required",
+            );
+          }
+        }
+      }
+    }
     if (enforcedDraftAction !== null && executableDrafts.length === 0) {
       await this.ctx.memory
         .recordWrite({
@@ -10540,10 +10661,9 @@ export class CommandExecutor {
       !explicitPublishRequested &&
       this.shouldEnforceExplicitPublishGate(payload)
     ) {
-      const blockedDraftCount = executionDrafts.filter((draft) => {
-        const action = draft.action.trim().toLowerCase();
-        return action === "post" || action === "story";
-      }).length;
+      const blockedDraftCount = executionDrafts.filter((draft) =>
+        this.isWriteDraftAction(draft.action),
+      ).length;
       if (blockedDraftCount > 0) {
         await this.ctx.memory.recordWrite({
           type: "publish_blocked_missing_explicit_request",
@@ -10555,7 +10675,7 @@ export class CommandExecutor {
         }).catch(() => undefined);
         return this.failedOutcome(
           command,
-          "Publish action blocked: explicit post/publish/share/story request required.",
+          "Write action blocked: explicit post/comment/reply/like/repost/story request required.",
           "publish_verb_required",
         );
       }
@@ -10824,6 +10944,164 @@ export class CommandExecutor {
     }
 
     return true;
+  }
+
+  private isWriteDraftAction(actionValue: string): boolean {
+    const action = actionValue.trim().toLowerCase();
+    return (
+      action === "post" ||
+      action === "story" ||
+      action === "comment" ||
+      action === "like" ||
+      action === "repost" ||
+      action === "avatar" ||
+      action === "banner"
+    );
+  }
+
+  private isChatWriteCommandExplicitlyRequested(
+    payload: Record<string, unknown>,
+  ): boolean {
+    if (
+      payload.explicitPublishRequested === true ||
+      payload.explicitPublishVerbDetected === true
+    ) {
+      return true;
+    }
+    const chatCommandName = this.resolveChatCommandName(payload);
+    if (chatCommandName) {
+      const normalized = chatCommandName.trim().toLowerCase().replace(/[\s-]+/gu, "_");
+      if (
+        normalized === "post" ||
+        normalized === "schedule" ||
+        normalized === "reply_post" ||
+        normalized === "replypost" ||
+        normalized === "reply_commenters" ||
+        normalized === "reply_comments" ||
+        normalized === "comment" ||
+        normalized === "like" ||
+        normalized === "repost" ||
+        normalized === "story" ||
+        normalized === "stories"
+      ) {
+        return true;
+      }
+      if (normalized === "assist") {
+        const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+        const args = Array.isArray(chatContext?.commandArgs)
+          ? chatContext.commandArgs
+              .map((entry) => asNonEmptyString(entry)?.trim().toLowerCase() ?? "")
+              .filter((entry) => entry.length > 0)
+          : [];
+        const assistAction = args[0] ?? "";
+        if (
+          assistAction === "reply-circle" ||
+          assistAction === "reply_circle" ||
+          assistAction === "advertise-post" ||
+          assistAction === "advertise_post" ||
+          assistAction === "like-circle-stories" ||
+          assistAction === "like_circle_stories"
+        ) {
+          return true;
+        }
+      }
+    }
+    const requestedAction = asNonEmptyString(payload.requestedAction)?.toLowerCase() ?? "";
+    if (
+      requestedAction === "post" ||
+      requestedAction === "story" ||
+      requestedAction === "comment" ||
+      requestedAction === "reply" ||
+      requestedAction === "like" ||
+      requestedAction === "repost"
+    ) {
+      return true;
+    }
+    const goal = asNonEmptyString(payload.goal)?.toLowerCase() ?? "";
+    return (
+      goal === "post" ||
+      goal === "story" ||
+      goal === "comment" ||
+      goal === "like" ||
+      goal === "repost"
+    );
+  }
+
+  private isChatMediaIntentPayload(payload: Record<string, unknown>): boolean {
+    if (payload.chatLiteralGenerate === true || payload.chatLiteralGenerate === "true") {
+      return true;
+    }
+    const generatedAssetType = asNonEmptyString(payload.generatedAssetType)?.toLowerCase() ?? "";
+    if (
+      generatedAssetType === "image" ||
+      generatedAssetType === "gif" ||
+      generatedAssetType === "video" ||
+      generatedAssetType === "mp4"
+    ) {
+      return true;
+    }
+    const requestedKinds = this.resolveRequestedGenerateKinds(payload, "media");
+    if (requestedKinds.includes("media") || requestedKinds.includes("multi_media")) {
+      return true;
+    }
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    const serverIntentHint = isRecord(chatContext?.serverIntentHint)
+      ? chatContext.serverIntentHint
+      : null;
+    if (serverIntentHint?.wantsGeneratedImage === true) {
+      return true;
+    }
+    const signal = [
+      asNonEmptyString(payload.mediaPrompt),
+      asNonEmptyString(payload.imagePrompt),
+      asNonEmptyString(payload.prompt),
+      asNonEmptyString(payload.topic),
+      asNonEmptyString(payload.requestText),
+      asNonEmptyString(chatContext?.originalMessage),
+      asNonEmptyString(chatContext?.commandRawArgs),
+    ]
+      .filter((value): value is string => Boolean(value))
+      .join(" ");
+    return /\b(image|gif|photo|picture|visual|illustration|art|render|sticker|emote|emoji|avatar|banner)\b/iu.test(
+      signal,
+    );
+  }
+
+  private resolveChatLiteralFallbackPromptFromDrafts(input: {
+    payload: Record<string, unknown>;
+    drafts: GeneratedDraft[];
+  }): string | null {
+    for (const draft of input.drafts) {
+      const draftPayload = isRecord(draft.payload) ? draft.payload : null;
+      if (!draftPayload) continue;
+      const resolved =
+        asNonEmptyString(draftPayload.mediaPrompt) ??
+        asNonEmptyString(draftPayload.imagePrompt) ??
+        asNonEmptyString(draftPayload.prompt) ??
+        asNonEmptyString(draftPayload.topic) ??
+        asNonEmptyString(draftPayload.caption) ??
+        asNonEmptyString(draftPayload.textBody) ??
+        asNonEmptyString(draftPayload.body);
+      if (resolved) return resolved;
+    }
+    return (
+      asNonEmptyString(input.payload.mediaPrompt) ??
+      asNonEmptyString(input.payload.imagePrompt) ??
+      asNonEmptyString(input.payload.prompt) ??
+      asNonEmptyString(input.payload.topic) ??
+      asNonEmptyString(input.payload.requestText) ??
+      null
+    );
+  }
+
+  private shouldRedirectBlockedChatWritesToLiteralGenerate(input: {
+    payload: Record<string, unknown>;
+    blockedDrafts: GeneratedDraft[];
+  }): boolean {
+    if (this.isChatMediaIntentPayload(input.payload)) {
+      return true;
+    }
+    return input.blockedDrafts.some((draft) => this.isPersonaMediaCompatibleDraft(draft));
   }
 
   private isChatOriginPayload(payload: Record<string, unknown> | null): boolean {

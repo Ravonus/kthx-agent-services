@@ -327,6 +327,25 @@ export class DirectiveManager implements DirectiveManagerLike {
       directive.agentId.trim().length > 0
         ? directive.agentId.trim()
         : null;
+    if (!targetAgentId) {
+      const error = "directive_target_agent_missing";
+      await this.ackDirective({
+        directiveId: id,
+        status: "failed",
+        kind: kind || null,
+        error,
+        actionNonce,
+      });
+      await this.ctx.memory.recordWrite({
+        type: "directive_rejected_missing_target_agent",
+        at: nowIso(),
+        directiveId: id,
+        kind,
+        actionNonce: actionNonce ?? null,
+        error,
+      });
+      return;
+    }
     const directiveGrantId = typeof directive.grantId === "string" && directive.grantId.trim().length
       ? (directive.grantId as string).trim() : null;
     const commandPayload = isRecord(directive.payload)
@@ -542,6 +561,24 @@ export class DirectiveManager implements DirectiveManagerLike {
         typeof pendingDoc.agentId === "string" && pendingDoc.agentId.trim().length > 0
           ? pendingDoc.agentId.trim()
           : null;
+      if (!pendingTargetAgentId) {
+        skippedTerminal += 1;
+        await this.ctx.memory.recordWrite({
+          type: "pending_rejected_missing_target_agent",
+          at: nowIso(),
+          pendingDirectiveId: pendingId,
+          sourceDirectiveId: pendingSourceDirectiveId,
+        }).catch(() => {});
+        const latestPending = await readJsonFile(pendingPath);
+        if (isRecord(latestPending)) {
+          const rec = latestPending as Record<string, unknown>;
+          rec.status = "failed";
+          rec.error = "directive_target_agent_missing";
+          rec.updatedAt = nowIso();
+          await writeJsonFile(pendingPath, latestPending).catch(() => {});
+        }
+        continue;
+      }
       const baseCommand: Command = {
         id: pendingId, createdAt, kind: sourceKind, grantId: pendingGrantId,
         payload: sourcePayload as Record<string, unknown>, sig: null,

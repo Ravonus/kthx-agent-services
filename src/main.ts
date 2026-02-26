@@ -1333,17 +1333,34 @@ const main = async (): Promise<void> => {
       const directivePayload: Record<string, unknown> = isRecord(payload.directive)
         ? { ...(payload.directive as Record<string, unknown>) }
         : { ...payload };
-      const hasAgentId =
+      const topicMatch = /^user:([^:]+):director$/iu.exec(envelope.topic.trim());
+      const topicAgentId = topicMatch?.[1]?.trim() ?? "";
+      const payloadAgentId =
         typeof directivePayload.agentId === "string" &&
-        directivePayload.agentId.trim().length > 0;
-      if (!hasAgentId) {
-        const topicMatch = /^user:([^:]+):director$/iu.exec(
-          envelope.topic.trim(),
-        );
-        const topicAgentId = topicMatch?.[1]?.trim() ?? "";
-        if (topicAgentId.length > 0) {
-          directivePayload.agentId = topicAgentId;
-        }
+        directivePayload.agentId.trim().length > 0
+          ? directivePayload.agentId.trim()
+          : "";
+      if (topicAgentId.length > 0 && payloadAgentId.length > 0 && topicAgentId !== payloadAgentId) {
+        const directiveIdRaw = directivePayload.id;
+        const directiveId =
+          typeof directiveIdRaw === "string" && directiveIdRaw.trim().length > 0
+            ? directiveIdRaw.trim()
+            : null;
+        await memory
+          .recordWrite({
+            type: "directive_topic_agent_mismatch",
+            at: nowIso(),
+            directiveId,
+            topicAgentId,
+            payloadAgentId,
+            topic: envelope.topic,
+            eventType,
+          })
+          .catch(() => {});
+        return;
+      }
+      if (!payloadAgentId.length && topicAgentId.length > 0) {
+        directivePayload.agentId = topicAgentId;
       }
       try {
         await flushSocketBatchForDirective("directive_intake");

@@ -16,7 +16,16 @@ const createCommandSealState = (): CommandSealState => ({
   runtimeConsumedCommandIds: new Set<string>(),
 });
 
-const createHarness = async () => {
+const createHarness = async (options?: {
+  recordWrite?: (payload: unknown) => Promise<void>;
+  trpc?: {
+    agent?: {
+      ackDirective?: {
+        mutate?: (input: Record<string, unknown>) => Promise<unknown>;
+      };
+    };
+  } | null;
+}) => {
   const root = path.join(
     os.tmpdir(),
     `molkgram-directive-manager-pending-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -43,9 +52,9 @@ const createHarness = async () => {
       resultsPath: path.join(root, "ipc", "results.jsonl"),
     },
     memory: {
-      recordWrite: async () => undefined,
+      recordWrite: options?.recordWrite ?? (async () => undefined),
     },
-    trpc: null,
+    trpc: options?.trpc ?? null,
     commandSeal: createCommandSealState(),
     directive: {
       pendingDirectives: [],
@@ -85,6 +94,7 @@ describe("directive manager pending promotion", () => {
     const pendingPath = path.join(pendingDir, "pending-1.json");
     const basePendingDoc = {
       id: "pending-1",
+      agentId: "agent-test-1",
       sourceKind: "brain.generateAndQueue",
       createdAt: new Date().toISOString(),
       status: "permission_denied",
@@ -155,5 +165,107 @@ describe("directive manager pending promotion", () => {
       .filter((entry) => entry.endsWith(".json"))
       .sort();
     expect(stagedFilesAfterSecond.length).toBe(2);
+  });
+
+  it("fails directives missing agent target instead of staging them", async () => {
+    const writes: unknown[] = [];
+    const ackDirectiveMutate = vi.fn(async () => ({ stored: true }));
+    const { manager, inboxDir, ensureDirectiveInQueue } = await createHarness({
+      recordWrite: async (payload: unknown) => {
+        writes.push(payload);
+      },
+      trpc: {
+        agent: {
+          ackDirective: {
+            mutate: ackDirectiveMutate,
+          },
+        },
+      },
+    });
+
+    await manager.intake({
+      id: "directive-missing-target",
+      createdAt: new Date().toISOString(),
+      kind: "brain.generateAndQueue",
+      payload: { goal: "post", textBody: "hello" },
+      actionNonce: "nonce-missing-target",
+    });
+
+    const stagedFiles = (await fs.readdir(inboxDir)).filter((entry) =>
+      entry.endsWith(".json"),
+    );
+    expect(stagedFiles).toHaveLength(0);
+    expect(ensureDirectiveInQueue).not.toHaveBeenCalled();
+    expect(ackDirectiveMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        directiveId: "directive-missing-target",
+        status: "failed",
+        error: "directive_target_agent_missing",
+      }),
+    );
+    const rejectionEvents = writes.filter(
+      (entry) =>
+        typeof entry === "object" &&
+        entry !== null &&
+        "type" in entry &&
+        (entry as { type?: unknown }).type ===
+          "directive_rejected_missing_target_agent",
+    );
+    expect(rejectionEvents).toHaveLength(1);
+  });
+
+  it("marks pending directives without agentId as failed during promotion", async () => {
+    const writes: unknown[] = [];
+    const { manager, inboxDir, pendingDir, ensureDirectiveInQueue } = await createHarness({
+      recordWrite: async (payload: unknown) => {
+        writes.push(payload);
+      },
+    });
+    const pendingPath = path.join(pendingDir, "pending-missing-target.json");
+    await fs.writeFile(
+      pendingPath,
+      JSON.stringify(
+        {
+          id: "pending-missing-target",
+          sourceKind: "brain.generateAndQueue",
+          createdAt: new Date().toISOString(),
+          status: "pending",
+          sourceDirectiveId: "directive-missing-target",
+          intent: { goal: "post", textBody: "hello" },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const result = await manager.promoteFromPending({
+      limit: 20,
+      retryPermissionDenied: true,
+      bypassCooldown: true,
+      source: "test_missing_target",
+    });
+    expect(result.promoted).toBe(0);
+    expect(result.skippedTerminal).toBe(1);
+    expect(ensureDirectiveInQueue).not.toHaveBeenCalled();
+
+    const stagedFiles = (await fs.readdir(inboxDir)).filter((entry) =>
+      entry.endsWith(".json"),
+    );
+    expect(stagedFiles).toHaveLength(0);
+
+    const pendingDocRaw = await fs.readFile(pendingPath, "utf8");
+    const pendingDoc = JSON.parse(pendingDocRaw) as Record<string, unknown>;
+    expect(pendingDoc.status).toBe("failed");
+    expect(pendingDoc.error).toBe("directive_target_agent_missing");
+
+    const rejectionEvents = writes.filter(
+      (entry) =>
+        typeof entry === "object" &&
+        entry !== null &&
+        "type" in entry &&
+        (entry as { type?: unknown }).type === "pending_rejected_missing_target_agent",
+    );
+    expect(rejectionEvents).toHaveLength(1);
   });
 });

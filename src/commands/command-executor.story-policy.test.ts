@@ -684,6 +684,118 @@ describe("command executor story policy", () => {
     }
   });
 
+  it("redirects non-explicit chat media drafts to literal generation instead of posting", async () => {
+    const createPostMutate = vi.fn(async () => ({
+      post: { id: 101 },
+    }));
+    const executor = createExecutor({ createPostMutate });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+    const literalGenerateSpy = vi.fn(async () => ({
+      at: new Date().toISOString(),
+      commandId: "test-story-policy",
+      kind: "brain.generateAndQueue",
+      grantId: null,
+      ok: true,
+      data: {
+        mode: "chat_literal_generate",
+      },
+    }));
+    invoker.executeChatLiteralGenerate = literalGenerateSpy;
+
+    const outcome = await invoker.executeGenerateAndQueue(
+      baseCommand({
+        runtimeOrigin: "chat_command",
+        payload: {
+          sourceContext: "chat",
+          goal: "chat",
+          prompt: "generare a cat dog but make it realism and a bit creepy",
+          chatContext: {
+            commandName: "agent-decide",
+            commandArgs: ["generare a cat dog but make it realism and a bit creepy"],
+            commandRawArgs: "generare a cat dog but make it realism and a bit creepy",
+            originalMessage: "generare a cat dog but make it realism and a bit creepy",
+            conversationId: "conv-policy",
+          },
+          drafts: [
+            {
+              action: "post",
+              payload: {
+                postType: "media",
+                mediaPrompt: "realistic creepy cat-dog hybrid portrait",
+                caption: "cat-dog study",
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(createPostMutate).toHaveBeenCalledTimes(0);
+    expect(literalGenerateSpy).toHaveBeenCalledTimes(1);
+    const literalPayload = literalGenerateSpy.mock.calls[0]?.[1];
+    expect(isRecord(literalPayload)).toBe(true);
+    if (isRecord(literalPayload)) {
+      expect(literalPayload.chatLiteralGenerate).toBe(true);
+      expect(literalPayload.goal).toBe("media");
+      expect(literalPayload.mediaPrompt).toBe("realistic creepy cat-dog hybrid portrait");
+    }
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(true);
+  });
+
+  it("does not execute non-explicit chat write drafts", async () => {
+    const createPostMutate = vi.fn(async () => ({
+      post: { id: 102 },
+    }));
+    const executor = createExecutor({ createPostMutate });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+    const literalGenerateSpy = vi.fn(async () => ({
+      at: new Date().toISOString(),
+      commandId: "test-story-policy",
+      kind: "brain.generateAndQueue",
+      grantId: null,
+      ok: true,
+      data: {
+        mode: "chat_literal_generate",
+      },
+    }));
+    invoker.executeChatLiteralGenerate = literalGenerateSpy;
+
+    const outcome = await invoker.executeGenerateAndQueue(
+      baseCommand({
+        runtimeOrigin: "chat_command",
+        payload: {
+          sourceContext: "chat",
+          goal: "chat",
+          prompt: "brainstorm three options",
+          chatContext: {
+            commandName: "agent-decide",
+            commandArgs: ["brainstorm three options"],
+            commandRawArgs: "brainstorm three options",
+            originalMessage: "brainstorm three options",
+            conversationId: "conv-policy",
+          },
+          drafts: [
+            {
+              action: "comment",
+              payload: {
+                postId: 101,
+                body: "Option A: keep it concise.",
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(createPostMutate).toHaveBeenCalledTimes(0);
+    expect(literalGenerateSpy).toHaveBeenCalledTimes(1);
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(true);
+  });
+
   it("requeues directive generation when persona setup prerequisites are incomplete", async () => {
     const generateMutate = vi.fn(async () => ({
       items: [],
