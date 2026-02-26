@@ -146,6 +146,58 @@ describe("queue manager planning", () => {
     expect(typeof planned.dueAt).toBe("string");
   });
 
+  it("uses fast backoff for media generation setup deferrals instead of long stalls", async () => {
+    const { queueStatePath, manager, inboxDir } = await createQueueManagerHarness({
+      queueRunnerConcurrency: 1,
+      processCommandFile: async () => false,
+    });
+
+    const state: QueueState = {
+      updatedAt: "2026-02-24T00:00:00.000Z",
+      runnerEnabled: true,
+      lastPlanAt: null,
+      lastPlanSource: null,
+      items: [
+        {
+          id: "item-media-not-ready",
+          directiveId: "directive-media-not-ready",
+          inboxFile: "media-not-ready.json",
+          queueClass: "media",
+          forceNow: true,
+          commandFingerprint: null,
+          status: "queued",
+          createdAt: "2026-02-24T00:00:00.000Z",
+          dueAt: null,
+          attempts: 8,
+          startedAt: null,
+          completedAt: null,
+          lastAttemptAt: null,
+          lastError: "image_generation_setup_required",
+          scheduledBy: null,
+        },
+      ],
+    };
+    await fs.writeFile(queueStatePath, JSON.stringify(state, null, 2), "utf8");
+    await fs.writeFile(path.join(inboxDir, "media-not-ready.json"), "{}", "utf8");
+
+    await manager.runnerTick();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const nextRaw = JSON.parse(await fs.readFile(queueStatePath, "utf8")) as QueueState;
+    const item = nextRaw.items.find((entry) => entry.id === "item-media-not-ready");
+    expect(item).toBeDefined();
+    if (!item) return;
+    expect(item.status).toBe("scheduled");
+    expect(item.scheduledBy).toBe("queue_not_ready_backoff");
+    expect(item.lastError).toBe("image_generation_setup_required");
+    expect(item.attempts).toBe(9);
+    expect(typeof item.dueAt).toBe("string");
+    if (typeof item.dueAt === "string") {
+      const retryDelaySeconds = Math.max(0, Math.round((Date.parse(item.dueAt) - Date.now()) / 1000));
+      expect(retryDelaySeconds).toBeLessThanOrEqual(30);
+    }
+  });
+
   it("recovers abandoned running items so queue drain can continue", async () => {
     const { queueStatePath, manager, inboxDir } = await createQueueManagerHarness({
       queueRunnerConcurrency: 1,

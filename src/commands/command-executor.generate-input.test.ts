@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { CommandExecutor } from "./command-executor.js";
 import type { Command } from "../types/ipc.js";
@@ -61,7 +61,10 @@ const directiveCommandWithoutSourceId = (): Command => ({
   runtimeSig: null,
 });
 
-const createExecutor = (options?: { personaFrames?: unknown[] }) => {
+const createExecutor = (options?: {
+  personaFrames?: unknown[];
+  upsertPersonaMutate?: (input: unknown) => Promise<unknown>;
+}) => {
   const root = path.join(
     os.tmpdir(),
     `molkgram-command-executor-generate-input-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -103,7 +106,7 @@ const createExecutor = (options?: { personaFrames?: unknown[] }) => {
         uploadDataUri: { mutate: noopMutate },
         uploadRemote: { mutate: noopMutate },
         listPersonas: { query: async () => [] },
-        upsertPersona: { mutate: noopMutate },
+        upsertPersona: { mutate: options?.upsertPersonaMutate ?? noopMutate },
         listPersonaFrames: { query: listPersonaFrames },
         upsertPersonaFrame: { mutate: noopMutate },
       },
@@ -535,6 +538,68 @@ describe("command executor generate input", () => {
     expect(plan.source).toBe("none");
   });
 
+  it("does not infer a new variant persona unless prompt explicitly asks to create one", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      resolvePersonaReferencePlan(
+        payload: Record<string, unknown>,
+        mainPersonaSlugRaw?: string | null,
+        command?: Command | null,
+      ): {
+        enabled: boolean;
+        source: string;
+        targetPersonaSlug: string;
+        allowNewPersonaCreation: boolean;
+      };
+    };
+
+    const plan = invoker.resolvePersonaReferencePlan(
+      {
+        mediaPersona: "default",
+        mediaPersonaLock: true,
+        mediaPrompt: "Cinematic neon portrait in rainy streets.",
+      },
+      "realistic_core",
+      baseCommand(),
+    );
+
+    expect(plan.enabled).toBe(true);
+    expect(plan.targetPersonaSlug).toBe("realistic_core");
+    expect(plan.allowNewPersonaCreation).toBe(false);
+    expect(plan.source).not.toBe("inferred_variant");
+  });
+
+  it("allows inferred variant persona only when prompt explicitly asks to create a new persona", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      resolvePersonaReferencePlan(
+        payload: Record<string, unknown>,
+        mainPersonaSlugRaw?: string | null,
+        command?: Command | null,
+      ): {
+        enabled: boolean;
+        source: string;
+        targetPersonaSlug: string;
+        allowNewPersonaCreation: boolean;
+      };
+    };
+
+    const plan = invoker.resolvePersonaReferencePlan(
+      {
+        mediaPersona: "default",
+        mediaPersonaLock: true,
+        mediaPrompt: "Create a new persona first with cinematic neon styling.",
+      },
+      "realistic_core",
+      baseCommand(),
+    );
+
+    expect(plan.enabled).toBe(true);
+    expect(plan.targetPersonaSlug).toBe("realistic_core_cinematic");
+    expect(plan.allowNewPersonaCreation).toBe(true);
+    expect(plan.source).toBe("inferred_variant");
+  });
+
   it("does not default non-autonomous write.createPost flows to persona references", () => {
     const executor = createExecutor();
     const invoker = executor as unknown as {
@@ -619,5 +684,115 @@ describe("command executor generate input", () => {
       "https://cdn.example.com/persona/auto-midshot-opt.jpg",
       "https://cdn.example.com/persona/auto-fullbody-opt.jpg",
     ]);
+  });
+
+  it("suppresses creating missing non-main persona unless prompt explicitly requests new persona creation", async () => {
+    const upsertPersonaMutate = vi.fn(async () => ({ ok: true }));
+    const executor = createExecutor({
+      upsertPersonaMutate,
+      personaFrames: [
+        {
+          id: 201,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/main-selfie.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/main-selfie-opt.jpg",
+          updatedAt: "2026-02-24T06:40:00.000Z",
+        },
+        {
+          id: 202,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/main-midshot.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/main-midshot-opt.jpg",
+          updatedAt: "2026-02-24T06:41:00.000Z",
+        },
+        {
+          id: 203,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/main-fullbody.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/main-fullbody-opt.jpg",
+          updatedAt: "2026-02-24T06:42:00.000Z",
+        },
+      ],
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        mediaPersona: "rare_alt",
+        mediaPersonaLock: true,
+        mediaPrompt: "Moody rooftop portrait with rain reflections and city bokeh.",
+      },
+      baseCommand(),
+    );
+
+    expect(Array.isArray(result.mediaReferenceUrls)).toBe(true);
+    if (!Array.isArray(result.mediaReferenceUrls)) return;
+    expect(result.mediaReferenceUrls).toEqual([
+      "https://cdn.example.com/persona/main-selfie-opt.jpg",
+      "https://cdn.example.com/persona/main-midshot-opt.jpg",
+      "https://cdn.example.com/persona/main-fullbody-opt.jpg",
+    ]);
+    expect(upsertPersonaMutate).toHaveBeenCalledTimes(0);
+  });
+
+  it("attempts creating a new non-main persona when prompt explicitly asks for new persona creation", async () => {
+    const upsertPersonaMutate = vi.fn(async () => ({ ok: true }));
+    const executor = createExecutor({
+      upsertPersonaMutate,
+      personaFrames: [
+        {
+          id: 301,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/main-selfie.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/main-selfie-opt.jpg",
+          updatedAt: "2026-02-24T06:50:00.000Z",
+        },
+        {
+          id: 302,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/main-midshot.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/main-midshot-opt.jpg",
+          updatedAt: "2026-02-24T06:51:00.000Z",
+        },
+        {
+          id: 303,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/main-fullbody.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/main-fullbody-opt.jpg",
+          updatedAt: "2026-02-24T06:52:00.000Z",
+        },
+      ],
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        mediaPersona: "rare_alt",
+        mediaPersonaLock: true,
+        mediaPrompt:
+          "Create a new persona first called rare_alt, then render a cinematic portrait.",
+      },
+      baseCommand(),
+    );
+
+    expect(upsertPersonaMutate).toHaveBeenCalledTimes(1);
   });
 });

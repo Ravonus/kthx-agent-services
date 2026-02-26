@@ -34,6 +34,16 @@ const createExecutor = (options?: {
   createStoryMutate?: (input: unknown) => Promise<unknown>;
   createPostMutate?: (input: unknown) => Promise<unknown>;
   generateMutate?: (input: unknown) => Promise<unknown>;
+  runOpenClawPrompt?: (input: {
+    prompt: string;
+    purpose: string;
+  }) => Promise<{
+    parsed: unknown;
+    raw: string;
+    agentName: string | null;
+    payloadText: string | null;
+    envelope: Record<string, unknown> | null;
+  } | null>;
 }) => {
   const root = path.join(
     os.tmpdir(),
@@ -87,13 +97,14 @@ const createExecutor = (options?: {
     },
     callAgentChatBridge: null,
     callAgentUploadChunk: null,
-    runOpenClawPrompt: null,
+    runOpenClawPrompt: options?.runOpenClawPrompt ?? null,
   });
 };
 
 type StoryPolicyInvoker = {
   executeGenerateAndQueue(command: Command): Promise<unknown>;
   executeWriteCreateStory(command: Command): Promise<unknown>;
+  executeWriteCreatePost(command: Command): Promise<unknown>;
   executeChatLiteralGenerate(
     command: Command,
     payload: Record<string, unknown>,
@@ -381,6 +392,90 @@ describe("command executor story policy", () => {
     expect(isRecord(outcome)).toBe(true);
     if (!isRecord(outcome)) return;
     expect(outcome.ok).toBe(true);
+  });
+
+  it("strips persona carryover media fields and generates fresh media for posts", async () => {
+    const createPostMutate = vi.fn(async (input: unknown) => ({
+      post: {
+        id: 109,
+        input,
+      },
+    }));
+    const runOpenClawPrompt = vi.fn(
+      async (_input: { prompt: string; purpose: string }) => ({
+        parsed: {
+          caption: "Stormlight portrait",
+          mediaPrompt:
+            "Muted stormlight portrait on a wet rooftop, reflective puddles, distant skyline bokeh",
+        },
+        payloadText: "",
+        raw: "",
+        agentName: null,
+        envelope: null,
+      }),
+    );
+    const executor = createExecutor({ createPostMutate, runOpenClawPrompt });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+    const capturedResolveInputs: unknown[] = [];
+    let resolvedCount = 0;
+    invoker.resolveMediaUpload = vi.fn(async (input: unknown) => {
+      capturedResolveInputs.push(input);
+      resolvedCount += 1;
+      return {
+        mediaUrl: `https://cdn.example.com/generated/new-post-${resolvedCount}.png`,
+        mediaOriginalUrl: `https://cdn.example.com/generated/new-post-${resolvedCount}-original.png`,
+        mediaOptimizedUrl: `https://cdn.example.com/generated/new-post-${resolvedCount}.png`,
+        mediaType: "image",
+        mediaSizeBytes: 4096 + resolvedCount,
+      };
+    }) as StoryPolicyInvoker["resolveMediaUpload"];
+
+    const stalePersonaUrl = "https://cdn.example.com/persona/selfie-existing.png";
+    const outcome = await invoker.executeWriteCreatePost(
+      baseCommand({
+        kind: "write.createPost",
+        sourceDirectiveId: null,
+        runtimeOrigin: "chat_command",
+        payload: {
+          postType: "media",
+          mediaPrompt: "Dramatic portrait in a rainy neon alley with cinematic tension",
+          mediaPersona: "realistic_core",
+          mediaPersonaLock: true,
+          mediaUrl: stalePersonaUrl,
+          mediaItems: [{ mediaUrl: stalePersonaUrl }],
+          recentGeneratedAsset: {
+            type: "persona",
+            href: stalePersonaUrl,
+            summary: "existing persona frame",
+          },
+        },
+      }),
+    );
+
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(true);
+
+    expect(capturedResolveInputs.length).toBeGreaterThan(0);
+    for (const capturedInput of capturedResolveInputs) {
+      expect(isRecord(capturedInput)).toBe(true);
+      if (!isRecord(capturedInput)) continue;
+      const sanitizedPayload = isRecord(capturedInput.payload)
+        ? capturedInput.payload
+        : null;
+      expect(sanitizedPayload).not.toBeNull();
+      if (!sanitizedPayload) continue;
+      expect(sanitizedPayload.mediaUrl).toBeUndefined();
+      expect(sanitizedPayload.mediaItems).toBeUndefined();
+      expect(sanitizedPayload.recentGeneratedAsset).toBeUndefined();
+    }
+
+    expect(createPostMutate).toHaveBeenCalledTimes(1);
+    const createPostInput = createPostMutate.mock.calls[0]?.[0];
+    expect(isRecord(createPostInput)).toBe(true);
+    if (isRecord(createPostInput)) {
+      expect(createPostInput.mediaUrl).not.toBe(stalePersonaUrl);
+    }
   });
 
   it("allows directive-origin story writes even when chat metadata is attached", async () => {

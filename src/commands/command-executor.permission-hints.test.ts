@@ -141,7 +141,8 @@ describe("command executor permission hint filters", () => {
     expect(isRecord(outcome)).toBe(true);
     if (!isRecord(outcome)) return;
     expect(outcome.ok).toBe(false);
-    expect(String(outcome.error?.code ?? "")).not.toBe("no_permitted_generate_kind");
+    const error = isRecord(outcome.error) ? outcome.error : null;
+    expect(String(error?.code ?? "")).not.toBe("no_permitted_generate_kind");
   });
 
   it("still applies permission hint filtering for non-directive commands", async () => {
@@ -184,7 +185,8 @@ describe("command executor permission hint filters", () => {
     expect(isRecord(outcome)).toBe(true);
     if (!isRecord(outcome)) return;
     expect(outcome.ok).toBe(false);
-    expect(String(outcome.error?.code ?? "")).toBe("no_permitted_generate_kind");
+    const error = isRecord(outcome.error) ? outcome.error : null;
+    expect(String(error?.code ?? "")).toBe("no_permitted_generate_kind");
   });
 
   it("treats post media grants as image generation permission for non-directive commands", async () => {

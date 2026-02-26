@@ -71,6 +71,8 @@ const PERSONA_SELF_REFERENCE_PROMPT_PATTERN =
   /\b(selfie|self[-\s]?portrait|portrait of (?:me|myself)|of me|my face|myself|as me|look like me|my appearance)\b/iu;
 const PERSONA_REQUEST_PROMPT_PATTERN =
   /\b(persona|avatar|identity|character look|appearance)\b/iu;
+const PERSONA_CREATION_REQUEST_PROMPT_PATTERN =
+  /\b(?:(?:create|make|build|craft|define|setup|set up|start)\s+(?:a\s+)?(?:new\s+)?(?:persona|avatar|identity|character)|(?:new|another|fresh)\s+(?:persona|avatar|identity|character))\b/iu;
 const PERSONA_VARIANT_PATTERNS: ReadonlyArray<{ key: string; pattern: RegExp }> = [
   { key: "cartoon", pattern: /\b(cartoon|toon|comic)\b/iu },
   { key: "anime", pattern: /\b(anime|manga)\b/iu },
@@ -1150,6 +1152,7 @@ type PersonaReferencePlan = {
   source: string;
   explicitPersonaSlug: string | null;
   variantKey: string | null;
+  allowNewPersonaCreation: boolean;
 };
 type MediaGeneratorStreamFrame = {
   sourceFileName: string | null;
@@ -2232,10 +2235,14 @@ export class CommandExecutor {
     if (this.inFlight.has(filePath)) return false;
     this.inFlight.add(filePath);
     try {
-      return await this.processCommandFilePath(filePath, {
-        attempts: opts?.attempts,
-        maxAttempts: opts?.maxAttempts,
-      });
+      const processOptions: { attempts?: number; maxAttempts?: number } = {};
+      if (typeof opts?.attempts === "number" && Number.isFinite(opts.attempts)) {
+        processOptions.attempts = opts.attempts;
+      }
+      if (typeof opts?.maxAttempts === "number" && Number.isFinite(opts.maxAttempts)) {
+        processOptions.maxAttempts = opts.maxAttempts;
+      }
+      return await this.processCommandFilePath(filePath, processOptions);
     } finally {
       this.inFlight.delete(filePath);
     }
@@ -2352,6 +2359,38 @@ export class CommandExecutor {
       }
     }
     return null;
+  }
+
+  private resolveExplicitPersonaVariantKey(payload: Record<string, unknown>): string | null {
+    const context = isRecord(payload.context) ? payload.context : null;
+    const variantRaw =
+      asNonEmptyString(payload.mediaPersonaVariant) ??
+      asNonEmptyString(payload.personaVariant) ??
+      asNonEmptyString(context?.mediaPersonaVariant) ??
+      asNonEmptyString(context?.personaVariant) ??
+      null;
+    if (!variantRaw) return null;
+    const normalized = variantRaw.trim().toLowerCase().replace(/[\s-]+/gu, "_");
+    if (!normalized.length) return null;
+    if (!/^[a-z0-9_]{1,40}$/u.test(normalized)) return null;
+    return normalized;
+  }
+
+  private isExplicitNewPersonaRequest(payload: Record<string, unknown>): boolean {
+    const context = isRecord(payload.context) ? payload.context : null;
+    if (
+      payload.createPersona === true ||
+      payload.newPersona === true ||
+      payload.createNewPersona === true ||
+      context?.createPersona === true ||
+      context?.newPersona === true ||
+      context?.createNewPersona === true
+    ) {
+      return true;
+    }
+    const promptText = this.extractPersonaPromptText(payload);
+    if (!promptText.length) return false;
+    return PERSONA_CREATION_REQUEST_PROMPT_PATTERN.test(promptText);
   }
 
   private resolvePersonaSelectionStrategy(payload: Record<string, unknown>): string | null {
@@ -2517,7 +2556,12 @@ export class CommandExecutor {
     const promptText = this.extractPersonaPromptText(payload);
     const selfIntent = PERSONA_SELF_REFERENCE_PROMPT_PATTERN.test(promptText);
     const personaIntent = selfIntent || PERSONA_REQUEST_PROMPT_PATTERN.test(promptText);
-    const variantKey = this.resolvePersonaVariantKeyFromPrompt(promptText);
+    const explicitNewPersonaRequest = this.isExplicitNewPersonaRequest(payload);
+    const explicitVariantKey = this.resolveExplicitPersonaVariantKey(payload);
+    const promptVariantKey = this.resolvePersonaVariantKeyFromPrompt(promptText);
+    const variantKey =
+      explicitVariantKey ??
+      (explicitNewPersonaRequest ? promptVariantKey : null);
     const mainPersonaSlug =
       this.normalizePersonaSlug(mainPersonaSlugRaw) ?? DEFAULT_MAIN_PERSONA_SLUG;
     const shouldDefaultPersona = this.shouldDefaultPersonaReferences(payload, command);
@@ -2530,6 +2574,7 @@ export class CommandExecutor {
         source: "explicit",
         explicitPersonaSlug: nonGenericExplicitSlug,
         variantKey,
+        allowNewPersonaCreation: explicitNewPersonaRequest,
       };
     }
 
@@ -2541,10 +2586,12 @@ export class CommandExecutor {
         source: "none",
         explicitPersonaSlug: explicitPersonaSlug,
         variantKey: null,
+        allowNewPersonaCreation: false,
       };
     }
 
-    const inferredVariantSlug = variantKey
+    const inferredVariantSlug =
+      explicitNewPersonaRequest && variantKey
       ? this.normalizePersonaSlug(`${mainPersonaSlug}_${variantKey}`)
       : null;
     const targetPersonaSlug = inferredVariantSlug ?? mainPersonaSlug;
@@ -2562,6 +2609,7 @@ export class CommandExecutor {
               : "inferred_main",
       explicitPersonaSlug,
       variantKey,
+      allowNewPersonaCreation: explicitNewPersonaRequest,
     };
   }
 
@@ -3217,11 +3265,12 @@ export class CommandExecutor {
       new Set([...profileSeedReferences, ...localSeedReferences]),
     ).slice(0, MAX_MEDIA_REFERENCE_INPUTS);
     const mainPersonaSlug = plan.mainPersonaSlug;
-    const targetPersonaSlug = plan.targetPersonaSlug;
+    const requestedPersonaSlug = plan.targetPersonaSlug;
+    let targetPersonaSlug = requestedPersonaSlug;
     let builtFrames = false;
     let mainFrames: PersonaFrameRecord[] = [];
     let mainFrameReferences: string[] = [];
-    if (targetPersonaSlug !== mainPersonaSlug) {
+    if (requestedPersonaSlug !== mainPersonaSlug) {
       mainFrames = await this.listPersonaFramesFromServer(mainPersonaSlug);
       mainFrameReferences = this.collectPersonaFrameReferences(mainFrames);
       if (mainFrameReferences.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT) {
@@ -3239,12 +3288,36 @@ export class CommandExecutor {
     }
 
     let frames =
-      targetPersonaSlug === mainPersonaSlug
+      requestedPersonaSlug === mainPersonaSlug
         ? mainFrames.length > 0
           ? mainFrames
-          : await this.listPersonaFramesFromServer(targetPersonaSlug)
-        : await this.listPersonaFramesFromServer(targetPersonaSlug);
+          : await this.listPersonaFramesFromServer(requestedPersonaSlug)
+        : await this.listPersonaFramesFromServer(requestedPersonaSlug);
     let targetFrameReferences = this.collectPersonaFrameReferences(frames);
+    if (
+      requestedPersonaSlug !== mainPersonaSlug &&
+      targetFrameReferences.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT &&
+      !plan.allowNewPersonaCreation
+    ) {
+      targetPersonaSlug = mainPersonaSlug;
+      frames = mainFrames.length > 0
+        ? mainFrames
+        : await this.listPersonaFramesFromServer(mainPersonaSlug);
+      mainFrames = frames;
+      mainFrameReferences = this.collectPersonaFrameReferences(mainFrames);
+      targetFrameReferences = mainFrameReferences;
+      await this.ctx.memory
+        .recordWrite({
+          type: "persona_reference_new_persona_suppressed",
+          at: nowIso(),
+          commandId: input.command.id,
+          requestedPersonaSlug,
+          mainPersonaSlug,
+          source: plan.source,
+          reason: "missing_target_frames_without_explicit_new_persona_request",
+        })
+        .catch(() => undefined);
+    }
     if (targetFrameReferences.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT) {
       const bootstrapSeedReferences = Array.from(
         new Set([
@@ -3279,10 +3352,12 @@ export class CommandExecutor {
         at: nowIso(),
         commandId: input.command.id,
         personaSlug: targetPersonaSlug,
+        requestedPersonaSlug,
         mainPersonaSlug,
         source: plan.source,
         explicitPersonaSlug: plan.explicitPersonaSlug,
         variantKey: plan.variantKey,
+        allowNewPersonaCreation: plan.allowNewPersonaCreation,
         builtFrames,
         targetFrameCount: targetFrameReferences.length,
         mainFrameCount: mainFrameReferences.length,
@@ -5182,6 +5257,36 @@ export class CommandExecutor {
     }
     const mediaCandidate = noveltyValidation.candidateText;
     const mediaSeedText = mediaPromptForWrite ?? captionForWrite ?? mediaCandidate;
+    const personaReferencePlan = this.resolvePersonaReferencePlan(payload, null, command);
+    const personaDrivenMediaGeneration = this.shouldUsePersonaFrameReferences(personaReferencePlan);
+    const carriedMediaPresent =
+      asNonEmptyString(payload.mediaUrl) !== null ||
+      (Array.isArray(payload.mediaItems) && payload.mediaItems.length > 0) ||
+      isRecord(payload.recentGeneratedAsset);
+    const mediaGenerationPayloadBase: Record<string, unknown> = {
+      ...payload,
+    };
+    if (personaDrivenMediaGeneration && carriedMediaPresent) {
+      delete mediaGenerationPayloadBase.mediaUrl;
+      delete mediaGenerationPayloadBase.mediaOriginalUrl;
+      delete mediaGenerationPayloadBase.mediaOptimizedUrl;
+      delete mediaGenerationPayloadBase.mediaContentHash;
+      delete mediaGenerationPayloadBase.mediaIpfsCid;
+      delete mediaGenerationPayloadBase.mediaSizeBytes;
+      delete mediaGenerationPayloadBase.mediaType;
+      delete mediaGenerationPayloadBase.mediaItems;
+      delete mediaGenerationPayloadBase.recentGeneratedAsset;
+      await this.ctx.memory
+        .recordWrite({
+          type: "media_post_persona_carryover_stripped",
+          at: nowIso(),
+          commandId: command.id,
+          commandKind: command.kind,
+          sourceDirectiveId,
+          personaSlug: personaReferencePlan.targetPersonaSlug,
+        })
+        .catch(() => undefined);
+    }
     const autonomousMediaTheme = this.resolveAutonomousTextTheme({
       commandId: command.id,
       postKind,
@@ -5214,7 +5319,7 @@ export class CommandExecutor {
         try {
           const slideMedia = await this.resolveMediaUpload({
             payload: {
-              ...payload,
+              ...mediaGenerationPayloadBase,
               generatedAssetType: "image",
             },
             keepOriginal: true,
@@ -5345,7 +5450,7 @@ export class CommandExecutor {
         .catch(() => undefined);
     }
     const payloadForMedia: Record<string, unknown> = {
-      ...payload,
+      ...mediaGenerationPayloadBase,
       ...(captionForWrite ? { caption: captionForWrite } : {}),
       ...(mediaPromptForWrite
         ? {
@@ -14583,7 +14688,7 @@ export class CommandExecutor {
   private mapDraftToWriteCommand(input: {
     draft: GeneratedDraft;
     command: Command;
-    sourceDirectiveId: string;
+    sourceDirectiveId: string | null;
     sourceDirectiveActionNonce: string | null;
     provenance: string | null;
   }): Command | null {

@@ -81,10 +81,61 @@ const NOT_READY_MIN_REQUEUE_DELAY_SECONDS = 2;
 const NOT_READY_MAX_REQUEUE_DELAY_SECONDS = 300;
 const NOT_READY_MAX_ATTEMPTS = 30;
 const RUNNING_RECOVERY_MIN_AGE_MS = 60_000;
+const MEDIA_GENERATION_FAST_REQUEUE_PATTERN =
+  /\b(image_generation_setup_required|media_generation_waiting_for_output|no_media_url|chat_delivery_media_url_invalid|unsupported_media_payload_mime|invalid_data_uri|media_source_empty|upload_only_image_video)\b/iu;
+const PERSONA_SETUP_REQUEUE_PATTERN = /\bpersona_reference_setup_required:/iu;
 
-const computeNotReadyRequeueDelaySeconds = (attempts: number): number => {
+const resolveNotReadyBackoffProfile = (reason: string | null | undefined): string => {
+  const normalizedReason = typeof reason === "string" ? reason.trim().toLowerCase() : "";
+  if (MEDIA_GENERATION_FAST_REQUEUE_PATTERN.test(normalizedReason)) {
+    return "media_generation_fast_retry";
+  }
+  if (PERSONA_SETUP_REQUEUE_PATTERN.test(normalizedReason)) {
+    return "persona_setup_retry";
+  }
+  return "default_not_ready_retry";
+};
+
+const computeNotReadyRequeueDelaySeconds = (
+  attempts: number,
+  reason?: string | null,
+): number => {
   const normalizedAttempts =
     Number.isFinite(attempts) && attempts > 0 ? Math.trunc(attempts) : 1;
+  const profile = resolveNotReadyBackoffProfile(reason);
+
+  if (profile === "media_generation_fast_retry") {
+    if (normalizedAttempts <= 5) {
+      return Math.max(
+        NOT_READY_MIN_REQUEUE_DELAY_SECONDS,
+        normalizedAttempts * 2,
+      );
+    }
+    if (normalizedAttempts <= 12) {
+      return Math.min(
+        NOT_READY_MAX_REQUEUE_DELAY_SECONDS,
+        10 + (normalizedAttempts - 5) * 2,
+      );
+    }
+    return Math.min(NOT_READY_MAX_REQUEUE_DELAY_SECONDS, 30);
+  }
+
+  if (profile === "persona_setup_retry") {
+    if (normalizedAttempts <= 4) {
+      return Math.min(
+        NOT_READY_MAX_REQUEUE_DELAY_SECONDS,
+        5 * normalizedAttempts,
+      );
+    }
+    if (normalizedAttempts <= 10) {
+      return Math.min(
+        NOT_READY_MAX_REQUEUE_DELAY_SECONDS,
+        20 + (normalizedAttempts - 4) * 5,
+      );
+    }
+    return Math.min(NOT_READY_MAX_REQUEUE_DELAY_SECONDS, 60);
+  }
+
   if (normalizedAttempts <= 3) {
     return Math.max(
       NOT_READY_MIN_REQUEUE_DELAY_SECONDS,
@@ -321,7 +372,10 @@ export class QueueManager implements QueueManagerLike {
               startedAt: nowIso(),
               lastAttemptAt: nowIso(),
               attempts: qi.attempts + 1,
-              lastError: null,
+              // Preserve the previous reason while running so retry profiling can
+              // still use a meaningful hint if the processor returns "not ready"
+              // without writing a more specific lastError.
+              lastError: qi.lastError ?? null,
             };
           });
           return next;
@@ -399,10 +453,14 @@ export class QueueManager implements QueueManagerLike {
           };
         }
         recovered += 1;
-        const retryDelaySeconds = computeNotReadyRequeueDelaySeconds(attempts);
+        const retryDelaySeconds = computeNotReadyRequeueDelaySeconds(
+          attempts,
+          item.lastError,
+        );
         return {
           ...item,
           status: "scheduled" as QueueItem["status"],
+          forceNow: false,
           dueAt: new Date(nowMs + retryDelaySeconds * 1000).toISOString(),
           scheduledBy: "queue_running_recovery",
           startedAt: null,
@@ -470,6 +528,7 @@ export class QueueManager implements QueueManagerLike {
             }
             const retryDelaySeconds = computeNotReadyRequeueDelaySeconds(
               nextAttemptCount,
+              preservedError,
             );
             nextDueAt = new Date(
               Date.now() + retryDelaySeconds * 1000,
@@ -477,6 +536,7 @@ export class QueueManager implements QueueManagerLike {
             return {
               ...qi,
               status: "scheduled" as QueueItem["status"],
+              forceNow: false,
               dueAt: nextDueAt,
               scheduledBy: "queue_not_ready_backoff",
               lastError: preservedError,
@@ -500,7 +560,8 @@ export class QueueManager implements QueueManagerLike {
         const retryInSeconds =
           typeof nextDueAtMs === "number" && Number.isFinite(nextDueAtMs)
             ? Math.max(1, Math.round((nextDueAtMs - Date.now()) / 1000))
-            : computeNotReadyRequeueDelaySeconds(nextAttemptCount);
+            : computeNotReadyRequeueDelaySeconds(nextAttemptCount, preservedError);
+        const backoffProfile = resolveNotReadyBackoffProfile(preservedError);
         await this.ctx.memory.recordWrite({
           type: "directive_queue_not_ready_requeued",
           at: nowIso(),
@@ -510,6 +571,7 @@ export class QueueManager implements QueueManagerLike {
           error: preservedError,
           attempts: nextAttemptCount,
           retryInSeconds,
+          backoffProfile,
         });
         return;
       }
@@ -555,7 +617,7 @@ export class QueueManager implements QueueManagerLike {
     mutate: (current: QueueState) => QueueState | Promise<QueueState>,
   ): Promise<QueueState> {
     let resolvedState: QueueState | null = null;
-    let mutationError: Error | null = null;
+    let mutationErrorMessage: string | null = null;
     this.ctx.queue.queueStateMutation = this.ctx.queue.queueStateMutation
       .then(async () => {
         const current = await this.readQueueState();
@@ -568,20 +630,21 @@ export class QueueManager implements QueueManagerLike {
         resolvedState = await this.writeQueueState(next);
       })
       .catch((error: unknown) => {
-        mutationError =
+        const mutationError =
           error instanceof Error ? error : new Error(String(error));
+        mutationErrorMessage = mutationError.message;
         console.warn(
           "[agent-runtime] queue state mutation failed (non-fatal)",
           mutationError.message,
         );
       });
     await this.ctx.queue.queueStateMutation;
-    if (mutationError) {
+    if (mutationErrorMessage) {
       void this.ctx.memory
         .recordWrite({
           type: "queue_state_mutation_error",
           at: nowIso(),
-          error: mutationError.message,
+          error: mutationErrorMessage,
         })
         .catch(() => undefined);
     }

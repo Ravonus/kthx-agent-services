@@ -48,14 +48,18 @@ const createExecutor = () => {
     id: 321,
     ...(isRecord(input) ? input : {}),
   }));
-  const runOpenClawPrompt = vi.fn(async () => ({
-    parsed: {
-      caption: "Directive fallback caption",
-      textBody: "Directive fallback body that passes curation checks.",
-    },
-    payloadText: "",
-    raw: "",
-  }));
+  const runOpenClawPrompt = vi.fn(
+    async (_input: { prompt: string; purpose: string }) => ({
+      parsed: {
+        caption: "Directive fallback caption",
+        textBody: "Directive fallback body that passes curation checks.",
+      },
+      payloadText: "",
+      raw: "",
+      agentName: null,
+      envelope: null,
+    }),
+  );
   const noopMutate = async () => ({ ok: true });
   const executor = new CommandExecutor({
     config: {

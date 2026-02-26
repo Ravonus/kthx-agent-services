@@ -69,8 +69,12 @@ const createExecutor = () => {
   };
 
   const noopMutate = async () => ({ ok: true });
-  const uploadRemoteMutate = vi.fn(async () => ({ ok: true }));
-  const uploadDataUriMutate = vi.fn(async () => ({ ok: true }));
+  const uploadRemoteMutate = vi.fn(
+    async (_input: Record<string, unknown>): Promise<unknown> => ({ ok: true }),
+  );
+  const uploadDataUriMutate = vi.fn(
+    async (_input: Record<string, unknown>): Promise<unknown> => ({ ok: true }),
+  );
 
   const executor = new CommandExecutor({
     config: {

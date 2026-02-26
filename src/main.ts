@@ -1330,36 +1330,34 @@ const main = async (): Promise<void> => {
       eventType === "directive" ||
       envelope.topic === "director"
     ) {
-      const directivePayload: unknown = isRecord(payload.directive)
+      const directivePayload: Record<string, unknown> = isRecord(payload.directive)
         ? { ...(payload.directive as Record<string, unknown>) }
         : { ...payload };
-      if (isRecord(directivePayload)) {
-        const hasAgentId =
-          typeof directivePayload.agentId === "string" &&
-          directivePayload.agentId.trim().length > 0;
-        if (!hasAgentId) {
-          const topicMatch = /^user:([^:]+):director$/iu.exec(
-            envelope.topic.trim(),
-          );
-          const topicAgentId = topicMatch?.[1]?.trim() ?? "";
-          if (topicAgentId.length > 0) {
-            directivePayload.agentId = topicAgentId;
-          }
+      const hasAgentId =
+        typeof directivePayload.agentId === "string" &&
+        directivePayload.agentId.trim().length > 0;
+      if (!hasAgentId) {
+        const topicMatch = /^user:([^:]+):director$/iu.exec(
+          envelope.topic.trim(),
+        );
+        const topicAgentId = topicMatch?.[1]?.trim() ?? "";
+        if (topicAgentId.length > 0) {
+          directivePayload.agentId = topicAgentId;
         }
       }
       try {
         await flushSocketBatchForDirective("directive_intake");
         await ctx.directiveManager?.intake(directivePayload);
       } catch (error: unknown) {
+        const directiveIdRaw = directivePayload.id;
         const directiveId =
-          typeof directivePayload.id === "string" &&
-          directivePayload.id.trim().length > 0
-            ? directivePayload.id.trim()
+          typeof directiveIdRaw === "string" && directiveIdRaw.trim().length > 0
+            ? directiveIdRaw.trim()
             : null;
+        const kindRaw = directivePayload.kind;
         const kind =
-          typeof directivePayload.kind === "string" &&
-          directivePayload.kind.trim().length > 0
-            ? directivePayload.kind.trim()
+          typeof kindRaw === "string" && kindRaw.trim().length > 0
+            ? kindRaw.trim()
             : null;
         const message = error instanceof Error ? error.message : String(error);
         await memory.recordWrite({
