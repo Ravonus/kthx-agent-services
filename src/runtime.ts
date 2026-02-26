@@ -450,6 +450,22 @@ export const startRuntime = async (deps: RuntimeDeps): Promise<void> => {
       await directiveBackfillInFlight;
       return;
     }
+    const socketReadyForDirectives =
+      isConnectedSocketState(ctx.ws.lastWsTransportState) &&
+      Boolean(ctx.subscriptionManager?.userSubscriptionsReady());
+    if (socketReadyForDirectives) {
+      if (trigger !== "interval") {
+        await ctx.memory
+          .recordWrite({
+            type: "directive_backfill_skipped",
+            at: nowIso(),
+            trigger,
+            reason: "realtime_socket_ready",
+          })
+          .catch(() => {});
+      }
+      return;
+    }
     if (!ctx.directiveManager || !ctx.trpc) return;
     const listPendingDirectivesQuery = (
       (ctx.trpc as Record<string, unknown>)?.agent as
