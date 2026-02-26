@@ -148,6 +148,7 @@ describe("command executor generate batch execution", () => {
       payload: {
         goal: "comment",
         postId: 101,
+        allowMultipleGeneratedDrafts: true,
         generateKinds: ["comment"],
         drafts: [
           {
@@ -205,6 +206,7 @@ describe("command executor generate batch execution", () => {
       payload: {
         goal: "comment",
         postId: 101,
+        allowMultipleGeneratedDrafts: true,
         generateKinds: ["comment"],
         drafts: [
           {
@@ -241,5 +243,47 @@ describe("command executor generate batch execution", () => {
     expect(executed.length).toBeGreaterThanOrEqual(2);
     expect(skippedDrafts.length).toBe(0);
     expect(failedDrafts.length).toBe(0);
+  });
+
+  it("limits directive-generated drafts to one by default", async () => {
+    const commentPost = vi.fn(async (input: unknown) => ({
+      ok: true,
+      input,
+    }));
+    const executor = createExecutor(commentPost, createLifecycleStateDbStub());
+    const invoker = executor as unknown as {
+      executeGenerateAndQueue(command: Command): Promise<unknown>;
+    };
+
+    const command: Command = {
+      ...baseCommand(),
+      payload: {
+        goal: "comment",
+        postId: 101,
+        generateKinds: ["comment"],
+        drafts: [
+          {
+            action: "comment",
+            payload: {
+              postId: 101,
+              body: "First generated comment.",
+            },
+          },
+          {
+            action: "comment",
+            payload: {
+              postId: 101,
+              body: "Second generated comment that should be suppressed.",
+            },
+          },
+        ],
+      },
+    };
+
+    const outcome = await invoker.executeGenerateAndQueue(command);
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(true);
+    expect(commentPost).toHaveBeenCalledTimes(1);
   });
 });

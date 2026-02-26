@@ -1107,6 +1107,22 @@ type GeneratedDraft = {
   payload: Record<string, unknown>;
 };
 
+type CuratedPostDraft = {
+  caption: string | null;
+  textBody: string | null;
+  mediaPrompt: string | null;
+};
+
+type CuratedPostDraftCacheEntry = {
+  value: CuratedPostDraft;
+  cachedAtMs: number;
+};
+
+type CuratedMediaPromptCacheEntry = {
+  prompt: string;
+  cachedAtMs: number;
+};
+
 type GeneratedAssetType = "image" | "gif" | "pdf" | "csv" | "code" | "file" | "txt" | "md";
 type GeneratedCustomAssetKind = "emote" | "sticker" | "gif";
 type GeneratedCustomAssetScope = "mine" | "group" | "server";
@@ -1370,8 +1386,20 @@ export class CommandExecutor {
     string,
     { drafts: GeneratedDraft[]; cachedAtMs: number }
   >();
+  /** Cache curated post drafts by command/postType so retries do not re-prompt OpenClaw. */
+  private readonly curatedPostDraftCache = new Map<
+    string,
+    CuratedPostDraftCacheEntry
+  >();
+  /** Cache curated media prompts by command+source so retries keep the exact same prompt. */
+  private readonly curatedMediaPromptCache = new Map<
+    string,
+    CuratedMediaPromptCacheEntry
+  >();
   private static readonly GENERATED_DRAFT_CACHE_MAX_ENTRIES = 50;
   private static readonly GENERATED_DRAFT_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
+  private static readonly CURATED_PROMPT_CACHE_MAX_ENTRIES = 200;
+  private static readonly CURATED_PROMPT_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
   private runtimeAgentIdCache: string | null = null;
   private runtimeAgentIdCheckedAtMs = 0;
 
@@ -1668,6 +1696,66 @@ export class CommandExecutor {
       removed += 1;
       if (removed >= overflow) break;
     }
+  }
+
+  private buildCuratedPostDraftCacheKey(input: {
+    commandId: string;
+    postType: "text" | "media";
+    signature: string;
+  }): string {
+    const signatureHash = crypto
+      .createHash("sha256")
+      .update(input.signature)
+      .digest("hex")
+      .slice(0, 16);
+    return `${input.commandId}:${input.postType}:${signatureHash}`;
+  }
+
+  private buildCuratedMediaPromptCacheKey(input: {
+    commandId: string;
+    sourcePrompt: string;
+    generatedAssetType: GeneratedAssetType;
+    mode: string;
+  }): string {
+    const promptHash = crypto
+      .createHash("sha256")
+      .update(input.sourcePrompt)
+      .digest("hex")
+      .slice(0, 16);
+    return `${input.commandId}:${input.generatedAssetType}:${input.mode}:${promptHash}`;
+  }
+
+  private pruneMapByTtlAndSize<T>(
+    map: Map<string, { cachedAtMs: number } & T>,
+    ttlMs: number,
+    maxEntries: number,
+  ): void {
+    const nowMs = Date.now();
+    for (const [key, cached] of map) {
+      if (nowMs - cached.cachedAtMs < ttlMs) continue;
+      map.delete(key);
+    }
+    if (map.size <= maxEntries) return;
+    const overflow = map.size - maxEntries;
+    let removed = 0;
+    for (const key of map.keys()) {
+      map.delete(key);
+      removed += 1;
+      if (removed >= overflow) break;
+    }
+  }
+
+  private pruneCuratedPromptCaches(): void {
+    this.pruneMapByTtlAndSize(
+      this.curatedPostDraftCache,
+      CommandExecutor.CURATED_PROMPT_CACHE_TTL_MS,
+      CommandExecutor.CURATED_PROMPT_CACHE_MAX_ENTRIES,
+    );
+    this.pruneMapByTtlAndSize(
+      this.curatedMediaPromptCache,
+      CommandExecutor.CURATED_PROMPT_CACHE_TTL_MS,
+      CommandExecutor.CURATED_PROMPT_CACHE_MAX_ENTRIES,
+    );
   }
 
   private pruneBridgeLookupCache(nowMs: number): void {
@@ -3242,6 +3330,7 @@ export class CommandExecutor {
           mode: "persona_reference_bootstrap",
           referenceInputs,
           keepOriginal: false,
+          commandId: input.command.id,
         });
         const compressed =
           (await this.compressPersonaReferenceImage({
@@ -4666,6 +4755,7 @@ export class CommandExecutor {
       payload,
     });
     const requiresCuration = sourceDirectiveId !== null ? true : isDirectiveRuntimeOrigin;
+    const directiveSinglePromptMode = requiresCuration;
     const directiveSeedHints = this.collectDirectiveSeedHints(payload);
     const postVariety = this.selectPostVarietyMode({
       commandId: command.id,
@@ -4737,78 +4827,100 @@ export class CommandExecutor {
             referencePreview: noveltyValidation.referencePreview,
           })
           .catch(() => undefined);
-        const recurationReferences = Array.from(
-          new Set<string>(
-            [
-              ...noveltyAvoidReferences,
-              noveltyValidation.referencePreview ?? "",
-              truncateText(noveltyValidation.candidateText, 260),
-            ]
-              .map((value) => value.trim())
-              .filter((value) => value.length > 0),
-          ),
-        );
-        const recuratedTextDraft = await this.curatePostDraftWithOpenClaw({
-          commandId: command.id,
-          postType: "text",
-          varietyMode: postVariety.mode,
-          caption: captionForWrite,
-          textBody: textBodyForWrite,
-          mediaPrompt: null,
-          context: postDraftContext,
-          seedHints: directiveSeedHints,
-          avoidReferences: recurationReferences,
-        });
-        if (!recuratedTextDraft) {
-          if (requiresCuration) {
-            throw new RequeueCommandError(
-              "post_curation_waiting_for_openclaw:text_novelty_recuration_unavailable",
-            );
-          }
-          return this.failedOutcome(
-            command,
-            `Blocked text post draft due to low novelty (${noveltyValidation.reason}).`,
-            "post_novelty_rejected",
-          );
-        }
-        captionForWrite = recuratedTextDraft.caption ?? captionForWrite;
-        textBodyForWrite = recuratedTextDraft.textBody ?? textBodyForWrite;
-        captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
-        textBodyForWrite = stripEmDashCharacters(textBodyForWrite);
-        noveltyValidation = this.validatePostDraftNovelty({
-          postType: "text",
-          caption: captionForWrite,
-          textBody: textBodyForWrite,
-          mediaPrompt: null,
-          context: postDraftContext,
-          seedHints: directiveSeedHints,
-        });
-        if (!noveltyValidation.ok) {
+        if (directiveSinglePromptMode) {
           await this.ctx.memory
             .recordWrite({
-              type: "post_novelty_blocked",
+              type: "post_novelty_recuration_skipped",
               at: nowIso(),
               commandId: command.id,
               postType: "text",
               reason: noveltyValidation.reason,
-              candidatePreview: truncateText(noveltyValidation.candidateText, 240),
-              referencePreview: noveltyValidation.referencePreview,
+              policy: "single_prompt_per_directive",
             })
             .catch(() => undefined);
-          return this.failedOutcome(
-            command,
-            `Blocked text post draft due to low novelty (${noveltyValidation.reason}).`,
-            "post_novelty_blocked",
+          noveltyValidation = {
+            ok: true,
+            candidateText: this.buildPostNoveltyCandidateText({
+              postType: "text",
+              caption: captionForWrite,
+              textBody: textBodyForWrite,
+              mediaPrompt: null,
+            }),
+          };
+        } else {
+          const recurationReferences = Array.from(
+            new Set<string>(
+              [
+                ...noveltyAvoidReferences,
+                noveltyValidation.referencePreview ?? "",
+                truncateText(noveltyValidation.candidateText, 260),
+              ]
+                .map((value) => value.trim())
+                .filter((value) => value.length > 0),
+            ),
           );
-        }
-        await this.ctx.memory
-          .recordWrite({
-            type: "post_novelty_recurated",
-            at: nowIso(),
+          const recuratedTextDraft = await this.curatePostDraftWithOpenClaw({
             commandId: command.id,
             postType: "text",
-          })
-          .catch(() => undefined);
+            varietyMode: postVariety.mode,
+            caption: captionForWrite,
+            textBody: textBodyForWrite,
+            mediaPrompt: null,
+            context: postDraftContext,
+            seedHints: directiveSeedHints,
+            avoidReferences: recurationReferences,
+          });
+          if (!recuratedTextDraft) {
+            if (requiresCuration) {
+              throw new RequeueCommandError(
+                "post_curation_waiting_for_openclaw:text_novelty_recuration_unavailable",
+              );
+            }
+            return this.failedOutcome(
+              command,
+              `Blocked text post draft due to low novelty (${noveltyValidation.reason}).`,
+              "post_novelty_rejected",
+            );
+          }
+          captionForWrite = recuratedTextDraft.caption ?? captionForWrite;
+          textBodyForWrite = recuratedTextDraft.textBody ?? textBodyForWrite;
+          captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
+          textBodyForWrite = stripEmDashCharacters(textBodyForWrite);
+          noveltyValidation = this.validatePostDraftNovelty({
+            postType: "text",
+            caption: captionForWrite,
+            textBody: textBodyForWrite,
+            mediaPrompt: null,
+            context: postDraftContext,
+            seedHints: directiveSeedHints,
+          });
+          if (!noveltyValidation.ok) {
+            await this.ctx.memory
+              .recordWrite({
+                type: "post_novelty_blocked",
+                at: nowIso(),
+                commandId: command.id,
+                postType: "text",
+                reason: noveltyValidation.reason,
+                candidatePreview: truncateText(noveltyValidation.candidateText, 240),
+                referencePreview: noveltyValidation.referencePreview,
+              })
+              .catch(() => undefined);
+            return this.failedOutcome(
+              command,
+              `Blocked text post draft due to low novelty (${noveltyValidation.reason}).`,
+              "post_novelty_blocked",
+            );
+          }
+          await this.ctx.memory
+            .recordWrite({
+              type: "post_novelty_recurated",
+              at: nowIso(),
+              commandId: command.id,
+              postType: "text",
+            })
+            .catch(() => undefined);
+        }
       }
       const candidate = noveltyValidation.candidateText;
       const autonomousTheme = this.resolveAutonomousTextTheme({
@@ -4934,6 +5046,7 @@ export class CommandExecutor {
             keepOriginal: true,
             promptFallbacks: [slidePrompt],
             command,
+            skipPromptCuration: true,
           });
           slideItems.push({
             mediaUrl: slideMedia.mediaUrl,
@@ -5051,6 +5164,7 @@ export class CommandExecutor {
             keepOriginal: true,
             promptFallbacks: [visualBackgroundPrompt],
             command,
+            skipPromptCuration: true,
           });
           const imageTextItem: Record<string, unknown> = {
             mediaUrl: backgroundMedia.mediaUrl,
@@ -5248,80 +5362,102 @@ export class CommandExecutor {
           referencePreview: noveltyValidation.referencePreview,
         })
         .catch(() => undefined);
-      const recurationReferences = Array.from(
-        new Set<string>(
-          [
-            ...noveltyAvoidReferences,
-            noveltyValidation.referencePreview ?? "",
-            truncateText(noveltyValidation.candidateText, 260),
-          ]
-            .map((value) => value.trim())
-            .filter((value) => value.length > 0),
-        ),
-      );
-      const recuratedMediaDraft = await this.curatePostDraftWithOpenClaw({
-        commandId: command.id,
-        postType: "media",
-        varietyMode: postVariety.mode,
-        caption: captionForWrite,
-        textBody: null,
-        mediaPrompt: mediaPromptForWrite,
-        context: postDraftContext,
-        seedHints: directiveSeedHints,
-        avoidReferences: recurationReferences,
-      });
-      if (!recuratedMediaDraft) {
-        if (requiresCuration) {
-          throw new RequeueCommandError(
-            "post_curation_waiting_for_openclaw:media_novelty_recuration_unavailable",
-          );
-        }
-        return this.failedOutcome(
-          command,
-          `Blocked media post draft due to low novelty (${noveltyValidation.reason}).`,
-          "post_novelty_rejected",
-        );
-      }
-      captionForWrite = recuratedMediaDraft.caption ?? captionForWrite;
-      mediaPromptForWrite = recuratedMediaDraft.mediaPrompt ?? mediaPromptForWrite;
-      captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
-      mediaPromptForWrite = mediaPromptForWrite
-        ? stripEmDashCharacters(mediaPromptForWrite)
-        : mediaPromptForWrite;
-      noveltyValidation = this.validatePostDraftNovelty({
-        postType: "media",
-        caption: captionForWrite,
-        textBody: null,
-        mediaPrompt: mediaPromptForWrite,
-        context: postDraftContext,
-        seedHints: directiveSeedHints,
-      });
-      if (!noveltyValidation.ok) {
+      if (directiveSinglePromptMode) {
         await this.ctx.memory
           .recordWrite({
-            type: "post_novelty_blocked",
+            type: "post_novelty_recuration_skipped",
             at: nowIso(),
             commandId: command.id,
             postType: "media",
             reason: noveltyValidation.reason,
-            candidatePreview: truncateText(noveltyValidation.candidateText, 240),
-            referencePreview: noveltyValidation.referencePreview,
+            policy: "single_prompt_per_directive",
           })
           .catch(() => undefined);
-        return this.failedOutcome(
-          command,
-          `Blocked media post draft due to low novelty (${noveltyValidation.reason}).`,
-          "post_novelty_blocked",
+        noveltyValidation = {
+          ok: true,
+          candidateText: this.buildPostNoveltyCandidateText({
+            postType: "media",
+            caption: captionForWrite,
+            textBody: null,
+            mediaPrompt: mediaPromptForWrite,
+          }),
+        };
+      } else {
+        const recurationReferences = Array.from(
+          new Set<string>(
+            [
+              ...noveltyAvoidReferences,
+              noveltyValidation.referencePreview ?? "",
+              truncateText(noveltyValidation.candidateText, 260),
+            ]
+              .map((value) => value.trim())
+              .filter((value) => value.length > 0),
+          ),
         );
-      }
-      await this.ctx.memory
-        .recordWrite({
-          type: "post_novelty_recurated",
-          at: nowIso(),
+        const recuratedMediaDraft = await this.curatePostDraftWithOpenClaw({
           commandId: command.id,
           postType: "media",
-        })
-        .catch(() => undefined);
+          varietyMode: postVariety.mode,
+          caption: captionForWrite,
+          textBody: null,
+          mediaPrompt: mediaPromptForWrite,
+          context: postDraftContext,
+          seedHints: directiveSeedHints,
+          avoidReferences: recurationReferences,
+        });
+        if (!recuratedMediaDraft) {
+          if (requiresCuration) {
+            throw new RequeueCommandError(
+              "post_curation_waiting_for_openclaw:media_novelty_recuration_unavailable",
+            );
+          }
+          return this.failedOutcome(
+            command,
+            `Blocked media post draft due to low novelty (${noveltyValidation.reason}).`,
+            "post_novelty_rejected",
+          );
+        }
+        captionForWrite = recuratedMediaDraft.caption ?? captionForWrite;
+        mediaPromptForWrite = recuratedMediaDraft.mediaPrompt ?? mediaPromptForWrite;
+        captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
+        mediaPromptForWrite = mediaPromptForWrite
+          ? stripEmDashCharacters(mediaPromptForWrite)
+          : mediaPromptForWrite;
+        noveltyValidation = this.validatePostDraftNovelty({
+          postType: "media",
+          caption: captionForWrite,
+          textBody: null,
+          mediaPrompt: mediaPromptForWrite,
+          context: postDraftContext,
+          seedHints: directiveSeedHints,
+        });
+        if (!noveltyValidation.ok) {
+          await this.ctx.memory
+            .recordWrite({
+              type: "post_novelty_blocked",
+              at: nowIso(),
+              commandId: command.id,
+              postType: "media",
+              reason: noveltyValidation.reason,
+              candidatePreview: truncateText(noveltyValidation.candidateText, 240),
+              referencePreview: noveltyValidation.referencePreview,
+            })
+            .catch(() => undefined);
+          return this.failedOutcome(
+            command,
+            `Blocked media post draft due to low novelty (${noveltyValidation.reason}).`,
+            "post_novelty_blocked",
+          );
+        }
+        await this.ctx.memory
+          .recordWrite({
+            type: "post_novelty_recurated",
+            at: nowIso(),
+            commandId: command.id,
+            postType: "media",
+          })
+          .catch(() => undefined);
+      }
     }
     const mediaCandidate = noveltyValidation.candidateText;
     const mediaSeedText = mediaPromptForWrite ?? captionForWrite ?? mediaCandidate;
@@ -5375,7 +5511,22 @@ export class CommandExecutor {
       mediaPrompt: mediaSeedText,
       theme: autonomousMediaTheme,
     });
-    const shouldAttemptMediaSlides = autonomousMediaSlides.length >= 2;
+    const explicitMultiMediaRequested = this.isExplicitMultiMediaRequest(payload);
+    const shouldAttemptMediaSlides =
+      explicitMultiMediaRequested && autonomousMediaSlides.length >= 2;
+    if (!shouldAttemptMediaSlides && autonomousMediaSlides.length >= 2) {
+      await this.ctx.memory
+        .recordWrite({
+          type: "media_post_slides_suppressed",
+          at: nowIso(),
+          commandId: command.id,
+          sourceDirectiveId,
+          reason: explicitMultiMediaRequested
+            ? "insufficient_slide_candidates"
+            : "single_prompt_policy",
+        })
+        .catch(() => undefined);
+    }
     if (shouldAttemptMediaSlides) {
       const slideItems: Array<Record<string, unknown>> = [];
       const slidePrompts = autonomousMediaSlides.slice(0, 4);
@@ -5397,6 +5548,7 @@ export class CommandExecutor {
               asNonEmptyString(payload.prompt),
             ],
             command,
+            skipPromptCuration: true,
           });
           slideItems.push({
             mediaUrl: slideMedia.mediaUrl,
@@ -5536,6 +5688,7 @@ export class CommandExecutor {
         asNonEmptyString(payload.prompt),
       ],
       command,
+      skipPromptCuration: true,
     });
     const result = await this.agent().createPost.mutate({
       ...buildBase(captionForWrite),
@@ -7112,9 +7265,31 @@ export class CommandExecutor {
     context: PostDraftContext;
     seedHints: string[];
     avoidReferences: string[];
-  }): Promise<{ caption: string | null; textBody: string | null; mediaPrompt: string | null } | null> {
+  }): Promise<CuratedPostDraft | null> {
     const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
     if (!runOpenClawPrompt) return null;
+    this.pruneCuratedPromptCaches();
+    const cacheSignature = [
+      input.varietyMode,
+      input.caption ?? "",
+      input.textBody ?? "",
+      input.mediaPrompt ?? "",
+      input.seedHints.join("|"),
+      input.avoidReferences.join("|"),
+    ].join("\n");
+    const cacheKey = this.buildCuratedPostDraftCacheKey({
+      commandId: input.commandId,
+      postType: input.postType,
+      signature: cacheSignature,
+    });
+    const cached = this.curatedPostDraftCache.get(cacheKey);
+    if (cached) {
+      return {
+        caption: cached.value.caption,
+        textBody: cached.value.textBody,
+        mediaPrompt: cached.value.mediaPrompt,
+      };
+    }
     const prompt = this.buildPostDraftCurationPrompt({
       postType: input.postType,
       varietyMode: input.varietyMode,
@@ -7145,6 +7320,14 @@ export class CommandExecutor {
         .filter((value) => value.trim().length > 0)
         .join("\n");
       if (candidate.length < 12) return null;
+      this.curatedPostDraftCache.set(cacheKey, {
+        value: {
+          caption: curated.caption,
+          textBody: curated.textBody,
+          mediaPrompt: curated.mediaPrompt,
+        },
+        cachedAtMs: Date.now(),
+      });
       await this.ctx.memory
         .recordWrite({
             type: "post_draft_curated",
@@ -10256,6 +10439,28 @@ export class CommandExecutor {
         "no_executable_draft",
       );
     }
+    const allowMultipleGeneratedDrafts =
+      payload.allowMultipleGeneratedDrafts === true ||
+      payload.executeAllDrafts === true;
+    if (
+      this.isDirectiveContextLinkedCommand(command) &&
+      !allowMultipleGeneratedDrafts &&
+      executionDrafts.length > 1
+    ) {
+      const keptDraft = executionDrafts[0];
+      executionDrafts = keptDraft ? [keptDraft] : [];
+      await this.ctx.memory
+        .recordWrite({
+          type: "generate_draft_multi_suppressed",
+          at: nowIso(),
+          commandId: command.id,
+          sourceDirectiveId,
+          originalDraftCount: permissionFilteredDrafts.length,
+          keptDraftAction: keptDraft?.action ?? null,
+          policy: "single_prompt_per_directive",
+        })
+        .catch(() => undefined);
+    }
     if (executionDrafts.length === 0) {
       if (payload.requireDraftOnly === true) {
         const previewDelivered = await this.sendDraftFailureMessage({
@@ -11836,6 +12041,7 @@ export class CommandExecutor {
             ? "chat_banner_update"
             : "chat_literal_generate",
         referenceInputs,
+        commandId: command.id,
         onProgress: emitStreamProgress,
       });
       generationCompleted = true;
@@ -14346,6 +14552,38 @@ export class CommandExecutor {
     return kinds.slice(0, 6);
   }
 
+  private isExplicitMultiMediaRequest(payload: Record<string, unknown>): boolean {
+    const context = isRecord(payload.context) ? payload.context : null;
+    const isTruthy = (value: unknown): boolean =>
+      value === true || value === "true";
+    if (
+      isTruthy(payload.multiMedia) ||
+      isTruthy(payload.carousel) ||
+      isTruthy(payload.mediaSlides) ||
+      isTruthy(payload.enableSlides) ||
+      isTruthy(context?.multiMedia) ||
+      isTruthy(context?.carousel) ||
+      isTruthy(context?.mediaSlides) ||
+      isTruthy(context?.enableSlides)
+    ) {
+      return true;
+    }
+    const directItems = Array.isArray(payload.mediaItems) ? payload.mediaItems : [];
+    const contextItems = Array.isArray(context?.mediaItems) ? context.mediaItems : [];
+    if (directItems.length > 1 || contextItems.length > 1) return true;
+    const goal = asNonEmptyString(payload.goal)?.toLowerCase() ?? "";
+    if (goal === "multi_media" || goal === "carousel") return true;
+    const mode =
+      asNonEmptyString(payload.mode)?.toLowerCase() ??
+      asNonEmptyString(payload.postMode)?.toLowerCase() ??
+      "";
+    if (mode === "multi_media" || mode === "carousel" || mode === "slides") {
+      return true;
+    }
+    const requestedKinds = this.resolveRequestedGenerateKinds(payload, "media");
+    return requestedKinds.includes("multi_media");
+  }
+
   private parsePermissionCanState(permissionState: unknown): {
     hasHints: boolean;
     can: {
@@ -15062,6 +15300,7 @@ export class CommandExecutor {
     keepOriginal?: boolean;
     promptFallbacks: Array<string | null>;
     command?: Command;
+    skipPromptCuration?: boolean;
   }): Promise<ResolvedMediaUpload> {
     const isRecoverableMediaSourceFailure = (error: unknown): boolean => {
       if (!(error instanceof Error)) return false;
@@ -15102,6 +15341,9 @@ export class CommandExecutor {
     };
     const payload = input.payload;
     const keepOriginal = input.keepOriginal === true;
+    const skipPromptCuration =
+      input.skipPromptCuration === true ||
+      (input.command ? this.isDirectiveContextLinkedCommand(input.command) : false);
     const markUploaded = async (
       result: ResolvedMediaUpload,
       source: string,
@@ -15178,6 +15420,8 @@ export class CommandExecutor {
         mode: "write_media_generate",
         referenceInputs,
         keepOriginal,
+        commandId: input.command?.id ?? null,
+        skipPromptCuration,
       });
       return markUploaded(generated, "generated_prompt");
     } catch (error: unknown) {
@@ -16080,6 +16324,8 @@ export class CommandExecutor {
       referenceInputs?: string[];
       maxReferenceInputs?: number;
       keepOriginal?: boolean;
+      commandId?: string | null;
+      skipPromptCuration?: boolean;
       onProgress?: ((progress: MediaGenerationProgress) => Promise<void> | void) | undefined;
     },
   ): Promise<ResolvedMediaUpload> {
@@ -16091,11 +16337,38 @@ export class CommandExecutor {
     const mode = opts?.mode ?? "media_generation";
     const streamEnabled =
       generatedAssetType === "image" && /^chat_/iu.test(mode);
-    const curatedPromptBase = await this.curateMediaPromptWithOpenClaw({
-      sourcePrompt,
-      generatedAssetType,
-      mode,
-    });
+    const commandId = asNonEmptyString(opts?.commandId) ?? null;
+    const skipPromptCuration = opts?.skipPromptCuration === true;
+    this.pruneCuratedPromptCaches();
+    let curatedPromptBase: string;
+    if (skipPromptCuration) {
+      curatedPromptBase = sourcePrompt;
+    } else {
+      const cacheKey = commandId
+        ? this.buildCuratedMediaPromptCacheKey({
+            commandId,
+            sourcePrompt,
+            generatedAssetType,
+            mode,
+          })
+        : null;
+      const cached = cacheKey ? this.curatedMediaPromptCache.get(cacheKey) : null;
+      if (cached) {
+        curatedPromptBase = cached.prompt;
+      } else {
+        curatedPromptBase = await this.curateMediaPromptWithOpenClaw({
+          sourcePrompt,
+          generatedAssetType,
+          mode,
+        });
+        if (cacheKey) {
+          this.curatedMediaPromptCache.set(cacheKey, {
+            prompt: curatedPromptBase,
+            cachedAtMs: Date.now(),
+          });
+        }
+      }
+    }
     const curatedPrompt =
       generatedAssetType === "gif"
         ? constrainGifPromptTo256(curatedPromptBase)
