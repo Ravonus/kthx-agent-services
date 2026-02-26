@@ -110,6 +110,9 @@ const createExecutor = (options?: {
         listPersonaFrames: { query: listPersonaFrames },
         upsertPersonaFrame: { mutate: noopMutate },
       },
+      realtime: {
+        ackDirective: { mutate: noopMutate },
+      },
     },
     commandSeal: {
       runtimeCommandSessionId: "session-test",

@@ -47,7 +47,7 @@ export interface DirectiveManagerContext {
     recordWrite(payload: unknown): Promise<void>;
   };
   trpc: {
-    agent?: {
+    realtime?: {
       ackDirective?: {
         mutate(input: unknown): Promise<unknown>;
       };
@@ -535,7 +535,7 @@ export class DirectiveManager implements DirectiveManagerLike {
   }): Promise<void> {
     if (!this.ctx.trpc) return;
     try {
-      const ackDirectiveMutator = this.ctx.trpc.agent?.ackDirective;
+      const ackDirectiveMutator = this.ctx.trpc.realtime?.ackDirective;
       if (!ackDirectiveMutator || typeof ackDirectiveMutator.mutate !== "function") {
         return;
       }

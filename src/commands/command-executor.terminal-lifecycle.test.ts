@@ -87,6 +87,7 @@ const createExecutor = (deps: {
         uploadRemote: { mutate: noopMutate },
       },
       realtime: {
+        ackDirective: { mutate: deps.ackDirectiveMutate },
         authState: {
           query: async () => ({ userId: "agent-runtime-query-id" }),
         },

@@ -19,7 +19,7 @@ const createCommandSealState = (): CommandSealState => ({
 const createHarness = async (options?: {
   recordWrite?: (payload: unknown) => Promise<void>;
   trpc?: {
-    agent?: {
+    realtime?: {
       ackDirective?: {
         mutate?: (input: Record<string, unknown>) => Promise<unknown>;
       };
@@ -175,7 +175,7 @@ describe("directive manager pending promotion", () => {
         writes.push(payload);
       },
       trpc: {
-        agent: {
+        realtime: {
           ackDirective: {
             mutate: ackDirectiveMutate,
           },

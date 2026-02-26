@@ -55,6 +55,7 @@ const createExecutor = (deps: {
           uploadRemote: { mutate: noopMutate },
         },
         realtime: {
+          ackDirective: { mutate: noopMutate },
           authState: {
             query: deps.authStateQuery,
           },

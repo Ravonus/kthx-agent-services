@@ -122,8 +122,7 @@ const parseDirectiveBackfillLimit = (): number => {
   return Math.max(1, Math.min(200, parsed));
 };
 
-const parseDirectiveBackfillEnabled = (): boolean =>
-  (trimEnv("MG_DIRECTIVE_BACKFILL_ENABLED") ?? "0") === "1";
+const parseDirectiveBackfillEnabled = (): boolean => false;
 
 const parsePendingDirectiveRows = (
   payload: unknown,

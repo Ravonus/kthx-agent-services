@@ -86,6 +86,9 @@ const createExecutor = () => {
         uploadDataUri: { mutate: noopMutate },
         uploadRemote: { mutate: noopMutate },
       },
+      realtime: {
+        ackDirective: { mutate: noopMutate },
+      },
     },
     commandSeal: {
       runtimeCommandSessionId: "session-test",

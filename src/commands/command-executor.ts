@@ -1006,7 +1006,6 @@ type AgentProcedure = {
 };
 
 type AgentRouterLike = {
-  ackDirective: AgentMutator;
   createPost: AgentMutator;
   createStory: AgentMutator;
   commentPost: AgentMutator;
@@ -2416,7 +2415,6 @@ export class CommandExecutor {
       throw new Error(`tRPC agent mutator is unavailable: agent.${String(name)}`);
     };
     return {
-      ackDirective: requireMutator("ackDirective"),
       createPost: requireMutator("createPost"),
       createStory: requireMutator("createStory"),
       commentPost: requireMutator("commentPost"),
@@ -2427,6 +2425,21 @@ export class CommandExecutor {
       generate: requireMutator("generate"),
       uploadDataUri: requireMutator("uploadDataUri"),
       uploadRemote: requireMutator("uploadRemote"),
+    };
+  }
+
+  private directiveAckMutator(): AgentMutator {
+    const router = this.ctx.trpc?.realtime;
+    if (!router) {
+      throw new Error("tRPC realtime client is unavailable.");
+    }
+    const candidate = router.ackDirective;
+    const mutateFn = candidate?.mutate;
+    if (typeof mutateFn !== "function") {
+      throw new Error("tRPC realtime mutator is unavailable: realtime.ackDirective");
+    }
+    return {
+      mutate: (input: Record<string, unknown>) => mutateFn(input),
     };
   }
 
@@ -18525,7 +18538,7 @@ export class CommandExecutor {
       outcome.ok ? null : outcome.error?.message ?? "failed",
     );
     try {
-      await this.agent().ackDirective.mutate({
+      await this.directiveAckMutator().mutate({
         directiveId,
         status: outcome.ok ? "executed" : "failed",
         kind: command.kind,
