@@ -313,6 +313,57 @@ describe("command executor generate input", () => {
     ]);
   });
 
+  it("accepts avif persona frame URLs without explicit mimeType", async () => {
+    const executor = createExecutor({
+      personaFrames: [
+        {
+          id: 501,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/selfie.avif",
+          updatedAt: "2026-02-26T03:13:43.000Z",
+        },
+        {
+          id: 502,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/midshot.avif",
+          updatedAt: "2026-02-26T03:14:13.000Z",
+        },
+        {
+          id: 503,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/fullbody.avif",
+          updatedAt: "2026-02-26T03:14:43.000Z",
+        },
+      ],
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        mediaPersona: "realistic_core",
+        mediaPrompt: "Generate a realistic portrait with rain and city lights.",
+      },
+      baseCommand(),
+    );
+
+    expect(Array.isArray(result.mediaReferenceUrls)).toBe(true);
+    if (!Array.isArray(result.mediaReferenceUrls)) return;
+    expect(result.mediaReferenceUrls).toEqual([
+      "https://cdn.example.com/persona/selfie.avif",
+      "https://cdn.example.com/persona/midshot.avif",
+      "https://cdn.example.com/persona/fullbody.avif",
+    ]);
+  });
+
   it("infers main persona references for selfie prompts when mediaPersona is generic", async () => {
     const executor = createExecutor({
       personaFrames: [

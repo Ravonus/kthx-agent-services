@@ -123,6 +123,21 @@ describe("command executor chat literal delivery url selection", () => {
     expect(mapped.mediaOptimizedUrl).toBe("https://cdn.example.com/generated/final-sticker.png");
   });
 
+  it("uses canonical upload url before optimized url when both are stable", () => {
+    const executor = createExecutor(null);
+    const invoker = executor as unknown as CommandExecutorInvoker;
+
+    const mapped = invoker.mapUploadResult({
+      url: "https://cdn.example.com/generated/fallback-url.png",
+      originalUrl: "https://cdn.example.com/generated/final-original.png",
+      optimizedUrl: "https://cdn.example.com/generated/final-optimized.png",
+    });
+
+    expect(mapped.mediaUrl).toBe("https://cdn.example.com/generated/fallback-url.png");
+    expect(mapped.mediaOptimizedUrl).toBe("https://cdn.example.com/generated/final-optimized.png");
+    expect(mapped.mediaOriginalUrl).toBe("https://cdn.example.com/generated/final-original.png");
+  });
+
   it("prefers stable upload urls over temp artifact urls", () => {
     const executor = createExecutor(null);
     const invoker = executor as unknown as CommandExecutorInvoker;
@@ -176,6 +191,36 @@ describe("command executor chat literal delivery url selection", () => {
     const resolved = invoker.extractMediaSourceFromParsedOutput(
       {
         status: "done",
+        streamEvents: [
+          {
+            sourceFileName: "tmp_frame_001.png",
+            outputPath: "https://cdn.example.com/generated/tmp_frame_001.png",
+            isStreamPart: true,
+          },
+          {
+            sourceFileName: "temp_frame_002.png",
+            outputPath: "https://cdn.example.com/generated/temp_frame_002.png",
+            streamPartIndex: 2,
+          },
+        ],
+        savedFiles: [
+          "https://cdn.example.com/generated/final-dragon-render.png",
+        ],
+      },
+      process.cwd(),
+      { requireFinalStreamFrame: true },
+    );
+
+    expect(resolved).toBe("https://cdn.example.com/generated/final-dragon-render.png");
+  });
+
+  it("uses stable saved artifacts even before terminal status when final frame marker is missing", () => {
+    const executor = createExecutor(null);
+    const invoker = executor as unknown as CommandExecutorInvoker;
+
+    const resolved = invoker.extractMediaSourceFromParsedOutput(
+      {
+        status: "running",
         streamEvents: [
           {
             sourceFileName: "tmp_frame_001.png",
@@ -578,5 +623,143 @@ describe("command executor chat literal delivery url selection", () => {
     expect(actionPreview.status).toBe("processing");
     expect(actionPreview.deferred).toBe(true);
     expect(actionPreview.deferredReason).toBe("media_generation_waiting_for_output:no_media_url");
+  });
+
+  it("fails chat literal generation without requeue on unsupported upload mime output", async () => {
+    const command = baseCommand();
+    const bridge = vi.fn(async (payload: unknown) => {
+      if (!isRecord(payload)) {
+        throw new Error("bridge payload must be an object");
+      }
+      const action = typeof payload.action === "string" ? payload.action : "";
+      if (action === "send_message" || action === "edit_message") {
+        return {
+          message: {
+            id: "msg-generate-failed-1",
+            clientMessageId: payload.clientMessageId,
+          },
+        };
+      }
+      if (action === "list_messages") {
+        return {
+          items: [
+            {
+              message: {
+                id: "msg-generate-failed-1",
+                clientMessageId: `runtime_generate_${command.id}`,
+              },
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected bridge action: ${action}`);
+    });
+
+    const executor = createExecutor(bridge);
+    const invoker = executor as unknown as CommandExecutorInvoker;
+    invoker.generateAndUploadMediaFromPrompt = vi.fn(async () => {
+      throw new Error("Only image and video uploads are supported.");
+    }) as CommandExecutorInvoker["generateAndUploadMediaFromPrompt"];
+
+    const outcome = await invoker.executeGenerateAndQueue({
+      ...command,
+      payload: {
+        chatLiteralGenerate: true,
+        generatedAssetType: "image",
+        mediaPrompt: "Generate a dragon chained up.",
+        chatContext: {
+          conversationId: "conv-test",
+        },
+      },
+    });
+
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(false);
+
+    const editPayloads = bridge.mock.calls
+      .map((call) => call[0])
+      .filter(
+        (payload): payload is Record<string, unknown> =>
+          isRecord(payload) && payload.action === "edit_message",
+      );
+    expect(editPayloads.length).toBeGreaterThan(0);
+    const lastEdit = editPayloads[editPayloads.length - 1];
+    const metadata = isRecord(lastEdit?.metadata) ? lastEdit.metadata : null;
+    const actionPreview =
+      metadata && isRecord(metadata.actionPreview) ? metadata.actionPreview : null;
+    expect(actionPreview).not.toBeNull();
+    if (!actionPreview) return;
+    expect(actionPreview.status).toBe("failed");
+    expect(actionPreview.deferred).not.toBe(true);
+  });
+
+  it("fails chat literal generation without requeue when no generation activity was observed", async () => {
+    const command = baseCommand();
+    const bridge = vi.fn(async (payload: unknown) => {
+      if (!isRecord(payload)) {
+        throw new Error("bridge payload must be an object");
+      }
+      const action = typeof payload.action === "string" ? payload.action : "";
+      if (action === "send_message" || action === "edit_message") {
+        return {
+          message: {
+            id: "msg-generate-no-activity-1",
+            clientMessageId: payload.clientMessageId,
+          },
+        };
+      }
+      if (action === "list_messages") {
+        return {
+          items: [
+            {
+              message: {
+                id: "msg-generate-no-activity-1",
+                clientMessageId: `runtime_generate_${command.id}`,
+              },
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected bridge action: ${action}`);
+    });
+
+    const executor = createExecutor(bridge);
+    const invoker = executor as unknown as CommandExecutorInvoker;
+    invoker.generateAndUploadMediaFromPrompt = vi.fn(async () => {
+      throw new Error("no_media_url_without_generation_activity");
+    }) as CommandExecutorInvoker["generateAndUploadMediaFromPrompt"];
+
+    const outcome = await invoker.executeGenerateAndQueue({
+      ...command,
+      payload: {
+        chatLiteralGenerate: true,
+        generatedAssetType: "image",
+        mediaPrompt: "Generate a dragon chained up.",
+        chatContext: {
+          conversationId: "conv-test",
+        },
+      },
+    });
+
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(false);
+
+    const editPayloads = bridge.mock.calls
+      .map((call) => call[0])
+      .filter(
+        (payload): payload is Record<string, unknown> =>
+          isRecord(payload) && payload.action === "edit_message",
+      );
+    expect(editPayloads.length).toBeGreaterThan(0);
+    const lastEdit = editPayloads[editPayloads.length - 1];
+    const metadata = isRecord(lastEdit?.metadata) ? lastEdit.metadata : null;
+    const actionPreview =
+      metadata && isRecord(metadata.actionPreview) ? metadata.actionPreview : null;
+    expect(actionPreview).not.toBeNull();
+    if (!actionPreview) return;
+    expect(actionPreview.status).toBe("failed");
+    expect(actionPreview.deferred).not.toBe(true);
   });
 });

@@ -481,6 +481,7 @@ const extToMime = (filePath: string): string => {
   const ext = path.extname(filePath).toLowerCase();
   if (ext === ".png") return "image/png";
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".avif") return "image/avif";
   if (ext === ".webp") return "image/webp";
   if (ext === ".gif") return "image/gif";
   if (ext === ".svg") return "image/svg+xml";
@@ -567,6 +568,7 @@ const mimeToExt = (mime: string): string => {
   const normalized = mime.trim().toLowerCase();
   if (normalized === "image/png") return "png";
   if (normalized === "image/jpeg") return "jpg";
+  if (normalized === "image/avif") return "avif";
   if (normalized === "image/webp") return "webp";
   if (normalized === "image/gif") return "gif";
   if (normalized === "image/svg+xml") return "svg";
@@ -1467,6 +1469,15 @@ export class CommandExecutor {
     }
     const rawMessage = input.error.message.trim();
     const loweredMessage = rawMessage.toLowerCase();
+    if (loweredMessage.includes("no_media_url_without_generation_activity")) {
+      return {
+        shouldRequeue: false,
+        reason: null,
+        reasonCode: null,
+        personaSlug: null,
+        imageGeneratorSetupRequired: false,
+      };
+    }
     const personaMatch = PERSONA_REFERENCE_SETUP_REQUIRED_PATTERN.exec(rawMessage);
     if (personaMatch?.[1]) {
       const personaSlug = personaMatch[1].trim().toLowerCase();
@@ -1504,6 +1515,18 @@ export class CommandExecutor {
                   : loweredMessage.includes("only image and video uploads are supported")
                     ? "upload_only_image_video"
                     : "media_output_unavailable";
+      const nonRetryableOutputReason =
+        normalizedReason === "unsupported_media_payload_mime" ||
+        normalizedReason === "upload_only_image_video";
+      if (nonRetryableOutputReason) {
+        return {
+          shouldRequeue: false,
+          reason: null,
+          reasonCode: null,
+          personaSlug: null,
+          imageGeneratorSetupRequired: false,
+        };
+      }
       return {
         shouldRequeue: true,
         reason: `media_generation_waiting_for_output:${normalizedReason}`,
@@ -1519,6 +1542,47 @@ export class CommandExecutor {
       personaSlug: null,
       imageGeneratorSetupRequired: false,
     };
+  }
+
+  private didMediaGenerationProduceActivity(payload: unknown): boolean {
+    const contextId = this.extractMediaGeneratorContextId(payload);
+    if (contextId) return true;
+    const context = this.extractMediaGeneratorContextRecord(payload);
+    const hasArrayEntries = (value: unknown): boolean => toUnknownArray(value).length > 0;
+    const hasUrlSignals = (value: Record<string, unknown>): boolean =>
+      Boolean(
+        asNonEmptyString(value.outputPath) ??
+          asNonEmptyString(value.savedOutputPath) ??
+          asNonEmptyString(value.latestOutputPath) ??
+          asNonEmptyString(value.lastOutputPath) ??
+          asNonEmptyString(value.url) ??
+          asNonEmptyString(value.mediaUrl) ??
+          asNonEmptyString(value.outputUrl) ??
+          asNonEmptyString(value.downloadUrl),
+      );
+    if (context) {
+      if (asNonEmptyString(context.status)) return true;
+      if (
+        hasArrayEntries(context.streamEvents) ||
+        hasArrayEntries(context.savedFiles) ||
+        hasArrayEntries(context.observedOutputFiles)
+      ) {
+        return true;
+      }
+      if (hasUrlSignals(context)) return true;
+    }
+    if (isRecord(payload)) {
+      if (asNonEmptyString(payload.status)) return true;
+      if (
+        hasArrayEntries(payload.streamEvents) ||
+        hasArrayEntries(payload.savedFiles) ||
+        hasArrayEntries(payload.observedOutputFiles)
+      ) {
+        return true;
+      }
+      if (hasUrlSignals(payload)) return true;
+    }
+    return false;
   }
 
   private async recordCommandLifecycleCheckpoint(input: {
@@ -2725,6 +2789,8 @@ export class CommandExecutor {
           asNonEmptyString(value.href) ??
           asNonEmptyString(value.imageUrl) ??
           asNonEmptyString(value.mediaUrl) ??
+          asNonEmptyString(value.mediaOptimizedUrl) ??
+          asNonEmptyString(value.optimizedUrl) ??
           null;
         if (nestedUrl) urls.add(nestedUrl);
       };
@@ -2739,6 +2805,8 @@ export class CommandExecutor {
         push(source.avatar);
         push(source.image);
         push(source.photo);
+        push(source.mediaOptimizedUrl);
+        push(source.optimizedUrl);
       }
       return [...urls]
         .filter(
@@ -11812,8 +11880,8 @@ export class CommandExecutor {
       });
       uploadCompleted = true;
       const chatDeliveryUrl = resolveChatDeliveryUrl(
-        media.mediaOriginalUrl,
         media.mediaUrl,
+        media.mediaOriginalUrl,
         media.mediaOptimizedUrl,
       );
       if (!chatDeliveryUrl) {
@@ -12079,8 +12147,8 @@ export class CommandExecutor {
       const finalChatDeliveryUrl = resolveChatDeliveryUrl(
         generatedCustomAssetSaveResult?.url,
         chatDeliveryUrl,
-        media.mediaOriginalUrl,
         media.mediaUrl,
+        media.mediaOriginalUrl,
         media.mediaOptimizedUrl,
       );
       if (!finalChatDeliveryUrl) {
@@ -14825,11 +14893,13 @@ export class CommandExecutor {
         if (!isRecord(entry)) continue;
         pushMaybe(entry.mediaRef);
         pushMaybe(entry.uploadedUrl);
-        pushMaybe(entry.originalUrl);
+        pushMaybe(entry.mediaUrl);
         pushMaybe(entry.url);
         pushMaybe(entry.image);
         pushMaybe(entry.imageUrl);
-        pushMaybe(entry.mediaUrl);
+        pushMaybe(entry.originalUrl);
+        pushMaybe(entry.mediaOptimizedUrl);
+        pushMaybe(entry.optimizedUrl);
         pushMaybe(entry.file);
         pushMaybe(entry.path);
         pushMaybe(entry.href);
@@ -14861,6 +14931,10 @@ export class CommandExecutor {
       context?.mediaReferenceFile,
       context?.referenceImage,
       context?.referenceMediaUrl,
+      payload.mediaOptimizedUrl,
+      payload.optimizedUrl,
+      context?.mediaOptimizedUrl,
+      context?.optimizedUrl,
     ].forEach((value) => pushMaybe(value));
 
     if (includeRecentGeneratedAsset) {
@@ -14871,6 +14945,9 @@ export class CommandExecutor {
       pushMaybe(recentGeneratedAsset?.url);
       pushMaybe(recentGeneratedAsset?.imageUrl);
       pushMaybe(recentGeneratedAsset?.mediaUrl);
+      pushMaybe(recentGeneratedAsset?.originalUrl);
+      pushMaybe(recentGeneratedAsset?.optimizedUrl);
+      pushMaybe(recentGeneratedAsset?.mediaOptimizedUrl);
     }
 
     return Array.from(new Set(collected)).slice(0, MAX_COLLECTED_REFERENCE_INPUTS);
@@ -15973,8 +16050,9 @@ export class CommandExecutor {
         const generationReady = requiresFinalStreamFrame
           ? hasFinalStreamFrame ||
             hasFinalStreamArtifact ||
+            hasFinalArtifactFile ||
             Boolean(resolvedCandidate) ||
-            (hasTerminalStatus && hasFinalArtifactFile)
+            hasTerminalStatus
           : useFileGenerator
             ? hasArtifacts || hasTerminalStatus
             : Boolean(resolvedCandidate);
@@ -16143,6 +16221,8 @@ export class CommandExecutor {
       throw new Error(String(reason));
     }
 
+    const parsedGeneratorOutput = parseJsonFromMixedText(execResult.stdout);
+    const hadGenerationActivity = this.didMediaGenerationProduceActivity(parsedGeneratorOutput);
     const resolvedSource = await this.resolveGeneratedMediaSourceWithRetry({
       requestDir,
       outputPath,
@@ -16154,6 +16234,9 @@ export class CommandExecutor {
       requireFinalStreamFrame: generatedAssetType === "image" && streamEnabled,
     });
     if (!resolvedSource) {
+      if (!hadGenerationActivity) {
+        throw new Error("no_media_url_without_generation_activity");
+      }
       throw new Error("no_media_url");
     }
     try {
@@ -16348,6 +16431,47 @@ export class CommandExecutor {
       if (!allowStreamPart && this.isStreamPartArtifactReference(absolute)) return null;
       return absolute;
     };
+    const scanArtifactArray = (value: unknown): string | null => {
+      const items = toUnknownArray(value);
+      if (items.length === 0) return null;
+      for (let i = items.length - 1; i >= 0; i -= 1) {
+        const entry = items[i];
+        const direct = resolveCandidate(entry);
+        if (direct) return direct;
+        if (!isRecord(entry)) continue;
+        const resolved = resolveCandidate(
+          asNonEmptyString(entry.outputPath) ??
+            asNonEmptyString(entry.savedOutputPath) ??
+            asNonEmptyString(entry.path) ??
+            asNonEmptyString(entry.lastOutputPath) ??
+            asNonEmptyString(entry.lastOutputFile) ??
+            asNonEmptyString(entry.latestOutputPath) ??
+            asNonEmptyString(entry.latestOutputFile) ??
+            asNonEmptyString(entry.fileUrl) ??
+            asNonEmptyString(entry.mediaUrl) ??
+            asNonEmptyString(entry.outputUrl) ??
+            asNonEmptyString(entry.downloadUrl) ??
+            asNonEmptyString(entry.resolvedUrl) ??
+            asNonEmptyString(entry.url),
+        );
+        if (resolved) return resolved;
+      }
+      return null;
+    };
+    const arrayKeys = [
+      "savedFiles",
+      "observedOutputFiles",
+      "files",
+      "outputFiles",
+    ];
+    const hasStableArtifactArrays = (value: Record<string, unknown>): boolean => {
+      for (const key of arrayKeys) {
+        if (scanArtifactArray(value[key])) {
+          return true;
+        }
+      }
+      return false;
+    };
 
     const hasTerminalStatus = (value: unknown): boolean =>
       isRecord(value) &&
@@ -16526,12 +16650,14 @@ export class CommandExecutor {
     if (streamResolved.resolved) return streamResolved.resolved;
     const rootTerminalStatus = hasTerminalStatus(parsed);
     const parsedContext = isRecord(parsed.context) ? parsed.context : null;
+    const hasStableRootArtifactArrays = hasStableArtifactArrays(parsed);
     const allowTopLevelFallback =
       !requireFinalStreamFrame ||
       !streamResolved.hasEvents ||
       streamResolved.hasFinalStreamFrame ||
       rootTerminalStatus ||
-      hasTerminalStatus(parsedContext);
+      hasTerminalStatus(parsedContext) ||
+      hasStableRootArtifactArrays;
     const urlKeys = [
       "lastOutputPath",
       "latestOutputPath",
@@ -16550,39 +16676,6 @@ export class CommandExecutor {
       "downloadUrl",
       "imageUrl",
     ];
-    const scanArtifactArray = (value: unknown): string | null => {
-      const items = toUnknownArray(value);
-      if (items.length === 0) return null;
-      for (let i = items.length - 1; i >= 0; i -= 1) {
-        const entry = items[i];
-        const direct = resolveCandidate(entry);
-        if (direct) return direct;
-        if (!isRecord(entry)) continue;
-        const resolved = resolveCandidate(
-          asNonEmptyString(entry.outputPath) ??
-            asNonEmptyString(entry.savedOutputPath) ??
-            asNonEmptyString(entry.path) ??
-            asNonEmptyString(entry.lastOutputPath) ??
-            asNonEmptyString(entry.lastOutputFile) ??
-            asNonEmptyString(entry.latestOutputPath) ??
-            asNonEmptyString(entry.latestOutputFile) ??
-            asNonEmptyString(entry.fileUrl) ??
-            asNonEmptyString(entry.mediaUrl) ??
-            asNonEmptyString(entry.outputUrl) ??
-            asNonEmptyString(entry.downloadUrl) ??
-            asNonEmptyString(entry.resolvedUrl) ??
-            asNonEmptyString(entry.url),
-        );
-        if (resolved) return resolved;
-      }
-      return null;
-    };
-    const arrayKeys = [
-      "savedFiles",
-      "observedOutputFiles",
-      "files",
-      "outputFiles",
-    ];
     if (allowTopLevelFallback) {
       for (const key of arrayKeys) {
         const resolved = scanArtifactArray(parsed[key]);
@@ -16599,11 +16692,13 @@ export class CommandExecutor {
       const contextStreamResolved = resolveFromStreamEvents(context.streamEvents);
       if (contextStreamResolved.resolved) return contextStreamResolved.resolved;
       const contextTerminalStatus = hasTerminalStatus(context);
+      const hasStableContextArtifactArrays = hasStableArtifactArrays(context);
       const allowContextFallback =
         !requireFinalStreamFrame ||
         !contextStreamResolved.hasEvents ||
         contextStreamResolved.hasFinalStreamFrame ||
-        contextTerminalStatus;
+        contextTerminalStatus ||
+        hasStableContextArtifactArrays;
       if (allowContextFallback) {
         for (const key of arrayKeys) {
           const resolved = scanArtifactArray(context[key]);
@@ -16632,11 +16727,13 @@ export class CommandExecutor {
         const runStreamResolved = resolveFromStreamEvents(run.streamEvents);
         if (runStreamResolved.resolved) return runStreamResolved.resolved;
         const runTerminalStatus = hasTerminalStatus(run);
+        const hasStableRunArtifactArrays = hasStableArtifactArrays(run);
         const allowRunFallback =
           !requireFinalStreamFrame ||
           !runStreamResolved.hasEvents ||
           runStreamResolved.hasFinalStreamFrame ||
-          runTerminalStatus;
+          runTerminalStatus ||
+          hasStableRunArtifactArrays;
         if (allowRunFallback) {
           for (const key of arrayKeys) {
             const resolved = scanArtifactArray(run[key]);
@@ -16652,11 +16749,13 @@ export class CommandExecutor {
           const runContextStreamResolved = resolveFromStreamEvents(runContext.streamEvents);
           if (runContextStreamResolved.resolved) return runContextStreamResolved.resolved;
           const runContextTerminalStatus = hasTerminalStatus(runContext);
+          const hasStableRunContextArtifactArrays = hasStableArtifactArrays(runContext);
           const allowRunContextFallback =
             !requireFinalStreamFrame ||
             !runContextStreamResolved.hasEvents ||
             runContextStreamResolved.hasFinalStreamFrame ||
-            runContextTerminalStatus;
+            runContextTerminalStatus ||
+            hasStableRunContextArtifactArrays;
           if (allowRunContextFallback) {
             for (const key of arrayKeys) {
               const resolved = scanArtifactArray(runContext[key]);
