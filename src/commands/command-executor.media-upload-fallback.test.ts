@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { CommandExecutor } from "./command-executor.js";
+import type { Command } from "../types/ipc.js";
 import { isRecord } from "../lib/guards.js";
 
 const tempDirs: string[] = [];
@@ -24,6 +25,7 @@ type CommandExecutorInvoker = {
     payload: Record<string, unknown>;
     keepOriginal?: boolean;
     promptFallbacks: Array<string | null>;
+    command?: Command;
   }): Promise<ResolvedMediaUpload>;
   uploadResolvedMediaSource(
     source: string,
@@ -34,6 +36,23 @@ type CommandExecutorInvoker = {
     options: unknown,
   ): Promise<ResolvedMediaUpload>;
 };
+
+const baseCommand = (): Command => ({
+  id: "test-media-upload-fallback",
+  createdAt: new Date().toISOString(),
+  kind: "write.createPost",
+  grantId: null,
+  payload: {},
+  sig: null,
+  sourceDirectiveId: "test-media-upload-fallback",
+  pendingDirectiveId: null,
+  actionNonce: "nonce-media-upload-fallback",
+  challenge: null,
+  forceNow: true,
+  runtimeSessionId: null,
+  runtimeOrigin: "director_directive",
+  runtimeSig: null,
+});
 
 const createExecutor = () => {
   const root = path.join(
@@ -188,5 +207,21 @@ describe("command executor media upload fallback", () => {
     expect(sentDataUri.startsWith("data:image/png;base64,")).toBe(true);
     expect(sentDataUri.startsWith("data:text/plain;base64,")).toBe(false);
     expect(result.mediaType).toBe("image");
+  });
+
+  it("requeues media generation when prompt output has no final media url", async () => {
+    const { executor } = createExecutor();
+    const invoker = executor as unknown as CommandExecutorInvoker;
+    invoker.generateAndUploadMediaFromPrompt = vi.fn(async () => {
+      throw new Error("no_media_url");
+    }) as CommandExecutorInvoker["generateAndUploadMediaFromPrompt"];
+
+    await expect(
+      invoker.resolveMediaUpload({
+        payload: {},
+        promptFallbacks: ["create a cinematic dragon render"],
+        command: baseCommand(),
+      }),
+    ).rejects.toThrow(/media_generation_waiting_for_output:no_media_url/iu);
   });
 });

@@ -186,5 +186,43 @@ describe("command executor permission hint filters", () => {
     expect(outcome.ok).toBe(false);
     expect(String(outcome.error?.code ?? "")).toBe("no_permitted_generate_kind");
   });
-});
 
+  it("treats post media grants as image generation permission for non-directive commands", async () => {
+    const generateMutate = vi.fn(async () => ({
+      items: [
+        {
+          drafts: [],
+        },
+      ],
+    }));
+    const executor = createExecutor(generateMutate);
+    const invoker = executor as unknown as {
+      executeGenerateAndQueue(command: Command): Promise<unknown>;
+    };
+    const command: Command = {
+      ...baseCommand(),
+      sourceDirectiveId: null,
+      actionNonce: null,
+      runtimeOrigin: "chat",
+      payload: {
+        goal: "media",
+        kind: "media",
+        permissionState: {
+          can: {
+            postMedia: true,
+            postText: false,
+            story: false,
+            comment: false,
+            like: false,
+            repost: false,
+            imageGenerate: false,
+            textGenerate: false,
+          },
+        },
+      },
+    };
+
+    await invoker.executeGenerateAndQueue(command);
+    expect(generateMutate).toHaveBeenCalledTimes(1);
+  });
+});

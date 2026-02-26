@@ -506,6 +506,67 @@ describe("command executor generate input", () => {
     ).toBe(true);
   });
 
+  it("does not force persona references for generic chat literal persona locks", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      resolvePersonaReferencePlan(
+        payload: Record<string, unknown>,
+        mainPersonaSlugRaw?: string | null,
+        command?: Command | null,
+      ): {
+        enabled: boolean;
+        source: string;
+        targetPersonaSlug: string;
+      };
+    };
+
+    const plan = invoker.resolvePersonaReferencePlan(
+      {
+        chatLiteralGenerate: true,
+        mediaPersona: "default",
+        mediaPersonaLock: true,
+        mediaPrompt: "Generate a realistic creepy cat-dog hybrid.",
+      },
+      null,
+      chatCommand(),
+    );
+
+    expect(plan.enabled).toBe(false);
+    expect(plan.source).toBe("none");
+  });
+
+  it("does not default non-autonomous write.createPost flows to persona references", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      resolvePersonaReferencePlan(
+        payload: Record<string, unknown>,
+        mainPersonaSlugRaw?: string | null,
+        command?: Command | null,
+      ): {
+        enabled: boolean;
+        source: string;
+        targetPersonaSlug: string;
+      };
+    };
+    const writeCommand: Command = {
+      ...baseCommand(),
+      kind: "write.createPost",
+    };
+
+    const plan = invoker.resolvePersonaReferencePlan(
+      {
+        postType: "media",
+        mediaPrompt: "Create a dramatic dragon render.",
+        provenance: "SYSTEM_DIRECTIVE",
+      },
+      null,
+      writeCommand,
+    );
+
+    expect(plan.enabled).toBe(false);
+    expect(plan.source).toBe("none");
+  });
+
   it("defaults autonomous media generation to main persona frame references", async () => {
     const executor = createExecutor({
       personaFrames: [

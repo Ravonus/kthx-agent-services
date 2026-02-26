@@ -169,6 +169,58 @@ describe("command executor chat literal delivery url selection", () => {
     expect(resolved).toBeNull();
   });
 
+  it("uses terminal saved artifacts when stream events never mark a final frame", () => {
+    const executor = createExecutor(null);
+    const invoker = executor as unknown as CommandExecutorInvoker;
+
+    const resolved = invoker.extractMediaSourceFromParsedOutput(
+      {
+        status: "done",
+        streamEvents: [
+          {
+            sourceFileName: "tmp_frame_001.png",
+            outputPath: "https://cdn.example.com/generated/tmp_frame_001.png",
+            isStreamPart: true,
+          },
+          {
+            sourceFileName: "temp_frame_002.png",
+            outputPath: "https://cdn.example.com/generated/temp_frame_002.png",
+            streamPartIndex: 2,
+          },
+        ],
+        savedFiles: [
+          "https://cdn.example.com/generated/final-dragon-render.png",
+        ],
+      },
+      process.cwd(),
+      { requireFinalStreamFrame: true },
+    );
+
+    expect(resolved).toBe("https://cdn.example.com/generated/final-dragon-render.png");
+  });
+
+  it("accepts explicit final stream frame urls even when filename matches partx", () => {
+    const executor = createExecutor(null);
+    const invoker = executor as unknown as CommandExecutorInvoker;
+
+    const resolved = invoker.extractMediaSourceFromParsedOutput(
+      {
+        status: "completed",
+        streamEvents: [
+          {
+            sourceFileName: "partx.png",
+            outputPath: "https://cdn.example.com/generated/partx.png",
+            isFinalStreamFrame: true,
+          },
+        ],
+      },
+      process.cwd(),
+      { requireFinalStreamFrame: true },
+    );
+
+    expect(resolved).toBe("https://cdn.example.com/generated/partx.png");
+  });
+
   it("finalizes chat literal preview with the stable image url when saved asset url is partx", async () => {
     const command = baseCommand();
     const bridge = vi.fn(async (payload: unknown) => {
@@ -375,5 +427,156 @@ describe("command executor chat literal delivery url selection", () => {
           payload.messageId.trim().length > 0,
       );
     expect(messageIdEdits).toHaveLength(0);
+  });
+
+  it("allows generic chat literal image generation with legacy default persona lock hints", async () => {
+    const command = baseCommand();
+    const bridge = vi.fn(async (payload: unknown) => {
+      if (!isRecord(payload)) {
+        throw new Error("bridge payload must be an object");
+      }
+      const action = typeof payload.action === "string" ? payload.action : "";
+      if (action === "send_message") {
+        return {
+          message: {
+            id: "msg-generic-literal-1",
+            clientMessageId: payload.clientMessageId,
+          },
+        };
+      }
+      if (action === "edit_message") {
+        return {
+          message: {
+            id: "msg-generic-literal-1",
+            clientMessageId: payload.clientMessageId,
+          },
+        };
+      }
+      if (action === "list_messages") {
+        return {
+          items: [
+            {
+              message: {
+                id: "msg-generic-literal-1",
+                clientMessageId: `runtime_generate_${command.id}`,
+              },
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected bridge action: ${action}`);
+    });
+
+    const executor = createExecutor(bridge);
+    const invoker = executor as unknown as CommandExecutorInvoker;
+    invoker.generateAndUploadMediaFromPrompt = vi.fn(
+      async () => ({
+        mediaUrl: "https://cdn.example.com/generated/catdog-creepy-final.png",
+        mediaOriginalUrl: "https://cdn.example.com/generated/catdog-creepy-final.png",
+        mediaOptimizedUrl: "https://cdn.example.com/generated/catdog-creepy-final.png",
+        mediaType: "image",
+        mediaSizeBytes: 2048,
+      }),
+    ) as CommandExecutorInvoker["generateAndUploadMediaFromPrompt"];
+
+    const outcome = await invoker.executeGenerateAndQueue({
+      ...command,
+      payload: {
+        chatLiteralGenerate: true,
+        generatedAssetType: "image",
+        mediaPrompt: "Generate a realistic creepy cat-dog hybrid.",
+        mediaPersona: "default",
+        mediaPersonaLock: true,
+        chatContext: {
+          conversationId: "conv-test",
+        },
+      },
+    });
+
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(true);
+    const data = isRecord(outcome.data) ? outcome.data : null;
+    expect(data).not.toBeNull();
+    if (!data) return;
+    expect(data.mediaUrl).toBe("https://cdn.example.com/generated/catdog-creepy-final.png");
+  });
+
+  it("requeues chat literal generation when no final media url is produced", async () => {
+    const command = baseCommand();
+    const bridge = vi.fn(async (payload: unknown) => {
+      if (!isRecord(payload)) {
+        throw new Error("bridge payload must be an object");
+      }
+      const action = typeof payload.action === "string" ? payload.action : "";
+      if (action === "send_message") {
+        return {
+          message: {
+            id: "msg-generate-requeue-1",
+            clientMessageId: payload.clientMessageId,
+          },
+        };
+      }
+      if (action === "edit_message") {
+        return {
+          message: {
+            id: "msg-generate-requeue-1",
+            clientMessageId: payload.clientMessageId,
+          },
+        };
+      }
+      if (action === "list_messages") {
+        return {
+          items: [
+            {
+              message: {
+                id: "msg-generate-requeue-1",
+                clientMessageId: `runtime_generate_${command.id}`,
+              },
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected bridge action: ${action}`);
+    });
+
+    const executor = createExecutor(bridge);
+    const invoker = executor as unknown as CommandExecutorInvoker;
+    invoker.generateAndUploadMediaFromPrompt = vi.fn(async () => {
+      throw new Error("no_media_url");
+    }) as CommandExecutorInvoker["generateAndUploadMediaFromPrompt"];
+
+    await expect(
+      invoker.executeGenerateAndQueue({
+        ...command,
+        payload: {
+          chatLiteralGenerate: true,
+          generatedAssetType: "image",
+          mediaPrompt: "Generate a dragon chained up.",
+          chatContext: {
+            conversationId: "conv-test",
+          },
+        },
+      }),
+    ).rejects.toThrow(/media_generation_waiting_for_output:no_media_url/iu);
+
+    const editPayloads = bridge.mock.calls
+      .map((call) => call[0])
+      .filter(
+        (payload): payload is Record<string, unknown> =>
+          isRecord(payload) && payload.action === "edit_message",
+      );
+    expect(editPayloads.length).toBeGreaterThan(0);
+    const lastEdit = editPayloads[editPayloads.length - 1];
+    expect(isRecord(lastEdit?.metadata)).toBe(true);
+    const metadata = isRecord(lastEdit?.metadata) ? lastEdit.metadata : null;
+    const actionPreview = metadata && isRecord(metadata.actionPreview)
+      ? metadata.actionPreview
+      : null;
+    expect(actionPreview).not.toBeNull();
+    if (!actionPreview) return;
+    expect(actionPreview.status).toBe("processing");
+    expect(actionPreview.deferred).toBe(true);
+    expect(actionPreview.deferredReason).toBe("media_generation_waiting_for_output:no_media_url");
   });
 });

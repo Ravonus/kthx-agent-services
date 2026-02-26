@@ -186,6 +186,10 @@ const AGENT_KTHX_GUIDE_LOCATION = (() => {
 })();
 const IMAGE_GENERATION_SETUP_REQUIRED_PATTERN =
   /\b(image_generator_unconfigured|file_generator_unconfigured|generate_command_unset|service_unreachable|service_http_|image_generation_failed|image_generation_timeout_after_)\b/iu;
+const PERSONA_REFERENCE_SETUP_REQUIRED_PATTERN =
+  /persona_reference_setup_required:([a-z0-9_]{1,64})/iu;
+const MEDIA_GENERATION_OUTPUT_UNAVAILABLE_PATTERN =
+  /\b(no_media_url|chat_delivery_media_url_invalid|unsupported_media_payload_mime:|invalid_data_uri|media_source_empty|empty media data|only image and video uploads are supported)\b/iu;
 const IMAGE_GENERATION_SETUP_HINT =
   ` Image generation is not ready yet. Install/start the KTHX OpenAI Media Generator using ${AGENT_KTHX_GUIDE_LOCATION}, then complete its first browser OpenAI login and retry.`;
 const COMMENT_TOKEN_STOP_WORDS = new Set([
@@ -1330,6 +1334,19 @@ type CommandLifecycleCheckpointStage =
   | "chat_delivery"
   | "ack_terminal";
 
+type MediaGenerationDeferralReason =
+  | "persona_reference_setup_required"
+  | "image_generation_setup_required"
+  | "media_generation_output_unavailable";
+
+type MediaGenerationDeferralDecision = {
+  shouldRequeue: boolean;
+  reason: string | null;
+  reasonCode: MediaGenerationDeferralReason | null;
+  personaSlug: string | null;
+  imageGeneratorSetupRequired: boolean;
+};
+
 type FollowTargetMode = "owner" | "agent";
 
 export class CommandExecutor {
@@ -1430,6 +1447,75 @@ export class CommandExecutor {
       asNonEmptyString(input.command.actionNonce) ??
       null
     );
+  }
+
+  private classifyMediaGenerationDeferral(input: {
+    error: unknown;
+    hasPrompt?: boolean;
+  }): MediaGenerationDeferralDecision {
+    if (!(input.error instanceof Error)) {
+      return {
+        shouldRequeue: false,
+        reason: null,
+        reasonCode: null,
+        personaSlug: null,
+        imageGeneratorSetupRequired: false,
+      };
+    }
+    const rawMessage = input.error.message.trim();
+    const loweredMessage = rawMessage.toLowerCase();
+    const personaMatch = PERSONA_REFERENCE_SETUP_REQUIRED_PATTERN.exec(rawMessage);
+    if (personaMatch?.[1]) {
+      const personaSlug = personaMatch[1].trim().toLowerCase();
+      return {
+        shouldRequeue: true,
+        reason: `persona_reference_setup_required:${personaSlug}`,
+        reasonCode: "persona_reference_setup_required",
+        personaSlug,
+        imageGeneratorSetupRequired: false,
+      };
+    }
+    if (IMAGE_GENERATION_SETUP_REQUIRED_PATTERN.test(rawMessage)) {
+      return {
+        shouldRequeue: true,
+        reason: "image_generation_setup_required",
+        reasonCode: "image_generation_setup_required",
+        personaSlug: null,
+        imageGeneratorSetupRequired: true,
+      };
+    }
+    const hasPrompt = input.hasPrompt !== false;
+    if (hasPrompt && MEDIA_GENERATION_OUTPUT_UNAVAILABLE_PATTERN.test(loweredMessage)) {
+      const normalizedReason =
+        loweredMessage.includes("no_media_url")
+          ? "no_media_url"
+          : loweredMessage.includes("chat_delivery_media_url_invalid")
+            ? "chat_delivery_media_url_invalid"
+            : loweredMessage.includes("unsupported_media_payload_mime:")
+              ? "unsupported_media_payload_mime"
+              : loweredMessage.includes("invalid_data_uri")
+                ? "invalid_data_uri"
+                : loweredMessage.includes("media_source_empty") ||
+                    loweredMessage.includes("empty media data")
+                  ? "media_source_empty"
+                  : loweredMessage.includes("only image and video uploads are supported")
+                    ? "upload_only_image_video"
+                    : "media_output_unavailable";
+      return {
+        shouldRequeue: true,
+        reason: `media_generation_waiting_for_output:${normalizedReason}`,
+        reasonCode: "media_generation_output_unavailable",
+        personaSlug: null,
+        imageGeneratorSetupRequired: false,
+      };
+    }
+    return {
+      shouldRequeue: false,
+      reason: null,
+      reasonCode: null,
+      personaSlug: null,
+      imageGeneratorSetupRequired: false,
+    };
   }
 
   private async recordCommandLifecycleCheckpoint(input: {
@@ -2346,19 +2432,50 @@ export class CommandExecutor {
     payload: Record<string, unknown>,
     command: Command | null,
   ): boolean {
-    if (this.isPersonaMediaLockEnabled(payload)) return true;
-    if (!this.isMediaLikePayloadForPersona(payload, command)) return false;
-
+    const context = isRecord(payload.context) ? payload.context : null;
     const commandKind = command?.kind.trim().toLowerCase() ?? "";
+    const explicitCandidates: unknown[] = [
+      payload.mediaPersona,
+      payload.persona,
+      payload.personaName,
+      context?.mediaPersona,
+      context?.persona,
+      context?.personaName,
+    ];
+    let explicitPersonaSlug: string | null = null;
+    for (const candidate of explicitCandidates) {
+      const normalized = this.normalizePersonaSlug(candidate);
+      if (!normalized) continue;
+      explicitPersonaSlug = normalized;
+      break;
+    }
+    const genericExplicitPersona =
+      explicitPersonaSlug !== null && this.isGenericPersonaSlug(explicitPersonaSlug);
+    const chatLiteralGenerate =
+      payload.chatLiteralGenerate === true ||
+      payload.chatLiteralGenerate === "true" ||
+      context?.chatLiteralGenerate === true ||
+      context?.chatLiteralGenerate === "true";
+    const avatarOrBannerRequest =
+      payload.avatarRequest === true ||
+      payload.bannerRequest === true ||
+      context?.avatarRequest === true ||
+      context?.bannerRequest === true;
+    const personaMediaLockEnabled = this.isPersonaMediaLockEnabled(payload);
     if (
-      commandKind === "write.createstory" ||
-      commandKind === "write.createpost" ||
-      commandKind === "write.updateavatar" ||
-      commandKind === "write.updatebanner"
+      personaMediaLockEnabled &&
+      !(chatLiteralGenerate && !avatarOrBannerRequest && genericExplicitPersona)
     ) {
       return true;
     }
-    const context = isRecord(payload.context) ? payload.context : null;
+    if (!this.isMediaLikePayloadForPersona(payload, command)) return false;
+    if (
+      commandKind === "write.updateavatar" ||
+      payload.avatarRequest === true ||
+      context?.avatarRequest === true
+    ) {
+      return true;
+    }
     const provenance =
       normalizeAgentProvenanceValue(payload.provenance) ??
       normalizeAgentProvenanceValue(context?.provenance);
@@ -9657,10 +9774,50 @@ export class CommandExecutor {
     this.pruneGeneratedDraftCache();
     const cachedEntry = this.generatedDraftCache.get(command.id);
     const inlineDrafts = cachedEntry ? cachedEntry.drafts : this.extractInlineDrafts(payload);
-    const generateInputRaw =
-      inlineDrafts.length > 0
-        ? null
-        : await this.buildGenerateInputWithRuntimeContext(payload, command);
+    let generateInputRaw: Record<string, unknown> | null = null;
+    if (!inlineDrafts.length) {
+      try {
+        generateInputRaw = await this.buildGenerateInputWithRuntimeContext(
+          payload,
+          command,
+        );
+      } catch (error: unknown) {
+        const deferred = this.classifyMediaGenerationDeferral({
+          error,
+          hasPrompt: true,
+        });
+        if (deferred.shouldRequeue && deferred.reason) {
+          const message = error instanceof Error ? error.message : String(error);
+          await this.recordCommandLifecycleCheckpoint({
+            command,
+            stage: "generated",
+            status: "failed",
+            message,
+            metadata: {
+              requeued: true,
+              reason: deferred.reason,
+              reasonCode: deferred.reasonCode,
+              personaSlug: deferred.personaSlug,
+              source: "build_generate_input",
+            },
+          });
+          await this.ctx.memory
+            .recordWrite({
+              type: "generate_deferred_for_setup",
+              at: nowIso(),
+              commandId: command.id,
+              sourceDirectiveId,
+              reason: deferred.reason,
+              reasonCode: deferred.reasonCode,
+              personaSlug: deferred.personaSlug,
+              error: message,
+            })
+            .catch(() => undefined);
+          throw new RequeueCommandError(deferred.reason);
+        }
+        throw error;
+      }
+    }
     const enforcePermissionHintFilters =
       ENFORCE_PERMISSION_HINT_FILTERS &&
       !this.isDirectiveContextLinkedCommand(command);
@@ -10915,14 +11072,11 @@ export class CommandExecutor {
       personaReferences.personaSlug !== null
         ? [...personaReferences.frameReferences]
         : [...fallbackReferenceInputs];
-    if (
+    const personaSetupRequiredSlug =
       personaReferences.personaSlug !== null &&
       referenceInputs.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT
-    ) {
-      throw new Error(
-        `persona_reference_setup_required:${personaReferences.personaSlug}`,
-      );
-    }
+        ? personaReferences.personaSlug
+        : null;
     if (
       personaReferences.personaSlug === null &&
       shouldReusePersonaReference &&
@@ -11498,6 +11652,9 @@ export class CommandExecutor {
           actionPreview: buildProcessingActionPreview(),
         },
       });
+      if (personaSetupRequiredSlug) {
+        throw new Error(`persona_reference_setup_required:${personaSetupRequiredSlug}`);
+      }
       const media = await this.generateAndUploadMediaFromPrompt(prompt, {
         generatedAssetType: avatarRequest || bannerRequest ? "image" : generatedAssetType,
         mode: avatarRequest
@@ -11919,21 +12076,22 @@ export class CommandExecutor {
         chatDeliveryHandled,
       });
     } catch (error: unknown) {
+      if (error instanceof RequeueCommandError) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       const isPromptCurationFailure = /prompt_curation_/iu.test(message);
       const isChatDeliveryFailure = /chat_preview_finalize_failed:/iu.test(message);
-      const isImageGenerationSetupFailure =
-        IMAGE_GENERATION_SETUP_REQUIRED_PATTERN.test(message);
+      const deferred = this.classifyMediaGenerationDeferral({
+        error,
+        hasPrompt: true,
+      });
+      const isImageGenerationSetupFailure = deferred.imageGeneratorSetupRequired;
       const imageGenerationSetupHint = isImageGenerationSetupFailure
         ? IMAGE_GENERATION_SETUP_HINT
         : "";
-      const isPersonaReferenceSetupFailure =
-        /persona_reference_setup_required:/iu.test(message);
-      const personaReferenceSetupSlug = (() => {
-        if (!isPersonaReferenceSetupFailure) return null;
-        const match = /persona_reference_setup_required:([a-z0-9_]{1,64})/iu.exec(message);
-        return match?.[1]?.trim().toLowerCase() ?? null;
-      })();
+      const isPersonaReferenceSetupFailure = deferred.reasonCode === "persona_reference_setup_required";
+      const personaReferenceSetupSlug = deferred.personaSlug;
       const failureStreamFrames = snapshotStreamFrames();
       const streamPreviewForFailure = failureStreamFrames.length > 0
         ? buildStreamPreviewDeltaMetadata({
@@ -11949,6 +12107,71 @@ export class CommandExecutor {
           : generationCompleted
             ? "generated"
             : "generated";
+      if (deferred.shouldRequeue && deferred.reason) {
+        const deferredBody = avatarRequest
+          ? "Avatar prerequisites are still in progress. I queued this request and will retry automatically."
+          : bannerRequest
+            ? "Banner prerequisites are still in progress. I queued this request and will retry automatically."
+            : isPersonaReferenceSetupFailure
+              ? `Persona setup for ${personaReferenceSetupSlug ? `\`${personaReferenceSetupSlug}\`` : "that persona"} is incomplete (need selfie, midshot, fullbody). I queued this request and will retry automatically.`
+              : isImageGenerationSetupFailure
+                ? `Image generation setup is still unavailable. I queued this request and will retry automatically once setup is ready.${imageGenerationSetupHint}`
+                : "I did not receive a final media asset yet. I queued this request and will retry automatically.";
+        const previewDeferredDelivered = await sendOrEditPreviewMessage({
+          kind: "processing",
+          body: deferredBody,
+          metadata: {
+            automated: true,
+            sourceContext: "CHAT",
+            actionPreview: {
+              type: avatarRequest ? "persona" : bannerRequest ? "banner" : generatedAssetType,
+              status: "processing",
+              streamSessionId: previewClientMessageId,
+              title:
+                avatarRequest
+                  ? "Avatar update queued"
+                  : bannerRequest
+                    ? "Banner update queued"
+                    : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} queued`,
+              summary,
+              deferred: true,
+              deferredReason: deferred.reason,
+              personaSetupRequired: isPersonaReferenceSetupFailure,
+              imageGenerationSetupRequired: isImageGenerationSetupFailure,
+              ...(streamPreviewForFailure?.metadata ?? {}),
+            },
+          },
+        }).catch(() => false);
+        await this.recordCommandLifecycleCheckpoint({
+          command,
+          stage: failureStage,
+          status: "failed",
+          message,
+          metadata: {
+            generatedAssetType,
+            avatarRequest,
+            bannerRequest,
+            requeued: true,
+            requeueReason: deferred.reason,
+            requeueReasonCode: deferred.reasonCode,
+            requeuePersonaSlug: deferred.personaSlug,
+            previewDeferredDelivered,
+          },
+        });
+        await this.ctx.memory.recordWrite({
+          type: "chat_literal_generate_deferred",
+          at: nowIso(),
+          commandId: command.id,
+          generatedAssetType,
+          avatarRequest,
+          bannerRequest,
+          reason: deferred.reason,
+          reasonCode: deferred.reasonCode,
+          personaSlug: deferred.personaSlug,
+          error: message,
+        });
+        throw new RequeueCommandError(deferred.reason);
+      }
       const previewFailureDelivered = await sendOrEditPreviewMessage({
         kind: "failed",
         body: avatarRequest
@@ -14044,6 +14267,44 @@ export class CommandExecutor {
         values.repost = true;
       }
     }
+    if (values.imageGenerate !== true) {
+      if (
+        hasActiveGrant([
+          "post:post:media",
+          "post:thread:media",
+          "story",
+          "write.createStory",
+          "image_generate",
+          "generate_image",
+        ]) ||
+        values.postMedia === true ||
+        values.story === true
+      ) {
+        values.imageGenerate = true;
+      }
+    }
+    if (values.textGenerate !== true) {
+      if (
+        hasActiveGrant([
+          "post:post:text",
+          "post:thread:text",
+          "comment",
+          "write.commentPost",
+          "like",
+          "write.votePost",
+          "repost",
+          "write.repostPost",
+          "text_generate",
+          "generate_text",
+        ]) ||
+        values.postText === true ||
+        values.comment === true ||
+        values.like === true ||
+        values.repost === true
+      ) {
+        values.textGenerate = true;
+      }
+    }
 
     const hasAnyHints =
       grantCandidates.length > 0 ||
@@ -14701,41 +14962,79 @@ export class CommandExecutor {
       input.promptFallbacks.find((entry) => typeof entry === "string" && entry.trim().length > 0) ??
       null;
     if (!prompt) {
-      throw new Error("no_media_url");
+      throw new Error("missing_media_input");
     }
     const fallbackReferenceInputs = this.collectMediaReferenceInputs(payload);
-    let referenceInputs = fallbackReferenceInputs;
-    if (input.command) {
-      const personaReferences = await this.resolvePersonaFrameReferences({
-        payload,
-        command: input.command,
-        fallbackReferenceInputs,
-      });
-      if (
-        personaReferences.personaSlug !== null &&
-        personaReferences.frameReferences.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT
-      ) {
-        throw new Error(
-          `persona_reference_setup_required:${personaReferences.personaSlug}`,
-        );
+    try {
+      let referenceInputs = fallbackReferenceInputs;
+      if (input.command) {
+        const personaReferences = await this.resolvePersonaFrameReferences({
+          payload,
+          command: input.command,
+          fallbackReferenceInputs,
+        });
+        if (
+          personaReferences.personaSlug !== null &&
+          personaReferences.frameReferences.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT
+        ) {
+          throw new Error(
+            `persona_reference_setup_required:${personaReferences.personaSlug}`,
+          );
+        }
+        referenceInputs =
+          personaReferences.personaSlug !== null
+            ? personaReferences.frameReferences
+            : fallbackReferenceInputs;
       }
-      referenceInputs =
-        personaReferences.personaSlug !== null
-          ? personaReferences.frameReferences
-          : fallbackReferenceInputs;
+      const requestedGeneratedAssetType = this.resolveGeneratedAssetType(
+        payload.generatedAssetType,
+      );
+      const generatedAssetType =
+        requestedGeneratedAssetType === "gif" ? "gif" : "image";
+      const generated = await this.generateAndUploadMediaFromPrompt(prompt, {
+        generatedAssetType,
+        mode: "write_media_generate",
+        referenceInputs,
+        keepOriginal,
+      });
+      return markUploaded(generated, "generated_prompt");
+    } catch (error: unknown) {
+      if (input.command) {
+        const deferred = this.classifyMediaGenerationDeferral({
+          error,
+          hasPrompt: true,
+        });
+        if (deferred.shouldRequeue && deferred.reason) {
+          const message = error instanceof Error ? error.message : String(error);
+          await this.recordCommandLifecycleCheckpoint({
+            command: input.command,
+            stage: "generated",
+            status: "failed",
+            message,
+            metadata: {
+              requeued: true,
+              reason: deferred.reason,
+              reasonCode: deferred.reasonCode,
+              personaSlug: deferred.personaSlug,
+              source: "resolve_media_upload",
+            },
+          });
+          await this.ctx.memory
+            .recordWrite({
+              type: "media_generation_deferred_for_setup",
+              at: nowIso(),
+              commandId: input.command.id,
+              reason: deferred.reason,
+              reasonCode: deferred.reasonCode,
+              personaSlug: deferred.personaSlug,
+              error: message,
+            })
+            .catch(() => undefined);
+          throw new RequeueCommandError(deferred.reason);
+        }
+      }
+      throw error;
     }
-    const requestedGeneratedAssetType = this.resolveGeneratedAssetType(
-      payload.generatedAssetType,
-    );
-    const generatedAssetType =
-      requestedGeneratedAssetType === "gif" ? "gif" : "image";
-    const generated = await this.generateAndUploadMediaFromPrompt(prompt, {
-      generatedAssetType,
-      mode: "write_media_generate",
-      referenceInputs,
-      keepOriginal,
-    });
-    return markUploaded(generated, "generated_prompt");
   }
 
   private async uploadResolvedMediaSource(
@@ -15553,7 +15852,6 @@ export class CommandExecutor {
         const observedOutputFilesCount = observedOutputFiles.length;
         const hasArtifacts = savedFilesCount > 0 || observedOutputFilesCount > 0;
         const hasFinalStreamFrame = progress.hasFinalStreamFrame;
-        const hasAnyStreamFrames = progress.streamFrameCount > 0;
         const hasFinalStreamArtifact = progress.streamFrames.some(
           (frame) =>
             frame.isFinalStreamFrame &&
@@ -15566,18 +15864,14 @@ export class CommandExecutor {
           this.extractMediaSourceFromParsedOutput(contextPayload, input.requestDir, {
             requireFinalStreamFrame: requiresFinalStreamFrame,
           }) ?? null;
+        const hasTerminalStatus = this.isTerminalMediaGeneratorStatus(status);
         const generationReady = requiresFinalStreamFrame
-          ? hasAnyStreamFrames
-            ? hasFinalStreamFrame || hasFinalStreamArtifact
-            : hasFinalStreamFrame ||
-              hasFinalStreamArtifact ||
-              hasFinalArtifactFile ||
-              (this.isTerminalMediaGeneratorStatus(status) &&
-                (hasFinalStreamFrame ||
-                  hasFinalStreamArtifact ||
-                  hasFinalArtifactFile))
+          ? hasFinalStreamFrame ||
+            hasFinalStreamArtifact ||
+            Boolean(resolvedCandidate) ||
+            (hasTerminalStatus && hasFinalArtifactFile)
           : useFileGenerator
-            ? hasArtifacts || this.isTerminalMediaGeneratorStatus(status)
+            ? hasArtifacts || hasTerminalStatus
             : Boolean(resolvedCandidate);
         if (generationReady) {
           return { payload: latestPayload, timedOut: false };
@@ -15908,10 +16202,16 @@ export class CommandExecutor {
     },
   ): string | null {
     const requireFinalStreamFrame = options?.requireFinalStreamFrame === true;
-    const resolveCandidate = (value: unknown): string | null => {
+    const resolveCandidate = (
+      value: unknown,
+      opts?: {
+        allowStreamPart?: boolean;
+      },
+    ): string | null => {
       const candidate = asNonEmptyString(value);
       if (!candidate) return null;
-      if (this.isStreamPartArtifactReference(candidate)) return null;
+      const allowStreamPart = opts?.allowStreamPart === true;
+      if (!allowStreamPart && this.isStreamPartArtifactReference(candidate)) return null;
       if (isDataUri(candidate)) {
         const parsed = parseDataUriPayload(candidate);
         if (!parsed || !this.isUploadableMediaMimeType(parsed.mime)) {
@@ -15940,9 +16240,13 @@ export class CommandExecutor {
       ) {
         return null;
       }
-      if (this.isStreamPartArtifactReference(absolute)) return null;
+      if (!allowStreamPart && this.isStreamPartArtifactReference(absolute)) return null;
       return absolute;
     };
+
+    const hasTerminalStatus = (value: unknown): boolean =>
+      isRecord(value) &&
+      this.isTerminalMediaGeneratorStatus(asNonEmptyString(value.status));
 
     const resolveFromStreamEvents = (
       value: unknown,
@@ -15964,6 +16268,7 @@ export class CommandExecutor {
       ): {
         resolved: string | null;
         finalFramePreview: string | null;
+        finalFrameRelaxed: string | null;
         isFinalStreamFrame: boolean;
       } => {
         const sourceFileName =
@@ -15971,9 +16276,10 @@ export class CommandExecutor {
           asNonEmptyString(entry.file_name);
         const isStreamPartFromName =
           sourceFileName !== null && this.isStreamPartArtifactReference(sourceFileName);
+        const hasExplicitFinalStreamFrameFlag =
+          entry.isFinalStreamFrame === true || entry.streamIsFinalFrame === true;
         const isFinalStreamFrame =
-          entry.isFinalStreamFrame === true ||
-          entry.streamIsFinalFrame === true ||
+          hasExplicitFinalStreamFrameFlag ||
           (sourceFileName !== null && !isStreamPartFromName);
         const artifactCandidates: unknown[] = [
           entry.outputPath,
@@ -15989,7 +16295,12 @@ export class CommandExecutor {
         for (const candidate of artifactCandidates) {
           const resolved = resolveCandidate(candidate);
           if (resolved) {
-            return { resolved, finalFramePreview: null, isFinalStreamFrame };
+            return {
+              resolved,
+              finalFramePreview: null,
+              finalFrameRelaxed: null,
+              isFinalStreamFrame,
+            };
           }
         }
         const finalFramePreviewCandidates: unknown[] =
@@ -16007,11 +16318,41 @@ export class CommandExecutor {
             return {
               resolved: null,
               finalFramePreview: resolved,
+              finalFrameRelaxed: null,
               isFinalStreamFrame,
             };
           }
         }
-        return { resolved: null, finalFramePreview: null, isFinalStreamFrame };
+        if (requireFinalStreamFrame && hasExplicitFinalStreamFrameFlag) {
+          for (const candidate of artifactCandidates) {
+            const resolved = resolveCandidate(candidate, { allowStreamPart: true });
+            if (resolved) {
+              return {
+                resolved: null,
+                finalFramePreview: null,
+                finalFrameRelaxed: resolved,
+                isFinalStreamFrame,
+              };
+            }
+          }
+          for (const candidate of finalFramePreviewCandidates) {
+            const resolved = resolveCandidate(candidate, { allowStreamPart: true });
+            if (resolved) {
+              return {
+                resolved: null,
+                finalFramePreview: null,
+                finalFrameRelaxed: resolved,
+                isFinalStreamFrame,
+              };
+            }
+          }
+        }
+        return {
+          resolved: null,
+          finalFramePreview: null,
+          finalFrameRelaxed: null,
+          isFinalStreamFrame,
+        };
       };
       let hasFinalStreamFrame = false;
       for (let i = events.length - 1; i >= 0; i -= 1) {
@@ -16031,6 +16372,13 @@ export class CommandExecutor {
         if (resolved.isFinalStreamFrame && resolved.finalFramePreview) {
           return {
             resolved: resolved.finalFramePreview,
+            hasEvents: true,
+            hasFinalStreamFrame,
+          };
+        }
+        if (resolved.isFinalStreamFrame && resolved.finalFrameRelaxed) {
+          return {
+            resolved: resolved.finalFrameRelaxed,
             hasEvents: true,
             hasFinalStreamFrame,
           };
@@ -16071,10 +16419,14 @@ export class CommandExecutor {
     if (!isRecord(parsed)) return null;
     const streamResolved = resolveFromStreamEvents(parsed.streamEvents);
     if (streamResolved.resolved) return streamResolved.resolved;
+    const rootTerminalStatus = hasTerminalStatus(parsed);
+    const parsedContext = isRecord(parsed.context) ? parsed.context : null;
     const allowTopLevelFallback =
       !requireFinalStreamFrame ||
       !streamResolved.hasEvents ||
-      streamResolved.hasFinalStreamFrame;
+      streamResolved.hasFinalStreamFrame ||
+      rootTerminalStatus ||
+      hasTerminalStatus(parsedContext);
     const urlKeys = [
       "lastOutputPath",
       "latestOutputPath",
@@ -16086,9 +16438,11 @@ export class CommandExecutor {
       "savedOutputPath",
       "savedPath",
       "url",
+      "resolvedUrl",
       "mediaUrl",
       "outputUrl",
       "fileUrl",
+      "downloadUrl",
       "imageUrl",
     ];
     const scanArtifactArray = (value: unknown): string | null => {
@@ -16111,6 +16465,7 @@ export class CommandExecutor {
             asNonEmptyString(entry.mediaUrl) ??
             asNonEmptyString(entry.outputUrl) ??
             asNonEmptyString(entry.downloadUrl) ??
+            asNonEmptyString(entry.resolvedUrl) ??
             asNonEmptyString(entry.url),
         );
         if (resolved) return resolved;
@@ -16134,14 +16489,16 @@ export class CommandExecutor {
       }
     }
 
-    const context = isRecord(parsed.context) ? parsed.context : null;
+    const context = parsedContext;
     if (context) {
       const contextStreamResolved = resolveFromStreamEvents(context.streamEvents);
       if (contextStreamResolved.resolved) return contextStreamResolved.resolved;
+      const contextTerminalStatus = hasTerminalStatus(context);
       const allowContextFallback =
         !requireFinalStreamFrame ||
         !contextStreamResolved.hasEvents ||
-        contextStreamResolved.hasFinalStreamFrame;
+        contextStreamResolved.hasFinalStreamFrame ||
+        contextTerminalStatus;
       if (allowContextFallback) {
         for (const key of arrayKeys) {
           const resolved = scanArtifactArray(context[key]);
@@ -16169,10 +16526,12 @@ export class CommandExecutor {
         if (!isRecord(run)) continue;
         const runStreamResolved = resolveFromStreamEvents(run.streamEvents);
         if (runStreamResolved.resolved) return runStreamResolved.resolved;
+        const runTerminalStatus = hasTerminalStatus(run);
         const allowRunFallback =
           !requireFinalStreamFrame ||
           !runStreamResolved.hasEvents ||
-          runStreamResolved.hasFinalStreamFrame;
+          runStreamResolved.hasFinalStreamFrame ||
+          runTerminalStatus;
         if (allowRunFallback) {
           for (const key of arrayKeys) {
             const resolved = scanArtifactArray(run[key]);
@@ -16187,10 +16546,12 @@ export class CommandExecutor {
         if (runContext) {
           const runContextStreamResolved = resolveFromStreamEvents(runContext.streamEvents);
           if (runContextStreamResolved.resolved) return runContextStreamResolved.resolved;
+          const runContextTerminalStatus = hasTerminalStatus(runContext);
           const allowRunContextFallback =
             !requireFinalStreamFrame ||
             !runContextStreamResolved.hasEvents ||
-            runContextStreamResolved.hasFinalStreamFrame;
+            runContextStreamResolved.hasFinalStreamFrame ||
+            runContextTerminalStatus;
           if (allowRunContextFallback) {
             for (const key of arrayKeys) {
               const resolved = scanArtifactArray(runContext[key]);

@@ -107,6 +107,10 @@ type StoryPolicyInvoker = {
     mediaType?: "image" | "video";
     mediaSizeBytes?: number;
   }>;
+  buildGenerateInputWithRuntimeContext: (
+    payload: Record<string, unknown>,
+    command: Command,
+  ) => Promise<Record<string, unknown>>;
 };
 
 describe("command executor story policy", () => {
@@ -583,5 +587,30 @@ describe("command executor story policy", () => {
       const error = isRecord(outcome.error) ? outcome.error : null;
       expect(error?.code).not.toBe("story_chat_disabled");
     }
+  });
+
+  it("requeues directive generation when persona setup prerequisites are incomplete", async () => {
+    const generateMutate = vi.fn(async () => ({
+      items: [],
+    }));
+    const executor = createExecutor({ generateMutate });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+    invoker.buildGenerateInputWithRuntimeContext = vi.fn(async () => {
+      throw new Error("persona_reference_setup_required:realistic_core");
+    }) as StoryPolicyInvoker["buildGenerateInputWithRuntimeContext"];
+
+    await expect(
+      invoker.executeGenerateAndQueue(
+        baseCommand({
+          runtimeOrigin: "director_directive",
+          payload: {
+            goal: "media",
+            mediaPrompt: "Create a chained dragon scene.",
+            mediaPersona: "realistic_core",
+          },
+        }),
+      ),
+    ).rejects.toThrow(/persona_reference_setup_required:realistic_core/iu);
+    expect(generateMutate).toHaveBeenCalledTimes(0);
   });
 });
