@@ -1016,6 +1016,7 @@ type AgentRouterLike = {
   generate: AgentMutator;
   uploadDataUri: AgentMutator;
   uploadRemote: AgentMutator;
+  submitReview: AgentMutator;
 };
 
 type TrpcLike = {
@@ -2425,6 +2426,7 @@ export class CommandExecutor {
       generate: requireMutator("generate"),
       uploadDataUri: requireMutator("uploadDataUri"),
       uploadRemote: requireMutator("uploadRemote"),
+      submitReview: requireMutator("submitReview"),
     };
   }
 
@@ -4052,6 +4054,10 @@ export class CommandExecutor {
       const outcome = await this.executeGenerateAndQueue(command);
       return { processed: true, outcome };
     }
+    if (kind === "review" || kind === "agent.review") {
+      const outcome = await this.executeReview(command);
+      return { processed: true, outcome };
+    }
 
     const outcome: CommandOutcome = {
       at: nowIso(),
@@ -4263,12 +4269,41 @@ export class CommandExecutor {
       .digest("hex");
   }
 
+  private buildPostActionIdempotencyKey(input: {
+    command: Command;
+    postType: "text" | "media";
+    postKind: "post" | "thread";
+  }): string {
+    const payload = isRecord(input.command.payload) ? input.command.payload : null;
+    const directiveId =
+      this.resolveCommandSourceDirectiveId({
+        command: input.command,
+        payload,
+      }) ?? input.command.id;
+    const actionNonce =
+      asNonEmptyString(payload?.sourceDirectiveActionNonce) ??
+      input.command.actionNonce ??
+      "";
+    return crypto
+      .createHash("sha256")
+      .update(
+        JSON.stringify({
+          directiveId,
+          actionNonce,
+          action: "post",
+          postType: input.postType,
+          postKind: input.postKind,
+        }),
+      )
+      .digest("hex");
+  }
+
   private beginActionLifecycle(input: {
     command: Command;
-    action: "comment" | "like" | "repost";
+    action: "comment" | "like" | "repost" | "post";
     idempotencyKey: string;
     target: {
-      postId: number;
+      postId: number | null;
       commentId: number | null;
       targetHash: string;
     };
@@ -4331,10 +4366,10 @@ export class CommandExecutor {
 
   private updateActionLifecycle(input: {
     command: Command;
-    action: "comment" | "like" | "repost";
+    action: "comment" | "like" | "repost" | "post";
     idempotencyKey: string;
     target: {
-      postId: number;
+      postId: number | null;
       commentId: number | null;
       targetHash: string;
     };
@@ -4361,6 +4396,90 @@ export class CommandExecutor {
       grantId: input.command.grantId,
       payload: input.command.payload,
     });
+  }
+
+  private async executeCreatePostMutationWithIdempotency(input: {
+    command: Command;
+    postType: "text" | "media";
+    postKind: "post" | "thread";
+    mutationInput: Record<string, unknown>;
+  }): Promise<
+    | {
+        skipped: false;
+        result: unknown;
+      }
+    | {
+        skipped: true;
+        reason: string;
+      }
+  > {
+    const idempotencyKey = this.buildPostActionIdempotencyKey({
+      command: input.command,
+      postType: input.postType,
+      postKind: input.postKind,
+    });
+    const target = {
+      postId: null,
+      commentId: null,
+      targetHash: crypto
+        .createHash("sha256")
+        .update(idempotencyKey)
+        .digest("hex"),
+    };
+    const dedupe = this.beginActionLifecycle({
+      command: input.command,
+      action: "post",
+      idempotencyKey,
+      target,
+      state: "action_running",
+    });
+    if (!dedupe.allowed) {
+      if (dedupe.requeue) {
+        throw new RequeueCommandError(`post_waiting_for_backoff:${dedupe.reason}`);
+      }
+      return {
+        skipped: true,
+        reason: dedupe.reason,
+      };
+    }
+
+    try {
+      const result = await this.agent().createPost.mutate(input.mutationInput);
+      this.updateActionLifecycle({
+        command: input.command,
+        action: "post",
+        idempotencyKey,
+        target,
+        state: "acked",
+        lastError: null,
+      });
+      return {
+        skipped: false,
+        result,
+      };
+    } catch (error: unknown) {
+      if (error instanceof RequeueCommandError) {
+        this.updateActionLifecycle({
+          command: input.command,
+          action: "post",
+          idempotencyKey,
+          target,
+          state: "requeue",
+          lastError: error.message,
+        });
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.updateActionLifecycle({
+        command: input.command,
+        action: "post",
+        idempotencyKey,
+        target,
+        state: "failed",
+        lastError: message,
+      });
+      throw error;
+    }
   }
 
   private ownerCapabilityCooldownKey(input: {
@@ -4796,6 +4915,16 @@ export class CommandExecutor {
     const postType = postTypeRaw === "text" ? "text" : "media";
     const kindRaw = asNonEmptyString(payload.kind)?.toLowerCase();
     const postKind = kindRaw === "thread" ? "thread" : "post";
+    if (
+      this.isChatOriginCommand(command, payload) &&
+      !this.isChatWriteRequesterOwner(payload)
+    ) {
+      return this.failedOutcome(
+        command,
+        "Chat write actions are owner-only unless explicitly granted.",
+        "chat_write_owner_only",
+      );
+    }
     const provenance = normalizeAgentProvenanceValue(payload.provenance);
     const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
       command,
@@ -4828,6 +4957,14 @@ export class CommandExecutor {
       ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
       ...(command.grantId ? { grantId: command.grantId } : {}),
     });
+    const skippedPostOutcome = (reason: string): CommandOutcome =>
+      this.successOutcome(command, {
+        skipped: true,
+        action: "post",
+        postType,
+        postKind,
+        decision: reason,
+      });
 
     const targetPostId = this.extractTargetPostIdForPostDraft(payload);
     const postDraftContext = await this.loadPostDraftContext({
@@ -5156,38 +5293,47 @@ export class CommandExecutor {
           const firstSlide = slideItems[0] ?? {};
           const firstSlideMediaUrl = asNonEmptyString(firstSlide.mediaUrl);
           if (firstSlideMediaUrl) {
-            const slideResult = await this.agent().createPost.mutate({
-              ...buildBase(captionForWrite, "media"),
-              mediaUrl: firstSlideMediaUrl,
-              ...(asNonEmptyString(firstSlide.mediaOriginalUrl)
-                ? { mediaOriginalUrl: asNonEmptyString(firstSlide.mediaOriginalUrl) }
-                : {}),
-              ...(asNonEmptyString(firstSlide.mediaOptimizedUrl)
-                ? { mediaOptimizedUrl: asNonEmptyString(firstSlide.mediaOptimizedUrl) }
-                : {}),
-              ...(asNonEmptyString(firstSlide.mediaContentHash)
-                ? { mediaContentHash: asNonEmptyString(firstSlide.mediaContentHash) }
-                : {}),
-              ...(asNonEmptyString(firstSlide.mediaIpfsCid)
-                ? { mediaIpfsCid: asNonEmptyString(firstSlide.mediaIpfsCid) }
-                : {}),
-              ...(typeof firstSlide.mediaSizeBytes === "number" &&
-              Number.isFinite(firstSlide.mediaSizeBytes)
-                ? {
-                    mediaSizeBytes: Math.max(
-                      1,
-                      Math.floor(firstSlide.mediaSizeBytes),
-                    ),
-                  }
-                : {}),
-              ...(asNonEmptyString(firstSlide.mediaType)
-                ? { mediaType: asNonEmptyString(firstSlide.mediaType) }
-                : {}),
-              mediaItems: slideItems,
-              ...(captionPositionForWrite
-                ? { captionPosition: captionPositionForWrite }
-                : {}),
+            const slideMutation = await this.executeCreatePostMutationWithIdempotency({
+              command,
+              postType: "media",
+              postKind,
+              mutationInput: {
+                ...buildBase(captionForWrite, "media"),
+                mediaUrl: firstSlideMediaUrl,
+                ...(asNonEmptyString(firstSlide.mediaOriginalUrl)
+                  ? { mediaOriginalUrl: asNonEmptyString(firstSlide.mediaOriginalUrl) }
+                  : {}),
+                ...(asNonEmptyString(firstSlide.mediaOptimizedUrl)
+                  ? { mediaOptimizedUrl: asNonEmptyString(firstSlide.mediaOptimizedUrl) }
+                  : {}),
+                ...(asNonEmptyString(firstSlide.mediaContentHash)
+                  ? { mediaContentHash: asNonEmptyString(firstSlide.mediaContentHash) }
+                  : {}),
+                ...(asNonEmptyString(firstSlide.mediaIpfsCid)
+                  ? { mediaIpfsCid: asNonEmptyString(firstSlide.mediaIpfsCid) }
+                  : {}),
+                ...(typeof firstSlide.mediaSizeBytes === "number" &&
+                Number.isFinite(firstSlide.mediaSizeBytes)
+                  ? {
+                      mediaSizeBytes: Math.max(
+                        1,
+                        Math.floor(firstSlide.mediaSizeBytes),
+                      ),
+                    }
+                  : {}),
+                ...(asNonEmptyString(firstSlide.mediaType)
+                  ? { mediaType: asNonEmptyString(firstSlide.mediaType) }
+                  : {}),
+                mediaItems: slideItems,
+                ...(captionPositionForWrite
+                  ? { captionPosition: captionPositionForWrite }
+                  : {}),
+              },
             });
+            if (slideMutation.skipped) {
+              return skippedPostOutcome(slideMutation.reason);
+            }
+            const slideResult = slideMutation.result;
             this.notePublishedPostForNoveltyHistory({
               postType: "media",
               caption: captionForWrite,
@@ -5271,38 +5417,47 @@ export class CommandExecutor {
               ? { captionPosition: captionPositionForWrite }
               : {}),
           };
-          const imageTextResult = await this.agent().createPost.mutate({
-            ...buildBase(captionForWrite, "media"),
-            mediaUrl: backgroundMedia.mediaUrl,
-            ...(backgroundMedia.mediaOriginalUrl
-              ? { mediaOriginalUrl: backgroundMedia.mediaOriginalUrl }
-              : {}),
-            ...(backgroundMedia.mediaOptimizedUrl
-              ? { mediaOptimizedUrl: backgroundMedia.mediaOptimizedUrl }
-              : {}),
-            ...(backgroundMedia.mediaContentHash
-              ? { mediaContentHash: backgroundMedia.mediaContentHash }
-              : {}),
-            ...(backgroundMedia.mediaIpfsCid
-              ? { mediaIpfsCid: backgroundMedia.mediaIpfsCid }
-              : {}),
-            ...(typeof backgroundMedia.mediaSizeBytes === "number" &&
-            Number.isFinite(backgroundMedia.mediaSizeBytes)
-              ? {
-                  mediaSizeBytes: Math.max(
-                    1,
-                    Math.floor(backgroundMedia.mediaSizeBytes),
-                  ),
-                }
-              : {}),
-            ...(backgroundMedia.mediaType
-              ? { mediaType: backgroundMedia.mediaType }
-              : {}),
-            mediaItems: [imageTextItem],
-            ...(captionPositionForWrite
-              ? { captionPosition: captionPositionForWrite }
-              : {}),
+          const imageTextMutation = await this.executeCreatePostMutationWithIdempotency({
+            command,
+            postType: "media",
+            postKind,
+            mutationInput: {
+              ...buildBase(captionForWrite, "media"),
+              mediaUrl: backgroundMedia.mediaUrl,
+              ...(backgroundMedia.mediaOriginalUrl
+                ? { mediaOriginalUrl: backgroundMedia.mediaOriginalUrl }
+                : {}),
+              ...(backgroundMedia.mediaOptimizedUrl
+                ? { mediaOptimizedUrl: backgroundMedia.mediaOptimizedUrl }
+                : {}),
+              ...(backgroundMedia.mediaContentHash
+                ? { mediaContentHash: backgroundMedia.mediaContentHash }
+                : {}),
+              ...(backgroundMedia.mediaIpfsCid
+                ? { mediaIpfsCid: backgroundMedia.mediaIpfsCid }
+                : {}),
+              ...(typeof backgroundMedia.mediaSizeBytes === "number" &&
+              Number.isFinite(backgroundMedia.mediaSizeBytes)
+                ? {
+                    mediaSizeBytes: Math.max(
+                      1,
+                      Math.floor(backgroundMedia.mediaSizeBytes),
+                    ),
+                  }
+                : {}),
+              ...(backgroundMedia.mediaType
+                ? { mediaType: backgroundMedia.mediaType }
+                : {}),
+              mediaItems: [imageTextItem],
+              ...(captionPositionForWrite
+                ? { captionPosition: captionPositionForWrite }
+                : {}),
+            },
           });
+          if (imageTextMutation.skipped) {
+            return skippedPostOutcome(imageTextMutation.reason);
+          }
+          const imageTextResult = imageTextMutation.result;
           this.notePublishedPostForNoveltyHistory({
             postType: "media",
             caption: captionForWrite,
@@ -5349,12 +5504,21 @@ export class CommandExecutor {
         }
       }
 
-      const result = await this.agent().createPost.mutate({
-        ...buildBase(captionForWrite, "text"),
-        textBody: textBodyForWrite,
-        textStyle: normalizedTextStyle,
-        ...(captionPositionForWrite ? { captionPosition: captionPositionForWrite } : {}),
+      const textMutation = await this.executeCreatePostMutationWithIdempotency({
+        command,
+        postType: "text",
+        postKind,
+        mutationInput: {
+          ...buildBase(captionForWrite, "text"),
+          textBody: textBodyForWrite,
+          textStyle: normalizedTextStyle,
+          ...(captionPositionForWrite ? { captionPosition: captionPositionForWrite } : {}),
+        },
       });
+      if (textMutation.skipped) {
+        return skippedPostOutcome(textMutation.reason);
+      }
+      const result = textMutation.result;
       this.notePublishedPostForNoveltyHistory({
         postType: "text",
         caption: captionForWrite,
@@ -5676,38 +5840,47 @@ export class CommandExecutor {
         const firstSlide = slideItems[0] ?? {};
         const firstSlideMediaUrl = asNonEmptyString(firstSlide.mediaUrl);
         if (firstSlideMediaUrl) {
-          const slideResult = await this.agent().createPost.mutate({
-            ...buildBase(captionForWrite, "media"),
-            mediaUrl: firstSlideMediaUrl,
-            ...(asNonEmptyString(firstSlide.mediaOriginalUrl)
-              ? { mediaOriginalUrl: asNonEmptyString(firstSlide.mediaOriginalUrl) }
-              : {}),
-            ...(asNonEmptyString(firstSlide.mediaOptimizedUrl)
-              ? { mediaOptimizedUrl: asNonEmptyString(firstSlide.mediaOptimizedUrl) }
-              : {}),
-            ...(asNonEmptyString(firstSlide.mediaContentHash)
-              ? { mediaContentHash: asNonEmptyString(firstSlide.mediaContentHash) }
-              : {}),
-            ...(asNonEmptyString(firstSlide.mediaIpfsCid)
-              ? { mediaIpfsCid: asNonEmptyString(firstSlide.mediaIpfsCid) }
-              : {}),
-            ...(typeof firstSlide.mediaSizeBytes === "number" &&
-            Number.isFinite(firstSlide.mediaSizeBytes)
-              ? {
-                  mediaSizeBytes: Math.max(
-                    1,
-                    Math.floor(firstSlide.mediaSizeBytes),
-                  ),
-                }
-              : {}),
-            ...(asNonEmptyString(firstSlide.mediaType)
-              ? { mediaType: asNonEmptyString(firstSlide.mediaType) }
-              : {}),
-            mediaItems: slideItems,
-            ...(captionPositionForWrite
-              ? { captionPosition: captionPositionForWrite }
-              : {}),
+          const slideMutation = await this.executeCreatePostMutationWithIdempotency({
+            command,
+            postType: "media",
+            postKind,
+            mutationInput: {
+              ...buildBase(captionForWrite, "media"),
+              mediaUrl: firstSlideMediaUrl,
+              ...(asNonEmptyString(firstSlide.mediaOriginalUrl)
+                ? { mediaOriginalUrl: asNonEmptyString(firstSlide.mediaOriginalUrl) }
+                : {}),
+              ...(asNonEmptyString(firstSlide.mediaOptimizedUrl)
+                ? { mediaOptimizedUrl: asNonEmptyString(firstSlide.mediaOptimizedUrl) }
+                : {}),
+              ...(asNonEmptyString(firstSlide.mediaContentHash)
+                ? { mediaContentHash: asNonEmptyString(firstSlide.mediaContentHash) }
+                : {}),
+              ...(asNonEmptyString(firstSlide.mediaIpfsCid)
+                ? { mediaIpfsCid: asNonEmptyString(firstSlide.mediaIpfsCid) }
+                : {}),
+              ...(typeof firstSlide.mediaSizeBytes === "number" &&
+              Number.isFinite(firstSlide.mediaSizeBytes)
+                ? {
+                    mediaSizeBytes: Math.max(
+                      1,
+                      Math.floor(firstSlide.mediaSizeBytes),
+                    ),
+                  }
+                : {}),
+              ...(asNonEmptyString(firstSlide.mediaType)
+                ? { mediaType: asNonEmptyString(firstSlide.mediaType) }
+                : {}),
+              mediaItems: slideItems,
+              ...(captionPositionForWrite
+                ? { captionPosition: captionPositionForWrite }
+                : {}),
+            },
           });
+          if (slideMutation.skipped) {
+            return skippedPostOutcome(slideMutation.reason);
+          }
+          const slideResult = slideMutation.result;
           this.notePublishedPostForNoveltyHistory({
             postType: "media",
             caption: captionForWrite,
@@ -5773,17 +5946,26 @@ export class CommandExecutor {
       command,
       skipPromptCuration: true,
     });
-    const result = await this.agent().createPost.mutate({
-      ...buildBase(captionForWrite),
-      mediaUrl: media.mediaUrl,
-      ...(media.mediaOriginalUrl ? { mediaOriginalUrl: media.mediaOriginalUrl } : {}),
-      ...(media.mediaOptimizedUrl ? { mediaOptimizedUrl: media.mediaOptimizedUrl } : {}),
-      ...(media.mediaContentHash ? { mediaContentHash: media.mediaContentHash } : {}),
-      ...(media.mediaIpfsCid ? { mediaIpfsCid: media.mediaIpfsCid } : {}),
-      ...(typeof media.mediaSizeBytes === "number" ? { mediaSizeBytes: media.mediaSizeBytes } : {}),
-      ...(media.mediaType ? { mediaType: media.mediaType } : {}),
-      ...(captionPositionForWrite ? { captionPosition: captionPositionForWrite } : {}),
+    const mediaMutation = await this.executeCreatePostMutationWithIdempotency({
+      command,
+      postType: "media",
+      postKind,
+      mutationInput: {
+        ...buildBase(captionForWrite),
+        mediaUrl: media.mediaUrl,
+        ...(media.mediaOriginalUrl ? { mediaOriginalUrl: media.mediaOriginalUrl } : {}),
+        ...(media.mediaOptimizedUrl ? { mediaOptimizedUrl: media.mediaOptimizedUrl } : {}),
+        ...(media.mediaContentHash ? { mediaContentHash: media.mediaContentHash } : {}),
+        ...(media.mediaIpfsCid ? { mediaIpfsCid: media.mediaIpfsCid } : {}),
+        ...(typeof media.mediaSizeBytes === "number" ? { mediaSizeBytes: media.mediaSizeBytes } : {}),
+        ...(media.mediaType ? { mediaType: media.mediaType } : {}),
+        ...(captionPositionForWrite ? { captionPosition: captionPositionForWrite } : {}),
+      },
     });
+    if (mediaMutation.skipped) {
+      return skippedPostOutcome(mediaMutation.reason);
+    }
+    const result = mediaMutation.result;
     this.notePublishedPostForNoveltyHistory({
       postType: "media",
       caption: captionForWrite,
@@ -10517,63 +10699,92 @@ export class CommandExecutor {
     }
     if (isChatOrigin && executionDrafts.length > 0) {
       const allowChatWriteExecution = this.isChatWriteCommandExplicitlyRequested(payload);
-      if (!allowChatWriteExecution) {
-        const blockedWriteDrafts = executionDrafts.filter((draft) =>
-          this.isWriteDraftAction(draft.action),
+      const blockedWriteDrafts = executionDrafts.filter((draft) =>
+        this.isWriteDraftAction(draft.action),
+      );
+      if (blockedWriteDrafts.length > 0 && !allowChatWriteExecution) {
+        executionDrafts = executionDrafts.filter(
+          (draft) => !this.isWriteDraftAction(draft.action),
         );
-        if (blockedWriteDrafts.length > 0) {
-          executionDrafts = executionDrafts.filter(
-            (draft) => !this.isWriteDraftAction(draft.action),
-          );
-          await this.ctx.memory
-            .recordWrite({
-              type: "chat_write_drafts_blocked_missing_explicit_request",
-              at: nowIso(),
-              commandId: command.id,
-              commandKind: command.kind,
-              sourceDirectiveId,
-              blockedDraftCount: blockedWriteDrafts.length,
-              blockedActions: blockedWriteDrafts
-                .map((draft) => draft.action.trim().toLowerCase())
-                .filter((value) => value.length > 0)
-                .slice(0, 12),
-              retainedDraftCount: executionDrafts.length,
+        await this.ctx.memory
+          .recordWrite({
+            type: "chat_write_drafts_blocked_missing_explicit_request",
+            at: nowIso(),
+            commandId: command.id,
+            commandKind: command.kind,
+            sourceDirectiveId,
+            blockedDraftCount: blockedWriteDrafts.length,
+            blockedActions: blockedWriteDrafts
+              .map((draft) => draft.action.trim().toLowerCase())
+              .filter((value) => value.length > 0)
+              .slice(0, 12),
+            retainedDraftCount: executionDrafts.length,
+          })
+          .catch(() => undefined);
+        if (executionDrafts.length === 0) {
+          if (
+            this.shouldRedirectBlockedChatWritesToLiteralGenerate({
+              payload,
+              blockedDrafts: blockedWriteDrafts,
             })
-            .catch(() => undefined);
-          if (executionDrafts.length === 0) {
-            if (
-              this.shouldRedirectBlockedChatWritesToLiteralGenerate({
+          ) {
+            const fallbackPrompt =
+              this.resolveChatLiteralFallbackPromptFromDrafts({
                 payload,
-                blockedDrafts: blockedWriteDrafts,
-              })
-            ) {
-              const fallbackPrompt =
-                this.resolveChatLiteralFallbackPromptFromDrafts({
-                  payload,
-                  drafts: blockedWriteDrafts,
-                });
-              await this.ctx.memory
-                .recordWrite({
-                  type: "chat_write_drafts_redirected_chat_literal_generate",
-                  at: nowIso(),
-                  commandId: command.id,
-                  commandKind: command.kind,
-                  sourceDirectiveId,
-                  blockedDraftCount: blockedWriteDrafts.length,
-                })
-                .catch(() => undefined);
-              const fallbackPayload = this.buildChatLiteralFallbackPayloadFromStory({
-                payload,
-                ...(fallbackPrompt ? { fallbackPrompt } : {}),
+                drafts: blockedWriteDrafts,
               });
-              return this.executeChatLiteralGenerate(command, fallbackPayload);
-            }
-            return this.failedOutcome(
-              command,
-              "Chat write actions require an explicit request to post/comment/reply/like/repost/story.",
-              "chat_write_explicit_required",
-            );
+            await this.ctx.memory
+              .recordWrite({
+                type: "chat_write_drafts_redirected_chat_literal_generate",
+                at: nowIso(),
+                commandId: command.id,
+                commandKind: command.kind,
+                sourceDirectiveId,
+                blockedDraftCount: blockedWriteDrafts.length,
+              })
+              .catch(() => undefined);
+            const fallbackPayload = this.buildChatLiteralFallbackPayloadFromStory({
+              payload,
+              ...(fallbackPrompt ? { fallbackPrompt } : {}),
+            });
+            return this.executeChatLiteralGenerate(command, fallbackPayload);
           }
+          return this.failedOutcome(
+            command,
+            "Chat write actions require an explicit request to post/comment/reply/like/repost/story.",
+            "chat_write_explicit_required",
+          );
+        }
+      }
+      if (
+        allowChatWriteExecution &&
+        blockedWriteDrafts.length > 0 &&
+        !this.isChatWriteRequesterOwner(payload)
+      ) {
+        executionDrafts = executionDrafts.filter(
+          (draft) => !this.isWriteDraftAction(draft.action),
+        );
+        await this.ctx.memory
+          .recordWrite({
+            type: "chat_write_drafts_blocked_non_owner",
+            at: nowIso(),
+            commandId: command.id,
+            commandKind: command.kind,
+            sourceDirectiveId,
+            blockedDraftCount: blockedWriteDrafts.length,
+            blockedActions: blockedWriteDrafts
+              .map((draft) => draft.action.trim().toLowerCase())
+              .filter((value) => value.length > 0)
+              .slice(0, 12),
+            retainedDraftCount: executionDrafts.length,
+          })
+          .catch(() => undefined);
+        if (executionDrafts.length === 0) {
+          return this.failedOutcome(
+            command,
+            "Chat write actions are owner-only unless explicitly granted.",
+            "chat_write_owner_only",
+          );
         }
       }
     }
@@ -10858,7 +11069,30 @@ export class CommandExecutor {
       const entryData = isRecord(entry.data) ? entry.data : null;
       return entryData?.skipped !== true;
     }).length;
+    const skippedReasonSet = new Set(
+      skippedDrafts
+        .map((entry) => entry.reason.trim().toLowerCase())
+        .filter((entry) => entry.length > 0),
+    );
+    const allSkippedReasonsIdempotentNoop =
+      skippedReasonSet.size > 0 &&
+      Array.from(skippedReasonSet).every(
+        (reason) => reason === "already_acked" || reason === "already_in_flight",
+      );
     if (appliedOutcomeCount === 0 && skippedDrafts.length > 0 && failedDrafts.length === 0) {
+      if (allSkippedReasonsIdempotentNoop) {
+        await this.recordCommandLifecycleCheckpoint({
+          command,
+          stage: "write_mutation",
+          status: "ok",
+          metadata: {
+            executedCount: executedOutcomes.length,
+            skippedCount: skippedDrafts.length,
+            failedCount: failedDrafts.length,
+            idempotentNoop: true,
+          },
+        });
+      } else {
       const firstSkipReason = skippedDrafts[0]?.reason ?? "no_executable_draft";
       await this.recordCommandLifecycleCheckpoint({
         command,
@@ -10876,6 +11110,7 @@ export class CommandExecutor {
         `Generated drafts were skipped: ${truncateText(firstSkipReason, 220)}.`,
         "no_executable_draft",
       );
+      }
     }
 
     if (executedOutcomes.length > 0 || skippedDrafts.length > 0 || failedDrafts.length > 0) {
@@ -10995,6 +11230,19 @@ export class CommandExecutor {
       action === "avatar" ||
       action === "banner"
     );
+  }
+
+  private isChatWriteRequesterOwner(payload: Record<string, unknown>): boolean {
+    const chatContext = isRecord(payload.chatContext) ? payload.chatContext : null;
+    const actorMainUserId =
+      asNonEmptyString(chatContext?.actorMainUserId) ??
+      asNonEmptyString(payload.actorMainUserId);
+    const ownerMainUserId =
+      asNonEmptyString(chatContext?.ownerMainUserId) ??
+      asNonEmptyString(payload.ownerMainUserId);
+    if (!ownerMainUserId) return true;
+    if (!actorMainUserId) return false;
+    return actorMainUserId === ownerMainUserId;
   }
 
   private isChatWriteCommandExplicitlyRequested(
@@ -11146,6 +11394,14 @@ export class CommandExecutor {
     if (!payload) return false;
     const sourceContext = asNonEmptyString(payload.sourceContext)?.toLowerCase() ?? "";
     if (sourceContext === "chat") return true;
+    if (
+      sourceContext === "directive" ||
+      sourceContext === "director" ||
+      sourceContext === "admin" ||
+      sourceContext === "autonomous"
+    ) {
+      return false;
+    }
     return isRecord(payload.chatContext);
   }
 
@@ -11157,19 +11413,20 @@ export class CommandExecutor {
     if (runtimeOrigin === "chat" || runtimeOrigin.startsWith("chat_")) {
       return true;
     }
+    const payload =
+      payloadOverride ??
+      (isRecord(command.payload) ? command.payload : null);
     if (
       runtimeOrigin === "director_directive" ||
       runtimeOrigin === "pending_promotion"
     ) {
-      return false;
+      return this.isChatOriginPayload(payload);
     }
     if (runtimeOrigin === "runtime_resealed") {
       const commandId = asNonEmptyString(command.id);
       const sourceDirectiveId = this.resolveCommandSourceDirectiveId({
         command,
-        payload:
-          payloadOverride ??
-          (isRecord(command.payload) ? command.payload : null),
+        payload,
       });
       const pendingDirectiveId = asNonEmptyString(command.pendingDirectiveId);
       if (
@@ -11179,9 +11436,6 @@ export class CommandExecutor {
         return false;
       }
     }
-    const payload =
-      payloadOverride ??
-      (isRecord(command.payload) ? command.payload : null);
     return this.isChatOriginPayload(payload);
   }
 
@@ -18450,6 +18704,174 @@ export class CommandExecutor {
     input: Record<string, unknown> & { target: string; bannerUrl: string },
   ): Promise<unknown> {
     return await this.agent().updateBanner.mutate(input);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Review command – content moderation review via LLM
+  // ---------------------------------------------------------------------------
+
+  private async executeReview(command: Command): Promise<CommandOutcome> {
+    const payload = isRecord(command.payload) ? command.payload : null;
+    if (!payload) {
+      return this.failedOutcome(command, "Invalid payload for review command.");
+    }
+
+    const requestId =
+      typeof payload.requestId === "string" ? payload.requestId : null;
+    const reviewType =
+      typeof payload.reviewType === "string" ? payload.reviewType : null;
+    const moderationGuidelines =
+      typeof payload.moderationGuidelines === "string"
+        ? payload.moderationGuidelines
+        : null;
+
+    if (!requestId || !reviewType) {
+      return this.failedOutcome(
+        command,
+        "Review payload missing requestId or reviewType.",
+        "review_invalid_payload",
+      );
+    }
+
+    // Build the text to review from the payload
+    const textParts: string[] = [];
+    if (typeof payload.newHandle === "string") {
+      textParts.push(`Username/handle: @${payload.newHandle}`);
+    }
+    if (typeof payload.newDisplayName === "string") {
+      textParts.push(`Display name: ${payload.newDisplayName}`);
+    }
+    const textToReview = textParts.join("\n") || "No text provided";
+
+    // Build the LLM prompt using the moderation guidelines from the server
+    const systemPrompt = moderationGuidelines ?? [
+      "You are a content moderation reviewer.",
+      "Evaluate the text for appropriateness. PG-13 acceptable. No racism, profanity, hate speech, or sexually explicit content.",
+      'Respond ONLY with JSON: { "verdict": "approve" | "reject", "reason": "brief explanation", "confidence": 0.0-1.0 }',
+    ].join("\n");
+
+    const fullPrompt = [
+      systemPrompt,
+      "",
+      "---",
+      `Review type: ${reviewType}`,
+      `Text to review:`,
+      textToReview,
+      "---",
+      "",
+      "Respond with ONLY a JSON object, no other text:",
+    ].join("\n");
+
+    // Call the LLM via OpenClaw
+    const runOpenClawPrompt = this.ctx.runOpenClawPrompt;
+    if (!runOpenClawPrompt) {
+      return this.failedOutcome(
+        command,
+        "OpenClaw prompt runner not available.",
+        "review_no_llm",
+      );
+    }
+
+    try {
+      const result = await runOpenClawPrompt({
+        prompt: fullPrompt,
+        purpose: "content_review",
+      });
+
+      if (!result) {
+        return this.failedOutcome(
+          command,
+          "LLM returned no result for review.",
+          "review_llm_empty",
+        );
+      }
+
+      // Parse the verdict from the LLM response
+      let verdict: "approve" | "reject" | "abstain" = "abstain";
+      let reason = "Could not parse LLM response.";
+      let confidence = 0.5;
+
+      const parsed = isRecord(result.parsed) ? result.parsed : null;
+      const rawText = result.raw ?? "";
+
+      if (parsed) {
+        if (parsed.verdict === "approve" || parsed.verdict === "reject") {
+          verdict = parsed.verdict;
+        }
+        if (typeof parsed.reason === "string") {
+          reason = parsed.reason;
+        }
+        if (typeof parsed.confidence === "number") {
+          confidence = Math.max(0, Math.min(1, parsed.confidence));
+        }
+      } else {
+        // Try to extract JSON from the raw text
+        const jsonMatch = rawText.match(/\{[^}]*"verdict"\s*:\s*"(approve|reject)"[^}]*\}/);
+        if (jsonMatch) {
+          try {
+            const extracted = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+            if (extracted.verdict === "approve" || extracted.verdict === "reject") {
+              verdict = extracted.verdict;
+            }
+            if (typeof extracted.reason === "string") {
+              reason = extracted.reason;
+            }
+            if (typeof extracted.confidence === "number") {
+              confidence = Math.max(0, Math.min(1, extracted.confidence));
+            }
+          } catch {
+            // Fall through with abstain
+          }
+        }
+      }
+
+      // Submit the review verdict to the server
+      const serverResult = await this.agent().submitReview.mutate({
+        requestId,
+        verdict,
+        reason,
+        confidence,
+      });
+
+      await this.ctx.memory
+        .recordWrite({
+          type: "review_submitted",
+          at: nowIso(),
+          commandId: command.id,
+          requestId,
+          reviewType,
+          verdict,
+          confidence,
+        })
+        .catch(() => undefined);
+
+      return this.successOutcome(command, {
+        requestId,
+        verdict,
+        reason,
+        confidence,
+        serverResult,
+      });
+    } catch (error: unknown) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      await this.ctx.memory
+        .recordWrite({
+          type: "review_failed",
+          at: nowIso(),
+          commandId: command.id,
+          requestId,
+          reviewType,
+          error: errorMessage,
+        })
+        .catch(() => undefined);
+
+      return this.failedOutcome(
+        command,
+        `Review execution failed: ${errorMessage}`,
+        "review_execution_failed",
+      );
+    }
   }
 
   private successOutcome(command: Command, data: unknown): CommandOutcome {

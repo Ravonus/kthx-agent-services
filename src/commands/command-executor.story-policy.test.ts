@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { CommandExecutor } from "./command-executor.js";
 import type { Command } from "../types/ipc.js";
 import { isRecord } from "../lib/guards.js";
+import type { StateSqliteStore } from "../state/sqlite-state.js";
 
 const tempDirs: string[] = [];
 
@@ -34,6 +35,7 @@ const createExecutor = (options?: {
   createStoryMutate?: (input: unknown) => Promise<unknown>;
   createPostMutate?: (input: unknown) => Promise<unknown>;
   generateMutate?: (input: unknown) => Promise<unknown>;
+  stateDb?: StateSqliteStore | null;
   runOpenClawPrompt?: (input: {
     prompt: string;
     purpose: string;
@@ -69,7 +71,7 @@ const createExecutor = (options?: {
     memory: {
       recordWrite: async () => undefined,
     },
-    stateDb: null,
+    stateDb: options?.stateDb ?? null,
     trpc: {
       agent: {
         ackDirective: { mutate: noopMutate },
@@ -102,6 +104,37 @@ const createExecutor = (options?: {
     callAgentUploadChunk: null,
     runOpenClawPrompt: options?.runOpenClawPrompt ?? null,
   });
+};
+
+const createLifecycleStateDbStub = () => {
+  const lifecycleByKey = new Map<
+    string,
+    {
+      state: string;
+      updatedAt: string;
+    }
+  >();
+  return {
+    enabled: true,
+    getCommandLifecycleByIdempotencyKey: (idempotencyKey: string) =>
+      lifecycleByKey.get(idempotencyKey) ?? null,
+    upsertCommandLifecycle: (payload: unknown) => {
+      if (!isRecord(payload)) return;
+      const idempotencyKey =
+        typeof payload.idempotencyKey === "string"
+          ? payload.idempotencyKey.trim()
+          : "";
+      if (!idempotencyKey.length) return;
+      const state =
+        typeof payload.state === "string" && payload.state.trim().length > 0
+          ? payload.state.trim()
+          : "queued";
+      lifecycleByKey.set(idempotencyKey, {
+        state,
+        updatedAt: new Date().toISOString(),
+      });
+    },
+  } as unknown as StateSqliteStore;
 };
 
 type StoryPolicyInvoker = {
@@ -481,7 +514,7 @@ describe("command executor story policy", () => {
     }
   });
 
-  it("allows directive-origin story writes even when chat metadata is attached", async () => {
+  it("allows directive-origin story writes when source context is directive", async () => {
     const createStoryMutate = vi.fn(async () => ({
       story: { id: 55 },
     }));
@@ -500,7 +533,7 @@ describe("command executor story policy", () => {
         kind: "write.createStory",
         runtimeOrigin: "director_directive",
         payload: {
-          sourceContext: "chat",
+          sourceContext: "directive",
           chatContext: {
             commandName: "story",
             commandArgs: ["story"],
@@ -797,6 +830,170 @@ describe("command executor story policy", () => {
     expect(isRecord(outcome)).toBe(true);
     if (!isRecord(outcome)) return;
     expect(outcome.ok).toBe(true);
+  });
+
+  it("applies chat write gating to directive runtime items with chat source context", async () => {
+    const createPostMutate = vi.fn(async () => ({
+      post: { id: 777 },
+    }));
+    const executor = createExecutor({ createPostMutate });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+    const literalGenerateSpy = vi.fn(async () => ({
+      at: new Date().toISOString(),
+      commandId: "test-story-policy",
+      kind: "brain.generateAndQueue",
+      grantId: null,
+      ok: true,
+      data: {
+        mode: "chat_literal_generate",
+      },
+    }));
+    invoker.executeChatLiteralGenerate = literalGenerateSpy;
+
+    const outcome = await invoker.executeGenerateAndQueue(
+      baseCommand({
+        runtimeOrigin: "director_directive",
+        payload: {
+          sourceContext: "chat",
+          goal: "chat",
+          prompt: "my qnap giving me some issues but yeah getting the infra setup still",
+          chatContext: {
+            commandName: "agent-decide",
+            commandArgs: [
+              "my qnap giving me some issues but yeah getting the infra setup still",
+            ],
+            commandRawArgs:
+              "my qnap giving me some issues but yeah getting the infra setup still",
+            originalMessage:
+              "my qnap giving me some issues but yeah getting the infra setup still",
+            conversationId: "conv-policy",
+          },
+          drafts: [
+            {
+              action: "post",
+              payload: {
+                postType: "media",
+                mediaPrompt: "A dark NAS rack room lit by one status LED.",
+                caption: "infra night",
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(createPostMutate).toHaveBeenCalledTimes(0);
+    expect(literalGenerateSpy).toHaveBeenCalledTimes(1);
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(true);
+  });
+
+  it("blocks explicit chat write drafts when actor is not the owner", async () => {
+    const createPostMutate = vi.fn(async () => ({
+      post: { id: 778 },
+    }));
+    const executor = createExecutor({ createPostMutate });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+
+    const outcome = await invoker.executeGenerateAndQueue(
+      baseCommand({
+        runtimeOrigin: "director_directive",
+        payload: {
+          sourceContext: "chat",
+          goal: "chat",
+          explicitPublishRequested: true,
+          explicitPublishVerbDetected: true,
+          requireExplicitPublishVerb: false,
+          chatContext: {
+            commandName: "post",
+            commandArgs: ["post"],
+            conversationId: "conv-policy",
+            actorMainUserId: "main-user-outsider",
+            ownerMainUserId: "main-user-owner",
+          },
+          drafts: [
+            {
+              action: "post",
+              payload: {
+                postType: "text",
+                textBody: "Please publish this.",
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(createPostMutate).toHaveBeenCalledTimes(0);
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(false);
+    const error = isRecord(outcome.error) ? outcome.error : null;
+    expect(error).not.toBeNull();
+    if (!error) return;
+    expect(error.code).toBe("chat_write_owner_only");
+  });
+
+  it("dedupes createpost retries by action nonce to prevent duplicate publishes", async () => {
+    const createPostMutate = vi.fn(async () => ({
+      post: { id: 779 },
+    }));
+    const runOpenClawPrompt = vi.fn(
+      async (_input: { prompt: string; purpose: string }) => ({
+        parsed: {
+          caption: "Infra update",
+          textBody: "Infrastructure progress update with concrete status details.",
+        },
+        payloadText: "",
+        raw: "",
+        agentName: null,
+        envelope: null,
+      }),
+    );
+    const stateDb = createLifecycleStateDbStub();
+    const executor = createExecutor({
+      createPostMutate,
+      stateDb,
+      runOpenClawPrompt,
+    });
+    const invoker = executor as unknown as StoryPolicyInvoker;
+    const command = baseCommand({
+      kind: "write.createPost",
+      runtimeOrigin: "director_directive",
+      actionNonce: "action-nonce-dedupe",
+      payload: {
+        sourceContext: "chat",
+        postType: "text",
+        textBody: "draft seed to curate before publish",
+        sourceDirectiveId: "directive-dedupe-1",
+        sourceDirectiveActionNonce: "action-nonce-dedupe",
+        chatContext: {
+          commandName: "post",
+          commandArgs: ["post"],
+          conversationId: "conv-policy",
+          actorMainUserId: "main-user-owner",
+          ownerMainUserId: "main-user-owner",
+        },
+      },
+    });
+
+    const first = await invoker.executeWriteCreatePost(command);
+    const second = await invoker.executeWriteCreatePost(command);
+
+    expect(createPostMutate).toHaveBeenCalledTimes(1);
+    expect(isRecord(first)).toBe(true);
+    if (isRecord(first)) {
+      expect(first.ok).toBe(true);
+    }
+    expect(isRecord(second)).toBe(true);
+    if (!isRecord(second)) return;
+    expect(second.ok).toBe(true);
+    const secondData = isRecord(second.data) ? second.data : null;
+    expect(secondData).not.toBeNull();
+    if (!secondData) return;
+    expect(secondData.skipped).toBe(true);
+    expect(secondData.decision).toBe("already_acked");
   });
 
   it("requeues directive generation when persona setup prerequisites are incomplete", async () => {
