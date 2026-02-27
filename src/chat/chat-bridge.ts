@@ -81,6 +81,15 @@ type BridgeStatus = {
   lastTicketFailures: TicketFailure[];
 };
 
+type GatewaySessionSnapshot = {
+  wsUrl: string;
+  authToken: string;
+  authTokenExpiresAtMs: number | null;
+  userTopic: string | null;
+  userTopicTicket: string | null;
+  userTopicExpiresAtMs: number | null;
+};
+
 type ReconnectOptions = {
   baseDelayMs?: number;
   bumpAttempt?: boolean;
@@ -185,6 +194,14 @@ const parseRetryAfterMs = (input: {
 const jitterDelay = (ms: number): number => {
   const multiplier = 1 + (Math.random() * 2 - 1) * 0.2;
   return Math.max(0, Math.round(ms * multiplier));
+};
+
+const parseIsoDateMs = (value: unknown): number | null => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed.length) return null;
+  const ms = Date.parse(trimmed);
+  return Number.isFinite(ms) ? ms : null;
 };
 
 const resolveHttpBaseUrl = (): string => {
@@ -484,6 +501,10 @@ const main = async (): Promise<void> => {
       Math.max(5_000, tokenPollMs * 5),
     ),
   );
+  const gatewaySessionReuseSkewMs = Math.max(
+    5_000,
+    parseIntEnv("MG_CHAT_AGENT_GATEWAY_SESSION_REUSE_SKEW_MS", 30_000),
+  );
   const rateLimitedRetryFallbackMs = Math.max(
     5_000,
     parseIntEnv("MG_CHAT_AGENT_RATE_LIMIT_RETRY_FALLBACK_MS", 15_000),
@@ -731,6 +752,8 @@ const main = async (): Promise<void> => {
   let idleTimer: ReturnType<typeof setInterval> | null = null;
   let tokenWatchTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectAttempt = 0;
+  let reconnectHaltReason: string | null = null;
+  let cachedGatewaySession: GatewaySessionSnapshot | null = null;
   let lastObservedTokenValue: string | null = null;
   let stopping = false;
   let viewerMainUserId: string | null = null;
@@ -1032,9 +1055,32 @@ const main = async (): Promise<void> => {
     }
   };
 
+  const haltReconnects = async (reason: string): Promise<void> => {
+    if (reconnectHaltReason) return;
+    reconnectHaltReason = reason;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    await appendBridgeEvent({
+      at: nowIso(),
+      type: "bridge_reconnect_halted",
+      reason,
+    });
+    await updateStatus({
+      state: "fatal",
+      connected: false,
+      lastError: reason,
+      reconnectAttempt,
+      subscriptionMode: desiredMode,
+      lastActivityAt: getLastActivityAtIso(),
+    });
+  };
+
   // Reconnect scheduler
   const scheduleReconnect = async (reason: string, options: ReconnectOptions = {}): Promise<void> => {
     if (stopping) return;
+    if (reconnectHaltReason) return;
     const force = options.force ?? false;
     if (force && reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -1076,55 +1122,128 @@ const main = async (): Promise<void> => {
       lastActivityAt: getLastActivityAtIso(),
     });
 
-    let session: Record<string, unknown>;
-    try {
-      session = await callBridge({ action: "gateway_session" }) as Record<string, unknown>;
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      if (isBridgeCallError(e) && e.status === 429) {
-        const retryMs = Math.max(1000, e.retryAfterMs ?? rateLimitedRetryFallbackMs);
-        await appendBridgeEvent({
-          at: nowIso(),
-          type: "gateway_session_rate_limited",
-          retryMs,
-          message,
-        });
-        await updateStatus({
-          state: "rate_limited",
-          connected: false,
-          lastError: `gateway_session_rate_limited: ${message}`,
-          subscriptionMode: connectMode,
-          lastActivityAt: getLastActivityAtIso(),
-        });
-        await scheduleReconnect("gateway_session_rate_limited", {
-          baseDelayMs: retryMs,
-          bumpAttempt: false,
-        });
+    const resolveReusableGatewaySession = (): Record<string, unknown> | null => {
+      const cached = cachedGatewaySession;
+      if (!cached) return null;
+      if (
+        cached.authTokenExpiresAtMs !== null &&
+        cached.authTokenExpiresAtMs <= Date.now() + gatewaySessionReuseSkewMs
+      ) {
+        cachedGatewaySession = null;
+        return null;
+      }
+      return {
+        enabled: true,
+        wsUrl: cached.wsUrl,
+        authToken: cached.authToken,
+        authTokenExpiresAt:
+          cached.authTokenExpiresAtMs !== null
+            ? new Date(cached.authTokenExpiresAtMs).toISOString()
+            : null,
+        userTopic: cached.userTopic,
+        userTopicTicket: cached.userTopicTicket,
+        userTopicExpiresAt:
+          cached.userTopicExpiresAtMs !== null
+            ? new Date(cached.userTopicExpiresAtMs).toISOString()
+            : null,
+      };
+    };
+
+    const captureGatewaySession = (input: Record<string, unknown>): void => {
+      if (input.enabled !== true) {
+        cachedGatewaySession = null;
         return;
       }
-      const missingToken = isMissingBotTokenError(message);
-      if (missingToken) {
-        await appendBridgeEvent({
-          at: nowIso(),
-          type: "gateway_session_waiting_for_bot_token",
-          retryMs: missingTokenRetryMs,
-          message,
-        });
-        await updateStatus({
-          state: "waiting_for_bot_token",
-          connected: false,
-          lastError: null,
-          subscriptionMode: connectMode,
-          lastActivityAt: getLastActivityAtIso(),
-        });
-        await scheduleReconnect("waiting_for_bot_token", {
-          baseDelayMs: missingTokenRetryMs,
-          bumpAttempt: false,
-        });
+      const wsUrl = typeof input.wsUrl === "string" ? input.wsUrl.trim() : "";
+      const authToken =
+        typeof input.authToken === "string" ? input.authToken.trim() : "";
+      if (!wsUrl.length || !authToken.length) {
+        cachedGatewaySession = null;
         return;
       }
-      await scheduleReconnect(`gateway_session_failed: ${message}`);
-      return;
+      cachedGatewaySession = {
+        wsUrl,
+        authToken,
+        authTokenExpiresAtMs: parseIsoDateMs(input.authTokenExpiresAt),
+        userTopic:
+          typeof input.userTopic === "string" && input.userTopic.trim().length > 0
+            ? input.userTopic.trim()
+            : null,
+        userTopicTicket:
+          typeof input.userTopicTicket === "string" &&
+          input.userTopicTicket.trim().length > 0
+            ? input.userTopicTicket.trim()
+            : null,
+        userTopicExpiresAtMs: parseIsoDateMs(input.userTopicExpiresAt),
+      };
+    };
+
+    let session: Record<string, unknown> | null = resolveReusableGatewaySession();
+    if (!session) {
+      try {
+        session = await callBridge({ action: "gateway_session" }) as Record<string, unknown>;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        if (isBridgeCallError(e) && e.status === 401) {
+          await appendBridgeEvent({
+            at: nowIso(),
+            type: "gateway_session_unauthorized",
+            message,
+          });
+          await haltReconnects(`gateway_session_unauthorized: ${message}`);
+          return;
+        }
+        if (isBridgeCallError(e) && e.status === 429) {
+          const retryMs = Math.max(1000, e.retryAfterMs ?? rateLimitedRetryFallbackMs);
+          await appendBridgeEvent({
+            at: nowIso(),
+            type: "gateway_session_rate_limited",
+            retryMs,
+            message,
+          });
+          await updateStatus({
+            state: "rate_limited",
+            connected: false,
+            lastError: `gateway_session_rate_limited: ${message}`,
+            subscriptionMode: connectMode,
+            lastActivityAt: getLastActivityAtIso(),
+          });
+          await scheduleReconnect("gateway_session_rate_limited", {
+            baseDelayMs: retryMs,
+            bumpAttempt: false,
+          });
+          return;
+        }
+        const missingToken = isMissingBotTokenError(message);
+        if (missingToken) {
+          await appendBridgeEvent({
+            at: nowIso(),
+            type: "gateway_session_waiting_for_bot_token",
+            retryMs: missingTokenRetryMs,
+            message,
+          });
+          await updateStatus({
+            state: "waiting_for_bot_token",
+            connected: false,
+            lastError: null,
+            subscriptionMode: connectMode,
+            lastActivityAt: getLastActivityAtIso(),
+          });
+          await scheduleReconnect("waiting_for_bot_token", {
+            baseDelayMs: missingTokenRetryMs,
+            bumpAttempt: false,
+          });
+          return;
+        }
+        await scheduleReconnect(`gateway_session_failed: ${message}`);
+        return;
+      }
+      captureGatewaySession(session);
+    } else {
+      await appendBridgeEvent({
+        at: nowIso(),
+        type: "gateway_session_reused",
+      });
     }
 
     if (!isRecord(session) || session.enabled !== true) { await scheduleReconnect("chat_gateway_disabled"); return; }
