@@ -157,6 +157,8 @@ const isBotTokenInvalidMessage = (message: string): boolean =>
   /bot token is invalid/iu.test(message) ||
   /bot token invalid/iu.test(message) ||
   /bot token expired/iu.test(message) ||
+  /bound to a different connectionid/iu.test(message) ||
+  /not bound to an agent/iu.test(message) ||
   /x-bot-session-token/iu.test(message);
 
 const parseRetryAfterMs = (input: {

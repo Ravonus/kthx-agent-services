@@ -160,7 +160,9 @@ const isBotTokenAuthFailureMessage = (message: string): boolean =>
   /bot token invalid/iu.test(message) ||
   /bot token expired/iu.test(message) ||
   /bot token missing/iu.test(message) ||
-  /x-bot-session-token/iu.test(message);
+  /x-bot-session-token/iu.test(message) ||
+  /bound to a different connectionid/iu.test(message) ||
+  /not bound to an agent/iu.test(message);
 
 const parseSupervisorPid = (value: string | null): number | null => {
   if (!value) return null;
@@ -1510,6 +1512,13 @@ const main = async (): Promise<void> => {
       10,
     ) || 15_000,
   );
+  const chatBridgeTokenAuthRetryMs = Math.max(
+    1_000,
+    Number.parseInt(
+      trimEnv("MG_CHAT_RUNTIME_BRIDGE_TOKEN_AUTH_RETRY_MS") ?? "5000",
+      10,
+    ) || 5_000,
+  );
   let chatBridgeRateLimitedUntilMs = 0;
   let chunkUploadRateLimitedUntilMs = 0;
   let bridgeAuthHaltReason: string | null = null;
@@ -1584,6 +1593,15 @@ const main = async (): Promise<void> => {
             () => undefined,
           );
           continue;
+        }
+        if (isTokenAuthFailure) {
+          chatBridgeRateLimitedUntilMs = Math.max(
+            chatBridgeRateLimitedUntilMs,
+            Date.now() + chatBridgeTokenAuthRetryMs,
+          );
+          throw new Error(
+            `agent chat bridge token auth failure: ${errorMessage} (retryAfterMs=${chatBridgeTokenAuthRetryMs})`,
+          );
         }
         bridgeAuthHaltReason = errorMessage;
         await memory
@@ -1669,6 +1687,15 @@ const main = async (): Promise<void> => {
             () => undefined,
           );
           continue;
+        }
+        if (isTokenAuthFailure) {
+          chunkUploadRateLimitedUntilMs = Math.max(
+            chunkUploadRateLimitedUntilMs,
+            Date.now() + chatBridgeTokenAuthRetryMs,
+          );
+          throw new Error(
+            `agent chunk upload token auth failure: ${errorMessage} (retryAfterMs=${chatBridgeTokenAuthRetryMs})`,
+          );
         }
         bridgeAuthHaltReason = errorMessage;
         await memory
