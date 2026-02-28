@@ -533,6 +533,7 @@ const main = async (): Promise<void> => {
   const rejectedBotTokenValues = new Set<string>();
   let bridgeRateLimitedUntilMs = 0;
   let bridgeRateLimitedReason: string | null = null;
+  let haltReconnectsFn: ((reason: string) => Promise<void>) | null = null;
 
   const resolveBotTokenCandidates = async (): Promise<Array<{ source: string; token: string | null }>> => {
     const candidates: Array<{ source: string; token: string }> = [];
@@ -632,11 +633,25 @@ const main = async (): Promise<void> => {
           tokenSource: candidate.source,
         });
       }
+      const isMissingToken = isMissingBotTokenError(errMsg);
+      const isTokenMismatch = isBotTokenInvalidMessage(errMsg);
+      const isTerminalAgentAuthFailure =
+        res.status === 401 && !isMissingToken && !isTokenMismatch;
+      if (isTerminalAgentAuthFailure) {
+        if (haltReconnectsFn) {
+          await haltReconnectsFn(
+            `bridge_unauthorized: ${errMsg} (tokenSource=${candidate.source})`,
+          );
+        }
+        throw new BridgeCallError(`${errMsg} (tokenSource=${candidate.source})`, {
+          status: res.status,
+          tokenSource: candidate.source,
+        });
+      }
       lastError = new BridgeCallError(`${errMsg} (tokenSource=${candidate.source})`, {
         status: res.status,
         tokenSource: candidate.source,
       });
-      const isTokenMismatch = isBotTokenInvalidMessage(errMsg);
       if (
         isTokenMismatch &&
         typeof candidate.token === "string" &&
@@ -734,8 +749,23 @@ const main = async (): Promise<void> => {
     lastShellSummary: null,
     lastTicketFailures: [],
   };
+  let reconnectHaltReason: string | null = null;
   const updateStatus = async (patch: Partial<BridgeStatus>): Promise<void> => {
-    status = { ...status, ...patch, updatedAt: nowIso() };
+    const currentState = status.state;
+    const requestedState = typeof patch.state === "string" ? patch.state : null;
+    const preserveTerminalState =
+      reconnectHaltReason !== null &&
+      (currentState === "fatal" || currentState === "unauthorized") &&
+      requestedState !== "stopped";
+    const nextPatch = preserveTerminalState
+      ? {
+          ...patch,
+          state: currentState,
+          connected: false,
+          lastError: status.lastError ?? patch.lastError ?? null,
+        }
+      : patch;
+    status = { ...status, ...nextPatch, updatedAt: nowIso() };
     await writeJsonFile(statusPath, status).catch(() => undefined);
     safeStateUpsertSnapshot({
       scope: "chat.bridge.status",
@@ -752,7 +782,6 @@ const main = async (): Promise<void> => {
   let idleTimer: ReturnType<typeof setInterval> | null = null;
   let tokenWatchTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectAttempt = 0;
-  let reconnectHaltReason: string | null = null;
   let cachedGatewaySession: GatewaySessionSnapshot | null = null;
   let lastObservedTokenValue: string | null = null;
   let stopping = false;
@@ -1062,13 +1091,20 @@ const main = async (): Promise<void> => {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+    const lowerReason = reason.toLowerCase();
+    const haltState =
+      lowerReason.includes("unauthorized") ||
+      lowerReason.includes("invalid agent key") ||
+      lowerReason.includes("x-agent-key")
+        ? "unauthorized"
+        : "fatal";
     await appendBridgeEvent({
       at: nowIso(),
       type: "bridge_reconnect_halted",
       reason,
     });
     await updateStatus({
-      state: "fatal",
+      state: haltState,
       connected: false,
       lastError: reason,
       reconnectAttempt,
@@ -1076,6 +1112,7 @@ const main = async (): Promise<void> => {
       lastActivityAt: getLastActivityAtIso(),
     });
   };
+  haltReconnectsFn = haltReconnects;
 
   // Reconnect scheduler
   const scheduleReconnect = async (reason: string, options: ReconnectOptions = {}): Promise<void> => {

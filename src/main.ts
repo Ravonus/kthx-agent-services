@@ -1512,7 +1512,13 @@ const main = async (): Promise<void> => {
   );
   let chatBridgeRateLimitedUntilMs = 0;
   let chunkUploadRateLimitedUntilMs = 0;
+  let bridgeAuthHaltReason: string | null = null;
   const callAgentChatBridge = async (payload: unknown): Promise<unknown> => {
+    if (bridgeAuthHaltReason) {
+      throw new Error(
+        `agent chat bridge disabled after unauthorized response: ${bridgeAuthHaltReason}`,
+      );
+    }
     const nowMs = Date.now();
     if (chatBridgeRateLimitedUntilMs > nowMs) {
       throw new Error(
@@ -1575,6 +1581,19 @@ const main = async (): Promise<void> => {
         );
         continue;
       }
+      if (response.status === 401 && !isTokenAuthFailure) {
+        bridgeAuthHaltReason = errorMessage;
+        await memory
+          .recordWrite({
+            type: "runtime_bridge_unauthorized_halt",
+            at: nowIso(),
+            endpoint: "/api/agent/chat",
+            status: response.status,
+            error: errorMessage,
+          })
+          .catch(() => {});
+        throw new Error(`agent chat bridge unauthorized: ${errorMessage}`);
+      }
       throw new Error(
         `agent chat bridge request failed: ${errorMessage}${bridgeIssuesSummary ?? ""}`,
       );
@@ -1582,6 +1601,11 @@ const main = async (): Promise<void> => {
   };
 
   const callAgentUploadChunk = async (payload: unknown): Promise<unknown> => {
+    if (bridgeAuthHaltReason) {
+      throw new Error(
+        `agent chunk upload disabled after unauthorized response: ${bridgeAuthHaltReason}`,
+      );
+    }
     const nowMs = Date.now();
     if (chunkUploadRateLimitedUntilMs > nowMs) {
       throw new Error(
@@ -1638,6 +1662,19 @@ const main = async (): Promise<void> => {
           () => undefined,
         );
         continue;
+      }
+      if (response.status === 401 && !isTokenAuthFailure) {
+        bridgeAuthHaltReason = errorMessage;
+        await memory
+          .recordWrite({
+            type: "runtime_bridge_unauthorized_halt",
+            at: nowIso(),
+            endpoint: "/api/agent/upload/chunk",
+            status: response.status,
+            error: errorMessage,
+          })
+          .catch(() => {});
+        throw new Error(`agent chunk upload unauthorized: ${errorMessage}`);
       }
       throw new Error(`agent chunk upload request failed: ${errorMessage}`);
     }
