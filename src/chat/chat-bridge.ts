@@ -206,6 +206,15 @@ const parseIsoDateMs = (value: unknown): number | null => {
   return Number.isFinite(ms) ? ms : null;
 };
 
+const parseAgentUserIdFromKeyBox = (keyBox: string | null): string | null => {
+  const trimmed = typeof keyBox === "string" ? keyBox.trim() : "";
+  if (!trimmed.length) return null;
+  const parts = trimmed.split(".");
+  if (parts.length !== 5 || parts[0] !== "mkbox_v1") return null;
+  const userId = parts[1]?.trim() ?? "";
+  return userId.length >= 8 ? userId : null;
+};
+
 const trimTrailingSlashes = (value: string): string =>
   value.replace(/\/+$/u, "");
 
@@ -522,6 +531,7 @@ const main = async (): Promise<void> => {
   const agentKeyBox = await readSecretFromEnvOrFile("MG_AGENT_KEY_BOX", "MG_AGENT_KEY_BOX_FILE");
   const agentKey = trimEnv("MG_AGENT_KEY");
   if (!agentKeyBox && !agentKey) throw new Error("Missing agent auth. Set MG_AGENT_KEY_BOX or MG_AGENT_KEY.");
+  const keyBoxAgentMainUserId = parseAgentUserIdFromKeyBox(agentKeyBox);
 
   const agentHomeDir = path.resolve(trimEnv("MG_AGENT_HOME_DIR") ?? "kthx-agents");
   const stateDir = path.resolve(trimEnv("MG_AGENT_STATE_DIR") ?? path.join(agentHomeDir, "state"));
@@ -939,6 +949,7 @@ const main = async (): Promise<void> => {
       viewerMainUserId?.trim() ??
       bridgeAgentMainUserId?.trim() ??
       (await resolveBridgeAgentMainUserId())?.trim() ??
+      keyBoxAgentMainUserId?.trim() ??
       "";
     const connectionId = realtimeConnectionId?.trim() ?? "";
     if (!resolvedUserId.length && !connectionId.length) {

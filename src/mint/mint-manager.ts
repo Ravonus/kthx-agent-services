@@ -67,8 +67,46 @@ const errCode = (e: unknown): string | null => {
   return sd && typeof sd.code === "string" ? (sd.code as string) : null;
 };
 
-const errMsg = (e: unknown): string =>
-  e instanceof Error ? e.message : typeof e === "string" ? e : "unknown error";
+const errMsg = (e: unknown): string => {
+  const baseMessage =
+    e instanceof Error && e.message.trim().length > 0
+      ? e.message.trim()
+      : typeof e === "string" && e.trim().length > 0
+        ? e.trim()
+        : "";
+  const shape = isRecord(e) && isRecord(e.shape) ? e.shape : null;
+  const shapeMessage =
+    shape && typeof shape.message === "string" && shape.message.trim().length > 0
+      ? shape.message.trim()
+      : "";
+  const cause = isRecord(e) && isRecord(e.cause) ? e.cause : null;
+  const causeMessage =
+    cause && typeof cause.message === "string" && cause.message.trim().length > 0
+      ? cause.message.trim()
+      : "";
+  const data = isRecord(e) && isRecord(e.data) ? e.data : null;
+  const dataCode =
+    data && typeof data.code === "string" && data.code.trim().length > 0
+      ? data.code.trim()
+      : "";
+  const httpStatus =
+    data && typeof data.httpStatus === "number" && Number.isFinite(data.httpStatus)
+      ? Math.floor(data.httpStatus)
+      : null;
+
+  const bestMessage =
+    (baseMessage && baseMessage.toLowerCase() !== "unknown error" ? baseMessage : "") ||
+    shapeMessage ||
+    causeMessage ||
+    baseMessage;
+  if (!bestMessage.length) return "unknown error";
+
+  const suffixParts: string[] = [];
+  if (dataCode.length > 0) suffixParts.push(`code=${dataCode}`);
+  if (httpStatus !== null) suffixParts.push(`httpStatus=${httpStatus}`);
+  if (suffixParts.length === 0) return bestMessage;
+  return `${bestMessage} (${suffixParts.join(", ")})`;
+};
 
 const MINT_CHALLENGE_SOLVER_MAX_ATTEMPTS = 2;
 const MINT_CHALLENGE_SOLVER_RETRY_DELAY_MS = 500;
