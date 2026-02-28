@@ -1464,13 +1464,16 @@ const main = async (): Promise<void> => {
           await disconnectRealtimeOnAuthDrift(reason);
           await appendBridgeEvent({
             at: nowIso(),
-            type: "gateway_session_auth_drift",
+            type: "gateway_session_waiting_for_bot_token",
             reason,
             message,
           });
-          await scheduleReconnect(`gateway_session_auth_drift: ${message}`, {
-            baseDelayMs: tokenFastRetryMs,
-            bumpAttempt: false,
+          await updateStatus({
+            state: "waiting_for_bot_token",
+            connected: false,
+            lastError: null,
+            subscriptionMode: connectMode,
+            lastActivityAt: getLastActivityAtIso(),
           });
           return;
         }
