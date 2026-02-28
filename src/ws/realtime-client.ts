@@ -61,6 +61,8 @@ export interface RealtimeClientOptions {
   clientKeepAliveMs: number;
   /** Async getter for the current bot token (may return null). */
   getBotToken: () => Promise<string | null>;
+  /** Optional async getter for the current agent key box (allows runtime self-heal updates). */
+  getAgentKeyBox?: () => Promise<string | null>;
   /**
    * Optional async function that returns runtime integrity hashes.
    * When provided, the hashes are sent in `connectionParams`.
@@ -89,7 +91,11 @@ const buildConnectionParamsDict = async (
   options: RealtimeClientOptions,
 ): Promise<Record<string, string>> => {
   const botToken = await options.getBotToken();
-  const agentKeyBox = trimEnv("MG_AGENT_KEY_BOX");
+  const resolvedAgentKeyBox =
+    typeof options.getAgentKeyBox === "function"
+      ? await options.getAgentKeyBox().catch(() => null)
+      : null;
+  const agentKeyBox = resolvedAgentKeyBox?.trim() ?? trimEnv("MG_AGENT_KEY_BOX");
 
   const runtimeIntegrity: RuntimeIntegrity | null =
     typeof options.getRuntimeIntegrity === "function"
@@ -98,7 +104,7 @@ const buildConnectionParamsDict = async (
 
   if (!botToken && !agentKeyBox) {
     throw new Error(
-      "Missing auth bootstrap. Set MG_BOT_SESSION_TOKEN or MG_AGENT_KEY_BOX.",
+      "Missing auth bootstrap. Set MG_BOT_SESSION_TOKEN or MG_AGENT_KEY_BOX (or MG_AGENT_KEY_BOX_FILE).",
     );
   }
 

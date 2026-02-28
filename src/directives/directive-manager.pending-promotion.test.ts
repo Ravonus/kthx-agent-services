@@ -21,7 +21,7 @@ const createHarness = async (options?: {
   trpc?: {
     realtime?: {
       ackDirective?: {
-        mutate?: (input: Record<string, unknown>) => Promise<unknown>;
+        mutate: (input: unknown) => Promise<unknown>;
       };
     };
   } | null;

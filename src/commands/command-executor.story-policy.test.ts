@@ -768,7 +768,7 @@ describe("command executor story policy", () => {
 
     expect(createPostMutate).toHaveBeenCalledTimes(0);
     expect(literalGenerateSpy).toHaveBeenCalledTimes(1);
-    const literalPayload = literalGenerateSpy.mock.calls[0]?.[1];
+    const literalPayload = (literalGenerateSpy.mock.calls[0] as unknown[] | undefined)?.[1];
     expect(isRecord(literalPayload)).toBe(true);
     if (isRecord(literalPayload)) {
       expect(literalPayload.chatLiteralGenerate).toBe(true);

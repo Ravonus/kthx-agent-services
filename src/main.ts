@@ -76,19 +76,6 @@ const touchWake = async (wakePath: string): Promise<void> => {
     .catch(() => {});
 };
 
-const readSecretFromEnvOrFile = async (
-  envKey: string,
-  fileKey: string,
-): Promise<string | null> => {
-  const direct = trimEnv(envKey);
-  if (direct) return direct;
-  const filePath = trimEnv(fileKey);
-  if (!filePath) return null;
-  const raw = await fs.readFile(path.resolve(filePath), "utf8").catch(() => null);
-  const trimmed = typeof raw === "string" ? raw.trim() : "";
-  return trimmed.length > 0 ? trimmed : null;
-};
-
 const resolveChatApiBaseUrl = (realtimeWsUrl: string): string => {
   const explicit =
     trimEnv("MG_CHAT_HTTP_BASE_URL") ??
@@ -163,6 +150,13 @@ const isBotTokenAuthFailureMessage = (message: string): boolean =>
   /x-bot-session-token/iu.test(message) ||
   /bound to a different connectionid/iu.test(message) ||
   /not bound to an agent/iu.test(message);
+
+const isAgentKeyBoxAuthFailureMessage = (message: string): boolean =>
+  /agent key is invalid for this realtime connection/iu.test(message) ||
+  /agent_key_box_resolution_failed/iu.test(message) ||
+  /runtime_integrity_gate/iu.test(message) ||
+  /agent_not_found/iu.test(message) ||
+  /x-agent-key-box/iu.test(message);
 
 const parseSupervisorPid = (value: string | null): number | null => {
   if (!value) return null;
@@ -416,33 +410,123 @@ const main = async (): Promise<void> => {
   const supervisorPid = parseSupervisorPid(trimEnv("MG_AGENT_SUPERVISOR_PID"));
   const supervisorConnectionId =
     trimEnv("MG_REALTIME_CONNECTION_ID")?.trim() ?? null;
-  let agentKeyBox = await readSecretFromEnvOrFile(
-    "MG_AGENT_KEY_BOX",
-    "MG_AGENT_KEY_BOX_FILE",
-  );
   const agentKey = trimEnv("MG_AGENT_KEY");
+  let agentKeyBox: string | null = null;
 
-  // Try reading a previously persisted agentKeyBox from state dir
-  if (!agentKeyBox && !agentKey) {
+  const readOwnedPersistedAgentKeyBox = async (): Promise<string | null> => {
+    if (agentKey) return null;
     const persisted = await readPersistedAgentKeyBox(config.stateDir);
-    if (persisted) {
-      const ownedByCurrentSupervisor =
-        typeof supervisorPid === "number" &&
-        persisted.ownerSupervisorPid === supervisorPid;
-      if (ownedByCurrentSupervisor) {
-        agentKeyBox = persisted.agentKeyBox;
-        process.env.MG_AGENT_KEY_BOX = persisted.agentKeyBox;
+    if (!persisted) return null;
+    const ownedByCurrentSupervisor =
+      typeof supervisorPid === "number" &&
+      persisted.ownerSupervisorPid === supervisorPid;
+    if (ownedByCurrentSupervisor) {
+      return persisted.agentKeyBox;
+    }
+    await clearPersistedAgentKeyBox(config.stateDir);
+    console.log(
+      "[agent-runtime] Ignored stale persisted agentKeyBox; cleared because supervisor PID did not match.",
+    );
+    return null;
+  };
+
+  const resolveAgentKeyBoxFromSources = async (options: {
+    allowPersisted: boolean;
+  }): Promise<{ keyBox: string | null; source: string | null }> => {
+    const envKeyBox = trimEnv("MG_AGENT_KEY_BOX");
+    if (envKeyBox && envKeyBox.trim().length > 0) {
+      return {
+        keyBox: envKeyBox.trim(),
+        source: "env:MG_AGENT_KEY_BOX",
+      };
+    }
+
+    const keyBoxFile = trimEnv("MG_AGENT_KEY_BOX_FILE");
+    if (keyBoxFile && keyBoxFile.trim().length > 0) {
+      const resolvedPath = path.resolve(keyBoxFile);
+      const raw = await fs.readFile(resolvedPath, "utf8").catch(() => null);
+      const fileKeyBox = typeof raw === "string" ? raw.trim() : "";
+      if (fileKeyBox.length > 0) {
+        return {
+          keyBox: fileKeyBox,
+          source: `file:${resolvedPath}`,
+        };
+      }
+    }
+
+    if (options.allowPersisted) {
+      const persistedKeyBox = await readOwnedPersistedAgentKeyBox();
+      if (persistedKeyBox && persistedKeyBox.trim().length > 0) {
+        return {
+          keyBox: persistedKeyBox.trim(),
+          source: "persisted:state",
+        };
+      }
+    }
+
+    return { keyBox: null, source: null };
+  };
+
+  const applyResolvedAgentKeyBox = async (input: {
+    keyBox: string;
+    source: string | null;
+    reason: string;
+  }): Promise<{ changed: boolean; source: string | null }> => {
+    const normalized = input.keyBox.trim();
+    if (!normalized.length) return { changed: false, source: input.source };
+    const changed = normalized !== (agentKeyBox ?? "");
+    agentKeyBox = normalized;
+    process.env.MG_AGENT_KEY_BOX = normalized;
+    if (changed && typeof supervisorPid === "number") {
+      const savedPath = await persistAgentKeyBox({
+        agentKeyBox: normalized,
+        stateDir: config.stateDir,
+        ownerSupervisorPid: supervisorPid,
+        ownerConnectionId: supervisorConnectionId,
+      }).catch(() => null);
+      if (savedPath) {
         console.log(
-          `[agent-runtime] Loaded agentKeyBox from persisted state (supervisor pid ${supervisorPid}).`,
-        );
-      } else {
-        await clearPersistedAgentKeyBox(config.stateDir);
-        console.log(
-          "[agent-runtime] Ignored stale persisted agentKeyBox; cleared because supervisor PID did not match.",
+          `[agent-runtime] Persisted refreshed agentKeyBox to ${savedPath} (reason=${input.reason}).`,
         );
       }
     }
-  }
+    if (changed) {
+      console.log(
+        `[agent-runtime] Loaded agentKeyBox from ${input.source ?? "unknown"} (reason=${input.reason}).`,
+      );
+    }
+    return { changed, source: input.source };
+  };
+
+  const refreshAgentKeyBoxFromLocalSources = async (
+    reason: string,
+    options: { allowPersisted?: boolean } = {},
+  ): Promise<{
+    ok: boolean;
+    changed: boolean;
+    source: string | null;
+  }> => {
+    const resolved = await resolveAgentKeyBoxFromSources({
+      allowPersisted: options.allowPersisted ?? true,
+    });
+    if (!resolved.keyBox) {
+      return { ok: false, changed: false, source: resolved.source };
+    }
+    const applied = await applyResolvedAgentKeyBox({
+      keyBox: resolved.keyBox,
+      source: resolved.source,
+      reason,
+    });
+    return {
+      ok: true,
+      changed: applied.changed,
+      source: applied.source,
+    };
+  };
+
+  await refreshAgentKeyBoxFromLocalSources("startup_bootstrap", {
+    allowPersisted: true,
+  });
 
   // First-time registration via owner invite token
   const ownerInviteToken = trimEnv("MG_OWNER_INVITE_TOKEN");
@@ -472,13 +556,13 @@ const main = async (): Promise<void> => {
           ? { handle: ownerHandle, name: ownerName }
           : undefined,
     });
-    agentKeyBox = result.agentKeyBox;
-    process.env.MG_AGENT_KEY_BOX = result.agentKeyBox;
+    agentKeyBox = result.agentKeyBox.trim();
+    process.env.MG_AGENT_KEY_BOX = agentKeyBox;
 
     // Persist credentials for future boots
     if (typeof supervisorPid === "number") {
       const savedPath = await persistAgentKeyBox({
-        agentKeyBox: result.agentKeyBox,
+        agentKeyBox,
         stateDir: config.stateDir,
         ownerSupervisorPid: supervisorPid,
         ownerConnectionId: supervisorConnectionId,
@@ -639,6 +723,12 @@ const main = async (): Promise<void> => {
     connectionId: config.connectionId,
     clientKeepAliveMs: config.heartbeatIntervalMs,
     getBotToken,
+    getAgentKeyBox: async () => {
+      await refreshAgentKeyBoxFromLocalSources("ws_connection_params", {
+        allowPersisted: true,
+      });
+      return agentKeyBox;
+    },
     getRuntimeIntegrity: async () => {
       const hashes = await collectRuntimeHashes();
       return hashes;
@@ -698,6 +788,31 @@ const main = async (): Promise<void> => {
   // Manager bootstrap
   // =========================================================================
 
+  const refreshAgentKeyBoxForAuth = async (reason: string): Promise<boolean> => {
+    const previous = agentKeyBox;
+    const resolved = await refreshAgentKeyBoxFromLocalSources(reason, {
+      allowPersisted: true,
+    });
+    const current = agentKeyBox;
+    const changed =
+      resolved.ok &&
+      typeof current === "string" &&
+      current.trim().length > 0 &&
+      current !== previous;
+    await memory
+      .recordWrite({
+        type: "auth_agent_key_box_refresh_attempt",
+        at: nowIso(),
+        reason,
+        success: resolved.ok,
+        changed,
+        source: resolved.source,
+        hasAgentKeyBox: Boolean(current && current.trim().length > 0),
+      })
+      .catch(() => {});
+    return changed;
+  };
+
   // -- AuthManager
   const authManager = new AuthManager({
     auth: ctx.auth,
@@ -709,6 +824,7 @@ const main = async (): Promise<void> => {
     misc: ctx.misc,
     wsClient: wsClient as any,
     writeDebugSnapshot: () => writeDebugSnapshot(ipcPaths, ctx.debugSnapshot),
+    refreshAgentKeyBox: refreshAgentKeyBoxForAuth,
   });
   ctx.authManager = authManager;
 
@@ -1457,6 +1573,7 @@ const main = async (): Promise<void> => {
     },
     ws: ctx.ws,
     misc: ctx.misc,
+    auth: ctx.auth,
     memory: { recordWrite: (p: unknown) => memory.recordWrite(p) },
     debugSnapshot: ctx.debugSnapshot,
     trpc: trpc as any,
@@ -1465,6 +1582,12 @@ const main = async (): Promise<void> => {
       markWsActivityFn(ctx.wsStateContext, source),
     handleEnvelope,
     authManager,
+    getAgentKeyBox: async () => {
+      await refreshAgentKeyBoxFromLocalSources("subscription_has_auth", {
+        allowPersisted: true,
+      });
+      return agentKeyBox;
+    },
     runBackendCall: <T>(label: string, fn: () => Promise<T>) =>
       runBackendCall(label, fn, ctx),
     resetLocalStateOnReconnect: async (reason: string) => {
@@ -1524,6 +1647,14 @@ const main = async (): Promise<void> => {
   let bridgeAuthHaltReason: string | null = null;
   const callAgentChatBridge = async (payload: unknown): Promise<unknown> => {
     if (bridgeAuthHaltReason) {
+      const refreshed = await refreshAgentKeyBoxForAuth(
+        "chat_bridge_halt_guard",
+      ).catch(() => false);
+      if (refreshed) {
+        bridgeAuthHaltReason = null;
+      }
+    }
+    if (bridgeAuthHaltReason) {
       throw new Error(
         `agent chat bridge disabled after unauthorized response: ${bridgeAuthHaltReason}`,
       );
@@ -1535,6 +1666,7 @@ const main = async (): Promise<void> => {
       );
     }
     let attemptedTokenRecovery = false;
+    let attemptedAgentKeyRecovery = false;
     while (true) {
       const botToken = await getBotToken();
       const response = await fetch(`${chatApiBaseUrl}/api/agent/chat`, {
@@ -1585,6 +1717,8 @@ const main = async (): Promise<void> => {
       const bridgeIssuesSummary = summarizeBridgeIssues(body);
       const isTokenAuthFailure =
         response.status === 401 && isBotTokenAuthFailureMessage(errorMessage);
+      const isAgentKeyAuthFailure =
+        response.status === 401 && isAgentKeyBoxAuthFailureMessage(errorMessage);
       if (response.status === 401) {
         if (isTokenAuthFailure && !attemptedTokenRecovery) {
           attemptedTokenRecovery = true;
@@ -1603,6 +1737,18 @@ const main = async (): Promise<void> => {
             `agent chat bridge token auth failure: ${errorMessage} (retryAfterMs=${chatBridgeTokenAuthRetryMs})`,
           );
         }
+        if (isAgentKeyAuthFailure && !attemptedAgentKeyRecovery) {
+          attemptedAgentKeyRecovery = true;
+          const refreshed = await refreshAgentKeyBoxForAuth(
+            "chat_bridge_agent_key_auth_failure",
+          ).catch(() => false);
+          if (refreshed) {
+            continue;
+          }
+        }
+        const ownerAction = isAgentKeyAuthFailure
+          ? "Generate a reset link at /settings#agent-key-reset, redeem it once, and update MG_AGENT_KEY_BOX_FILE (or MG_AGENT_KEY_BOX)."
+          : null;
         bridgeAuthHaltReason = errorMessage;
         await memory
           .recordWrite({
@@ -1611,9 +1757,12 @@ const main = async (): Promise<void> => {
             endpoint: "/api/agent/chat",
             status: response.status,
             error: errorMessage,
+            ...(ownerAction ? { ownerAction } : {}),
           })
           .catch(() => {});
-        throw new Error(`agent chat bridge unauthorized: ${errorMessage}`);
+        throw new Error(
+          `agent chat bridge unauthorized: ${errorMessage}${ownerAction ? ` ${ownerAction}` : ""}`,
+        );
       }
       throw new Error(
         `agent chat bridge request failed: ${errorMessage}${bridgeIssuesSummary ?? ""}`,
@@ -1622,6 +1771,14 @@ const main = async (): Promise<void> => {
   };
 
   const callAgentUploadChunk = async (payload: unknown): Promise<unknown> => {
+    if (bridgeAuthHaltReason) {
+      const refreshed = await refreshAgentKeyBoxForAuth(
+        "chunk_upload_halt_guard",
+      ).catch(() => false);
+      if (refreshed) {
+        bridgeAuthHaltReason = null;
+      }
+    }
     if (bridgeAuthHaltReason) {
       throw new Error(
         `agent chunk upload disabled after unauthorized response: ${bridgeAuthHaltReason}`,
@@ -1634,6 +1791,7 @@ const main = async (): Promise<void> => {
       );
     }
     let attemptedTokenRecovery = false;
+    let attemptedAgentKeyRecovery = false;
     while (true) {
       const botToken = await getBotToken();
       const response = await fetch(`${chatApiBaseUrl}/api/agent/upload/chunk`, {
@@ -1679,6 +1837,8 @@ const main = async (): Promise<void> => {
           : `HTTP ${response.status}`;
       const isTokenAuthFailure =
         response.status === 401 && isBotTokenAuthFailureMessage(errorMessage);
+      const isAgentKeyAuthFailure =
+        response.status === 401 && isAgentKeyBoxAuthFailureMessage(errorMessage);
       if (response.status === 401) {
         if (isTokenAuthFailure && !attemptedTokenRecovery) {
           attemptedTokenRecovery = true;
@@ -1697,6 +1857,18 @@ const main = async (): Promise<void> => {
             `agent chunk upload token auth failure: ${errorMessage} (retryAfterMs=${chatBridgeTokenAuthRetryMs})`,
           );
         }
+        if (isAgentKeyAuthFailure && !attemptedAgentKeyRecovery) {
+          attemptedAgentKeyRecovery = true;
+          const refreshed = await refreshAgentKeyBoxForAuth(
+            "chunk_upload_agent_key_auth_failure",
+          ).catch(() => false);
+          if (refreshed) {
+            continue;
+          }
+        }
+        const ownerAction = isAgentKeyAuthFailure
+          ? "Generate a reset link at /settings#agent-key-reset, redeem it once, and update MG_AGENT_KEY_BOX_FILE (or MG_AGENT_KEY_BOX)."
+          : null;
         bridgeAuthHaltReason = errorMessage;
         await memory
           .recordWrite({
@@ -1705,9 +1877,12 @@ const main = async (): Promise<void> => {
             endpoint: "/api/agent/upload/chunk",
             status: response.status,
             error: errorMessage,
+            ...(ownerAction ? { ownerAction } : {}),
           })
           .catch(() => {});
-        throw new Error(`agent chunk upload unauthorized: ${errorMessage}`);
+        throw new Error(
+          `agent chunk upload unauthorized: ${errorMessage}${ownerAction ? ` ${ownerAction}` : ""}`,
+        );
       }
       throw new Error(`agent chunk upload request failed: ${errorMessage}`);
     }

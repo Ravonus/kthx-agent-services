@@ -169,6 +169,8 @@ export interface AuthTrackingState {
   lastAuthRefreshAtMs: number;
   unauthorizedStreak: number;
   lastUnauthorizedAtMs: number;
+  agentKeyAuthFailureStreak: number;
+  agentKeyAuthBackoffUntilMs: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +358,8 @@ export class RuntimeContext {
       lastAuthRefreshAtMs: 0,
       unauthorizedStreak: 0,
       lastUnauthorizedAtMs: 0,
+      agentKeyAuthFailureStreak: 0,
+      agentKeyAuthBackoffUntilMs: 0,
     };
 
     this.mint = {

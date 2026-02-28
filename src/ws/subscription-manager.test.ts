@@ -43,6 +43,9 @@ describe("subscription manager reconnect reset", () => {
         lastSubscriptionRefreshAtMs: 0,
         lastWsOpenTransitionAtMs: 0,
       },
+      auth: {
+        agentKeyAuthBackoffUntilMs: 0,
+      },
       memory: {
         recordWrite: async (payload: unknown) => {
           writes.push(payload);
@@ -95,6 +98,9 @@ describe("subscription manager reconnect reset", () => {
         lastSubscriptionResyncAtMs: 0,
         lastSubscriptionRefreshAtMs: 0,
         lastWsOpenTransitionAtMs: 0,
+      },
+      auth: {
+        agentKeyAuthBackoffUntilMs: 0,
       },
       memory: {
         recordWrite: async (payload: unknown) => {

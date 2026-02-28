@@ -46,6 +46,8 @@ export interface AuthManagerContext {
   } | null;
   /** Callback to persist the debug snapshot to disk. */
   writeDebugSnapshot(): Promise<void>;
+  /** Optional callback to refresh agent key-box auth material from local state. */
+  refreshAgentKeyBox?: (reason: string) => Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -56,8 +58,32 @@ export interface AuthManagerContext {
  * Extract a tRPC error message from an unknown error value.
  */
 const getTrpcErrorMessage = (error: unknown): string | null => {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string" && error.trim().length > 0) return error.trim();
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return error.message.trim();
+  }
+  if (typeof error === "string" && error.trim().length > 0) {
+    return error.trim();
+  }
+  if (isRecord(error)) {
+    const shape = isRecord(error.shape) ? error.shape : null;
+    const shapeMessage =
+      shape && typeof shape.message === "string" && shape.message.trim().length > 0
+        ? shape.message.trim()
+        : null;
+    if (shapeMessage) return shapeMessage;
+    const data = isRecord(error.data) ? error.data : null;
+    const dataMessage =
+      data && typeof data.message === "string" && data.message.trim().length > 0
+        ? data.message.trim()
+        : null;
+    if (dataMessage) return dataMessage;
+    const cause = isRecord(error.cause) ? error.cause : null;
+    const causeMessage =
+      cause && typeof cause.message === "string" && cause.message.trim().length > 0
+        ? cause.message.trim()
+        : null;
+    if (causeMessage) return causeMessage;
+  }
   return null;
 };
 
@@ -80,6 +106,20 @@ const isBotTokenHardInvalidMessage = (message: string | null): boolean => {
   );
 };
 
+const isAgentKeyBoxInvalidMessage = (message: string | null): boolean => {
+  const normalized =
+    typeof message === "string" && message.trim().length > 0
+      ? message.trim().toLowerCase()
+      : "";
+  if (!normalized.length) return false;
+  return (
+    normalized.includes("agent key is invalid for this realtime connection") ||
+    normalized.includes("agent_key_box_resolution_failed") ||
+    normalized.includes("runtime_integrity_gate") ||
+    normalized.includes("agent_not_found")
+  );
+};
+
 // ---------------------------------------------------------------------------
 // AuthManager
 // ---------------------------------------------------------------------------
@@ -93,6 +133,8 @@ const AUTH_REFRESH_MIN_GAP_MS = 10_000;
  * If the last UNAUTHORIZED was more than this many ms ago, the streak resets.
  */
 const UNAUTHORIZED_STREAK_RESET_MS = 180_000;
+const AGENT_KEY_AUTH_BACKOFF_MIN_MS = 15_000;
+const AGENT_KEY_AUTH_BACKOFF_MAX_MS = 5 * 60_000;
 
 export class AuthManager implements AuthManagerLike {
   private readonly ctx: AuthManagerContext;
@@ -138,6 +180,51 @@ export class AuthManager implements AuthManagerLike {
       (reason === "heartbeat_unauthorized" ||
         reason === "command_unauthorized" ||
         reason === "subscription_unauthorized");
+    const keyBoxAuthFailure =
+      isAgentKeyBoxInvalidMessage(errorMessage) &&
+      (reason === "heartbeat_unauthorized" ||
+        reason === "command_unauthorized" ||
+        reason === "subscription_unauthorized");
+
+    if (keyBoxAuthFailure) {
+      const refreshed = this.ctx.refreshAgentKeyBox
+        ? await this.ctx
+            .refreshAgentKeyBox(`auth_unauthorized:${reason}`)
+            .catch(() => false)
+        : false;
+      if (refreshed) {
+        this.ctx.auth.agentKeyAuthFailureStreak = 0;
+        this.ctx.auth.agentKeyAuthBackoffUntilMs = 0;
+        await this.ctx.memory.recordWrite({
+          type: "auth_agent_key_box_refreshed",
+          reason,
+          at: nowIso(),
+          ...(errorMessage ? { error: errorMessage } : {}),
+        });
+        await this.refreshAndReconnect(reason, {
+          invalidateToken: false,
+          force: true,
+        });
+        return;
+      }
+
+      this.ctx.auth.agentKeyAuthFailureStreak += 1;
+      const backoffMs = Math.min(
+        AGENT_KEY_AUTH_BACKOFF_MAX_MS,
+        AGENT_KEY_AUTH_BACKOFF_MIN_MS *
+          Math.max(1, 2 ** (this.ctx.auth.agentKeyAuthFailureStreak - 1)),
+      );
+      this.ctx.auth.agentKeyAuthBackoffUntilMs = nowMs + backoffMs;
+      await this.ctx.memory.recordWrite({
+        type: "auth_agent_key_box_backoff",
+        reason,
+        at: nowIso(),
+        backoffMs,
+        retryAt: new Date(this.ctx.auth.agentKeyAuthBackoffUntilMs).toISOString(),
+        ...(errorMessage ? { error: errorMessage } : {}),
+      });
+      return;
+    }
 
     await this.ctx.memory.recordWrite({
       type: "auth_unauthorized",
@@ -157,7 +244,7 @@ export class AuthManager implements AuthManagerLike {
     };
     await this.ctx.writeDebugSnapshot();
 
-    await this.refreshAndReconnect(reason, { invalidateToken });
+    await this.refreshAndReconnect(reason, { invalidateToken, force: false });
 
     if (invalidateToken) {
       this.ctx.auth.unauthorizedStreak = 0;
@@ -170,10 +257,12 @@ export class AuthManager implements AuthManagerLike {
    */
   async refreshIfNeeded(): Promise<void> {
     const nowMs = Date.now();
+    if (nowMs < this.ctx.auth.agentKeyAuthBackoffUntilMs) return;
     if (nowMs - this.ctx.misc.lastSubscriptionRefreshAtMs < 20_000) return;
     this.ctx.misc.lastSubscriptionRefreshAtMs = nowMs;
     await this.refreshAndReconnect("subscription_unauthorized_refresh", {
       invalidateToken: false,
+      force: false,
     });
   }
 
@@ -207,7 +296,7 @@ export class AuthManager implements AuthManagerLike {
    */
   private async refreshAndReconnect(
     reason: string,
-    options: { invalidateToken: boolean },
+    options: { invalidateToken: boolean; force?: boolean },
   ): Promise<void> {
     const nowMs = Date.now();
     if (this.ctx.auth.authRefreshInFlight) {
@@ -217,8 +306,12 @@ export class AuthManager implements AuthManagerLike {
       return;
     }
     const debounceHit =
+      !options.force &&
       nowMs - this.ctx.auth.lastAuthRefreshAtMs < AUTH_REFRESH_MIN_GAP_MS;
     if (debounceHit && !options.invalidateToken) return;
+    if (!options.invalidateToken && nowMs < this.ctx.auth.agentKeyAuthBackoffUntilMs) {
+      return;
+    }
 
     this.ctx.auth.authRefreshInFlight = true;
     this.ctx.auth.lastAuthRefreshAtMs = nowMs;

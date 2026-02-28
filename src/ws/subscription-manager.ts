@@ -35,6 +35,9 @@ export interface SubscriptionManagerContext {
     lastSubscriptionRefreshAtMs: number;
     lastWsOpenTransitionAtMs: number;
   };
+  auth: {
+    agentKeyAuthBackoffUntilMs: number;
+  };
   memory: { recordWrite(payload: unknown): Promise<void> };
   debugSnapshot: {
     auth: Record<string, unknown> | null;
@@ -52,6 +55,7 @@ export interface SubscriptionManagerContext {
   markWsActivity(source: string): void;
   handleEnvelope(e: { receivedAt: string; source: string; topic: string; payload: unknown }): Promise<void>;
   authManager: AuthManagerLike | null;
+  getAgentKeyBox?: () => Promise<string | null>;
   runBackendCall<T>(label: string, fn: () => Promise<T>): Promise<T>;
   resetLocalStateOnReconnect?: (reason: string) => Promise<unknown>;
 }
@@ -170,7 +174,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   // -- Subscribe helpers ---------------------------------------------------
 
   private subUser(topic: string): void {
-    if (this.isCompetingTunnelCoolingDown()) return;
+    if (this.isCompetingTunnelCoolingDown() || this.isAgentKeyAuthCoolingDown()) return;
     if (this.userSubs.has(topic) || !this.ctx.trpc) return;
     const st: TopicState = { sub: null, started: false, createdAtMs: Date.now(), lastDataAtMs: null };
     this.userSubs.set(topic, st);
@@ -198,7 +202,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   }
 
   private subPublic(topic: string): void {
-    if (this.isCompetingTunnelCoolingDown()) return;
+    if (this.isCompetingTunnelCoolingDown() || this.isAgentKeyAuthCoolingDown()) return;
     if (this.publicSubs.has(topic) || !this.ctx.trpc) return;
     const st: TopicState = { sub: null, started: false, createdAtMs: Date.now(), lastDataAtMs: null };
     this.publicSubs.set(topic, st);
@@ -226,7 +230,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   }
 
   private subHeartbeat(): void {
-    if (this.isCompetingTunnelCoolingDown()) return;
+    if (this.isCompetingTunnelCoolingDown() || this.isAgentKeyAuthCoolingDown()) return;
     if (this.heartbeatSub || !this.ctx.trpc) return;
     const sub = this.ctx.trpc.realtime.heartbeat.subscribe(
       { intervalMs: Math.min(30_000, Math.max(1_000, this.ctx.config.heartbeatIntervalMs)) },
@@ -248,7 +252,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   // -- Resync & heal -------------------------------------------------------
 
   private async runResync(): Promise<void> {
-    if (this.isCompetingTunnelCoolingDown()) return;
+    if (this.isCompetingTunnelCoolingDown() || this.isAgentKeyAuthCoolingDown()) return;
     if (!this.ctx.misc.subscriptionResyncRequested) return;
     const now = Date.now();
     if (now - this.ctx.misc.lastSubscriptionResyncAtMs < 2_000) return;
@@ -282,7 +286,7 @@ export class SubscriptionManager implements SubscriptionManagerLike {
   }
 
   private async healTick(): Promise<void> {
-    if (this.isCompetingTunnelCoolingDown()) return;
+    if (this.isCompetingTunnelCoolingDown() || this.isAgentKeyAuthCoolingDown()) return;
     await this.runResync().catch(() => {});
     this.subHeartbeat();
     void this.subscribeUserTopics();
@@ -445,20 +449,28 @@ export class SubscriptionManager implements SubscriptionManagerLike {
 
   private async hasAuth(): Promise<boolean> {
     const token = await getBotToken();
-    const key = trimEnv("MG_AGENT_KEY_BOX");
+    const keyFromProvider =
+      typeof this.ctx.getAgentKeyBox === "function"
+        ? await this.ctx.getAgentKeyBox().catch(() => null)
+        : null;
+    const key = keyFromProvider ?? trimEnv("MG_AGENT_KEY_BOX");
     return Boolean(token || (key && key.trim().length > 0));
   }
 
   private retry(fn: () => void, ms = 1_500): void {
-    if (this.isCompetingTunnelCoolingDown()) return;
+    if (this.isCompetingTunnelCoolingDown() || this.isAgentKeyAuthCoolingDown()) return;
     setTimeout(() => {
-      if (this.isCompetingTunnelCoolingDown()) return;
+      if (this.isCompetingTunnelCoolingDown() || this.isAgentKeyAuthCoolingDown()) return;
       fn();
     }, ms);
   }
 
   private isCompetingTunnelCoolingDown(): boolean {
     return Date.now() < this.competingTunnelCooldownUntilMs;
+  }
+
+  private isAgentKeyAuthCoolingDown(): boolean {
+    return Date.now() < this.ctx.auth.agentKeyAuthBackoffUntilMs;
   }
 
   private errMessage(err: unknown): string {

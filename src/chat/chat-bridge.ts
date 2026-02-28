@@ -161,6 +161,13 @@ const isBotTokenInvalidMessage = (message: string): boolean =>
   /not bound to an agent/iu.test(message) ||
   /x-bot-session-token/iu.test(message);
 
+const isAgentKeyAuthFailureMessage = (message: string): boolean =>
+  /agent key is invalid for this realtime connection/iu.test(message) ||
+  /agent_key_box_resolution_failed/iu.test(message) ||
+  /runtime_integrity_gate/iu.test(message) ||
+  /agent_not_found/iu.test(message) ||
+  /x-agent-key-box/iu.test(message);
+
 const parseRetryAfterMs = (input: {
   response: Response;
   body: unknown;
@@ -281,7 +288,6 @@ const requestRealtimeDisconnect = async (input: {
         connectionId: connectionId.length > 0 ? connectionId : null,
         reason: input.reason,
       }),
-      cache: "no-store",
       signal: controller.signal,
     });
     const body = (await response.json().catch(() => null)) as unknown;
@@ -528,10 +534,10 @@ const main = async (): Promise<void> => {
   await loadDotEnv();
 
   const baseHttpUrl = resolveHttpBaseUrl();
-  const agentKeyBox = await readSecretFromEnvOrFile("MG_AGENT_KEY_BOX", "MG_AGENT_KEY_BOX_FILE");
+  let agentKeyBox = await readSecretFromEnvOrFile("MG_AGENT_KEY_BOX", "MG_AGENT_KEY_BOX_FILE");
   const agentKey = trimEnv("MG_AGENT_KEY");
   if (!agentKeyBox && !agentKey) throw new Error("Missing agent auth. Set MG_AGENT_KEY_BOX or MG_AGENT_KEY.");
-  const keyBoxAgentMainUserId = parseAgentUserIdFromKeyBox(agentKeyBox);
+  let keyBoxAgentMainUserId = parseAgentUserIdFromKeyBox(agentKeyBox);
 
   const agentHomeDir = path.resolve(trimEnv("MG_AGENT_HOME_DIR") ?? "kthx-agents");
   const stateDir = path.resolve(trimEnv("MG_AGENT_STATE_DIR") ?? path.join(agentHomeDir, "state"));
@@ -681,7 +687,23 @@ const main = async (): Promise<void> => {
     return candidates;
   };
 
-  const buildHeaders = (botToken: string | null): Record<string, string> => ({
+  const refreshAgentKeyBox = async (reason: string): Promise<boolean> => {
+    const latestKeyBox = await readSecretFromEnvOrFile(
+      "MG_AGENT_KEY_BOX",
+      "MG_AGENT_KEY_BOX_FILE",
+    );
+    const normalized = typeof latestKeyBox === "string" ? latestKeyBox.trim() : "";
+    if (!normalized.length) return false;
+    if (normalized === (agentKeyBox ?? "")) return false;
+    agentKeyBox = normalized;
+    keyBoxAgentMainUserId = parseAgentUserIdFromKeyBox(agentKeyBox);
+    console.warn(
+      `[chat-bridge] Reloaded agent key box from local auth sources (reason=${reason}).`,
+    );
+    return true;
+  };
+
+  const buildHeaders = async (botToken: string | null): Promise<Record<string, string>> => ({
     "content-type": "application/json",
     ...(botToken ? { "x-bot-session-token": botToken } : {}),
     ...(agentKeyBox ? { "x-agent-key-box": agentKeyBox } : { "x-agent-key": agentKey! }),
@@ -721,12 +743,13 @@ const main = async (): Promise<void> => {
       attempts.push({ source: "none", token: null });
     }
     let lastError: BridgeCallError | null = null;
+    let attemptedAgentKeyRefresh = false;
 
     for (let i = 0; i < attempts.length; i++) {
       const candidate = attempts[i]!;
       const res = await fetch(`${baseHttpUrl}/api/agent/chat`, {
         method: "POST",
-        headers: buildHeaders(candidate.token),
+        headers: await buildHeaders(candidate.token),
         body: JSON.stringify(payload),
       });
       const body = (await res.json().catch(() => null)) as unknown;
@@ -767,13 +790,29 @@ const main = async (): Promise<void> => {
       }
       const isTerminalAgentAuthFailure =
         res.status === 401 && !isMissingToken && !isTokenMismatch;
+      const isAgentKeyAuthFailure =
+        res.status === 401 && isAgentKeyAuthFailureMessage(errMsg);
+      if (isAgentKeyAuthFailure && !attemptedAgentKeyRefresh) {
+        attemptedAgentKeyRefresh = true;
+        const refreshed = await refreshAgentKeyBox("bridge_agent_key_auth_failure");
+        if (refreshed) {
+          i -= 1;
+          continue;
+        }
+      }
       if (isTerminalAgentAuthFailure) {
+        const ownerAction = isAgentKeyAuthFailure
+          ? "Generate a new reset link at /settings#agent-key-reset, redeem it once, and update MG_AGENT_KEY_BOX_FILE (or MG_AGENT_KEY_BOX)."
+          : null;
+        if (ownerAction) {
+          console.warn(`[chat-bridge] ${ownerAction}`);
+        }
         if (disconnectOnAuthDriftFn) {
           await disconnectOnAuthDriftFn("chat_bridge_unauthorized");
         }
         if (haltReconnectsFn) {
           await haltReconnectsFn(
-            `bridge_unauthorized: ${errMsg} (tokenSource=${candidate.source})`,
+            `bridge_unauthorized: ${errMsg} (tokenSource=${candidate.source})${ownerAction ? ` ${ownerAction}` : ""}`,
           );
         }
         throw new BridgeCallError(`${errMsg} (tokenSource=${candidate.source})`, {
@@ -924,9 +963,8 @@ const main = async (): Promise<void> => {
     try {
       const response = await fetch(`${baseHttpUrl}/api/agent/chat`, {
         method: "POST",
-        headers: buildHeaders(null),
+        headers: await buildHeaders(null),
         body: JSON.stringify({ action: "agent_profile" }),
-        cache: "no-store",
       });
       const body = (await response.json().catch(() => null)) as unknown;
       if (!response.ok || !isRecord(body) || body.ok !== true || !isRecord(body.data)) {
@@ -1955,6 +1993,23 @@ const main = async (): Promise<void> => {
   tokenWatchTimer = setInterval(() => {
     void (async () => {
       if (stopping) return;
+      const refreshedAgentKeyBox = await refreshAgentKeyBox("token_watch_poll");
+      if (reconnectHaltReason && refreshedAgentKeyBox) {
+        const previousHaltReason = reconnectHaltReason;
+        reconnectHaltReason = null;
+        await appendBridgeEvent({
+          at: nowIso(),
+          type: "bridge_reconnect_unhalted",
+          reason: "agent_key_box_updated",
+          previousHaltReason,
+        });
+        await scheduleReconnect("agent_key_box_updated", {
+          baseDelayMs: tokenFastRetryMs,
+          bumpAttempt: false,
+          force: true,
+        });
+        return;
+      }
       const candidates = await resolveBotTokenCandidates();
       const latest = candidates.length > 0 ? candidates[0]!.token : null;
       if (latest === lastObservedTokenValue) return;
