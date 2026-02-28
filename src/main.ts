@@ -1536,6 +1536,9 @@ const main = async (): Promise<void> => {
             ? { "x-agent-key-box": agentKeyBox }
             : { "x-agent-key": agentKey ?? "" }),
           ...(botToken ? { "x-bot-session-token": botToken } : {}),
+          ...(supervisorConnectionId
+            ? { "x-realtime-connection-id": supervisorConnectionId }
+            : {}),
         },
         body: JSON.stringify(payload),
       });
@@ -1573,15 +1576,15 @@ const main = async (): Promise<void> => {
       const bridgeIssuesSummary = summarizeBridgeIssues(body);
       const isTokenAuthFailure =
         response.status === 401 && isBotTokenAuthFailureMessage(errorMessage);
-      if (isTokenAuthFailure && !attemptedTokenRecovery) {
-        attemptedTokenRecovery = true;
-        clearBotTokenState("chat_bridge_token_auth_failure");
-        await ctx.mintManager?.attemptMint("chat_bridge_token_auth_failure").catch(
-          () => undefined,
-        );
-        continue;
-      }
-      if (response.status === 401 && !isTokenAuthFailure) {
+      if (response.status === 401) {
+        if (isTokenAuthFailure && !attemptedTokenRecovery) {
+          attemptedTokenRecovery = true;
+          clearBotTokenState("chat_bridge_token_auth_failure");
+          await ctx.mintManager?.attemptMint("chat_bridge_token_auth_failure").catch(
+            () => undefined,
+          );
+          continue;
+        }
         bridgeAuthHaltReason = errorMessage;
         await memory
           .recordWrite({
@@ -1623,6 +1626,9 @@ const main = async (): Promise<void> => {
             ? { "x-agent-key-box": agentKeyBox }
             : { "x-agent-key": agentKey ?? "" }),
           ...(botToken ? { "x-bot-session-token": botToken } : {}),
+          ...(supervisorConnectionId
+            ? { "x-realtime-connection-id": supervisorConnectionId }
+            : {}),
         },
         body: JSON.stringify(payload),
       });
@@ -1655,15 +1661,15 @@ const main = async (): Promise<void> => {
           : `HTTP ${response.status}`;
       const isTokenAuthFailure =
         response.status === 401 && isBotTokenAuthFailureMessage(errorMessage);
-      if (isTokenAuthFailure && !attemptedTokenRecovery) {
-        attemptedTokenRecovery = true;
-        clearBotTokenState("chunk_upload_token_auth_failure");
-        await ctx.mintManager?.attemptMint("chunk_upload_token_auth_failure").catch(
-          () => undefined,
-        );
-        continue;
-      }
-      if (response.status === 401 && !isTokenAuthFailure) {
+      if (response.status === 401) {
+        if (isTokenAuthFailure && !attemptedTokenRecovery) {
+          attemptedTokenRecovery = true;
+          clearBotTokenState("chunk_upload_token_auth_failure");
+          await ctx.mintManager?.attemptMint("chunk_upload_token_auth_failure").catch(
+            () => undefined,
+          );
+          continue;
+        }
         bridgeAuthHaltReason = errorMessage;
         await memory
           .recordWrite({

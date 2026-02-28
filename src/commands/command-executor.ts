@@ -2415,6 +2415,16 @@ export class CommandExecutor {
       }
       throw new Error(`tRPC agent mutator is unavailable: agent.${String(name)}`);
     };
+    const optionalMutator = (name: keyof AgentRouterLike): AgentMutator | null => {
+      const candidate = router[String(name)];
+      const mutateFn = candidate?.mutate;
+      if (typeof mutateFn === "function") {
+        return {
+          mutate: (input: Record<string, unknown>) => mutateFn(input),
+        };
+      }
+      return null;
+    };
     return {
       createPost: requireMutator("createPost"),
       createStory: requireMutator("createStory"),
@@ -2426,7 +2436,13 @@ export class CommandExecutor {
       generate: requireMutator("generate"),
       uploadDataUri: requireMutator("uploadDataUri"),
       uploadRemote: requireMutator("uploadRemote"),
-      submitReview: requireMutator("submitReview"),
+      submitReview:
+        optionalMutator("submitReview") ??
+        {
+          mutate: async () => {
+            throw new Error("tRPC agent mutator is unavailable: agent.submitReview");
+          },
+        },
     };
   }
 

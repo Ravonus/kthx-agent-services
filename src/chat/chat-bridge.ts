@@ -204,6 +204,109 @@ const parseIsoDateMs = (value: unknown): number | null => {
   return Number.isFinite(ms) ? ms : null;
 };
 
+const trimTrailingSlashes = (value: string): string =>
+  value.replace(/\/+$/u, "");
+
+const resolveRealtimeInternalHttpUrl = (): string | null => {
+  const explicit =
+    trimEnv("REALTIME_INTERNAL_HTTP_URL") ??
+    trimEnv("MG_REALTIME_INTERNAL_HTTP_URL") ??
+    trimEnv("MG_REALTIME_HTTP_URL");
+  if (explicit) return trimTrailingSlashes(explicit);
+
+  const realtimeWsUrl = trimEnv("MG_REALTIME_WS_URL") ?? trimEnv("NEXT_PUBLIC_REALTIME_WS_URL");
+  if (!realtimeWsUrl) return null;
+  try {
+    const parsed = new URL(realtimeWsUrl);
+    parsed.protocol = parsed.protocol === "wss:" ? "https:" : "http:";
+    parsed.search = "";
+    parsed.hash = "";
+    parsed.pathname = parsed.pathname.replace(/\/trpc\/?$/u, "") || "/";
+    return trimTrailingSlashes(parsed.toString());
+  } catch {
+    return null;
+  }
+};
+
+const requestRealtimeDisconnect = async (input: {
+  userId: string | null;
+  connectionId: string | null;
+  reason: string;
+}): Promise<{ ok: boolean; disconnected: number | null; error: string | null }> => {
+  const baseUrl = resolveRealtimeInternalHttpUrl();
+  if (!baseUrl) {
+    return {
+      ok: false,
+      disconnected: null,
+      error: "realtime_internal_url_unconfigured",
+    };
+  }
+  const userId = typeof input.userId === "string" ? input.userId.trim() : "";
+  const connectionId =
+    typeof input.connectionId === "string" ? input.connectionId.trim() : "";
+  if (!userId.length && !connectionId.length) {
+    return {
+      ok: false,
+      disconnected: null,
+      error: "disconnect_target_missing",
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1_200);
+  try {
+    const headers = new Headers();
+    headers.set("content-type", "application/json");
+    const internalToken =
+      trimEnv("REALTIME_INTERNAL_TOKEN") ?? trimEnv("MG_REALTIME_INTERNAL_TOKEN");
+    if (internalToken && internalToken.length > 0) {
+      headers.set("x-mg-internal-token", internalToken);
+    }
+    const response = await fetch(`${baseUrl}/internal/disconnect`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        userId: userId.length > 0 ? userId : null,
+        connectionId: connectionId.length > 0 ? connectionId : null,
+        reason: input.reason,
+      }),
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    const body = (await response.json().catch(() => null)) as unknown;
+    const disconnected =
+      isRecord(body) &&
+      typeof body.disconnected === "number" &&
+      Number.isFinite(body.disconnected)
+        ? Math.max(0, Math.floor(body.disconnected))
+        : null;
+    if (response.ok) {
+      return {
+        ok: true,
+        disconnected,
+        error: null,
+      };
+    }
+    const error =
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : `disconnect_http_${response.status}`;
+    return {
+      ok: false,
+      disconnected,
+      error,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      disconnected: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 const resolveHttpBaseUrl = (): string => {
   const explicit = trimEnv("MG_CHAT_HTTP_BASE_URL") ?? trimEnv("MG_BASE_URL") ?? trimEnv("MG_AGENT_HTTP_BASE_URL") ?? trimEnv("BETTER_AUTH_BASE_URL");
   if (explicit) return explicit.replace(/\/+$/u, "");
@@ -494,13 +597,6 @@ const main = async (): Promise<void> => {
     100,
     Math.min(5_000, parseIntEnv("MG_CHAT_AGENT_TOKEN_FAST_RETRY_MS", 250)),
   );
-  const missingTokenRetryMs = Math.max(
-    2_000,
-    parseIntEnv(
-      "MG_CHAT_AGENT_MISSING_TOKEN_RETRY_MS",
-      Math.max(5_000, tokenPollMs * 5),
-    ),
-  );
   const gatewaySessionReuseSkewMs = Math.max(
     5_000,
     parseIntEnv("MG_CHAT_AGENT_GATEWAY_SESSION_REUSE_SKEW_MS", 30_000),
@@ -508,6 +604,10 @@ const main = async (): Promise<void> => {
   const rateLimitedRetryFallbackMs = Math.max(
     5_000,
     parseIntEnv("MG_CHAT_AGENT_RATE_LIMIT_RETRY_FALLBACK_MS", 15_000),
+  );
+  const agentProfileResolveCooldownMs = Math.max(
+    2_000,
+    parseIntEnv("MG_CHAT_AGENT_PROFILE_RESOLVE_COOLDOWN_MS", 15_000),
   );
   const idleEnabled = parseBooleanEnv("MG_CHAT_AGENT_IDLE_SUBSCRIPTIONS_ENABLED", true);
   const idleTimeoutMs = Math.max(30_000, parseIntEnv("MG_CHAT_AGENT_IDLE_TIMEOUT_MS", 300_000));
@@ -534,6 +634,10 @@ const main = async (): Promise<void> => {
   let bridgeRateLimitedUntilMs = 0;
   let bridgeRateLimitedReason: string | null = null;
   let haltReconnectsFn: ((reason: string) => Promise<void>) | null = null;
+  let disconnectOnAuthDriftFn: ((reason: string) => Promise<void>) | null = null;
+  const realtimeConnectionId = trimEnv("MG_REALTIME_CONNECTION_ID") ?? null;
+  let bridgeAgentMainUserId: string | null = null;
+  let lastAgentProfileResolveAtMs = 0;
 
   const resolveBotTokenCandidates = async (): Promise<Array<{ source: string; token: string | null }>> => {
     const candidates: Array<{ source: string; token: string }> = [];
@@ -569,6 +673,9 @@ const main = async (): Promise<void> => {
     "content-type": "application/json",
     ...(botToken ? { "x-bot-session-token": botToken } : {}),
     ...(agentKeyBox ? { "x-agent-key-box": agentKeyBox } : { "x-agent-key": agentKey! }),
+    ...(realtimeConnectionId
+      ? { "x-realtime-connection-id": realtimeConnectionId }
+      : {}),
   });
 
   const callBridge = async (payload: Record<string, unknown>): Promise<unknown> => {
@@ -587,6 +694,9 @@ const main = async (): Promise<void> => {
     const candidates = await resolveBotTokenCandidates();
     const requiresBotToken = payloadRequiresBotToken(payload);
     if (requiresBotToken && candidates.length === 0) {
+      if (disconnectOnAuthDriftFn) {
+        await disconnectOnAuthDriftFn("chat_bridge_missing_bot_token");
+      }
       throw new BridgeCallError(
         "Bot token missing. Provide x-bot-session-token. (tokenSource=none)",
         { status: 401, tokenSource: "none" },
@@ -635,9 +745,20 @@ const main = async (): Promise<void> => {
       }
       const isMissingToken = isMissingBotTokenError(errMsg);
       const isTokenMismatch = isBotTokenInvalidMessage(errMsg);
+      if (res.status === 401 && (isMissingToken || isTokenMismatch)) {
+        const authDriftReason = isMissingToken
+          ? "chat_bridge_missing_bot_token"
+          : "chat_bridge_invalid_bot_token";
+        if (disconnectOnAuthDriftFn) {
+          await disconnectOnAuthDriftFn(authDriftReason);
+        }
+      }
       const isTerminalAgentAuthFailure =
         res.status === 401 && !isMissingToken && !isTokenMismatch;
       if (isTerminalAgentAuthFailure) {
+        if (disconnectOnAuthDriftFn) {
+          await disconnectOnAuthDriftFn("chat_bridge_unauthorized");
+        }
         if (haltReconnectsFn) {
           await haltReconnectsFn(
             `bridge_unauthorized: ${errMsg} (tokenSource=${candidate.source})`,
@@ -663,7 +784,12 @@ const main = async (): Promise<void> => {
           preferredTokenSource = null;
         }
       }
-      if (isTokenMismatch && i < attempts.length - 1) continue;
+      if (res.status === 401 && i < attempts.length - 1) {
+        if (isTokenMismatch || isMissingToken) continue;
+      }
+      if (res.status === 401) {
+        throw lastError;
+      }
       throw lastError;
     }
     throw lastError ?? new Error("unknown_bridge_error");
@@ -774,6 +900,65 @@ const main = async (): Promise<void> => {
       data: status,
     });
   };
+
+  const resolveBridgeAgentMainUserId = async (): Promise<string | null> => {
+    if (bridgeAgentMainUserId) return bridgeAgentMainUserId;
+    const nowMs = Date.now();
+    if (nowMs - lastAgentProfileResolveAtMs < agentProfileResolveCooldownMs) {
+      return null;
+    }
+    lastAgentProfileResolveAtMs = nowMs;
+
+    try {
+      const response = await fetch(`${baseHttpUrl}/api/agent/chat`, {
+        method: "POST",
+        headers: buildHeaders(null),
+        body: JSON.stringify({ action: "agent_profile" }),
+        cache: "no-store",
+      });
+      const body = (await response.json().catch(() => null)) as unknown;
+      if (!response.ok || !isRecord(body) || body.ok !== true || !isRecord(body.data)) {
+        return null;
+      }
+      const data = body.data;
+      const agent = isRecord(data.agent) ? data.agent : null;
+      const mainUserId =
+        typeof agent?.mainUserId === "string" ? agent.mainUserId.trim() : "";
+      if (!mainUserId.length) return null;
+      bridgeAgentMainUserId = mainUserId;
+      return mainUserId;
+    } catch {
+      return null;
+    }
+  };
+
+  const disconnectRealtimeOnAuthDrift = async (reason: string): Promise<void> => {
+    const resolvedUserId =
+      viewerMainUserId?.trim() ??
+      bridgeAgentMainUserId?.trim() ??
+      (await resolveBridgeAgentMainUserId())?.trim() ??
+      "";
+    const connectionId = realtimeConnectionId?.trim() ?? "";
+    if (!resolvedUserId.length && !connectionId.length) {
+      return;
+    }
+    const result = await requestRealtimeDisconnect({
+      userId: resolvedUserId.length > 0 ? resolvedUserId : null,
+      connectionId: connectionId.length > 0 ? connectionId : null,
+      reason,
+    });
+    await appendBridgeEvent({
+      at: nowIso(),
+      type: "realtime_disconnect_requested",
+      reason,
+      userId: resolvedUserId.length > 0 ? resolvedUserId : null,
+      connectionId: connectionId.length > 0 ? connectionId : null,
+      ok: result.ok,
+      disconnected: result.disconnected,
+      ...(result.error ? { error: result.error } : {}),
+    });
+  };
+  disconnectOnAuthDriftFn = disconnectRealtimeOnAuthDrift;
 
   // WebSocket state
   let activeSocket: WebSocket | null = null;
@@ -1091,6 +1276,21 @@ const main = async (): Promise<void> => {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+    if (pingTimer) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+    }
+    const socket = activeSocket;
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      try {
+        socket.close(4004, "bridge_unauthorized");
+      } catch {
+        // ignore
+      }
+    }
+    if (activeSocket === socket) {
+      activeSocket = null;
+    }
     const lowerReason = reason.toLowerCase();
     const haltState =
       lowerReason.includes("unauthorized") ||
@@ -1103,6 +1303,9 @@ const main = async (): Promise<void> => {
       type: "bridge_reconnect_halted",
       reason,
     });
+    if (haltState === "unauthorized") {
+      await disconnectRealtimeOnAuthDrift("chat_bridge_reconnect_halted_unauthorized");
+    }
     await updateStatus({
       state: haltState,
       connected: false,
@@ -1221,7 +1424,10 @@ const main = async (): Promise<void> => {
         session = await callBridge({ action: "gateway_session" }) as Record<string, unknown>;
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
-        if (isBridgeCallError(e) && e.status === 401) {
+        const isTokenAuthDrift =
+          isMissingBotTokenError(message) || isBotTokenInvalidMessage(message);
+        if (isBridgeCallError(e) && e.status === 401 && !isTokenAuthDrift) {
+          await disconnectRealtimeOnAuthDrift("chat_bridge_gateway_session_unauthorized");
           await appendBridgeEvent({
             at: nowIso(),
             type: "gateway_session_unauthorized",
@@ -1251,23 +1457,19 @@ const main = async (): Promise<void> => {
           });
           return;
         }
-        const missingToken = isMissingBotTokenError(message);
-        if (missingToken) {
+        if (isBridgeCallError(e) && e.status === 401 && isTokenAuthDrift) {
+          const reason = isMissingBotTokenError(message)
+            ? "chat_bridge_missing_bot_token"
+            : "chat_bridge_invalid_bot_token";
+          await disconnectRealtimeOnAuthDrift(reason);
           await appendBridgeEvent({
             at: nowIso(),
-            type: "gateway_session_waiting_for_bot_token",
-            retryMs: missingTokenRetryMs,
+            type: "gateway_session_auth_drift",
+            reason,
             message,
           });
-          await updateStatus({
-            state: "waiting_for_bot_token",
-            connected: false,
-            lastError: null,
-            subscriptionMode: connectMode,
-            lastActivityAt: getLastActivityAtIso(),
-          });
-          await scheduleReconnect("waiting_for_bot_token", {
-            baseDelayMs: missingTokenRetryMs,
+          await scheduleReconnect(`gateway_session_auth_drift: ${message}`, {
+            baseDelayMs: tokenFastRetryMs,
             bumpAttempt: false,
           });
           return;
@@ -1283,7 +1485,10 @@ const main = async (): Promise<void> => {
       });
     }
 
-    if (!isRecord(session) || session.enabled !== true) { await scheduleReconnect("chat_gateway_disabled"); return; }
+    if (!isRecord(session) || session.enabled !== true) {
+      await haltReconnects("chat_gateway_disabled");
+      return;
+    }
     const wsUrl = typeof session.wsUrl === "string" ? session.wsUrl : null;
     const authToken = typeof session.authToken === "string" ? session.authToken : null;
     if (!wsUrl || !authToken) {
