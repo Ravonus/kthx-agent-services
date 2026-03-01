@@ -113,6 +113,32 @@ const readPersistedAgentKeyBoxOwnerPid = (stateDir: string): number | null => {
   }
 };
 
+const readPersistedAgentKeyBoxForOwner = (
+  stateDir: string,
+  ownerSupervisorPid: number,
+): string | null => {
+  const filePath = persistedAgentKeyBoxPath(stateDir);
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) return null;
+    const persistedOwnerPid = parsed.ownerSupervisorPid;
+    if (
+      typeof persistedOwnerPid !== "number" ||
+      !Number.isInteger(persistedOwnerPid) ||
+      persistedOwnerPid !== ownerSupervisorPid
+    ) {
+      return null;
+    }
+    const keyBox =
+      typeof parsed.agentKeyBox === "string" ? parsed.agentKeyBox.trim() : "";
+    return keyBox.length > 0 ? keyBox : null;
+  } catch {
+    return null;
+  }
+};
+
 const clearPersistedAgentKeyBoxFile = (stateDir: string, reason: string): void => {
   const filePath = persistedAgentKeyBoxPath(stateDir);
   try {
@@ -513,6 +539,25 @@ const main = async (): Promise<void> => {
     // Single writer for bot-session token file to avoid runtime/supervisor races.
     if (!env.MG_AGENT_BOT_SESSION_FILE_WRITER?.trim()) env.MG_AGENT_BOT_SESSION_FILE_WRITER = "supervisor";
 
+    if (!env.MG_AGENT_KEY_BOX?.trim()) {
+      const persistedKeyBox = readPersistedAgentKeyBoxForOwner(stateDir, process.pid);
+      if (persistedKeyBox) {
+        env.MG_AGENT_KEY_BOX = persistedKeyBox;
+        console.log("[supervisor] Loaded MG_AGENT_KEY_BOX from persisted state for runtime bootstrap");
+      }
+    }
+
+    const hasInviteToken = Boolean(env.MG_OWNER_INVITE_TOKEN?.trim());
+    const hasKeyAuthSource = Boolean(env.MG_AGENT_KEY_BOX?.trim() || env.MG_AGENT_KEY?.trim());
+    if (hasInviteToken && hasKeyAuthSource) {
+      delete env.MG_OWNER_INVITE_TOKEN;
+      delete env.MG_OWNER_HANDLE;
+      delete env.MG_OWNER_NAME;
+      console.log(
+        "[supervisor] Ignoring MG_OWNER_INVITE_TOKEN because key auth is already available.",
+      );
+    }
+
     const forward = parsed.stripBotTokenEnv ? false : parsed.keepBotTokenEnv;
     if (!forward) { delete env.MG_BOT_SESSION_TOKEN; delete env.MG_BOT_SESSION_EXPIRES_AT; }
 
@@ -528,11 +573,11 @@ const main = async (): Promise<void> => {
       }
     }
 
-    if (!env.MG_AGENT_KEY_BOX?.trim()) {
+    if (!env.MG_AGENT_KEY_BOX?.trim() && !env.MG_AGENT_KEY?.trim()) {
       // Allow startup without MG_AGENT_KEY_BOX when MG_OWNER_INVITE_TOKEN is set.
       // The runtime will handle first-time registration and obtain the key itself.
       if (!env.MG_OWNER_INVITE_TOKEN?.trim()) {
-        return { ok: false, error: "[supervisor] missing MG_AGENT_KEY_BOX (set MG_OWNER_INVITE_TOKEN for first-time registration)" };
+        return { ok: false, error: "[supervisor] missing agent auth (set MG_AGENT_KEY_BOX / MG_AGENT_KEY, or MG_OWNER_INVITE_TOKEN for first-time registration)" };
       }
       console.log("[supervisor] MG_AGENT_KEY_BOX not set — runtime will attempt first-time registration via MG_OWNER_INVITE_TOKEN");
     }

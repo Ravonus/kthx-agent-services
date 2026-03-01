@@ -306,6 +306,7 @@ const main = async (): Promise<number> => {
     persistedKeyBoxJson.agentKeyBox.trim().length > 0
       ? persistedKeyBoxJson.agentKeyBox.trim()
       : "";
+  let keyBoxFileLoaded = false;
 
   if (keyBoxFileEnv) {
     const keyBoxFilePath = path.resolve(keyBoxFileEnv);
@@ -319,6 +320,7 @@ const main = async (): Promise<number> => {
         `Configured but empty/unreadable: ${keyBoxFilePath}`,
       );
     } else {
+      keyBoxFileLoaded = true;
       addResult(
         results,
         "ok",
@@ -329,9 +331,26 @@ const main = async (): Promise<number> => {
   }
 
   const authSources: string[] = [];
+  const hasKeyAuthSource = Boolean(
+    keyBoxEnv || agentKeyEnv || persistedKeyBox || keyBoxFileLoaded,
+  );
   if (keyBoxEnv) authSources.push("env:MG_AGENT_KEY_BOX");
   if (agentKeyEnv) authSources.push("env:MG_AGENT_KEY");
-  if (ownerInviteToken) authSources.push("env:MG_OWNER_INVITE_TOKEN");
+  if (ownerInviteToken) {
+    authSources.push(
+      hasKeyAuthSource
+        ? "env:MG_OWNER_INVITE_TOKEN(ignored)"
+        : "env:MG_OWNER_INVITE_TOKEN",
+    );
+    if (hasKeyAuthSource) {
+      addResult(
+        results,
+        "warn",
+        "MG_OWNER_INVITE_TOKEN",
+        "Invite token is present but key auth is already available; runtime ignores invite token after successful registration.",
+      );
+    }
+  }
   if (persistedKeyBox) authSources.push(`file:${persistedKeyBoxPath}`);
   if (authSources.length > 0) {
     addResult(

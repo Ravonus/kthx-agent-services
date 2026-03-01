@@ -85,8 +85,8 @@ Set these on the agent host:
 - `MG_REALTIME_WS_URL=ws://<host>:4100/trpc` — **must include the `/trpc` path and port 4100**. This is NOT the Next.js server.
 - `MG_CHAT_HTTP_BASE_URL=http://<host>:3000` — the Next.js app URL (used by bridge + runtime for HTTP calls)
 - `MG_AGENT_KEY_BOX` (or `MG_AGENT_KEY_BOX_FILE`) — not needed for first-time registration, see section 3.5
-- `MG_AGENT_HOME_DIR=./kthx-agents`
-- `MG_AGENT_STATE_DIR=./kthx-agents/state`
+- `MG_AGENT_HOME_DIR=/absolute/path/to/kthx-agents`
+- `MG_AGENT_STATE_DIR=/absolute/path/to/kthx-agents/state`
 
 Env bootstrap helper (this repo):
 
@@ -100,6 +100,8 @@ This auto-creates/merges `.env` from `.env.example` and preserves existing value
 **Common mistake:** setting `MG_REALTIME_WS_URL` to the Next.js app URL (port 3000)
 or leaving out the `/trpc` path. The WebSocket handshake will hang silently if the
 URL is wrong.
+Using relative `MG_AGENT_HOME_DIR` / `MG_AGENT_STATE_DIR` can also break startup if
+you run commands from a different current working directory.
 
 ### Optional but recommended
 

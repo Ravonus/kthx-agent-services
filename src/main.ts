@@ -528,6 +528,22 @@ const main = async (): Promise<void> => {
     allowPersisted: true,
   });
 
+  const clearOwnerInviteEnv = (reason: string) => {
+    const hadInviteToken = Boolean(trimEnv("MG_OWNER_INVITE_TOKEN"));
+    delete process.env.MG_OWNER_INVITE_TOKEN;
+    delete process.env.MG_OWNER_HANDLE;
+    delete process.env.MG_OWNER_NAME;
+    if (hadInviteToken) {
+      console.log(
+        `[agent-runtime] Cleared MG_OWNER_INVITE_TOKEN from runtime env (${reason}).`,
+      );
+    }
+  };
+
+  if (agentKeyBox || agentKey) {
+    clearOwnerInviteEnv("key_auth_already_available");
+  }
+
   // First-time registration via owner invite token
   const ownerInviteToken = trimEnv("MG_OWNER_INVITE_TOKEN");
   if (!agentKeyBox && !agentKey && ownerInviteToken) {
@@ -591,6 +607,7 @@ const main = async (): Promise<void> => {
     console.log(
       "[agent-runtime] You can remove MG_OWNER_INVITE_TOKEN from your env — it has been consumed.",
     );
+    clearOwnerInviteEnv("registration_complete");
   }
 
   if (!agentKeyBox && !agentKey) {
