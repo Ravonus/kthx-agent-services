@@ -13,7 +13,7 @@ import type {
   RetentionCategory,
 } from "~/types/memory.js";
 import { isRecord } from "~/lib/guards.js";
-import { toShortLine } from "~/lib/time.js";
+import { toShortLine } from "~/lib/text.js";
 
 // ---------------------------------------------------------------------------
 // extractKeysFromPayload

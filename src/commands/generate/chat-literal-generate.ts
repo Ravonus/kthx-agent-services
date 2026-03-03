@@ -1,0 +1,932 @@
+/**
+ * Execute a chat-initiated literal media generation request.
+ *
+ * Handles avatar updates, banner updates, and generic image/GIF generation
+ * with real-time stream preview updates delivered back to the chat.
+ */
+
+import type {
+  Command,
+  CommandOutcome,
+  CommandLifecycleCheckpointStage,
+  GeneratedAssetType,
+  GeneratedCustomAssetSaveResult,
+  GeneratedCustomAssetSaveIntent,
+  PersonaReferenceResolution,
+  MediaGenerationProgress,
+  MediaGenerationDeferralDecision,
+} from "../types.js";
+import { RequeueCommandError } from "../types.js";
+import {
+  asNonEmptyString,
+  truncateText,
+  normalizeAgentProvenanceValue,
+  normalizeProfileCropSpec,
+  buildProfileCropSpec,
+  buildProfileCropPromptHint,
+} from "../helpers.js";
+import { isRecord } from "../../lib/guards.js";
+import { nowIso } from "../../lib/text.js";
+import { resolveChatTargetFromPayload } from "../../chat/chat-context.js";
+import {
+  REQUIRED_PERSONA_REFERENCE_FRAME_COUNT,
+  IMAGE_GENERATION_SETUP_HINT,
+} from "../constants.js";
+import {
+  createChatLiteralPreviewState,
+  buildStreamPreviewMetadata,
+  buildStreamPreviewDeltaMetadata,
+  MAX_FINALIZE_STREAM_FRAMES,
+} from "./chat-literal-preview-state.js";
+
+// ---------------------------------------------------------------------------
+// Dependency types
+// ---------------------------------------------------------------------------
+
+type MemoryWriter = { recordWrite(entry: unknown): Promise<void> };
+type ChatBridgeFn = (input: unknown) => Promise<unknown>;
+type RecordCheckpointFn = (input: {
+  command: Command;
+  stage: CommandLifecycleCheckpointStage;
+  status?: "ok" | "failed";
+  message?: string | null;
+  metadata?: Record<string, unknown>;
+}) => Promise<void>;
+
+export type ChatLiteralGenerateDeps = {
+  callAgentChatBridge: ChatBridgeFn | null;
+  memory: MemoryWriter;
+  resolveCommandSourceDirectiveId: (input: {
+    command: Command;
+    payload: Record<string, unknown>;
+  }) => string | null;
+  resolveCommandSourceDirectiveActionNonce: (input: {
+    command: Command;
+    payload: Record<string, unknown>;
+  }) => string | null;
+  resolveGeneratedAssetType: (value: unknown) => string;
+  collectMediaReferenceInputs: (
+    payload: Record<string, unknown>,
+  ) => string[];
+  resolvePersonaFrameReferences: (input: {
+    payload: Record<string, unknown>;
+    command: Command;
+    fallbackReferenceInputs: string[];
+  }) => Promise<PersonaReferenceResolution>;
+  resolveGeneratedCustomAssetSaveIntent: (
+    payload: Record<string, unknown>,
+    prompt: string,
+  ) => GeneratedCustomAssetSaveIntent | null;
+  resolveChatProcessingClientMessageId: (command: Command) => string | null;
+  generateAndUploadMediaFromPrompt: (
+    prompt: string,
+    opts: Record<string, unknown>,
+  ) => Promise<Record<string, unknown>>;
+  resolveGeneratedAttachmentMimeType: (input: {
+    generatedAssetType: GeneratedAssetType;
+    mediaUrl: string;
+    mediaType?: "image" | "video";
+  }) => string;
+  recordCommandLifecycleCheckpoint: RecordCheckpointFn;
+  saveGeneratedCustomAsset: (input: {
+    command: Command;
+    payload: Record<string, unknown>;
+    intent: GeneratedCustomAssetSaveIntent;
+    sourcePrompt: string;
+    mediaUrl: string;
+    mimeType: string;
+    chatTarget: { conversationId?: string; channelId?: string };
+  }) => Promise<GeneratedCustomAssetSaveResult | null>;
+  updateAvatar: (
+    input: Record<string, unknown> & { target: string; imageUrl: string },
+  ) => Promise<unknown>;
+  updateBanner: (
+    input: Record<string, unknown> & { target: string; bannerUrl: string },
+  ) => Promise<unknown>;
+  classifyMediaGenerationDeferral: (input: {
+    error: unknown;
+    hasPrompt: boolean;
+  }) => MediaGenerationDeferralDecision;
+  isStreamPartArtifactReference: (
+    value: string | null | undefined,
+  ) => boolean;
+  failedOutcome: (
+    command: Command,
+    message: string,
+    code?: string,
+  ) => CommandOutcome;
+  successOutcome: (command: Command, data: unknown) => CommandOutcome;
+};
+
+// ---------------------------------------------------------------------------
+// Profile update helper (avatar / banner merged)
+// ---------------------------------------------------------------------------
+
+async function applyProfileUpdateResult(input: {
+  kind: "avatar" | "banner";
+  target: string;
+  media: Record<string, unknown>;
+  profileCropSpec: ReturnType<typeof normalizeProfileCropSpec>;
+  chatDeliveryUrl: string;
+  mimeType: string;
+  sizeBytes: number;
+  summary: string;
+  previewClientMessageId: string;
+  provenance: string | null;
+  sourceDirectiveId: string | null;
+  sourceDirectiveActionNonce: string | null;
+  previewState: ReturnType<typeof createChatLiteralPreviewState>;
+  deps: Pick<ChatLiteralGenerateDeps, "updateAvatar" | "updateBanner" | "memory" | "successOutcome">;
+  command: Command;
+  chatTarget: { conversationId?: string; channelId?: string };
+}): Promise<CommandOutcome> {
+  const {
+    kind, target, media, profileCropSpec, chatDeliveryUrl,
+    mimeType, sizeBytes, summary, previewClientMessageId,
+    provenance, sourceDirectiveId, sourceDirectiveActionNonce,
+    previewState, deps, command, chatTarget,
+  } = input;
+
+  const cropSpec =
+    profileCropSpec?.target === kind
+      ? profileCropSpec
+      : normalizeProfileCropSpec(buildProfileCropSpec(kind));
+
+  const mutationInput = {
+    target,
+    ...(kind === "avatar"
+      ? { imageUrl: media.mediaUrl as string }
+      : { bannerUrl: media.mediaUrl as string }),
+    ...(media.mediaOriginalUrl ? { originalUrl: media.mediaOriginalUrl } : {}),
+    ...(media.mediaOptimizedUrl ? { optimizedUrl: media.mediaOptimizedUrl } : {}),
+    ...(media.mediaContentHash ? { contentHash: media.mediaContentHash } : {}),
+    ...(media.mediaIpfsCid ? { ipfsCid: media.mediaIpfsCid } : {}),
+    ...(typeof media.mediaSizeBytes === "number"
+      ? { sizeBytes: media.mediaSizeBytes }
+      : {}),
+    ...(provenance ? { provenance } : {}),
+    ...(sourceDirectiveId ? { sourceDirectiveId } : {}),
+    ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
+  };
+
+  const updateResult =
+    kind === "avatar"
+      ? await deps.updateAvatar(mutationInput as Record<string, unknown> & { target: string; imageUrl: string })
+      : await deps.updateBanner(mutationInput as Record<string, unknown> & { target: string; bannerUrl: string });
+
+  const resultData = isRecord(updateResult) ? updateResult : null;
+  const user = isRecord(resultData?.user) ? resultData.user : null;
+  const handle = asNonEmptyString(user?.handle);
+  const userId = asNonEmptyString(user?.id);
+  const profileHref =
+    target === "owner" && handle
+      ? `/u/${handle.replace(/^@+/u, "")}?edit=${kind}&crop=1`
+      : null;
+
+  const streamPreviewForSuccess = buildStreamPreviewMetadata({
+    frames: previewState.snapshotStreamFrames(),
+    maxFrames: MAX_FINALIZE_STREAM_FRAMES,
+    finalPreviewUrl: chatDeliveryUrl,
+  });
+  const streamPreviewDeltaForSuccess = buildStreamPreviewDeltaMetadata({
+    frames: previewState.snapshotStreamFrames(),
+    deltaBaseCount: previewState.previewStreamFrameCursor,
+    maxDeltaFrames: MAX_FINALIZE_STREAM_FRAMES,
+    finalPreviewUrl: chatDeliveryUrl,
+  });
+
+  const isOwner = target === "owner";
+  const kindLabel = kind === "avatar" ? "avatar" : "banner";
+  const completionText =
+    kind === "avatar"
+      ? isOwner
+        ? "Done. Here is your new avatar. If framing looks off, tap Crop avatar and keep your face in the center safe zone."
+        : "Done. Here is my new avatar. If framing looks off, tap Crop avatar and keep the face in the center safe zone."
+      : isOwner
+        ? "Done. Here is your new banner. If framing looks off, tap Crop banner and keep key details in the center safe zone."
+        : "Done. Here is my new banner. If framing looks off, keep key details in the center safe zone.";
+
+  const previewType = kind === "avatar" ? "persona" : "banner";
+  const chatDeliveryHandled = await previewState.sendOrEditPreviewMessage({
+    kind: "success",
+    body: completionText,
+    attachments: [
+      {
+        url: chatDeliveryUrl,
+        mimeType,
+        sizeBytes,
+        metadata: {
+          source: `runtime.${kindLabel}`,
+          generatedAssetType: previewType,
+          ...(kind === "avatar" ? { personaType: "persona" } : {}),
+          cropZones: cropSpec,
+        },
+      },
+    ],
+    metadata: {
+      automated: true,
+      sourceContext: "CHAT",
+      actionPreview: {
+        type: previewType,
+        status: "success",
+        title:
+          kind === "avatar"
+            ? "Persona avatar updated"
+            : "Profile banner updated",
+        summary,
+        streamSessionId: previewClientMessageId,
+        previewUrl: chatDeliveryUrl,
+        href: chatDeliveryUrl,
+        hrefLabel: `Open ${kindLabel} image`,
+        ...(streamPreviewForSuccess ?? {}),
+        ...(streamPreviewDeltaForSuccess?.metadata ?? {}),
+        cropHint: cropSpec.guidance,
+        cropZones: cropSpec,
+        ...(profileHref
+          ? {
+              secondaryHref: profileHref,
+              secondaryHrefLabel: `Crop ${kindLabel}`,
+            }
+          : {}),
+        [`${kindLabel}Target`]: target,
+        ...(handle ? { handle } : {}),
+        ...(userId ? { userId } : {}),
+      },
+    },
+  });
+
+  if (!chatDeliveryHandled) {
+    const editError = previewState.previewLastEditError ?? "preview_delivery_unresolved";
+    throw new Error(
+      `chat_preview_finalize_failed:chat_${kindLabel}_update:${editError}`,
+    );
+  }
+
+  await deps.memory.recordWrite({
+    type: `chat_${kindLabel}_updated`,
+    at: nowIso(),
+    commandId: command.id,
+    [`${kindLabel}Target`]: target,
+    mediaUrl: media.mediaUrl,
+    prompt: summary,
+    ...(kind === "avatar" ? { personaType: "persona" } : {}),
+    cropZones: cropSpec,
+    userId,
+    handle,
+    targetConversationId: chatTarget.conversationId ?? null,
+    targetChannelId: chatTarget.channelId ?? null,
+  });
+
+  return deps.successOutcome(command, {
+    mode: `chat_${kindLabel}_update`,
+    [`${kindLabel}Target`]: target,
+    mediaUrl: media.mediaUrl,
+    prompt: summary,
+    updateResult,
+    chatDeliveryHandled,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// executeChatLiteralGenerate
+// ---------------------------------------------------------------------------
+
+export async function executeChatLiteralGenerate(
+  deps: ChatLiteralGenerateDeps,
+  command: Command,
+  payload: Record<string, unknown>,
+): Promise<CommandOutcome> {
+  // -- S1: Input validation & payload parsing --------------------------------
+
+  const chatTarget = resolveChatTargetFromPayload(payload);
+  if (!chatTarget) {
+    return deps.failedOutcome(
+      command,
+      "Missing chat context for literal generate request.",
+      "chat_context_missing",
+    );
+  }
+  if (!deps.callAgentChatBridge) {
+    return deps.failedOutcome(
+      command,
+      "Chat bridge unavailable for literal generate request.",
+      "chat_bridge_unavailable",
+    );
+  }
+
+  const requestedAction =
+    asNonEmptyString(payload.requestedAction)?.toLowerCase() ?? "";
+  const avatarRequest =
+    payload.avatarRequest === true || requestedAction === "avatar";
+  const bannerRequest =
+    !avatarRequest &&
+    (payload.bannerRequest === true || requestedAction === "banner");
+  const avatarTargetRaw =
+    asNonEmptyString(payload.avatarTarget)?.toLowerCase();
+  const avatarTarget = avatarTargetRaw === "owner" ? "owner" : "agent";
+  const bannerTargetRaw =
+    asNonEmptyString(payload.bannerTarget)?.toLowerCase();
+  const bannerTarget = bannerTargetRaw === "owner" ? "owner" : "agent";
+  const defaultAvatarPrompt =
+    avatarTarget === "owner"
+      ? "Create a profile avatar for my account on this social app."
+      : "Create a profile avatar for your account on this social app.";
+  const defaultBannerPrompt =
+    bannerTarget === "owner"
+      ? "Create a profile banner for my account on this social app."
+      : "Create a profile banner for your account on this social app.";
+  const basePrompt =
+    asNonEmptyString(payload.mediaPrompt) ??
+    asNonEmptyString(payload.imagePrompt) ??
+    asNonEmptyString(payload.prompt) ??
+    asNonEmptyString(payload.topic) ??
+    asNonEmptyString(payload.requestText) ??
+    (avatarRequest
+      ? defaultAvatarPrompt
+      : bannerRequest
+        ? defaultBannerPrompt
+        : null);
+  if (!basePrompt) {
+    return deps.failedOutcome(
+      command,
+      "No prompt provided for literal generate request.",
+      "missing_prompt",
+    );
+  }
+  const recentGeneratedAsset = isRecord(payload.recentGeneratedAsset)
+    ? payload.recentGeneratedAsset
+    : null;
+  const recentGeneratedAssetType =
+    asNonEmptyString(recentGeneratedAsset?.type)?.toLowerCase() ?? "";
+  const recentGeneratedAssetSummary = asNonEmptyString(
+    recentGeneratedAsset?.summary,
+  );
+  const recentGeneratedAssetHref = asNonEmptyString(
+    recentGeneratedAsset?.href,
+  );
+  const shouldReusePersonaReference =
+    avatarRequest &&
+    avatarTarget === "agent" &&
+    (recentGeneratedAssetType === "persona" ||
+      recentGeneratedAssetType === "avatar");
+  const profileCropSpec = avatarRequest
+    ? normalizeProfileCropSpec(buildProfileCropSpec("avatar"))
+    : bannerRequest
+      ? normalizeProfileCropSpec(buildProfileCropSpec("banner"))
+      : null;
+  const promptBase = shouldReusePersonaReference
+    ? [
+        basePrompt,
+        "Maintain visual persona continuity with the previous avatar.",
+        recentGeneratedAssetSummary
+          ? `Previous persona summary: ${recentGeneratedAssetSummary}`
+          : null,
+        recentGeneratedAssetHref
+          ? `Previous persona reference URL: ${recentGeneratedAssetHref}`
+          : null,
+      ]
+        .filter((entry): entry is string => Boolean(entry))
+        .join("\n")
+    : basePrompt;
+  const prompt = profileCropSpec
+    ? [promptBase, buildProfileCropPromptHint(profileCropSpec)]
+        .filter((entry) => entry.trim().length > 0)
+        .join("\n\n")
+    : promptBase;
+  const provenance = normalizeAgentProvenanceValue(payload.provenance);
+  const sourceDirectiveId = deps.resolveCommandSourceDirectiveId({
+    command,
+    payload,
+  });
+  const sourceDirectiveActionNonce =
+    deps.resolveCommandSourceDirectiveActionNonce({ command, payload });
+
+  // -- S2: Persona reference resolution & asset intent ----------------------
+
+  const generatedAssetType = deps.resolveGeneratedAssetType(
+    payload.generatedAssetType,
+  );
+  const fallbackReferenceInputs =
+    deps.collectMediaReferenceInputs(payload);
+  const personaReferences = await deps.resolvePersonaFrameReferences({
+    payload,
+    command,
+    fallbackReferenceInputs,
+  });
+  const referenceInputs =
+    personaReferences.personaSlug !== null
+      ? [...personaReferences.frameReferences]
+      : [...fallbackReferenceInputs];
+  const personaSetupRequiredSlug =
+    personaReferences.personaSlug !== null &&
+    referenceInputs.length < REQUIRED_PERSONA_REFERENCE_FRAME_COUNT
+      ? personaReferences.personaSlug
+      : null;
+  if (
+    personaReferences.personaSlug === null &&
+    shouldReusePersonaReference &&
+    recentGeneratedAssetHref &&
+    !referenceInputs.includes(recentGeneratedAssetHref)
+  ) {
+    referenceInputs.unshift(recentGeneratedAssetHref);
+  }
+  const generatedLabel = bannerRequest
+    ? "banner"
+    : generatedAssetType === "gif"
+      ? "GIF"
+      : "image";
+  const generatedCustomAssetSaveIntent =
+    !avatarRequest && !bannerRequest
+      ? deps.resolveGeneratedCustomAssetSaveIntent(payload, basePrompt)
+      : null;
+  const summary = truncateText(basePrompt, 220);
+  const chatRoute = chatTarget.conversationId
+    ? { conversationId: chatTarget.conversationId }
+    : { channelId: chatTarget.channelId };
+  const previewType = avatarRequest
+    ? "persona"
+    : bannerRequest
+      ? "banner"
+      : generatedAssetType;
+  const processingTitle = avatarRequest
+    ? "Generating avatar"
+    : bannerRequest
+      ? "Generating banner"
+      : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} in progress`;
+  const processingBody = avatarRequest
+    ? "Working on your avatar now..."
+    : bannerRequest
+      ? "Working on your banner now..."
+      : `Generating ${generatedLabel} for "${summary}".`;
+
+  // -- S3: Create preview state (closures now in preview-state module) ------
+
+  const existingProcessingClientMessageId =
+    deps.resolveChatProcessingClientMessageId(command);
+  const previewClientMessageId =
+    existingProcessingClientMessageId ?? `runtime_generate_${command.id}`;
+
+  const previewState = createChatLiteralPreviewState(
+    {
+      callAgentChatBridge: deps.callAgentChatBridge,
+      memoryRecordWrite: (entry) => deps.memory.recordWrite(entry),
+      isStreamPartArtifactReference: deps.isStreamPartArtifactReference,
+    },
+    {
+      previewClientMessageId,
+      chatRoute,
+      previewType,
+      processingTitle,
+      summary,
+      processingBody,
+      commandId: command.id,
+    },
+    {
+      previewMessageCreateAttempted: Boolean(
+        existingProcessingClientMessageId,
+      ),
+    },
+  );
+
+  // -- S4-S8: Generation, success flows, error handling ---------------------
+
+  try {
+    await previewState.sendOrEditPreviewMessage({
+      kind: "processing",
+      body: processingBody,
+      metadata: {
+        automated: true,
+        sourceContext: "CHAT",
+        actionPreview: previewState.buildProcessingActionPreview(),
+      },
+    });
+    if (personaSetupRequiredSlug) {
+      throw new Error(
+        `persona_reference_setup_required:${personaSetupRequiredSlug}`,
+      );
+    }
+    const media = await deps.generateAndUploadMediaFromPrompt(prompt, {
+      generatedAssetType:
+        avatarRequest || bannerRequest ? "image" : generatedAssetType,
+      mode: avatarRequest
+        ? "chat_avatar_update"
+        : bannerRequest
+          ? "chat_banner_update"
+          : "chat_literal_generate",
+      referenceInputs,
+      commandId: command.id,
+      onProgress: (progress: MediaGenerationProgress) =>
+        previewState.emitStreamProgress(progress),
+    });
+    const mediaUrl = media.mediaUrl as string;
+    const mediaType = media.mediaType as "image" | "video" | undefined;
+    const mimeType = deps.resolveGeneratedAttachmentMimeType({
+      generatedAssetType: generatedAssetType as GeneratedAssetType,
+      mediaUrl,
+      ...(mediaType ? { mediaType } : {}),
+    });
+    const sizeBytes =
+      typeof media.mediaSizeBytes === "number" &&
+      Number.isFinite(media.mediaSizeBytes) &&
+      (media.mediaSizeBytes as number) > 0
+        ? Math.max(1, Math.floor(media.mediaSizeBytes as number))
+        : 1;
+    const mode = avatarRequest
+      ? "chat_avatar_update"
+      : bannerRequest
+        ? "chat_banner_update"
+        : "chat_literal_generate";
+    await deps.recordCommandLifecycleCheckpoint({
+      command,
+      stage: "generated",
+      status: "ok",
+      metadata: { generatedAssetType, mode },
+    });
+    await deps.recordCommandLifecycleCheckpoint({
+      command,
+      stage: "uploaded",
+      status: "ok",
+      metadata: {
+        generatedAssetType,
+        mediaUrl: media.mediaUrl,
+        mimeType,
+        mode,
+      },
+    });
+    const chatDeliveryUrl = previewState.resolveChatDeliveryUrl(
+      media.mediaUrl as string | null,
+      media.mediaOriginalUrl as string | null,
+      media.mediaOptimizedUrl as string | null,
+    );
+    if (!chatDeliveryUrl) {
+      throw new Error("chat_delivery_media_url_invalid");
+    }
+
+    // -- Avatar / Banner success flow (merged) ----------------------------
+
+    if (avatarRequest || bannerRequest) {
+      return applyProfileUpdateResult({
+        kind: avatarRequest ? "avatar" : "banner",
+        target: avatarRequest ? avatarTarget : bannerTarget,
+        media,
+        profileCropSpec: profileCropSpec!,
+        chatDeliveryUrl,
+        mimeType,
+        sizeBytes,
+        summary,
+        previewClientMessageId,
+        provenance,
+        sourceDirectiveId,
+        sourceDirectiveActionNonce,
+        previewState,
+        deps,
+        command,
+        chatTarget,
+      });
+    }
+
+    // -- Generic generate success flow ------------------------------------
+
+    let generatedCustomAssetSaveResult: GeneratedCustomAssetSaveResult | null =
+      null;
+    let generatedCustomAssetSaveError: string | null = null;
+    if (generatedCustomAssetSaveIntent) {
+      try {
+        generatedCustomAssetSaveResult = await deps.saveGeneratedCustomAsset({
+          command,
+          payload,
+          intent: generatedCustomAssetSaveIntent,
+          sourcePrompt: basePrompt,
+          mediaUrl,
+          mimeType,
+          chatTarget,
+        });
+      } catch (error: unknown) {
+        generatedCustomAssetSaveError =
+          error instanceof Error ? error.message : String(error);
+      }
+    }
+    const customAssetScopeLabel =
+      generatedCustomAssetSaveResult?.scope === "group"
+        ? "this group"
+        : generatedCustomAssetSaveResult?.scope === "server"
+          ? "this server"
+          : "your library";
+    const successBody = generatedCustomAssetSaveResult
+      ? `Generated ${generatedLabel} for "${summary}". Saved as ${generatedCustomAssetSaveResult.kind} \`${generatedCustomAssetSaveResult.name}\` in ${customAssetScopeLabel}.`
+      : generatedCustomAssetSaveError && generatedCustomAssetSaveIntent
+        ? `Generated ${generatedLabel} for "${summary}". Could not save to ${generatedCustomAssetSaveIntent.scope} ${generatedCustomAssetSaveIntent.kind}s (${truncateText(generatedCustomAssetSaveError, 120)}).`
+        : `Generated ${generatedLabel} for "${summary}".`;
+    const finalChatDeliveryUrl = previewState.resolveChatDeliveryUrl(
+      generatedCustomAssetSaveResult?.url ?? null,
+      chatDeliveryUrl,
+      media.mediaUrl as string | null,
+      media.mediaOriginalUrl as string | null,
+      media.mediaOptimizedUrl as string | null,
+    );
+    if (!finalChatDeliveryUrl) {
+      throw new Error("chat_delivery_media_url_invalid");
+    }
+    const finalMimeType =
+      generatedCustomAssetSaveResult?.mimeType ?? mimeType;
+    const streamPreviewForSuccess = buildStreamPreviewMetadata({
+      frames: previewState.snapshotStreamFrames(),
+      maxFrames: MAX_FINALIZE_STREAM_FRAMES,
+      finalPreviewUrl: finalChatDeliveryUrl,
+    });
+    const streamPreviewDeltaForSuccess = buildStreamPreviewDeltaMetadata({
+      frames: previewState.snapshotStreamFrames(),
+      deltaBaseCount: previewState.previewStreamFrameCursor,
+      maxDeltaFrames: MAX_FINALIZE_STREAM_FRAMES,
+      finalPreviewUrl: finalChatDeliveryUrl,
+    });
+    const chatDeliveryHandled = await previewState.sendOrEditPreviewMessage({
+      kind: "success",
+      body: successBody,
+      attachments: [
+        {
+          url: finalChatDeliveryUrl,
+          mimeType: finalMimeType,
+          sizeBytes,
+          metadata: {
+            source: "runtime.generate",
+            generatedAssetType,
+          },
+        },
+      ],
+      metadata: {
+        automated: true,
+        sourceContext: "CHAT",
+        actionPreview: {
+          type: generatedAssetType,
+          status: "success",
+          title: `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generated`,
+          summary,
+          streamSessionId: previewClientMessageId,
+          previewUrl: finalChatDeliveryUrl,
+          href: finalChatDeliveryUrl,
+          hrefLabel: `Open ${generatedLabel}`,
+          ...(generatedCustomAssetSaveResult
+            ? {
+                customAsset: {
+                  kind: generatedCustomAssetSaveResult.kind,
+                  scope: generatedCustomAssetSaveResult.scope,
+                  name: generatedCustomAssetSaveResult.name,
+                  id: generatedCustomAssetSaveResult.id,
+                },
+              }
+            : generatedCustomAssetSaveError && generatedCustomAssetSaveIntent
+              ? {
+                  customAssetSaveError: truncateText(
+                    generatedCustomAssetSaveError,
+                    180,
+                  ),
+                }
+              : {}),
+          ...(streamPreviewForSuccess ?? {}),
+          ...(streamPreviewDeltaForSuccess?.metadata ?? {}),
+        },
+      },
+    });
+    if (!chatDeliveryHandled) {
+      const editError =
+        previewState.previewLastEditError ?? "preview_delivery_unresolved";
+      throw new Error(
+        `chat_preview_finalize_failed:chat_literal_generate:${editError}`,
+      );
+    }
+    await deps.memory.recordWrite({
+      type: "chat_literal_generate_sent",
+      at: nowIso(),
+      commandId: command.id,
+      generatedAssetType,
+      mediaUrl: finalChatDeliveryUrl,
+      prompt: summary,
+      customAssetKind: generatedCustomAssetSaveResult?.kind ?? null,
+      customAssetScope: generatedCustomAssetSaveResult?.scope ?? null,
+      customAssetName: generatedCustomAssetSaveResult?.name ?? null,
+      customAssetId: generatedCustomAssetSaveResult?.id ?? null,
+      customAssetSaveError: generatedCustomAssetSaveError,
+      targetConversationId: chatTarget.conversationId ?? null,
+      targetChannelId: chatTarget.channelId ?? null,
+    });
+    return deps.successOutcome(command, {
+      generatedAssetType,
+      mediaUrl: finalChatDeliveryUrl,
+      prompt: summary,
+      ...(generatedCustomAssetSaveResult
+        ? { customAsset: generatedCustomAssetSaveResult }
+        : {}),
+      ...(generatedCustomAssetSaveError && generatedCustomAssetSaveIntent
+        ? { customAssetSaveError: generatedCustomAssetSaveError }
+        : {}),
+      mode: "chat_literal_generate",
+      chatDeliveryHandled,
+    });
+  } catch (error: unknown) {
+    if (error instanceof RequeueCommandError) {
+      throw error;
+    }
+    const message =
+      error instanceof Error ? error.message : String(error);
+    const isPromptCurationFailure = /prompt_curation_/iu.test(message);
+    const isChatDeliveryFailure =
+      /chat_preview_finalize_failed:/iu.test(message);
+    const deferred = deps.classifyMediaGenerationDeferral({
+      error,
+      hasPrompt: true,
+    });
+    const isImageGenerationSetupFailure =
+      deferred.imageGeneratorSetupRequired;
+    const imageGenerationSetupHint = isImageGenerationSetupFailure
+      ? IMAGE_GENERATION_SETUP_HINT
+      : "";
+    const isPersonaReferenceSetupFailure =
+      deferred.reasonCode === "persona_reference_setup_required";
+    const personaReferenceSetupSlug = deferred.personaSlug;
+    const failureStreamFrames = previewState.snapshotStreamFrames();
+    const streamPreviewForFailure =
+      failureStreamFrames.length > 0
+        ? buildStreamPreviewDeltaMetadata({
+            frames: failureStreamFrames,
+            deltaBaseCount: previewState.previewStreamFrameCursor,
+            maxDeltaFrames: MAX_FINALIZE_STREAM_FRAMES,
+          })
+        : null;
+    const failureStage: CommandLifecycleCheckpointStage =
+      isChatDeliveryFailure ? "chat_delivery" : "generated";
+    if (deferred.shouldRequeue && deferred.reason) {
+      const deferredBody = avatarRequest
+        ? "Avatar prerequisites are still in progress. I queued this request and will retry automatically."
+        : bannerRequest
+          ? "Banner prerequisites are still in progress. I queued this request and will retry automatically."
+          : isPersonaReferenceSetupFailure
+            ? `Persona setup for ${personaReferenceSetupSlug ? `\`${personaReferenceSetupSlug}\`` : "that persona"} is incomplete (need selfie, midshot, fullbody). I queued this request and will retry automatically.`
+            : isImageGenerationSetupFailure
+              ? `Image generation setup is still unavailable. I queued this request and will retry automatically once setup is ready.${imageGenerationSetupHint}`
+              : "I did not receive a final media asset yet. I queued this request and will retry automatically.";
+      const previewDeferredDelivered =
+        await previewState
+          .sendOrEditPreviewMessage({
+            kind: "processing",
+            body: deferredBody,
+            metadata: {
+              automated: true,
+              sourceContext: "CHAT",
+              actionPreview: {
+                type: avatarRequest
+                  ? "persona"
+                  : bannerRequest
+                    ? "banner"
+                    : generatedAssetType,
+                status: "processing",
+                streamSessionId: previewClientMessageId,
+                title: avatarRequest
+                  ? "Avatar update queued"
+                  : bannerRequest
+                    ? "Banner update queued"
+                    : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} queued`,
+                summary,
+                deferred: true,
+                deferredReason: deferred.reason,
+                personaSetupRequired: isPersonaReferenceSetupFailure,
+                imageGenerationSetupRequired:
+                  isImageGenerationSetupFailure,
+                ...(streamPreviewForFailure?.metadata ?? {}),
+              },
+            },
+          })
+          .catch(() => false);
+      await deps.recordCommandLifecycleCheckpoint({
+        command,
+        stage: failureStage,
+        status: "failed",
+        message,
+        metadata: {
+          generatedAssetType,
+          avatarRequest,
+          bannerRequest,
+          requeued: true,
+          requeueReason: deferred.reason,
+          requeueReasonCode: deferred.reasonCode,
+          requeuePersonaSlug: deferred.personaSlug,
+          previewDeferredDelivered,
+        },
+      });
+      await deps.memory.recordWrite({
+        type: "chat_literal_generate_deferred",
+        at: nowIso(),
+        commandId: command.id,
+        generatedAssetType,
+        avatarRequest,
+        bannerRequest,
+        reason: deferred.reason,
+        reasonCode: deferred.reasonCode,
+        personaSlug: deferred.personaSlug,
+        error: message,
+      });
+      throw new RequeueCommandError(deferred.reason);
+    }
+    const previewFailureDelivered =
+      await previewState
+        .sendOrEditPreviewMessage({
+          kind: "failed",
+          body: avatarRequest
+            ? "I could not update that avatar right now. Please retry in a moment."
+            : bannerRequest
+              ? "I could not update that banner right now. Please retry in a moment."
+              : isPersonaReferenceSetupFailure
+                ? `I couldn't prepare persona references for ${personaReferenceSetupSlug ? `\`${personaReferenceSetupSlug}\`` : "that persona"} yet. I need three photorealistic baseline frames (selfie, midshot, fullbody) before generating with persona continuity.${imageGenerationSetupHint}`
+                : isChatDeliveryFailure
+                  ? `I generated that ${generatedLabel}, but failed to finalize delivery in chat. Please retry.`
+                  : isPromptCurationFailure
+                    ? `I could not prepare a generation prompt for that ${generatedLabel} right now. Please retry in a moment.`
+                    : `I could not generate that ${generatedLabel} right now. Please retry in a moment.${imageGenerationSetupHint}`,
+          metadata: {
+            automated: true,
+            sourceContext: "CHAT",
+            actionPreview: {
+              type: avatarRequest
+                ? "persona"
+                : bannerRequest
+                  ? "banner"
+                  : generatedAssetType,
+              status: "failed",
+              streamSessionId: previewClientMessageId,
+              title: avatarRequest
+                ? "Avatar update failed"
+                : bannerRequest
+                  ? "Banner update failed"
+                  : isChatDeliveryFailure
+                    ? "Delivery failed"
+                    : isPromptCurationFailure
+                      ? "Prompt curation failed"
+                      : `${generatedLabel.charAt(0).toUpperCase()}${generatedLabel.slice(1)} generation failed`,
+              error: truncateText(message, 240),
+              imageGenerationSetupRequired:
+                isImageGenerationSetupFailure,
+              ...(streamPreviewForFailure?.metadata ?? {}),
+            },
+          },
+        })
+        .catch(() => false);
+    await deps.recordCommandLifecycleCheckpoint({
+      command,
+      stage: failureStage,
+      status:
+        failureStage === "chat_delivery" && previewFailureDelivered
+          ? "ok"
+          : "failed",
+      message:
+        failureStage === "chat_delivery" && previewFailureDelivered
+          ? null
+          : message,
+      metadata: {
+        generatedAssetType,
+        avatarRequest,
+        bannerRequest,
+        ...(failureStage === "chat_delivery"
+          ? { recoveredWithFailureMessage: previewFailureDelivered }
+          : {}),
+      },
+    });
+    await deps.memory.recordWrite({
+      type: "chat_literal_generate_failed",
+      at: nowIso(),
+      commandId: command.id,
+      generatedAssetType,
+      avatarRequest,
+      bannerRequest,
+      error: message,
+    });
+    const failed = deps.failedOutcome(
+      command,
+      avatarRequest
+        ? `Avatar update failed: ${message}`
+        : bannerRequest
+          ? `Banner update failed: ${message}`
+          : isPersonaReferenceSetupFailure
+            ? `Persona reference setup failed: ${message}`
+            : isChatDeliveryFailure
+              ? `Literal generate delivery failed: ${message}`
+              : `Literal generate failed: ${message}`,
+      avatarRequest
+        ? "avatar_update_failed"
+        : bannerRequest
+          ? "banner_update_failed"
+          : isChatDeliveryFailure
+            ? "chat_delivery_failed"
+            : "literal_generate_failed",
+    );
+    return {
+      ...failed,
+      data: {
+        mode: "chat_literal_generate",
+        generatedAssetType,
+        chatDeliveryHandled: previewFailureDelivered,
+        chatDeliveryCheckpointRecorded: failureStage === "chat_delivery",
+        chatPreviewDeliveryError: previewState.previewLastEditError,
+      },
+    };
+  }
+}

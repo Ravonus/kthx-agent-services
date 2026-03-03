@@ -28,7 +28,8 @@ import type { KthxRetentionConfig } from "~/types/config.js";
 import type { StateSqliteStore } from "~/state/sqlite-state.js";
 import { isRecord } from "~/lib/guards.js";
 import { ensureDir, readJsonFile, writeJsonFile, appendJsonLine, readLastJsonLines } from "~/lib/fs-helpers.js";
-import { nowIso, normalizeIso, toShortLine, unique } from "~/lib/time.js";
+import { normalizeIso, unique } from "~/lib/time.js";
+import { nowIso, toShortLine } from "~/lib/text.js";
 import {
   extractKeysFromPayload,
   extractActorHintFromPayload,

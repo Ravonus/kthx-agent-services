@@ -9,6 +9,7 @@ import SuperJSON from "superjson";
 import { createTRPCClient, createWSClient, wsLink } from "@trpc/client";
 import type { AnyRouter } from "@trpc/server";
 
+import { jitterDelay } from "../lib/async.js";
 import { trimEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
 
@@ -27,15 +28,6 @@ const baseReconnectDelaysMs: readonly number[] = [
 export const isConnectedSocketState = (
   state: string | null,
 ): boolean => state === "connected" || state === "open";
-
-/**
- * Applies +/- 20% jitter to `valueMs`.
- */
-const jitterDelay = (valueMs: number): number => {
-  const jitter = 0.2;
-  const multiplier = 1 + (Math.random() * 2 - 1) * jitter;
-  return Math.max(0, Math.round(valueMs * multiplier));
-};
 
 // ---------------------------------------------------------------------------
 // Runtime integrity

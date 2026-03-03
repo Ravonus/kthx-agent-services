@@ -14,7 +14,8 @@ import type {
   ExtractedKeys,
 } from "~/types/memory.js";
 import { isRecord } from "~/lib/guards.js";
-import { nowIso, toShortLine, unique } from "~/lib/time.js";
+import { unique } from "~/lib/time.js";
+import { nowIso, toShortLine } from "~/lib/text.js";
 import {
   extractKeysFromPayload,
   extractActorHintFromPayload,

@@ -9,6 +9,7 @@
  */
 
 import fs from "node:fs/promises";
+import { sleep } from "../lib/async.js";
 import { nowIso, toAnswerPreview, sanitizeChallengePromptText } from "../lib/text.js";
 import { isRecord } from "../lib/guards.js";
 import { appendJsonLine } from "../lib/fs-helpers.js";
@@ -113,11 +114,6 @@ const MINT_CHALLENGE_SOLVER_RETRY_DELAY_MS = 500;
 const MINT_MAX_CHALLENGE_STEPS_PER_FLOW = 12;
 const MINT_MAX_SOLVER_FLOW_FAILS_PER_CHALLENGE = 3;
 const MINT_PENDING_CHALLENGE_EXPIRY_SKEW_MS = 1_000;
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-
 interface MintDebug {
   updatedAt: string; inFlight: boolean; reason: string | null;
   challengeId: string | null; promptToken: string | null;

@@ -26,6 +26,7 @@ import path from "node:path";
 import { loadDotEnv } from "../config/dotenv.js";
 import { trimEnv, parseIntEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
+import { sleep } from "../lib/async.js";
 import { nowIso } from "../lib/text.js";
 import { appendJsonLine, ensureDir } from "../lib/fs-helpers.js";
 
@@ -68,9 +69,6 @@ const respond = (res: ServerResponse, code: number, payload: unknown): void => {
   res.setHeader("content-length", Buffer.byteLength(body));
   res.end(body);
 };
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------------------
 // Wake hint builder

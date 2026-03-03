@@ -10,15 +10,32 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { sleep } from "../lib/async.js";
 import { isRecord } from "../lib/guards.js";
 import { nowIso, toAnswerPreview } from "../lib/text.js";
 import { readJsonFile, writeJsonFile } from "../lib/fs.js";
 import type { ChatManagerLike } from "../runtime-context.js";
+import type { ContextBundle, RetrievalIntent } from "../types/memory.js";
 import type {
-  ContextBundle,
-  ContextRequest,
-  RetrievalIntent,
-} from "../types/memory.js";
+  AgentReplyPolicyValue,
+  ChatManagerContext,
+  DeterministicRouteMatch,
+  DeterministicRouteParseResult,
+  DeterministicRoutePayload,
+  DeterministicRoutePolicy,
+  DeterministicRouteRegistration,
+  DeterministicRouteTargetedPayload,
+  DmAutomatedPolicyValue,
+  DmPolicyValue,
+  LinkedOwnerIdentity,
+  ProfileSettingsTarget,
+  ReplyTargetContext,
+  RetentionDialogConfig,
+  RetentionDialogState,
+  RetentionDialogStep,
+  StaleReplyDecision,
+  StreamState,
+} from "./chat-types.js";
 import type { ChatInboxEntry } from "./chat-reply.js";
 import {
   truncateChatReply,
@@ -27,108 +44,6 @@ import {
 } from "./chat-reply.js";
 import { normalizeInboxEntry, buildAutoReply } from "./chat-intent.js";
 
-// ---------------------------------------------------------------------------
-// Narrow context interface
-// ---------------------------------------------------------------------------
-
-export interface ChatManagerContext {
-  config: {
-    chatRuntimeEnabled: boolean;
-    chatRuntimePollMs: number;
-    chatRuntimeReadChunkBytes: number;
-    chatRuntimeSeenMessageLimit: number;
-    chatRuntimeReplyMaxChars: number;
-    chatRuntimeOpenClawInputMaxChars: number;
-    chatRuntimeUseOpenClaw: boolean;
-    chatRuntimeReplayOnStart: boolean;
-    chatRuntimeChannelRequireMention: boolean;
-    chatRuntimeMentionNames: string[];
-    chatRuntimeTextStreamEnabled: boolean;
-    chatRuntimeTextStreamNativeEnabled: boolean;
-    chatRuntimeTextStreamNativeOnly: boolean;
-    chatRuntimeTextStreamStepChars: number;
-    chatRuntimeTextStreamStepMs: number;
-    chatRuntimeTextStreamUpdateMinMs: number;
-    chatRuntimeStaleReplyMaxAgeMs: number;
-    chatRuntimeStaleReplyMaxAgeImportantMs: number;
-  };
-  ipcPaths: {
-    chatInboxPath: string;
-    chatRuntimeStatePath: string;
-  };
-  memory: {
-    recordWrite(payload: unknown): Promise<void>;
-    buildContext?: (request: ContextRequest) => Promise<ContextBundle>;
-  };
-  chat: ChatTrackingState;
-  callAgentChatBridge: (payload: unknown) => Promise<unknown>;
-  runOpenClawPrompt: (opts: {
-    prompt: string; purpose: string;
-    onTextDelta?: ((delta: string) => void) | null;
-  }) => Promise<OpenClawPromptResponse | null>;
-  resolveOpenClawAgentName: () => Promise<string | null>;
-  runMemoryCheckpoint: (opts: { force: boolean; source: string; allowAgentCompression: boolean }) => Promise<void>;
-}
-
-export interface ChatTrackingState {
-  chatInboxPollInFlight: boolean;
-  chatInboxCursorInitialized: boolean;
-  chatInboxReadOffset: number;
-  chatInboxPartialLine: string;
-  chatRuntimeStateDirty: boolean;
-  chatRuntimeStateWriteAtMs: number;
-  chatReplyThrottleUntilMs: number;
-  chatSeenMessageIds: Set<string>;
-  chatSeenMessageIdQueue: string[];
-  chatMentionTokensCache: string[];
-  chatMentionTokensCachedAtMs: number;
-}
-
-interface OpenClawPromptResponse {
-  parsed: unknown;
-  raw: string;
-  agentName: string | null;
-  payloadText: string | null;
-  envelope: Record<string, unknown> | null;
-}
-
-interface StreamState {
-  entry: ChatInboxEntry;
-  messageId: string | null;
-  currentBody: string;
-  targetBody: string;
-  lastUpdateAtMs: number;
-  nativeDeltaChars: number;
-}
-
-interface StaleReplyDecision {
-  skipReply: boolean;
-  ageMs: number | null;
-  important: boolean;
-  reason: "fresh" | "stale_not_important" | "stale_important_expired" | "stale_important_allowed" | "invalid_timestamp";
-}
-
-interface ReplyTargetContext {
-  messageId: string;
-  authorDisplay: string | null;
-  authorHandle: string | null;
-  bodyPreview: string | null;
-  attachmentSummary: string | null;
-  hintPostId: number | null;
-  hintCommentId: number | null;
-  retrievalQueryFragment: string;
-}
-
-interface LinkedOwnerIdentity {
-  agentMainUserId: string;
-  agentHandle: string | null;
-  agentName: string | null;
-  ownerMainUserId: string;
-  ownerHandle: string;
-  ownerName: string | null;
-}
-
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
 const stripEmDashCharacters = (value: string): string => value.replace(/[—–]/gu, "-");
 
 const DOC_CONTEXT_RELEVANT_LINE_PATTERN =
@@ -941,30 +856,6 @@ const MEMORY_INTERNAL_BULLET_PATTERN =
 const STALE_IMPORTANT_PATTERN =
   /\?|(\b(can you|could you|would you|please|help|urgent|asap|stuck|error|failed|fix|why|where|when|what|how|follow up|follow-up)\b)/iu;
 
-type RetentionDialogStep =
-  | "ask_days"
-  | "ask_interval"
-  | "ask_long_term"
-  | "ask_agent_compression"
-  | "ask_confirm";
-
-interface RetentionDialogConfig {
-  days: number;
-  intervalMinutes: number;
-  longTermEnabled: boolean;
-  longTermUseAgentCompression: boolean;
-}
-
-interface RetentionDialogState {
-  key: string;
-  step: RetentionDialogStep;
-  createdAt: string;
-  updatedAt: string;
-  conversationId: string | null;
-  authorMainUserId: string | null;
-  pending: Partial<RetentionDialogConfig>;
-}
-
 const RETENTION_INTENT_PATTERN =
   /\b(retention|retain|retained|memory\s+policy|memory\s+retention|cleanup\s+interval|archive\s+policy|ttl)\b/iu;
 const RETENTION_ACTION_PATTERN =
@@ -993,136 +884,6 @@ const parseBooleanChatInput = (value: string): boolean | null => {
   if (normalized === "n") return false;
   return null;
 };
-
-type ProfileSettingsTarget = "agent" | "owner";
-type DmPolicyValue = "everyone" | "following_only" | "followers_only" | "mutual_only";
-type DmAutomatedPolicyValue = "allow_all" | "allow_followed" | "deny_all";
-type AgentReplyPolicyValue = "allow_all" | "deny_all" | "deny_selected";
-
-type DeterministicRoutePayload =
-  | {
-      action: "update_profile";
-      target: ProfileSettingsTarget;
-      name?: string;
-      bio?: string | null;
-      imageUrl?: string;
-      bannerUrl?: string;
-    }
-  | {
-      action: "update_settings";
-      target: ProfileSettingsTarget;
-      defaultLensId?: number | null;
-      readReceipts?: boolean;
-      dmPolicy?: DmPolicyValue;
-      dmAutomatedPolicy?: DmAutomatedPolicyValue;
-      agentReplyPolicy?: AgentReplyPolicyValue;
-      showOnlineStatus?: boolean;
-    }
-  | {
-      action: "follow_user";
-      target: ProfileSettingsTarget;
-      userId?: string;
-      handle?: string;
-    }
-  | {
-      action: "unfollow_user";
-      target: ProfileSettingsTarget;
-      userId?: string;
-      handle?: string;
-    }
-  | {
-      action: "suggest_followers";
-      limit?: number;
-      includeAgents?: boolean;
-    }
-  | {
-      action: "browse_agents";
-      query?: string;
-      limit?: number;
-      includeFollowing?: boolean;
-      includeFollowers?: boolean;
-      includeRecentPosters?: boolean;
-    }
-  | {
-      action: "agent_profile";
-    }
-  | {
-      action: "find_user";
-      handle?: string;
-      mainUserId?: string;
-    }
-  | {
-      action: "find_post";
-      postId?: number;
-      authorHandle?: string;
-      searchText?: string;
-      latest?: boolean;
-    }
-  | {
-      action: "find_comment";
-      postId: number;
-      commentId?: number;
-      searchText?: string;
-    }
-  | {
-      action: "browse_posts";
-      limit?: number;
-    }
-  | {
-      action: "browse_comments";
-      postId?: number;
-      searchText?: string;
-      limit?: number;
-    }
-  | {
-      action: "browse_notifications";
-      limit?: number;
-      unreadOnly?: boolean;
-    }
-  | {
-      action: "browse_home_feed";
-      limit?: number;
-    }
-  | {
-      action: "browse_top_engagers";
-      limit?: number;
-      windowHours?: number;
-    };
-
-type DeterministicRouteParseResult =
-  | { kind: "action"; payload: DeterministicRoutePayload }
-  | { kind: "clarify"; reply: string };
-
-interface DeterministicRoutePolicy {
-  dmOnly: boolean;
-  allowChannel: boolean;
-  allowedTargets?: readonly ProfileSettingsTarget[];
-  requireLinkedOwnerForOwnerTarget?: boolean;
-}
-
-interface DeterministicRouteRegistration {
-  action: DeterministicRoutePayload["action"];
-  parse: (body: string) => DeterministicRouteParseResult | null;
-  policy: DeterministicRoutePolicy;
-  summarizeSuccess: (
-    payload: DeterministicRoutePayload,
-    response: unknown,
-  ) => string;
-  failureLabel: string;
-}
-
-type DeterministicRouteMatch =
-  | {
-      kind: "action";
-      payload: DeterministicRoutePayload;
-      registration: DeterministicRouteRegistration;
-    }
-  | { kind: "clarify"; reply: string };
-
-type DeterministicRouteTargetedPayload = Extract<
-  DeterministicRoutePayload,
-  { target: ProfileSettingsTarget }
->;
 
 const hasDeterministicRouteTarget = (
   payload: DeterministicRoutePayload,

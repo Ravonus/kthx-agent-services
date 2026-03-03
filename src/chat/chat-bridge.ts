@@ -25,7 +25,9 @@ import WebSocket from "ws";
 import { loadDotEnv } from "../config/dotenv.js";
 import { trimEnv, parseIntEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
+import { jitterDelay } from "../lib/async.js";
 import { nowIso } from "../lib/text.js";
+import { parseIsoToMs } from "../lib/time.js";
 import { appendJsonLine, writeJsonFile, ensureDir } from "../lib/fs-helpers.js";
 import { createStateSqliteStoreFromEnv } from "../state/sqlite-state.js";
 
@@ -200,18 +202,6 @@ const parseRetryAfterMs = (input: {
   return Math.max(1000, input.fallbackMs);
 };
 
-const jitterDelay = (ms: number): number => {
-  const multiplier = 1 + (Math.random() * 2 - 1) * 0.2;
-  return Math.max(0, Math.round(ms * multiplier));
-};
-
-const parseIsoDateMs = (value: unknown): number | null => {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  if (!trimmed.length) return null;
-  const ms = Date.parse(trimmed);
-  return Number.isFinite(ms) ? ms : null;
-};
 
 const parseAgentUserIdFromKeyBox = (keyBox: string | null): string | null => {
   const trimmed = typeof keyBox === "string" ? keyBox.trim() : "";
@@ -1455,7 +1445,7 @@ const main = async (): Promise<void> => {
       cachedGatewaySession = {
         wsUrl,
         authToken,
-        authTokenExpiresAtMs: parseIsoDateMs(input.authTokenExpiresAt),
+        authTokenExpiresAtMs: parseIsoToMs(input.authTokenExpiresAt),
         userTopic:
           typeof input.userTopic === "string" && input.userTopic.trim().length > 0
             ? input.userTopic.trim()
@@ -1465,7 +1455,7 @@ const main = async (): Promise<void> => {
           input.userTopicTicket.trim().length > 0
             ? input.userTopicTicket.trim()
             : null,
-        userTopicExpiresAtMs: parseIsoDateMs(input.userTopicExpiresAt),
+        userTopicExpiresAtMs: parseIsoToMs(input.userTopicExpiresAt),
       };
     };
 

@@ -10,18 +10,11 @@ import path from "node:path";
 
 import { trimEnv } from "../lib/env-parse.js";
 import { nowIso } from "../lib/text.js";
+import { parseIsoToMs } from "../lib/time.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-const parseIsoToMs = (value: unknown): number | null => {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  if (!trimmed.length) return null;
-  const ms = Date.parse(trimmed);
-  return Number.isFinite(ms) ? ms : null;
-};
 
 const resolveBotSessionTokenFilePath = (): string => {
   const explicitFile = trimEnv("MG_BOT_SESSION_TOKEN_FILE");

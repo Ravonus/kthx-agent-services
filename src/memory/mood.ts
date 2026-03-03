@@ -13,7 +13,8 @@ import type {
   ExtractedKeys,
 } from "~/types/memory.js";
 import { isRecord } from "~/lib/guards.js";
-import { nowIso, normalizeIso, clampNumber, toShortLine, unique } from "~/lib/time.js";
+import { normalizeIso, clampNumber, unique } from "~/lib/time.js";
+import { nowIso, toShortLine } from "~/lib/text.js";
 
 // ---------------------------------------------------------------------------
 // defaultMoodState

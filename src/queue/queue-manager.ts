@@ -12,6 +12,7 @@ import path from "node:path";
 
 import { isRecord } from "../lib/guards.js";
 import { nowIso } from "../lib/text.js";
+import { parseIsoToMs } from "../lib/time.js";
 import { readJsonFile, writeJsonFile } from "../lib/fs.js";
 import type { QueueItem, QueueState } from "../types/ipc.js";
 import type {
@@ -67,18 +68,6 @@ export interface QueueTrackingState {
   queueRunnerTickInFlight: boolean;
   queueStateMutation: Promise<void>;
 }
-
-// ---------------------------------------------------------------------------
-// Internal ISO parsing helper
-// ---------------------------------------------------------------------------
-
-const parseIsoToMs = (value: unknown): number | null => {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  if (!trimmed.length) return null;
-  const ms = Date.parse(trimmed);
-  return Number.isFinite(ms) ? ms : null;
-};
 
 const NOT_READY_MIN_REQUEUE_DELAY_SECONDS = 2;
 const NOT_READY_MAX_REQUEUE_DELAY_SECONDS = 300;

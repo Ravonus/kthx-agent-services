@@ -14,7 +14,7 @@ import { createGzip, createGunzip } from "node:zlib";
 import type { ArchiveIndex, MemoryEnvelope } from "~/types/memory.js";
 import { isRecord } from "~/lib/guards.js";
 import { ensureDir, readJsonFile, writeJsonFile } from "~/lib/fs-helpers.js";
-import { nowIso } from "~/lib/time.js";
+import { nowIso } from "~/lib/text.js";
 import { parseMemoryEnvelope, extractKeysFromPayload } from "./extract.js";
 
 // ---------------------------------------------------------------------------

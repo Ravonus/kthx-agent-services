@@ -25,7 +25,9 @@ import { loadDotEnv } from "../config/dotenv.js";
 import { loadOrInitKthxConfig } from "../config/kthx.js";
 import { trimEnv, parseIntEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
+import { sleep, jitterDelay } from "../lib/async.js";
 import { nowIso } from "../lib/text.js";
+import { parseIsoToMs } from "../lib/time.js";
 import type { KthxUpdatesConfig } from "../types/config.js";
 import { runAgentServiceUpdate } from "./update-manager.js";
 
@@ -40,12 +42,10 @@ const MANAGED_NAMES = new Set(["runtime", "bridge", "health", "all"]);
 const ACTIONS = new Set(["status", "start", "stop", "restart", "shutdown", "update"]);
 const BACKOFFS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 const parseBoolEnv = (v: unknown): boolean => typeof v === "string" && v.trim() === "1";
-const jitter = (ms: number): number => { const s = Math.floor(ms * 0.25); return Math.max(0, ms + Math.floor(Math.random() * (s * 2 + 1)) - s); };
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+const jitter = (ms: number): number => jitterDelay(ms, 0.25);
 const formatExit = (code: number | null, signal: string | null): string => typeof signal === "string" && signal.length ? `signal=${signal}` : typeof code === "number" ? `code=${code}` : "code=<unknown>";
 const normalizeTarget = (v: unknown): string | null => { if (typeof v !== "string") return null; const n = v.trim().toLowerCase(); return MANAGED_NAMES.has(n) ? n : null; };
 const getOpt = (args: string[], names: string | string[]): string | null => { for (const name of Array.isArray(names) ? names : [names]) { const idx = args.indexOf(name); if (idx === -1) continue; const val = args[idx + 1]; if (typeof val === "string" && val.trim().length > 0 && !val.startsWith("--")) return val.trim(); } return null; };
-const parseIsoToMs = (v: unknown): number | null => { if (typeof v !== "string") return null; const ms = Date.parse(v.trim()); return Number.isFinite(ms) ? ms : null; };
 const normalizeConnectionId = (v: unknown): string | null => { if (typeof v !== "string") return null; const t = v.trim(); if (!t.length || t.length > 200) return null; return /^[a-zA-Z0-9._:-]+$/u.test(t) ? t : null; };
 
 /* State-dir helpers (synchronous FS for supervisor resilience) */

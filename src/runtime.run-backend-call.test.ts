@@ -1,10 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import { sleep } from "./lib/async.js";
 import { runBackendCall } from "./runtime.js";
 import type { RuntimeContext } from "./runtime-context.js";
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
 
 const buildRuntimeContext = (connectionId: string): RuntimeContext =>
   ({
