@@ -20,6 +20,8 @@ import {
   parseMintChallengeRetryRequired,
 } from "./challenge.js";
 import type { ChallengeContext } from "./challenge.js";
+import { errCode, errMsg } from "./mint-error-utils.js";
+import { restorePendingChallengeFromDebug as _restorePendingChallengeFromDebug } from "./mint-pending-challenge-restore.js";
 import type { MintManagerLike, MintTrackingState } from "../runtime-context.js";
 
 // ---------------------------------------------------------------------------
@@ -58,56 +60,6 @@ export interface MintManagerContext {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-const errCode = (e: unknown): string | null => {
-  if (!isRecord(e)) return null;
-  const d = isRecord(e.data) ? e.data : null;
-  if (d && typeof d.code === "string") return d.code as string;
-  const s = isRecord(e.shape) ? e.shape : null;
-  const sd = s && isRecord(s.data) ? s.data : null;
-  return sd && typeof sd.code === "string" ? (sd.code as string) : null;
-};
-
-const errMsg = (e: unknown): string => {
-  const baseMessage =
-    e instanceof Error && e.message.trim().length > 0
-      ? e.message.trim()
-      : typeof e === "string" && e.trim().length > 0
-        ? e.trim()
-        : "";
-  const shape = isRecord(e) && isRecord(e.shape) ? e.shape : null;
-  const shapeMessage =
-    shape && typeof shape.message === "string" && shape.message.trim().length > 0
-      ? shape.message.trim()
-      : "";
-  const cause = isRecord(e) && isRecord(e.cause) ? e.cause : null;
-  const causeMessage =
-    cause && typeof cause.message === "string" && cause.message.trim().length > 0
-      ? cause.message.trim()
-      : "";
-  const data = isRecord(e) && isRecord(e.data) ? e.data : null;
-  const dataCode =
-    data && typeof data.code === "string" && data.code.trim().length > 0
-      ? data.code.trim()
-      : "";
-  const httpStatus =
-    data && typeof data.httpStatus === "number" && Number.isFinite(data.httpStatus)
-      ? Math.floor(data.httpStatus)
-      : null;
-
-  const bestMessage =
-    (baseMessage && baseMessage.toLowerCase() !== "unknown error" ? baseMessage : "") ||
-    shapeMessage ||
-    causeMessage ||
-    baseMessage;
-  if (!bestMessage.length) return "unknown error";
-
-  const suffixParts: string[] = [];
-  if (dataCode.length > 0) suffixParts.push(`code=${dataCode}`);
-  if (httpStatus !== null) suffixParts.push(`httpStatus=${httpStatus}`);
-  if (suffixParts.length === 0) return bestMessage;
-  return `${bestMessage} (${suffixParts.join(", ")})`;
-};
 
 const MINT_CHALLENGE_SOLVER_MAX_ATTEMPTS = 2;
 const MINT_CHALLENGE_SOLVER_RETRY_DELAY_MS = 500;
@@ -704,78 +656,13 @@ export class MintManager implements MintManagerLike {
   }
 
   private async restorePendingChallengeFromDebug(): Promise<void> {
-    const raw = await fs.readFile(this.ctx.ipcPaths.mintDebugPath, "utf8").catch(() => null);
-    if (!raw || !raw.trim().length) return;
-    let parsed: unknown = null;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return;
-    }
-    if (!isRecord(parsed)) return;
-    const challengeId =
-      typeof parsed.pendingChallengeId === "string" && parsed.pendingChallengeId.trim().length > 0
-        ? parsed.pendingChallengeId.trim()
-        : null;
-    if (!challengeId) return;
-    const instruction =
-      typeof parsed.pendingChallengeInstruction === "string" &&
-      parsed.pendingChallengeInstruction.trim().length > 0
-        ? parsed.pendingChallengeInstruction.trim()
-        : null;
-    if (!instruction) return;
-    const promptToken =
-      typeof parsed.pendingPromptToken === "string" && parsed.pendingPromptToken.trim().length > 0
-        ? parsed.pendingPromptToken.trim()
-        : null;
-    const answerType =
-      typeof parsed.pendingChallengeAnswerType === "string" &&
-      parsed.pendingChallengeAnswerType.trim().length > 0
-        ? parsed.pendingChallengeAnswerType.trim()
-        : null;
-    const attemptsRemaining =
-      typeof parsed.pendingChallengeAttemptsRemaining === "number" &&
-      Number.isFinite(parsed.pendingChallengeAttemptsRemaining)
-        ? Math.max(0, Math.floor(parsed.pendingChallengeAttemptsRemaining))
-        : null;
-    const expiresAt =
-      typeof parsed.pendingChallengeExpiresAt === "string" &&
-      parsed.pendingChallengeExpiresAt.trim().length > 0
-        ? parsed.pendingChallengeExpiresAt.trim()
-        : null;
-    const expiresAtMs =
-      expiresAt && Number.isFinite(Date.parse(expiresAt))
-        ? Date.parse(expiresAt)
-        : null;
-    if (
-      expiresAtMs !== null &&
-      Date.now() >= expiresAtMs - MINT_PENDING_CHALLENGE_EXPIRY_SKEW_MS
-    ) {
-      return;
-    }
-    const solverFailures =
-      typeof parsed.pendingChallengeSolverFailures === "number" &&
-      Number.isFinite(parsed.pendingChallengeSolverFailures)
-        ? Math.max(0, Math.floor(parsed.pendingChallengeSolverFailures))
-        : 0;
-    this.pendingChallenge = {
-      challengeId,
-      promptToken,
-      instruction,
-      answerType,
-      attemptsRemaining,
-      expiresAt,
-      expiresAtMs,
-      solverFailures,
-    };
-    await this.trace({
-      type: "mint_challenge_restored_from_debug",
-      challengeId,
-      promptToken,
-      attemptsRemaining,
-      expiresAt,
-      solverFailures,
+    const restored = await _restorePendingChallengeFromDebug({
+      mintDebugPath: this.ctx.ipcPaths.mintDebugPath,
+      expirySkewMs: MINT_PENDING_CHALLENGE_EXPIRY_SKEW_MS,
+      trace: (payload) => this.trace(payload),
     });
+    if (!restored) return;
+    this.pendingChallenge = restored;
   }
 
   private async trace(payload: unknown): Promise<void> {

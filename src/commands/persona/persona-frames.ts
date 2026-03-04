@@ -1,11 +1,9 @@
 /** Persona frame management, bootstrapping, and reference resolution. */
-
 import { isRecord } from "../../lib/guards.js";
 import { nowIso } from "../../lib/text.js";
 
 import {
   asNonEmptyString,
-  asPositiveInt,
   truncateText,
   inferMimeTypeFromUrl,
 } from "../helpers.js";
@@ -23,10 +21,6 @@ import type {
   PersonaReferencePlan,
   PersonaReferenceResolution,
   ResolvedMediaUpload,
-  CommandExecutorContext,
-  AgentRouterLike,
-  AgentMutator,
-  AgentQuery,
   Command,
 } from "../types.js";
 
@@ -35,420 +29,59 @@ import { PERSONA_REFERENCE_FRAME_ROLES } from "../types.js";
 import {
   normalizePersonaSlug,
   isGenericPersonaSlug,
-  isLikelyImageReference,
   isImageMimeType,
   shouldUsePersonaFrameReferences,
   resolvePersonaReferencePlan,
   resolveMainPersonaSlugFromBridge,
-  type CallBridgeLookupCachedFn,
-  type ResolveRequestedGenerateKindsFn,
 } from "./persona-resolution.js";
+import {
+  collectPersonaSeedReferenceInputs,
+  collectAgentProfilePersonaSeedReferences,
+  updatePersonaReferenceSnapshot,
+  type PersonaFrameDeps,
+  type CollectMediaReferenceInputsFn,
+  type IsStreamPartArtifactReferenceFn,
+  type ResolvePreferredMediaUrlFn,
+  type GenerateAndUploadMediaFromPromptFn,
+  type UploadBytesViaChunkRouteFn,
+  type MapUploadResultFn,
+  type TransformCustomAssetMediaFn,
+} from "./persona-frame-context.js";
+import {
+  parsePersonaFrameRecords,
+  getPersonaFrameRoleSortValue,
+  sortPersonaFrames,
+  pickPersonaFrameReferenceUrl,
+  collectPersonaFrameReferences,
+} from "./persona-frame-records.js";
+import {
+  normalizePersonaFrameRole,
+  parseIsoOrNull,
+} from "./persona-frame-parsing.js";
 
-// ---------------------------------------------------------------------------
-// Callback signatures for methods that still live on the class
-// ---------------------------------------------------------------------------
-
-/**
- * Matches `CommandExecutor.collectMediaReferenceInputs`.
- */
-export type CollectMediaReferenceInputsFn = (
-  payload: Record<string, unknown>,
-  options: { includeRecentGeneratedAsset: boolean },
-) => string[];
-
-/**
- * Matches `CommandExecutor.isStreamPartArtifactReference`.
- */
-export type IsStreamPartArtifactReferenceFn = (value: string | null | undefined) => boolean;
-
-/**
- * Matches `CommandExecutor.resolvePreferredMediaUrl`.
- */
-export type ResolvePreferredMediaUrlFn = (
-  ...values: Array<string | null | undefined>
-) => string | null;
-
-/**
- * Matches `CommandExecutor.generateAndUploadMediaFromPrompt`.
- */
-export type GenerateAndUploadMediaFromPromptFn = (
-  prompt: string,
-  options: {
-    generatedAssetType: string;
-    mode: string;
-    referenceInputs: string[];
-    keepOriginal: boolean;
-    commandId: string;
-  },
-) => Promise<ResolvedMediaUpload>;
-
-/**
- * Matches `CommandExecutor.uploadBytesViaChunkRoute`.
- */
-export type UploadBytesViaChunkRouteFn = (input: {
-  bytes: Buffer;
-  mimeType: string;
-  filename: string;
-  keepOriginal: boolean;
-}) => Promise<ResolvedMediaUpload | null>;
-
-/**
- * Matches `CommandExecutor.mapUploadResult`.
- */
-export type MapUploadResultFn = (uploaded: unknown) => ResolvedMediaUpload;
-
-/**
- * Transform spec matching the custom-asset-transform module.
- */
-export type TransformCustomAssetMediaFn = (input: {
-  sourceUrl: string;
-  sourceMimeType: string;
-  kind: string;
-  spec: {
-    width: number;
-    height: number;
-    fit: string;
-    format: string;
-    quality: number;
-  };
-}) => Promise<{ bytes: Buffer; mimeType: string } | null>;
-
-// ---------------------------------------------------------------------------
-// Shared deps bundle passed into most frame-management functions
-// ---------------------------------------------------------------------------
-
-export type PersonaFrameDeps = {
-  ctx: CommandExecutorContext;
-  agent: () => AgentRouterLike;
-  agentQueryOptional: (name: string) => AgentQuery | null;
-  agentMutatorOptional: (name: string) => AgentMutator | null;
-  callBridgeLookupCached: CallBridgeLookupCachedFn;
-  collectMediaReferenceInputs: CollectMediaReferenceInputsFn;
-  isStreamPartArtifactReference: IsStreamPartArtifactReferenceFn;
-  resolvePreferredMediaUrl: ResolvePreferredMediaUrlFn;
-  generateAndUploadMediaFromPrompt: GenerateAndUploadMediaFromPromptFn;
-  uploadBytesViaChunkRoute: UploadBytesViaChunkRouteFn;
-  mapUploadResult: MapUploadResultFn;
-  transformCustomAssetMedia: TransformCustomAssetMediaFn;
-  resolveRequestedGenerateKinds: ResolveRequestedGenerateKindsFn;
+export {
+  collectPersonaSeedReferenceInputs,
+  collectAgentProfilePersonaSeedReferences,
+  updatePersonaReferenceSnapshot,
+  parsePersonaFrameRecords,
+  getPersonaFrameRoleSortValue,
+  sortPersonaFrames,
+  pickPersonaFrameReferenceUrl,
+  collectPersonaFrameReferences,
+  normalizePersonaFrameRole,
+  parseIsoOrNull,
 };
 
-// ---------------------------------------------------------------------------
-// collectPersonaSeedReferenceInputs
-// ---------------------------------------------------------------------------
-
-export function collectPersonaSeedReferenceInputs(
-  input: {
-    payload: Record<string, unknown>;
-    fallbackReferenceInputs: string[];
-  },
-  deps: Pick<
-    PersonaFrameDeps,
-    "collectMediaReferenceInputs" | "isStreamPartArtifactReference"
-  >,
-): string[] {
-  const directInputs = deps.collectMediaReferenceInputs(input.payload, {
-    includeRecentGeneratedAsset: false,
-  });
-  const deduped = new Set<string>();
-  const push = (value: string | null | undefined): void => {
-    const normalized = asNonEmptyString(value);
-    if (!normalized || deps.isStreamPartArtifactReference(normalized)) return;
-    if (!isLikelyImageReference(normalized)) return;
-    deduped.add(normalized);
-  };
-  for (const entry of directInputs) push(entry);
-  for (const entry of input.fallbackReferenceInputs) push(entry);
-
-  const recent = isRecord(input.payload.recentGeneratedAsset)
-    ? input.payload.recentGeneratedAsset
-    : null;
-  const recentType = asNonEmptyString(recent?.type)?.toLowerCase() ?? "";
-  if (recentType === "persona" || recentType === "avatar") {
-    push(asNonEmptyString(recent?.href));
-    push(asNonEmptyString(recent?.url));
-    push(asNonEmptyString(recent?.imageUrl));
-    push(asNonEmptyString(recent?.mediaUrl));
-  }
-  return [...deduped].slice(0, MAX_MEDIA_REFERENCE_INPUTS);
-}
-
-// ---------------------------------------------------------------------------
-// collectAgentProfilePersonaSeedReferences
-// ---------------------------------------------------------------------------
-
-export async function collectAgentProfilePersonaSeedReferences(
-  deps: Pick<
-    PersonaFrameDeps,
-    "ctx" | "callBridgeLookupCached" | "isStreamPartArtifactReference"
-  >,
-): Promise<string[]> {
-  if (!deps.ctx.callAgentChatBridge) return [];
-  try {
-    const response = await deps.callBridgeLookupCached({
-      action: "agent_profile",
-    });
-    const root = isRecord(response.value) ? response.value : null;
-    if (!root) return [];
-    const agent = isRecord(root.agent) ? root.agent : null;
-    const profile = isRecord(root.profile) ? root.profile : null;
-    const config = isRecord(root.config) ? root.config : null;
-    const urls = new Set<string>();
-    const push = (value: unknown): void => {
-      const direct = asNonEmptyString(value);
-      if (direct) {
-        urls.add(direct);
-        return;
-      }
-      if (!isRecord(value)) return;
-      const nestedUrl =
-        asNonEmptyString(value.url) ??
-        asNonEmptyString(value.href) ??
-        asNonEmptyString(value.imageUrl) ??
-        asNonEmptyString(value.mediaUrl) ??
-        asNonEmptyString(value.mediaOptimizedUrl) ??
-        asNonEmptyString(value.optimizedUrl) ??
-        null;
-      if (nestedUrl) urls.add(nestedUrl);
-    };
-    for (const source of [root, agent, profile, config]) {
-      if (!source) continue;
-      push(source.avatarUrl);
-      push(source.profileImageUrl);
-      push(source.imageUrl);
-      push(source.photoUrl);
-      push(source.profilePhotoUrl);
-      push(source.pfpUrl);
-      push(source.avatar);
-      push(source.image);
-      push(source.photo);
-      push(source.mediaOptimizedUrl);
-      push(source.optimizedUrl);
-    }
-    return [...urls]
-      .filter(
-        (entry) =>
-          !deps.isStreamPartArtifactReference(entry) &&
-          isLikelyImageReference(entry),
-      )
-      .slice(0, MAX_MEDIA_REFERENCE_INPUTS);
-  } catch {
-    return [];
-  }
-}
-
-// ---------------------------------------------------------------------------
-// updatePersonaReferenceSnapshot
-// ---------------------------------------------------------------------------
-
-export function updatePersonaReferenceSnapshot(
-  input: {
-    mainPersonaSlug: string;
-    personaSlug: string;
-    source: string;
-    frameReferences: string[];
-    builtFrames: boolean;
-    variantKey: string | null;
-  },
-  ctx: CommandExecutorContext,
-): void {
-  const stateDb = ctx.stateDb;
-  if (!stateDb?.enabled) return;
-  const scope = "runtime.persona.references";
-  const existing = stateDb.getSnapshot<Record<string, unknown>>(scope);
-  const previousPersonas = isRecord(existing) && isRecord(existing.personas)
-    ? existing.personas
-    : {};
-  const nextPersonas: Record<string, unknown> = {
-    ...previousPersonas,
-    [input.personaSlug]: {
-      mainPersonaSlug: input.mainPersonaSlug,
-      source: input.source,
-      frameCount: input.frameReferences.length,
-      frameReferences: input.frameReferences.slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT),
-      builtFrames: input.builtFrames,
-      variantKey: input.variantKey,
-      updatedAt: nowIso(),
-    },
-  };
-  if (!isRecord(nextPersonas[input.mainPersonaSlug])) {
-    nextPersonas[input.mainPersonaSlug] = {
-      mainPersonaSlug: input.mainPersonaSlug,
-      source: "main_persona",
-      frameCount: input.frameReferences.length,
-      frameReferences: input.frameReferences.slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT),
-      builtFrames: input.builtFrames,
-      variantKey: null,
-      updatedAt: nowIso(),
-    };
-  }
-  stateDb.upsertSnapshot({
-    scope,
-    visibility: "private",
-    data: {
-      mainPersonaSlug: input.mainPersonaSlug,
-      updatedAt: nowIso(),
-      personas: nextPersonas,
-    },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// normalizePersonaFrameRole
-// ---------------------------------------------------------------------------
-
-export function normalizePersonaFrameRole(value: unknown): PersonaFrameRole | null {
-  const normalized = asNonEmptyString(value)?.toLowerCase() ?? "";
-  if (normalized === "selfie") return "selfie";
-  if (normalized === "midshot" || normalized === "halfbody" || normalized === "half_body") {
-    return "midshot";
-  }
-  if (
-    normalized === "fullbody" ||
-    normalized === "full_body" ||
-    normalized === "full" ||
-    normalized === "fullshot" ||
-    normalized === "full_shot"
-  ) {
-    return "fullbody";
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// parseIsoOrNull
-// ---------------------------------------------------------------------------
-
-export function parseIsoOrNull(value: unknown): string | null {
-  const text = asNonEmptyString(value);
-  if (!text) return null;
-  const parsed = new Date(text);
-  if (Number.isNaN(parsed.getTime())) return null;
-  return parsed.toISOString();
-}
-
-// ---------------------------------------------------------------------------
-// parsePersonaFrameRecords
-// ---------------------------------------------------------------------------
-
-export function parsePersonaFrameRecords(value: unknown): PersonaFrameRecord[] {
-  const asRows = (input: unknown): unknown[] => {
-    if (Array.isArray(input)) return input;
-    if (isRecord(input) && Array.isArray(input.frames)) return input.frames;
-    return [];
-  };
-  const records: PersonaFrameRecord[] = [];
-  for (const rawEntry of asRows(value)) {
-    if (!isRecord(rawEntry)) continue;
-    const idRaw =
-      asPositiveInt(rawEntry.id) ??
-      (typeof rawEntry.id === "number" && Number.isFinite(rawEntry.id)
-        ? Math.max(1, Math.floor(rawEntry.id))
-        : null);
-    const personaSlug = normalizePersonaSlug(rawEntry.personaSlug);
-    const frameRole = normalizePersonaFrameRole(rawEntry.frameRole);
-    const mediaUrl = asNonEmptyString(rawEntry.mediaUrl);
-    if (!idRaw || !personaSlug || !frameRole || !mediaUrl) continue;
-    const width =
-      typeof rawEntry.width === "number" && Number.isFinite(rawEntry.width)
-        ? Math.max(1, Math.floor(rawEntry.width))
-        : null;
-    const height =
-      typeof rawEntry.height === "number" && Number.isFinite(rawEntry.height)
-        ? Math.max(1, Math.floor(rawEntry.height))
-        : null;
-    const sizeBytes =
-      typeof rawEntry.sizeBytes === "number" && Number.isFinite(rawEntry.sizeBytes)
-        ? Math.max(1, Math.floor(rawEntry.sizeBytes))
-        : null;
-    records.push({
-      id: idRaw,
-      personaSlug,
-      frameRole,
-      mediaUrl,
-      originalUrl: asNonEmptyString(rawEntry.originalUrl),
-      optimizedUrl: asNonEmptyString(rawEntry.optimizedUrl),
-      mimeType: asNonEmptyString(rawEntry.mimeType),
-      width,
-      height,
-      sizeBytes,
-      sourcePrompt: asNonEmptyString(rawEntry.sourcePrompt),
-      sourceCommandId: asNonEmptyString(rawEntry.sourceCommandId),
-      createdAt: parseIsoOrNull(rawEntry.createdAt),
-      updatedAt: parseIsoOrNull(rawEntry.updatedAt),
-    });
-  }
-  return records;
-}
-
-// ---------------------------------------------------------------------------
-// getPersonaFrameRoleSortValue
-// ---------------------------------------------------------------------------
-
-export function getPersonaFrameRoleSortValue(frameRole: PersonaFrameRole): number {
-  const index = PERSONA_REFERENCE_FRAME_ROLES.indexOf(frameRole);
-  return index >= 0 ? index : PERSONA_REFERENCE_FRAME_ROLES.length + 1;
-}
-
-// ---------------------------------------------------------------------------
-// sortPersonaFrames
-// ---------------------------------------------------------------------------
-
-export function sortPersonaFrames(frames: PersonaFrameRecord[]): PersonaFrameRecord[] {
-  return [...frames].sort((left, right) => {
-    const roleDelta =
-      getPersonaFrameRoleSortValue(left.frameRole) -
-      getPersonaFrameRoleSortValue(right.frameRole);
-    if (roleDelta !== 0) return roleDelta;
-    const leftUpdated = left.updatedAt ? Date.parse(left.updatedAt) : 0;
-    const rightUpdated = right.updatedAt ? Date.parse(right.updatedAt) : 0;
-    if (leftUpdated !== rightUpdated) return rightUpdated - leftUpdated;
-    return right.id - left.id;
-  });
-}
-
-// ---------------------------------------------------------------------------
-// pickPersonaFrameReferenceUrl
-// ---------------------------------------------------------------------------
-
-export function pickPersonaFrameReferenceUrl(
-  frame: PersonaFrameRecord,
-  isStreamPartArtifactReference: IsStreamPartArtifactReferenceFn,
-): string | null {
-  const candidates = [frame.optimizedUrl, frame.mediaUrl, frame.originalUrl];
-  for (const candidate of candidates) {
-    const normalized = asNonEmptyString(candidate);
-    if (!normalized) continue;
-    if (isStreamPartArtifactReference(normalized)) continue;
-    if (!isLikelyImageReference(normalized, frame.mimeType)) continue;
-    return normalized;
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// collectPersonaFrameReferences
-// ---------------------------------------------------------------------------
-
-export function collectPersonaFrameReferences(
-  frames: PersonaFrameRecord[],
-  isStreamPartArtifactReference: IsStreamPartArtifactReferenceFn,
-): string[] {
-  const ordered = sortPersonaFrames(frames);
-  const seen = new Set<string>();
-  const collected: string[] = [];
-  for (const role of PERSONA_REFERENCE_FRAME_ROLES) {
-    const matches = ordered.filter((frame) => frame.frameRole === role);
-    for (const match of matches) {
-      const selected = pickPersonaFrameReferenceUrl(match, isStreamPartArtifactReference);
-      if (!selected || seen.has(selected)) continue;
-      seen.add(selected);
-      collected.push(selected);
-      break;
-    }
-  }
-  return collected.slice(0, REQUIRED_PERSONA_REFERENCE_FRAME_COUNT);
-}
+export type {
+  PersonaFrameDeps,
+  CollectMediaReferenceInputsFn,
+  IsStreamPartArtifactReferenceFn,
+  ResolvePreferredMediaUrlFn,
+  GenerateAndUploadMediaFromPromptFn,
+  UploadBytesViaChunkRouteFn,
+  MapUploadResultFn,
+  TransformCustomAssetMediaFn,
+};
 
 // ---------------------------------------------------------------------------
 // listPersonaFramesFromServer

@@ -24,6 +24,15 @@ import {
   normalizeQueueState,
   computeDeterministicDelay,
 } from "./queue-state.js";
+import {
+  NOT_READY_MAX_ATTEMPTS,
+  RUNNING_RECOVERY_MIN_AGE_MS,
+  TERMINAL_QUEUE_STATUSES,
+  resolveNotReadyBackoffProfile,
+  computeNotReadyRequeueDelaySeconds,
+} from "./queue-backoff.js";
+import { resetQueueOnReconnect as _resetQueueOnReconnect } from "./queue-reconnect-reset.js";
+import { recoverAbandonedRunningItems as _recoverAbandonedRunningItems } from "./queue-running-recovery.js";
 
 // ---------------------------------------------------------------------------
 // Narrow context interface
@@ -68,92 +77,6 @@ export interface QueueTrackingState {
   queueRunnerTickInFlight: boolean;
   queueStateMutation: Promise<void>;
 }
-
-const NOT_READY_MIN_REQUEUE_DELAY_SECONDS = 2;
-const NOT_READY_MAX_REQUEUE_DELAY_SECONDS = 300;
-const NOT_READY_MAX_ATTEMPTS = 30;
-const RUNNING_RECOVERY_MIN_AGE_MS = 60_000;
-const TERMINAL_QUEUE_STATUSES = new Set<QueueItem["status"]>([
-  "done",
-  "failed",
-  "missing",
-  "cancelled",
-]);
-const MEDIA_GENERATION_FAST_REQUEUE_PATTERN =
-  /\b(image_generation_setup_required|media_generation_waiting_for_output|no_media_url|chat_delivery_media_url_invalid|unsupported_media_payload_mime|invalid_data_uri|media_source_empty|upload_only_image_video)\b/iu;
-const PERSONA_SETUP_REQUEUE_PATTERN = /\bpersona_reference_setup_required:/iu;
-
-const resolveNotReadyBackoffProfile = (reason: string | null | undefined): string => {
-  const normalizedReason = typeof reason === "string" ? reason.trim().toLowerCase() : "";
-  if (MEDIA_GENERATION_FAST_REQUEUE_PATTERN.test(normalizedReason)) {
-    return "media_generation_fast_retry";
-  }
-  if (PERSONA_SETUP_REQUEUE_PATTERN.test(normalizedReason)) {
-    return "persona_setup_retry";
-  }
-  return "default_not_ready_retry";
-};
-
-const computeNotReadyRequeueDelaySeconds = (
-  attempts: number,
-  reason?: string | null,
-): number => {
-  const normalizedAttempts =
-    Number.isFinite(attempts) && attempts > 0 ? Math.trunc(attempts) : 1;
-  const profile = resolveNotReadyBackoffProfile(reason);
-
-  if (profile === "media_generation_fast_retry") {
-    if (normalizedAttempts <= 5) {
-      return Math.max(
-        NOT_READY_MIN_REQUEUE_DELAY_SECONDS,
-        normalizedAttempts * 2,
-      );
-    }
-    if (normalizedAttempts <= 12) {
-      return Math.min(
-        NOT_READY_MAX_REQUEUE_DELAY_SECONDS,
-        10 + (normalizedAttempts - 5) * 2,
-      );
-    }
-    return Math.min(NOT_READY_MAX_REQUEUE_DELAY_SECONDS, 30);
-  }
-
-  if (profile === "persona_setup_retry") {
-    if (normalizedAttempts <= 4) {
-      return Math.min(
-        NOT_READY_MAX_REQUEUE_DELAY_SECONDS,
-        5 * normalizedAttempts,
-      );
-    }
-    if (normalizedAttempts <= 10) {
-      return Math.min(
-        NOT_READY_MAX_REQUEUE_DELAY_SECONDS,
-        20 + (normalizedAttempts - 4) * 5,
-      );
-    }
-    return Math.min(NOT_READY_MAX_REQUEUE_DELAY_SECONDS, 60);
-  }
-
-  if (normalizedAttempts <= 3) {
-    return Math.max(
-      NOT_READY_MIN_REQUEUE_DELAY_SECONDS,
-      normalizedAttempts * 2,
-    );
-  }
-  if (normalizedAttempts <= 8) {
-    return Math.min(
-      NOT_READY_MAX_REQUEUE_DELAY_SECONDS,
-      12 + (normalizedAttempts - 3) * 8,
-    );
-  }
-  if (normalizedAttempts <= 20) {
-    return Math.min(
-      NOT_READY_MAX_REQUEUE_DELAY_SECONDS,
-      60 + (normalizedAttempts - 8) * 10,
-    );
-  }
-  return NOT_READY_MAX_REQUEUE_DELAY_SECONDS;
-};
 
 // ---------------------------------------------------------------------------
 // QueueManager
@@ -404,89 +327,15 @@ export class QueueManager implements QueueManagerLike {
   }
 
   async resetQueueOnReconnect(reason: string): Promise<QueueReconnectResetResult> {
-    const normalizedReason =
-      typeof reason === "string" && reason.trim().length > 0
-        ? reason.trim()
-        : "reconnect_reset";
-    let scanned = 0;
-    let cancelled = 0;
-    let cancelledQueued = 0;
-    let cancelledScheduled = 0;
-    let cancelledRunning = 0;
-    let skippedTerminal = 0;
-    const cancelledInboxFiles = new Set<string>();
-    const cancelledAt = nowIso();
-
-    await this.mutateQueueState((current) => {
-      const nextItems = current.items.map((item) => {
-        scanned += 1;
-        const hasCompletedAt =
-          typeof item.completedAt === "string" && item.completedAt.trim().length > 0;
-        if (hasCompletedAt || TERMINAL_QUEUE_STATUSES.has(item.status)) {
-          skippedTerminal += 1;
-          return item;
-        }
-        cancelled += 1;
-        if (item.status === "queued") {
-          cancelledQueued += 1;
-          if (item.inboxFile.trim().length > 0) {
-            cancelledInboxFiles.add(item.inboxFile.trim());
-          }
-        } else if (item.status === "scheduled") {
-          cancelledScheduled += 1;
-          if (item.inboxFile.trim().length > 0) {
-            cancelledInboxFiles.add(item.inboxFile.trim());
-          }
-        } else if (item.status === "running") {
-          cancelledRunning += 1;
-        }
-        return {
-          ...item,
-          status: "cancelled" as QueueItem["status"],
-          forceNow: false,
-          dueAt: null,
-          startedAt: null,
-          completedAt: cancelledAt,
-          lastError: `cancelled_on_reconnect:${normalizedReason}`,
-          scheduledBy: "reconnect_reset",
-        };
-      });
-      if (cancelled === 0) return current;
-      return {
-        ...current,
-        items: nextItems,
-      };
-    });
-
-    let removedInboxFiles = 0;
-    for (const inboxFile of cancelledInboxFiles) {
-      if (path.basename(inboxFile) !== inboxFile) continue;
-      const inboxPath = path.join(this.ctx.ipcPaths.inboxDir, inboxFile);
-      const removed = await fs
-        .unlink(inboxPath)
-        .then(() => true)
-        .catch(() => false);
-      if (removed) removedInboxFiles += 1;
-    }
-
-    const result: QueueReconnectResetResult = {
-      scanned,
-      cancelled,
-      cancelledQueued,
-      cancelledScheduled,
-      cancelledRunning,
-      skippedTerminal,
-      removedInboxFiles,
-    };
-    await this.ctx.memory
-      .recordWrite({
-        type: "directive_queue_reconnect_reset",
-        at: nowIso(),
-        reason: normalizedReason,
-        ...result,
-      })
-      .catch(() => undefined);
-    return result;
+    return _resetQueueOnReconnect(
+      {
+        mutateQueueState: (mutate) => this.mutateQueueState(mutate),
+        terminalStatuses: TERMINAL_QUEUE_STATUSES,
+        inboxDir: this.ctx.ipcPaths.inboxDir,
+        recordWrite: (payload) => this.ctx.memory.recordWrite(payload),
+      },
+      reason,
+    );
   }
 
   // -----------------------------------------------------------------------
@@ -498,73 +347,15 @@ export class QueueManager implements QueueManagerLike {
   }
 
   private async recoverAbandonedRunningItems(): Promise<void> {
-    const nowMs = Date.now();
-    let recovered = 0;
-    let failedTerminal = 0;
-    await this.mutateQueueState((current) => {
-      const nextItems = current.items.map((item) => {
-        if (item.status !== "running") return item;
-        if (this.activeExecutions.has(item.id)) return item;
-        const startedAtMs = parseIsoToMs(item.startedAt);
-        const lastAttemptAtMs = parseIsoToMs(item.lastAttemptAt);
-        const referenceMs =
-          typeof startedAtMs === "number" && Number.isFinite(startedAtMs)
-            ? startedAtMs
-            : typeof lastAttemptAtMs === "number" && Number.isFinite(lastAttemptAtMs)
-              ? lastAttemptAtMs
-              : null;
-        if (
-          typeof referenceMs === "number" &&
-          Number.isFinite(referenceMs) &&
-          nowMs - referenceMs < RUNNING_RECOVERY_MIN_AGE_MS
-        ) {
-          return item;
-        }
-        const attempts =
-          typeof item.attempts === "number" &&
-          Number.isFinite(item.attempts) &&
-          item.attempts > 0
-            ? Math.trunc(item.attempts)
-            : 1;
-        if (attempts >= NOT_READY_MAX_ATTEMPTS) {
-          failedTerminal += 1;
-          return {
-            ...item,
-            status: "failed" as QueueItem["status"],
-            completedAt: nowIso(),
-            startedAt: null,
-            lastError: `max_retry_exceeded_during_recovery (${attempts} attempts): ${item.lastError ?? "running_item_abandoned"}`,
-          };
-        }
-        recovered += 1;
-        const retryDelaySeconds = computeNotReadyRequeueDelaySeconds(
-          attempts,
-          item.lastError,
-        );
-        return {
-          ...item,
-          status: "scheduled" as QueueItem["status"],
-          forceNow: false,
-          dueAt: new Date(nowMs + retryDelaySeconds * 1000).toISOString(),
-          scheduledBy: "queue_running_recovery",
-          startedAt: null,
-          lastError: item.lastError ?? "running_item_recovered",
-        };
-      });
-      if (recovered === 0 && failedTerminal === 0) return current;
-      return {
-        ...current,
-        items: nextItems,
-      };
+    return _recoverAbandonedRunningItems({
+      activeExecutions: this.activeExecutions,
+      runningRecoveryMinAgeMs: RUNNING_RECOVERY_MIN_AGE_MS,
+      maxAttempts: NOT_READY_MAX_ATTEMPTS,
+      computeNotReadyRequeueDelaySeconds: (attempts, reason) =>
+        computeNotReadyRequeueDelaySeconds(attempts, reason),
+      mutateQueueState: (mutate) => this.mutateQueueState(mutate),
+      recordWrite: (payload) => this.ctx.memory.recordWrite(payload),
     });
-    if (recovered > 0 || failedTerminal > 0) {
-      await this.ctx.memory.recordWrite({
-        type: "directive_queue_running_recovered",
-        at: nowIso(),
-        recovered,
-        failedTerminal,
-      });
-    }
   }
 
   private async executeCandidate(item: QueueItem): Promise<void> {
