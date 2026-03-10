@@ -611,12 +611,38 @@ const main = async (): Promise<void> => {
     return Array.from(merged.values()).sort((left, right) => right.expiresAtMs - left.expiresAtMs);
   };
 
+  const resolvePlannerRuntimeAgentId = async () => {
+    const queryFn = ctx.trpc?.realtime?.authState?.query;
+    if (typeof queryFn === "function") {
+      try {
+        const authState = await queryFn();
+        if (isRecord(authState) && typeof authState.userId === "string") {
+          const userId = authState.userId.trim();
+          if (userId.length > 0) {
+            return userId;
+          }
+        }
+      } catch {
+        // Fall through to the last known snapshot.
+      }
+    }
+    const authSnapshot = ctx.debugSnapshot.auth;
+    if (isRecord(authSnapshot) && typeof authSnapshot.userId === "string") {
+      const userId = authSnapshot.userId.trim();
+      if (userId.length > 0) {
+        return userId;
+      }
+    }
+    return null;
+  };
+
   triggerAutoCreditPlanner = createAutoCreditPlanner({
     hasDirectiveManager: () => Boolean(ctx.directiveManager),
     isQueueRunnerEnabled: () =>
       ctx.queueManager ? ctx.queueManager.isRunnerEnabled() : true,
     getPermissionState: () => ctx.debugSnapshot.permission,
     resolveGrantCandidates,
+    resolveRuntimeAgentId: resolvePlannerRuntimeAgentId,
     callAgentChatBridge,
     intakeDirective: async (directive) => {
       if (!ctx.directiveManager) return;
@@ -631,6 +657,7 @@ const main = async (): Promise<void> => {
       ctx.queueManager ? ctx.queueManager.isRunnerEnabled() : true,
     getPermissionState: () => ctx.debugSnapshot.permission,
     resolveGrantCandidates,
+    resolveRuntimeAgentId: resolvePlannerRuntimeAgentId,
     intakeDirective: async (directive) => {
       if (!ctx.directiveManager) return;
       await ctx.directiveManager.intake(directive);

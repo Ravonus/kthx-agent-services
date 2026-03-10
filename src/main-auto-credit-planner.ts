@@ -14,6 +14,7 @@ export type AutoCreditPlannerDeps = {
   isQueueRunnerEnabled: () => boolean;
   getPermissionState: () => unknown;
   resolveGrantCandidates: (permissionState: unknown) => GrantState[];
+  resolveRuntimeAgentId: () => Promise<string | null>;
   callAgentChatBridge: (payload: unknown) => Promise<unknown>;
   intakeDirective: (directive: Record<string, unknown>) => Promise<void>;
   recordWrite: (payload: unknown) => Promise<unknown>;
@@ -105,6 +106,22 @@ export const createAutoCreditPlanner = (
       const requestedActions = (Object.keys(AUTO_CREDIT_ACTION_CAPS) as EngagementAction[])
         .filter((action) => budgets[action].available > 0 && AUTO_CREDIT_ACTION_CAPS[action] > 0);
       if (requestedActions.length === 0) return;
+
+      const targetAgentId = await deps.resolveRuntimeAgentId().catch(() => null);
+      if (!targetAgentId) {
+        await deps.recordWrite({
+          type: "auto_credit_planner_skipped",
+          at: nowIso(),
+          trigger: opts.trigger,
+          reason: "agent_identity_unresolved",
+          budgets: {
+            like: budgets.like.available,
+            comment: budgets.comment.available,
+            repost: budgets.repost.available,
+          },
+        }).catch(() => {});
+        return;
+      }
 
       const parsePositiveInt = (value: unknown): number | null => {
         if (typeof value === "number" && Number.isFinite(value) && value > 0) {
@@ -541,6 +558,7 @@ export const createAutoCreditPlanner = (
             .slice(0, 12)}`;
           const directivePayload: Record<string, unknown> = {
             id: directiveId,
+            agentId: targetAgentId,
             kind: "brain.generateAndQueue",
             createdAt: nowIso(),
             ...(budgets[action].grantId ? { grantId: budgets[action].grantId } : {}),

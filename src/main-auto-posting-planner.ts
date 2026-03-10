@@ -9,6 +9,7 @@ export type AutoPostingPlannerDeps = {
   isQueueRunnerEnabled: () => boolean;
   getPermissionState: () => unknown;
   resolveGrantCandidates: (permissionState: unknown) => GrantState[];
+  resolveRuntimeAgentId: () => Promise<string | null>;
   intakeDirective: (directive: Record<string, unknown>) => Promise<void>;
   recordWrite: (payload: unknown) => Promise<unknown>;
 };
@@ -189,12 +190,31 @@ export const createAutoPostingPlanner = (
         return;
       }
 
+      const targetAgentId = await deps.resolveRuntimeAgentId().catch(() => null);
+      if (!targetAgentId) {
+        await deps.recordWrite({
+          type: "auto_posting_planner_skipped",
+          at: nowIso(),
+          trigger: opts.trigger,
+          reason: "agent_identity_unresolved",
+          action: selected.action,
+          grantId: selected.grantId,
+          available: selected.available,
+          availableByAction,
+          notBeforeBlockedByAction,
+          cooldownBlocked,
+          grantCandidateCount: grantCandidates.length,
+        }).catch(() => {});
+        return;
+      }
+
       const directiveId = `auto_post_${selected.action}_${Date.now().toString(36)}_${crypto
         .randomUUID()
         .replaceAll("-", "")
         .slice(0, 12)}`;
       const directivePayloadBase: Record<string, unknown> = {
         id: directiveId,
+        agentId: targetAgentId,
         kind: "brain.generateAndQueue",
         createdAt: nowIso(),
         ...(selected.grantId ? { grantId: selected.grantId } : {}),
