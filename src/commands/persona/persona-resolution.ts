@@ -4,7 +4,6 @@ import { isRecord } from "../../lib/guards.js";
 
 import {
   asNonEmptyString,
-  normalizeAgentProvenanceValue,
   inferMimeTypeFromUrl,
   parseDataUriPayload,
 } from "../helpers.js";
@@ -278,6 +277,15 @@ export function shouldDefaultPersonaReferences(
   }
   const genericExplicitPersona =
     explicitPersonaSlug !== null && isGenericPersonaSlug(explicitPersonaSlug);
+  const promptText = extractPersonaPromptText(payload);
+  const explicitSelfIntent = PERSONA_SELF_REFERENCE_PROMPT_PATTERN.test(promptText);
+  const explicitPersonaRequest =
+    explicitSelfIntent || PERSONA_REQUEST_PROMPT_PATTERN.test(promptText);
+  const requestedMediaMode =
+    asNonEmptyString(payload.mediaMode)?.trim().toLowerCase() ??
+    asNonEmptyString(context?.mediaMode)?.trim().toLowerCase() ??
+    "";
+  const selfieModeRequested = requestedMediaMode === "selfie";
   const chatLiteralGenerate =
     payload.chatLiteralGenerate === true ||
     payload.chatLiteralGenerate === "true" ||
@@ -288,6 +296,8 @@ export function shouldDefaultPersonaReferences(
     payload.bannerRequest === true ||
     context?.avatarRequest === true ||
     context?.bannerRequest === true;
+  const genericPersonaReferenceRequested =
+    genericExplicitPersona && !(chatLiteralGenerate && !avatarOrBannerRequest);
   const personaMediaLockEnabled = isPersonaMediaLockEnabled(payload);
   if (
     personaMediaLockEnabled &&
@@ -305,10 +315,7 @@ export function shouldDefaultPersonaReferences(
   ) {
     return true;
   }
-  const provenance =
-    normalizeAgentProvenanceValue(payload.provenance) ??
-    normalizeAgentProvenanceValue(context?.provenance);
-  return provenance === "AGENT_AUTONOMOUS";
+  return explicitPersonaRequest || genericPersonaReferenceRequested || selfieModeRequested;
 }
 
 // ---------------------------------------------------------------------------

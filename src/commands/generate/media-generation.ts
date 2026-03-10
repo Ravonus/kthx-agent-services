@@ -27,10 +27,14 @@ import {
   truncateText,
 } from "../helpers.js";
 
+const PERSONA_REFERENCE_GUIDANCE =
+  "Use the reference images only for identity continuity. Generate a new shot that matches the prompt instead of recreating any reference photo. Change the composition, pose, crop, background, and moment unless the prompt explicitly asks to keep one of them.";
+
 type GenerateMediaPromptOptions = {
   generatedAssetType?: GeneratedAssetType;
   mode?: string;
   referenceInputs?: string[];
+  referenceStrategy?: "generic" | "persona_identity";
   maxReferenceInputs?: number;
   keepOriginal?: boolean;
   commandId?: string | null;
@@ -225,6 +229,7 @@ export async function resolveMediaUpload(
   const fallbackReferenceInputs = this.collectMediaReferenceInputs(payload);
   try {
     let referenceInputs = fallbackReferenceInputs;
+    let referenceStrategy: GenerateMediaPromptOptions["referenceStrategy"] = "generic";
     if (input.command) {
       const personaReferences = await this.resolvePersonaFrameReferences({
         payload,
@@ -243,6 +248,8 @@ export async function resolveMediaUpload(
         personaReferences.personaSlug !== null
           ? personaReferences.frameReferences
           : fallbackReferenceInputs;
+      referenceStrategy =
+        personaReferences.personaSlug !== null ? "persona_identity" : "generic";
     }
 
     const requestedGeneratedAssetType = this.resolveGeneratedAssetType(
@@ -254,6 +261,7 @@ export async function resolveMediaUpload(
       generatedAssetType,
       mode: "write_media_generate",
       referenceInputs,
+      referenceStrategy,
       keepOriginal,
       commandId: input.command?.id ?? null,
       skipPromptCuration,
@@ -350,6 +358,16 @@ export async function generateAndUploadMediaFromPrompt(
     generatedAssetType === "gif"
       ? constrainGifPromptTo256(curatedPromptBase)
       : curatedPromptBase;
+  const referenceInputs = Array.isArray(opts?.referenceInputs)
+    ? opts.referenceInputs.filter(
+        (entry): entry is string =>
+          typeof entry === "string" && entry.trim().length > 0,
+      )
+    : [];
+  const finalPrompt =
+    opts?.referenceStrategy === "persona_identity" && referenceInputs.length > 0
+      ? [curatedPrompt, PERSONA_REFERENCE_GUIDANCE].join("\n\n")
+      : curatedPrompt;
 
   const useFileGenerator = generatedAssetType !== "image";
   const template = useFileGenerator
@@ -374,14 +392,7 @@ export async function generateAndUploadMediaFromPrompt(
     requestDir,
     `output.${outputExtensionForGeneratedAssetType(generatedAssetType)}`,
   );
-  await fs.writeFile(promptFilePath, `${curatedPrompt}\n`, "utf8").catch(() => undefined);
-
-  const referenceInputs = Array.isArray(opts?.referenceInputs)
-    ? opts.referenceInputs.filter(
-        (entry): entry is string =>
-          typeof entry === "string" && entry.trim().length > 0,
-      )
-    : [];
+  await fs.writeFile(promptFilePath, `${finalPrompt}\n`, "utf8").catch(() => undefined);
   const referenceFiles = await this.materializeMediaReferenceFiles({
     requestDir,
     referenceInputs,
@@ -432,7 +443,7 @@ export async function generateAndUploadMediaFromPrompt(
       mode,
       generatedAssetType,
       sourcePromptChars: sourcePrompt.length,
-      promptChars: curatedPrompt.length,
+      promptChars: finalPrompt.length,
       referenceInputCount: referenceInputs.length,
       referenceFileCount: referenceFiles.length,
       commandPreview: command.slice(0, 240),
@@ -440,7 +451,7 @@ export async function generateAndUploadMediaFromPrompt(
     .catch(() => undefined);
 
   const serviceRun = await this.runMediaGeneratorViaHttp({
-    prompt: curatedPrompt,
+    prompt: finalPrompt,
     generatedAssetType,
     requestDir,
     referenceFiles,
@@ -457,7 +468,7 @@ export async function generateAndUploadMediaFromPrompt(
         timedOut: serviceRun.timedOut,
       }
     : await this.runShellCommand(command, {
-        MG_IMAGE_PROMPT: curatedPrompt,
+        MG_IMAGE_PROMPT: finalPrompt,
         MG_IMAGE_PROMPT_DIR: requestDir,
         MG_IMAGE_OUTPUT: outputPath,
         MG_IMAGE_PROMPT_FILE: promptFilePath,

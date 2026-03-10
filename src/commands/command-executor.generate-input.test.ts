@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { CommandExecutor } from "./command-executor.js";
+import { buildPersonaLockedMediaFallbackDraft } from "./generate/generate-input.js";
 import type { Command } from "../types/ipc.js";
 import { isRecord } from "../lib/guards.js";
 
@@ -563,6 +564,32 @@ describe("command executor generate input", () => {
     ).toBe(true);
   });
 
+  it("keeps persona fallback drafts scene-driven instead of forcing selfie mode", () => {
+    const fallback = buildPersonaLockedMediaFallbackDraft({
+      payload: {
+        mediaPersonaLock: true,
+        prompt: "Brass trumpet valves on a messy rehearsal table under tungsten light.",
+      },
+      drafts: [
+        {
+          action: "post",
+          payload: {
+            caption: "late rehearsal mess",
+            textBody: "Brass trumpet valves on a messy rehearsal table under tungsten light.",
+          },
+        },
+      ],
+    });
+
+    expect(fallback).not.toBeNull();
+    if (!fallback || !isRecord(fallback.payload)) return;
+    expect(fallback.payload.mediaPersonaLock).toBe(true);
+    expect(fallback.payload.mediaMode).toBeUndefined();
+    expect(fallback.payload.mediaPrompt).toBe(
+      "Brass trumpet valves on a messy rehearsal table under tungsten light.",
+    );
+  });
+
   it("does not force persona references for generic chat literal persona locks", () => {
     const executor = createExecutor();
     const invoker = executor as unknown as {
@@ -686,7 +713,7 @@ describe("command executor generate input", () => {
     expect(plan.source).toBe("none");
   });
 
-  it("defaults autonomous media generation to main persona frame references", async () => {
+  it("does not default autonomous media generation to persona frame references", async () => {
     const executor = createExecutor({
       personaFrames: [
         {
@@ -731,12 +758,61 @@ describe("command executor generate input", () => {
       baseCommand(),
     );
 
+    expect(result.mediaReferenceUrls).toBeUndefined();
+  });
+
+  it("defaults explicit selfie-mode autonomous media generation to persona frame references", async () => {
+    const executor = createExecutor({
+      personaFrames: [
+        {
+          id: 31,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/selfie-selfie.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/selfie-selfie-opt.jpg",
+          updatedAt: "2026-02-24T07:10:00.000Z",
+        },
+        {
+          id: 32,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/selfie-midshot.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/selfie-midshot-opt.jpg",
+          updatedAt: "2026-02-24T07:11:00.000Z",
+        },
+        {
+          id: 33,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/selfie-fullbody.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/selfie-fullbody-opt.jpg",
+          updatedAt: "2026-02-24T07:12:00.000Z",
+        },
+      ],
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        provenance: "runtime_auto_posting",
+        mediaMode: "selfie",
+        mediaPrompt: "A new candid mirror selfie before heading out.",
+      },
+      baseCommand(),
+    );
+
     expect(Array.isArray(result.mediaReferenceUrls)).toBe(true);
     if (!Array.isArray(result.mediaReferenceUrls)) return;
     expect(result.mediaReferenceUrls).toEqual([
-      "https://cdn.example.com/persona/auto-selfie-opt.jpg",
-      "https://cdn.example.com/persona/auto-midshot-opt.jpg",
-      "https://cdn.example.com/persona/auto-fullbody-opt.jpg",
+      "https://cdn.example.com/persona/selfie-selfie-opt.jpg",
+      "https://cdn.example.com/persona/selfie-midshot-opt.jpg",
+      "https://cdn.example.com/persona/selfie-fullbody-opt.jpg",
     ]);
   });
 

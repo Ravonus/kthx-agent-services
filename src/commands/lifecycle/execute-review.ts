@@ -59,21 +59,14 @@ export async function executeReview(
     );
   }
 
-  // Build the text to review from the payload
-  const textParts: string[] = [];
-  if (typeof payload.newHandle === "string") {
-    textParts.push(`Username/handle: @${payload.newHandle}`);
-  }
-  if (typeof payload.newDisplayName === "string") {
-    textParts.push(`Display name: ${payload.newDisplayName}`);
-  }
-  const textToReview = textParts.join("\n") || "No text provided";
+  const reviewDetails = buildReviewDetails(reviewType, payload);
 
   // Build the LLM prompt using the moderation guidelines from the server
   const systemPrompt = moderationGuidelines ?? [
     "You are a content moderation reviewer.",
-    "Evaluate the text for appropriateness. PG-13 acceptable. No racism, profanity, hate speech, or sexually explicit content.",
-    'Respond ONLY with JSON: { "verdict": "approve" | "reject", "reason": "brief explanation", "confidence": 0.0-1.0 }',
+    "Evaluate the provided content for appropriateness. PG-13 is acceptable. Reject explicit hate, slurs, racism, violent extremism, or disallowed sexual content.",
+    "If you cannot inspect the content well enough, respond with abstain instead of guessing.",
+    'Respond ONLY with JSON: { "verdict": "approve" | "reject" | "abstain", "reason": "brief explanation", "confidence": 0.0-1.0 }',
   ].join("\n");
 
   const fullPrompt = [
@@ -81,8 +74,7 @@ export async function executeReview(
     "",
     "---",
     `Review type: ${reviewType}`,
-    `Text to review:`,
-    textToReview,
+    ...reviewDetails,
     "---",
     "",
     "Respond with ONLY a JSON object, no other text:",
@@ -120,7 +112,11 @@ export async function executeReview(
     const rawText = result.raw ?? "";
 
     if (parsed) {
-      if (parsed.verdict === "approve" || parsed.verdict === "reject") {
+      if (
+        parsed.verdict === "approve" ||
+        parsed.verdict === "reject" ||
+        parsed.verdict === "abstain"
+      ) {
         verdict = parsed.verdict;
       }
       if (typeof parsed.reason === "string") {
@@ -131,11 +127,15 @@ export async function executeReview(
       }
     } else {
       // Try to extract JSON from the raw text
-      const jsonMatch = rawText.match(/\{[^}]*"verdict"\s*:\s*"(approve|reject)"[^}]*\}/);
+      const jsonMatch = rawText.match(/\{[^}]*"verdict"\s*:\s*"(approve|reject|abstain)"[^}]*\}/);
       if (jsonMatch) {
         try {
           const extracted = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
-          if (extracted.verdict === "approve" || extracted.verdict === "reject") {
+          if (
+            extracted.verdict === "approve" ||
+            extracted.verdict === "reject" ||
+            extracted.verdict === "abstain"
+          ) {
             verdict = extracted.verdict;
           }
           if (typeof extracted.reason === "string") {
@@ -197,4 +197,51 @@ export async function executeReview(
       "review_execution_failed",
     );
   }
+}
+
+function buildReviewDetails(
+  reviewType: string,
+  payload: Record<string, unknown>,
+): string[] {
+  if (reviewType === "username_review") {
+    const textParts: string[] = ["Text to review:"];
+    if (typeof payload.newHandle === "string") {
+      textParts.push(`Username/handle: @${payload.newHandle}`);
+    }
+    if (typeof payload.newDisplayName === "string") {
+      textParts.push(`Display name: ${payload.newDisplayName}`);
+    }
+    if (textParts.length === 1) {
+      textParts.push("No text provided");
+    }
+    return textParts;
+  }
+
+  const sections: string[] = [];
+  if (typeof payload.contentUrl === "string") {
+    sections.push(`Primary media URL: ${payload.contentUrl}`);
+  }
+  if (typeof payload.textContent === "string" && payload.textContent.trim().length > 0) {
+    sections.push(`Associated text:\n${payload.textContent.trim()}`);
+  }
+  const algorithmicSummary =
+    payload.algorithmicSummary &&
+    typeof payload.algorithmicSummary === "object" &&
+    !Array.isArray(payload.algorithmicSummary)
+      ? JSON.stringify(payload.algorithmicSummary)
+      : null;
+  if (algorithmicSummary) {
+    sections.push(`Algorithmic summary: ${algorithmicSummary}`);
+  }
+  const policy =
+    payload.policy && typeof payload.policy === "object" && !Array.isArray(payload.policy)
+      ? JSON.stringify(payload.policy)
+      : null;
+  if (policy) {
+    sections.push(`Policy: ${policy}`);
+  }
+  if (sections.length === 0) {
+    sections.push("No structured review details were provided.");
+  }
+  return sections;
 }

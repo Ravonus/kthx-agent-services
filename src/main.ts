@@ -612,7 +612,14 @@ const main = async (): Promise<void> => {
   };
 
   const resolvePlannerRuntimeAgentId = async () => {
-    const queryFn = ctx.trpc?.realtime?.authState?.query;
+    const realtimeProcedures = ctx.trpc?.realtime as
+      | {
+          authState?: {
+            query?: () => Promise<unknown>;
+          };
+        }
+      | undefined;
+    const queryFn = realtimeProcedures?.authState?.query;
     if (typeof queryFn === "function") {
       try {
         const authState = await queryFn();

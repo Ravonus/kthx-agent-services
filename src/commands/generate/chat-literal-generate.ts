@@ -265,6 +265,8 @@ export async function executeChatLiteralGenerate(
           ? "chat_banner_update"
           : "chat_literal_generate",
       referenceInputs,
+      referenceStrategy:
+        personaReferences.personaSlug !== null ? "persona_identity" : "generic",
       commandId: command.id,
       onProgress: (progress: MediaGenerationProgress) =>
         previewState.emitStreamProgress(progress),

@@ -367,14 +367,10 @@ export function buildPersonaLockedMediaFallbackDraft(input: {
     asNonEmptyString(input.payload.imagePrompt) ??
     asNonEmptyString(input.payload.prompt) ??
     asNonEmptyString(input.payload.topic) ??
-    "Photorealistic selfie of yourself with strong identity continuity.";
+    "Create a new photorealistic image with strong identity continuity and a fresh scene.";
   const caption =
     asNonEmptyString(sourcePayload?.caption) ??
     asNonEmptyString(input.payload.caption);
-  const mediaMode =
-    asNonEmptyString(input.payload.mediaMode) ??
-    asNonEmptyString(sourcePayload?.mediaMode) ??
-    "selfie";
   const nextPayload: Record<string, unknown> = {
     ...(sourcePayload ?? {}),
     ...input.payload,
@@ -383,7 +379,6 @@ export function buildPersonaLockedMediaFallbackDraft(input: {
     mediaPrompt,
     imagePrompt: mediaPrompt,
     prompt: mediaPrompt,
-    mediaMode,
     mediaPersonaLock: true,
   };
   if (caption) {
