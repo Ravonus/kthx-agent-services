@@ -61,6 +61,7 @@ const createLifecycleStateDbStub = () => {
 
 const createExecutor = (
   commentPostMutate: (input: unknown) => Promise<unknown>,
+  createPostMutate: (input: unknown) => Promise<unknown> = async () => ({ ok: true }),
   stateDbOverride: StateSqliteStore | null = null,
 ) => {
   const root = path.join(
@@ -91,7 +92,7 @@ const createExecutor = (
     trpc: {
       agent: {
         ackDirective: { mutate: noopMutate },
-        createPost: { mutate: noopMutate },
+        createPost: { mutate: createPostMutate },
         createStory: { mutate: noopMutate },
         commentPost: { mutate: commentPostMutate },
         updateAvatar: { mutate: noopMutate },
@@ -199,7 +200,11 @@ describe("command executor generate batch execution", () => {
       ok: true,
       input,
     }));
-    const executor = createExecutor(commentPost, createLifecycleStateDbStub());
+    const executor = createExecutor(
+      commentPost,
+      async () => ({ ok: true }),
+      createLifecycleStateDbStub(),
+    );
     const invoker = executor as unknown as {
       executeGenerateAndQueue(command: Command): Promise<unknown>;
     };
@@ -253,7 +258,11 @@ describe("command executor generate batch execution", () => {
       ok: true,
       input,
     }));
-    const executor = createExecutor(commentPost, createLifecycleStateDbStub());
+    const executor = createExecutor(
+      commentPost,
+      async () => ({ ok: true }),
+      createLifecycleStateDbStub(),
+    );
     const invoker = executor as unknown as {
       executeGenerateAndQueue(command: Command): Promise<unknown>;
     };
@@ -288,5 +297,64 @@ describe("command executor generate batch execution", () => {
     if (!isRecord(outcome)) return;
     expect(outcome.ok).toBe(true);
     expect(commentPost).toHaveBeenCalledTimes(1);
+  });
+
+  it("honors comment-only directive scope even when a post draft is present", async () => {
+    const commentPost = vi.fn(async (input: unknown) => ({
+      ok: true,
+      input,
+    }));
+    const createPost = vi.fn(async (input: unknown) => ({
+      ok: true,
+      input,
+    }));
+    const executor = createExecutor(
+      commentPost,
+      createPost,
+      createLifecycleStateDbStub(),
+    );
+    const invoker = executor as unknown as {
+      executeGenerateAndQueue(command: Command): Promise<unknown>;
+    };
+
+    const command: Command = {
+      ...baseCommand(),
+      payload: {
+        goal: "post",
+        postId: 101,
+        directiveScope: {
+          allowedCommandKinds: ["write.commentPost"],
+          targetPostId: 101,
+          target: {
+            postId: 101,
+          },
+        },
+        allowMultipleGeneratedDrafts: true,
+        drafts: [
+          {
+            action: "post",
+            payload: {
+              postType: "media",
+              caption: "this should not publish as a post",
+              mediaPrompt: "cinematic neon portrait",
+            },
+          },
+          {
+            action: "comment",
+            payload: {
+              postId: 101,
+              body: "This should be the only executable draft.",
+            },
+          },
+        ],
+      },
+    };
+
+    const outcome = await invoker.executeGenerateAndQueue(command);
+    expect(isRecord(outcome)).toBe(true);
+    if (!isRecord(outcome)) return;
+    expect(outcome.ok).toBe(true);
+    expect(commentPost).toHaveBeenCalledTimes(1);
+    expect(createPost).not.toHaveBeenCalled();
   });
 });

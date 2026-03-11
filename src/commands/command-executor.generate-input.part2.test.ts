@@ -328,6 +328,7 @@ describe("command executor generate input", () => {
     const result = await invoker.buildGenerateInputWithRuntimeContext(
       {
         goal: "media",
+        targetKind: "person",
         taggedHandles: ["@kael"],
         mediaPrompt: "Kael at a library table under warm reading lamps.",
       },
@@ -397,6 +398,7 @@ describe("command executor generate input", () => {
     const result = await invoker.buildGenerateInputWithRuntimeContext(
       {
         goal: "media",
+        targetKind: "person",
         taggedHandles: ["kael"],
         mediaPrompt: "Kael opening a stack of mail in a hallway.",
       },
@@ -404,6 +406,225 @@ describe("command executor generate input", () => {
     );
 
     expect(result.mediaReferenceUrls).toBeUndefined();
+  });
+
+  it("prefers a topic-matched external agent persona before falling back to main", async () => {
+    const executor = createExecutor({
+      listProfilePersonasQuery: async (input) => {
+        expect(input).toEqual({ handle: "kael" });
+        return {
+          mainPersonaSlug: "realistic_core",
+          items: [
+            {
+              slug: "realistic_core",
+              labels: ["realistic_core", "persona_reference"],
+              weight: 5,
+              frames: [
+                {
+                  id: 741,
+                  frameRole: "selfie",
+                  mediaUrl: "https://cdn.example.com/persona/kael-main-selfie.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-main-selfie-opt.jpg",
+                  updatedAt: "2026-02-24T07:50:00.000Z",
+                },
+                {
+                  id: 742,
+                  frameRole: "midshot",
+                  mediaUrl: "https://cdn.example.com/persona/kael-main-midshot.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-main-midshot-opt.jpg",
+                  updatedAt: "2026-02-24T07:51:00.000Z",
+                },
+                {
+                  id: 743,
+                  frameRole: "fullbody",
+                  mediaUrl: "https://cdn.example.com/persona/kael-main-fullbody.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-main-fullbody-opt.jpg",
+                  updatedAt: "2026-02-24T07:52:00.000Z",
+                },
+              ],
+            },
+            {
+              slug: "trail_runner",
+              labels: ["hiking", "outdoors", "trail"],
+              weight: 7,
+              frames: [
+                {
+                  id: 751,
+                  frameRole: "selfie",
+                  mediaUrl: "https://cdn.example.com/persona/kael-trail-selfie.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-trail-selfie-opt.jpg",
+                  updatedAt: "2026-02-24T07:55:00.000Z",
+                },
+                {
+                  id: 752,
+                  frameRole: "midshot",
+                  mediaUrl: "https://cdn.example.com/persona/kael-trail-midshot.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-trail-midshot-opt.jpg",
+                  updatedAt: "2026-02-24T07:56:00.000Z",
+                },
+                {
+                  id: 753,
+                  frameRole: "fullbody",
+                  mediaUrl: "https://cdn.example.com/persona/kael-trail-fullbody.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-trail-fullbody-opt.jpg",
+                  updatedAt: "2026-02-24T07:57:00.000Z",
+                },
+              ],
+            },
+          ],
+        };
+      },
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        targetKind: "person",
+        taggedHandles: ["kael"],
+        tags: ["hiking", "outdoors"],
+        mediaPrompt: "Kael hiking along a windy alpine trail at sunrise.",
+      },
+      baseCommand(),
+    );
+
+    expect(result.mediaReferenceUrls).toEqual([
+      "https://cdn.example.com/persona/kael-trail-selfie-opt.jpg",
+      "https://cdn.example.com/persona/kael-trail-midshot-opt.jpg",
+      "https://cdn.example.com/persona/kael-trail-fullbody-opt.jpg",
+    ]);
+  });
+
+  it("does not force external persona references for a scene prompt that only tags someone in text", async () => {
+    const executor = createExecutor({
+      listProfilePersonasQuery: async () => ({
+        mainPersonaSlug: "realistic_core",
+        items: [
+          {
+            slug: "realistic_core",
+            frames: [
+              {
+                id: 771,
+                frameRole: "selfie",
+                mediaUrl: "https://cdn.example.com/persona/kael-selfie.jpg",
+                optimizedUrl: "https://cdn.example.com/persona/kael-selfie-opt.jpg",
+                updatedAt: "2026-02-24T08:20:00.000Z",
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        targetKind: "scene",
+        taggedHandles: ["kael"],
+        caption: "trail recap with @kael",
+        mediaPrompt: "Fog moving through pine trees above a damp mountain trail.",
+      },
+      baseCommand(),
+    );
+
+    expect(result.mediaReferenceUrls).toBeUndefined();
+  });
+
+  it("resolves external persona frames from @handle mentions in the media prompt", async () => {
+    const executor = createExecutor({
+      personaFrames: [
+        {
+          id: 801,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/local-selfie.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/local-selfie-opt.jpg",
+          updatedAt: "2026-02-24T08:00:00.000Z",
+        },
+        {
+          id: 802,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/local-midshot.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/local-midshot-opt.jpg",
+          updatedAt: "2026-02-24T08:01:00.000Z",
+        },
+        {
+          id: 803,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/local-fullbody.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/local-fullbody-opt.jpg",
+          updatedAt: "2026-02-24T08:02:00.000Z",
+        },
+      ],
+      listProfilePersonasQuery: async (input) => {
+        expect(input).toEqual({ handle: "kael" });
+        return {
+          mainPersonaSlug: "realistic_core",
+          items: [
+            {
+              slug: "realistic_core",
+              frames: [
+                {
+                  id: 901,
+                  frameRole: "selfie",
+                  mediaUrl: "https://cdn.example.com/persona/kael-prompt-selfie.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-prompt-selfie-opt.jpg",
+                  updatedAt: "2026-02-24T08:10:00.000Z",
+                },
+                {
+                  id: 902,
+                  frameRole: "midshot",
+                  mediaUrl: "https://cdn.example.com/persona/kael-prompt-midshot.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-prompt-midshot-opt.jpg",
+                  updatedAt: "2026-02-24T08:11:00.000Z",
+                },
+                {
+                  id: 903,
+                  frameRole: "fullbody",
+                  mediaUrl: "https://cdn.example.com/persona/kael-prompt-fullbody.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-prompt-fullbody-opt.jpg",
+                  updatedAt: "2026-02-24T08:12:00.000Z",
+                },
+              ],
+            },
+          ],
+        };
+      },
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        targetKind: "person",
+        mediaPrompt: "@kael checking maps in a sunlit train station.",
+      },
+      baseCommand(),
+    );
+
+    expect(result.mediaReferenceUrls).toEqual([
+      "https://cdn.example.com/persona/kael-prompt-selfie-opt.jpg",
+      "https://cdn.example.com/persona/kael-prompt-midshot-opt.jpg",
+      "https://cdn.example.com/persona/kael-prompt-fullbody-opt.jpg",
+    ]);
   });
 
   it("uses the target post author handle when no explicit tagged handle is present", async () => {
@@ -468,6 +689,7 @@ describe("command executor generate input", () => {
     const result = await invoker.buildGenerateInputWithRuntimeContext(
       {
         goal: "media",
+        targetKind: "person",
         postId: 42,
         mediaPrompt: "A candid shot of the post author in a narrow bookstore aisle.",
       },

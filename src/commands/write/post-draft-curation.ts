@@ -506,6 +506,7 @@ export function extractCuratedPostDraftFromUnknown(
       : collectTaggedHandlesFromUnknown(rawSelectedTaggedHandles, 8);
   const useTargetContext =
     typeof value.useTargetContext === "boolean" ? value.useTargetContext : null;
+  const targetKind = parsePostDraftDecisionTargetKind(value.targetKind);
   if (postType === "text" && textBody) {
     return {
       caption: caption ? stripEmDashCharacters(caption) : null,
@@ -513,6 +514,7 @@ export function extractCuratedPostDraftFromUnknown(
       mediaPrompt: null,
       selectedTaggedHandles,
       useTargetContext,
+      targetKind,
     };
   }
   if (postType === "media" && (mediaPrompt || caption)) {
@@ -522,6 +524,7 @@ export function extractCuratedPostDraftFromUnknown(
       mediaPrompt: mediaPrompt ? truncateText(stripEmDashCharacters(mediaPrompt), 320) : null,
       selectedTaggedHandles,
       useTargetContext,
+      targetKind,
     };
   }
   for (const key of ["draft", "payload", "result", "output", "data", "content"] as const) {
@@ -539,8 +542,12 @@ export function buildDirectiveScopedMediaGenerationPayload(input: {
   payload: Record<string, unknown>;
   selectedTaggedHandles: string[] | null;
   useTargetContext: boolean | null;
+  targetKind?: PostDraftDecision["targetKind"] | null;
 }): Record<string, unknown> {
   const nextPayload: Record<string, unknown> = { ...input.payload };
+  if (input.targetKind) {
+    nextPayload.targetKind = input.targetKind;
+  }
   if (Array.isArray(input.selectedTaggedHandles)) {
     if (input.selectedTaggedHandles.length > 0) {
       nextPayload.taggedHandles = input.selectedTaggedHandles;

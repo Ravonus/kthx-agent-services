@@ -244,6 +244,9 @@ export async function resolveMediaUpload(
           `persona_reference_setup_required:${personaReferences.personaSlug}`,
         );
       }
+      if (personaReferences.source === "external_handle_missing_frames") {
+        throw new Error("external_persona_reference_required");
+      }
       referenceInputs =
         personaReferences.personaSlug !== null
           ? personaReferences.frameReferences

@@ -5,7 +5,10 @@ import path from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { CommandExecutor } from "./command-executor.js";
-import { buildPersonaLockedMediaFallbackDraft } from "./generate/generate-input.js";
+import {
+  buildPersonaLockedMediaFallbackDraft,
+  resolveEnforcedDraftAction,
+} from "./generate/generate-input.js";
 import type { Command } from "../types/ipc.js";
 import { isRecord } from "../lib/guards.js";
 
@@ -840,6 +843,58 @@ describe("command executor generate input", () => {
       "https://cdn.example.com/persona/selfie-midshot-opt.jpg",
       "https://cdn.example.com/persona/selfie-fullbody-opt.jpg",
     ]);
+  });
+
+  it("does not carry persona recentGeneratedAsset into generic media references", async () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        mediaPrompt: "Rainy street at dusk with reflected headlights.",
+        recentGeneratedAsset: {
+          type: "persona",
+          href: "https://cdn.example.com/persona/recent-selfie.png",
+          optimizedUrl: "https://cdn.example.com/persona/recent-selfie-opt.png",
+        },
+      },
+      baseCommand(),
+    );
+
+    expect(result.mediaReferenceUrls).toBeUndefined();
+  });
+
+  it("enforces engagement draft action from directive scope allowed command kinds", () => {
+    expect(
+      resolveEnforcedDraftAction({
+        goal: "post",
+        directiveScope: {
+          allowedCommandKinds: ["write.commentPost"],
+        },
+      }),
+    ).toBe("comment");
+
+    expect(
+      resolveEnforcedDraftAction({
+        directiveScope: {
+          allowedCommandKinds: ["write.votePost"],
+        },
+      }),
+    ).toBe("like");
+
+    expect(
+      resolveEnforcedDraftAction({
+        directiveScope: {
+          allowedCommandKinds: ["write.repostPost"],
+        },
+      }),
+    ).toBe("repost");
   });
 
 });

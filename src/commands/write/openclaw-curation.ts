@@ -219,6 +219,7 @@ export async function curatePostDraftWithOpenClaw(
       mediaPrompt: cached.value.mediaPrompt,
       selectedTaggedHandles: cached.value.selectedTaggedHandles,
       useTargetContext: cached.value.useTargetContext,
+      targetKind: cached.value.targetKind,
     };
   }
   const decision = await decidePostDraftWithOpenClaw(
@@ -277,6 +278,8 @@ export async function curatePostDraftWithOpenClaw(
           curated.selectedTaggedHandles ?? decision?.includeTaggedHandles ?? null,
         useTargetContext:
           curated.useTargetContext ?? decision?.useTargetContext ?? null,
+        targetKind:
+          curated.targetKind ?? decision?.targetKind ?? null,
       },
       cachedAtMs: Date.now(),
     });
@@ -284,6 +287,8 @@ export async function curatePostDraftWithOpenClaw(
       curated.selectedTaggedHandles ?? decision?.includeTaggedHandles ?? null;
     const useTargetContext =
       curated.useTargetContext ?? decision?.useTargetContext ?? null;
+    const targetKind =
+      curated.targetKind ?? decision?.targetKind ?? null;
     await deps.memory
       .recordWrite({
           type: "post_draft_curated",
@@ -296,6 +301,7 @@ export async function curatePostDraftWithOpenClaw(
           mediaPrompt: curated.mediaPrompt,
           selectedTaggedHandles,
           useTargetContext,
+          targetKind,
       })
       .catch(() => undefined);
     return {
@@ -304,6 +310,7 @@ export async function curatePostDraftWithOpenClaw(
       mediaPrompt: curated.mediaPrompt,
       selectedTaggedHandles,
       useTargetContext,
+      targetKind,
     };
   } catch (error: unknown) {
     await deps.memory

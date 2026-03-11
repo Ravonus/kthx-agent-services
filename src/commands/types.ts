@@ -191,6 +191,7 @@ export type CuratedPostDraft = {
   mediaPrompt: string | null;
   selectedTaggedHandles: string[] | null;
   useTargetContext: boolean | null;
+  targetKind: PostDraftDecision["targetKind"] | null;
 };
 
 export type CuratedPostDraftCacheEntry = {

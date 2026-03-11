@@ -79,6 +79,8 @@ export async function executeWriteCreatePostText(
     curatedTextDraft?.selectedTaggedHandles ?? null;
   let useTargetContextForMediaGeneration =
     curatedTextDraft?.useTargetContext ?? null;
+  let targetKindForMediaGeneration =
+    curatedTextDraft?.targetKind ?? null;
   captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
   textBodyForWrite = stripEmDashCharacters(textBodyForWrite);
   if (!textBodyForWrite) {
@@ -166,6 +168,8 @@ export async function executeWriteCreatePostText(
         recuratedTextDraft.selectedTaggedHandles ?? null;
       useTargetContextForMediaGeneration =
         recuratedTextDraft.useTargetContext ?? null;
+      targetKindForMediaGeneration =
+        recuratedTextDraft.targetKind ?? null;
       captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
       textBodyForWrite = stripEmDashCharacters(textBodyForWrite);
       noveltyValidation = this.validatePostDraftNovelty({
@@ -304,6 +308,7 @@ export async function executeWriteCreatePostText(
       payload,
       selectedTaggedHandles: selectedTaggedHandlesForMediaGeneration,
       useTargetContext: useTargetContextForMediaGeneration,
+      targetKind: targetKindForMediaGeneration,
     });
   const visualBackgroundPromptRaw =
     visualPlan?.backgroundImagePrompt ??

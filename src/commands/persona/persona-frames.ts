@@ -5,6 +5,7 @@ import { nowIso } from "../../lib/text.js";
 import {
   asNonEmptyString,
   asPositiveInt,
+  normalizeInterestTagToken,
   truncateText,
   inferMimeTypeFromUrl,
 } from "../helpers.js";
@@ -97,6 +98,10 @@ const normalizeHandle = (value: unknown): string | null => {
   return normalized.length > 0 ? normalized : null;
 };
 
+const HANDLE_MENTION_PATTERN = /(?:^|[^@\w])@([a-z0-9_][a-z0-9_.-]{0,31})/giu;
+const EXTERNAL_PERSONA_AUTHOR_PATTERN =
+  /\b(post author|comment author|the author|author)\b/iu;
+
 const collectHandleCandidatesFromValue = (value: unknown, max: number): string[] => {
   if (!Array.isArray(value)) return [];
   const collected: string[] = [];
@@ -111,6 +116,21 @@ const collectHandleCandidatesFromValue = (value: unknown, max: number): string[]
     const nestedHandle = normalizeHandle(entry.handle);
     if (!nestedHandle) continue;
     collected.push(nestedHandle);
+    if (collected.length >= max) break;
+  }
+  return collected;
+};
+
+const collectHandleMentionsFromText = (value: unknown, max: number): string[] => {
+  const text = asNonEmptyString(value);
+  if (!text) return [];
+  const collected: string[] = [];
+  const seen = new Set<string>();
+  for (const match of text.matchAll(HANDLE_MENTION_PATTERN)) {
+    const normalized = normalizeHandle(match[1]);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    collected.push(normalized);
     if (collected.length >= max) break;
   }
   return collected;
@@ -146,6 +166,20 @@ function collectTargetHandleCandidates(payload: Record<string, unknown>): string
   push(context?.authorHandle);
   push(context?.postAuthorHandle);
   push(context?.commentAuthorHandle);
+
+  const promptFields: unknown[] = [
+    payload.prompt,
+    payload.mediaPrompt,
+    payload.imagePrompt,
+    context?.prompt,
+    context?.mediaPrompt,
+    context?.imagePrompt,
+  ];
+  for (const field of promptFields) {
+    for (const handle of collectHandleMentionsFromText(field, 24)) {
+      collected.add(handle);
+    }
+  }
 
   return [...collected].slice(0, 24);
 }
@@ -249,6 +283,7 @@ async function resolveOwnAgentHandleFromBridge(
 
 async function listProfilePersonaFramesByHandleFromServer(
   handle: string,
+  payload: Record<string, unknown>,
   deps: Pick<PersonaFrameDeps, "ctx" | "userQueryOptional" | "isStreamPartArtifactReference">,
 ): Promise<{ personaSlug: string | null; frameReferences: string[] }> {
   const listProfilePersonas = deps.userQueryOptional("listProfilePersonas");
@@ -260,11 +295,21 @@ async function listProfilePersonaFramesByHandleFromServer(
     const root = isRecord(response) ? response : null;
     const mainPersonaSlug = normalizePersonaSlug(root?.mainPersonaSlug);
     const items = root && Array.isArray(root.items) ? root.items : [];
+    const matchTokens = collectExternalPersonaMatchTokens(payload);
     const parsed = items
       .map((entry) => {
         if (!isRecord(entry)) return null;
         const slug = normalizePersonaSlug(entry.slug);
         if (!slug) return null;
+        const labels = Array.isArray(entry.labels)
+          ? entry.labels
+              .map((label) => asNonEmptyString(label))
+              .filter((label): label is string => Boolean(label))
+          : [];
+        const weight =
+          typeof entry.weight === "number" && Number.isFinite(entry.weight)
+            ? entry.weight
+            : 0;
         const framesRaw = Array.isArray(entry.frames) ? entry.frames : [];
         const frames = parsePersonaFrameRecords({
           frames: framesRaw.map((frame) =>
@@ -282,8 +327,10 @@ async function listProfilePersonaFramesByHandleFromServer(
         );
         return {
           slug,
+          labels,
           frameReferences,
           frameCount: frames.length,
+          weight,
         };
       })
       .filter(
@@ -291,20 +338,39 @@ async function listProfilePersonaFramesByHandleFromServer(
           entry,
         ): entry is {
           slug: string;
+          labels: string[];
           frameReferences: string[];
           frameCount: number;
+          weight: number;
         } => Boolean(entry),
       );
 
     const selected =
-      (mainPersonaSlug
-        ? parsed.find((entry) => entry.slug === mainPersonaSlug)
-        : null) ??
       [...parsed].sort((left, right) => {
+        const leftComplete =
+          left.frameReferences.length >= REQUIRED_PERSONA_REFERENCE_FRAME_COUNT ? 1 : 0;
+        const rightComplete =
+          right.frameReferences.length >= REQUIRED_PERSONA_REFERENCE_FRAME_COUNT ? 1 : 0;
+        if (rightComplete !== leftComplete) {
+          return rightComplete - leftComplete;
+        }
+        const leftOverlap = countExternalPersonaLabelOverlap(left.labels, matchTokens);
+        const rightOverlap = countExternalPersonaLabelOverlap(right.labels, matchTokens);
+        if (rightOverlap !== leftOverlap) {
+          return rightOverlap - leftOverlap;
+        }
+        const leftIsMain = left.slug === mainPersonaSlug ? 1 : 0;
+        const rightIsMain = right.slug === mainPersonaSlug ? 1 : 0;
+        if (rightIsMain !== leftIsMain) {
+          return rightIsMain - leftIsMain;
+        }
         if (right.frameReferences.length !== left.frameReferences.length) {
           return right.frameReferences.length - left.frameReferences.length;
         }
-        return right.frameCount - left.frameCount;
+        if (right.frameCount !== left.frameCount) {
+          return right.frameCount - left.frameCount;
+        }
+        return right.weight - left.weight;
       })[0] ??
       null;
 
@@ -374,9 +440,20 @@ async function resolveExternalPersonaFrameReferences(
       source: null,
     };
   }
+  if (!shouldUseExternalPersonaFrames(input.payload, payloadHandles, bridgeHandles)) {
+    return {
+      resolution: null,
+      suppressOwnPersona: false,
+      source: null,
+    };
+  }
 
   for (const handle of handles) {
-    const external = await listProfilePersonaFramesByHandleFromServer(handle, deps);
+    const external = await listProfilePersonaFramesByHandleFromServer(
+      handle,
+      input.payload,
+      deps,
+    );
     if (
       external.personaSlug &&
       external.frameReferences.length >= REQUIRED_PERSONA_REFERENCE_FRAME_COUNT
@@ -418,6 +495,164 @@ async function resolveExternalPersonaFrameReferences(
     source: "external_handle_missing_frames",
   };
 }
+
+const collectExternalPersonaMatchTokensFromArray = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return [];
+  const tokens = new Set<string>();
+  for (const entry of value) {
+    const normalized = normalizeInterestTagToken(entry);
+    if (normalized) {
+      tokens.add(normalized);
+    }
+  }
+  return [...tokens];
+};
+
+const collectExternalPersonaMatchTokensFromText = (value: unknown): string[] => {
+  const text = asNonEmptyString(value);
+  if (!text) return [];
+  const tokens = new Set<string>();
+  for (const rawToken of text.split(/[^a-z0-9_]+/iu)) {
+    const normalized = normalizeInterestTagToken(rawToken);
+    if (normalized) {
+      tokens.add(normalized);
+    }
+  }
+  return [...tokens];
+};
+
+const collectExternalPersonaMatchTokens = (payload: Record<string, unknown>): string[] => {
+  const context = isRecord(payload.context) ? payload.context : null;
+  const tokens = new Set<string>();
+  const pushArray = (value: unknown): void => {
+    for (const token of collectExternalPersonaMatchTokensFromArray(value)) {
+      tokens.add(token);
+    }
+  };
+  const pushText = (value: unknown): void => {
+    for (const token of collectExternalPersonaMatchTokensFromText(value)) {
+      tokens.add(token);
+    }
+  };
+
+  [
+    payload.tags,
+    payload.mediaLabels,
+    payload.labels,
+    context?.tags,
+    context?.mediaLabels,
+    context?.labels,
+  ].forEach((value) => pushArray(value));
+
+  [
+    payload.mediaPrompt,
+    payload.imagePrompt,
+    payload.prompt,
+    payload.topic,
+    context?.mediaPrompt,
+    context?.imagePrompt,
+    context?.prompt,
+    context?.topic,
+  ].forEach((value) => pushText(value));
+
+  return [...tokens].slice(0, 24);
+};
+
+const collectExternalPersonaLabelTokens = (labels: string[]): Set<string> => {
+  const tokens = new Set<string>();
+  for (const label of labels) {
+    for (const part of label.split(/[^a-z0-9_]+/iu)) {
+      const normalized = normalizeInterestTagToken(part);
+      if (normalized) {
+        tokens.add(normalized);
+      }
+    }
+  }
+  return tokens;
+};
+
+const countExternalPersonaLabelOverlap = (
+  labels: string[],
+  matchTokens: string[],
+): number => {
+  if (labels.length === 0 || matchTokens.length === 0) return 0;
+  const labelTokens = collectExternalPersonaLabelTokens(labels);
+  let overlap = 0;
+  for (const token of matchTokens) {
+    if (labelTokens.has(token)) {
+      overlap += 1;
+    }
+  }
+  return overlap;
+};
+
+const resolveExternalPersonaTargetKind = (
+  payload: Record<string, unknown>,
+): "self" | "person" | "post" | "topic" | "scene" | null => {
+  const context = isRecord(payload.context) ? payload.context : null;
+  const normalized =
+    asNonEmptyString(payload.targetKind)?.trim().toLowerCase() ??
+    asNonEmptyString(context?.targetKind)?.trim().toLowerCase() ??
+    null;
+  if (
+    normalized === "self" ||
+    normalized === "person" ||
+    normalized === "post" ||
+    normalized === "topic" ||
+    normalized === "scene"
+  ) {
+    return normalized;
+  }
+  return null;
+};
+
+const resolveExternalPersonaMediaMode = (payload: Record<string, unknown>): string | null => {
+  const context = isRecord(payload.context) ? payload.context : null;
+  return (
+    asNonEmptyString(payload.mediaMode)?.trim().toLowerCase() ??
+    asNonEmptyString(context?.mediaMode)?.trim().toLowerCase() ??
+    null
+  );
+};
+
+const collectVisualPromptFields = (payload: Record<string, unknown>): unknown[] => {
+  const context = isRecord(payload.context) ? payload.context : null;
+  return [
+    payload.prompt,
+    payload.mediaPrompt,
+    payload.imagePrompt,
+    context?.prompt,
+    context?.mediaPrompt,
+    context?.imagePrompt,
+  ];
+};
+
+const hasVisualPromptHandleMention = (payload: Record<string, unknown>): boolean =>
+  collectVisualPromptFields(payload).some(
+    (value) => collectHandleMentionsFromText(value, 1).length > 0,
+  );
+
+const hasExternalAuthorReferencePrompt = (payload: Record<string, unknown>): boolean =>
+  collectVisualPromptFields(payload).some((value) => {
+    const text = asNonEmptyString(value);
+    return text ? EXTERNAL_PERSONA_AUTHOR_PATTERN.test(text) : false;
+  });
+
+const shouldUseExternalPersonaFrames = (
+  payload: Record<string, unknown>,
+  payloadHandles: string[],
+  bridgeHandles: string[],
+): boolean => {
+  const targetKind = resolveExternalPersonaTargetKind(payload);
+  const mediaMode = resolveExternalPersonaMediaMode(payload);
+  const hasAnyHandleSignals = payloadHandles.length > 0 || bridgeHandles.length > 0;
+  if (!hasAnyHandleSignals) return false;
+  if (hasVisualPromptHandleMention(payload)) return true;
+  if (targetKind === "person") return true;
+  if (mediaMode === "group") return true;
+  if (bridgeHandles.length > 0 && hasExternalAuthorReferencePrompt(payload)) return true;
+  return false;
+};
 
 // ---------------------------------------------------------------------------
 // listPersonaFramesFromServer

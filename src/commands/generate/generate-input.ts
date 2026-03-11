@@ -237,6 +237,14 @@ export function mapGoalToGenerateKind(goal: string): string {
 export function resolveEnforcedDraftAction(
   payload: Record<string, unknown>,
 ): "comment" | "like" | "repost" | null {
+  const scopedGenerateKinds = resolveDirectiveScopeGenerateKinds(payload).filter(
+    (kind): kind is "comment" | "like" | "repost" =>
+      kind === "comment" || kind === "like" || kind === "repost",
+  );
+  if (scopedGenerateKinds.length === 1) {
+    return scopedGenerateKinds[0] ?? null;
+  }
+
   const normalizedKinds = resolveRequestedGenerateKinds(payload, "story");
   const goal = asNonEmptyString(payload.goal)?.toLowerCase() ?? "";
   if (goal === "comment" || goal === "like" || goal === "repost") {
@@ -470,14 +478,12 @@ export function collectMediaReferenceInputs(
     payload.mediaReferenceMedia,
     payload.referenceMedia,
     payload.referenceImages,
-    payload.taggedUsers,
     payload.mediaItems,
     context?.mediaReferenceUrls,
     context?.mediaReferenceFiles,
     context?.mediaReferenceMedia,
     context?.referenceMedia,
     context?.referenceImages,
-    context?.taggedUsers,
     context?.mediaItems,
   ].forEach((value) => pushMaybeArray(value));
   [
@@ -499,13 +505,19 @@ export function collectMediaReferenceInputs(
     const recentGeneratedAsset = isRecord(payload.recentGeneratedAsset)
       ? payload.recentGeneratedAsset
       : null;
-    pushMaybe(recentGeneratedAsset?.href);
-    pushMaybe(recentGeneratedAsset?.url);
-    pushMaybe(recentGeneratedAsset?.imageUrl);
-    pushMaybe(recentGeneratedAsset?.mediaUrl);
-    pushMaybe(recentGeneratedAsset?.originalUrl);
-    pushMaybe(recentGeneratedAsset?.optimizedUrl);
-    pushMaybe(recentGeneratedAsset?.mediaOptimizedUrl);
+    const recentGeneratedAssetType =
+      asNonEmptyString(recentGeneratedAsset?.type)?.trim().toLowerCase() ?? "";
+    const includeRecentGeneratedPersonaReference =
+      recentGeneratedAssetType !== "persona" && recentGeneratedAssetType !== "avatar";
+    if (includeRecentGeneratedPersonaReference) {
+      pushMaybe(recentGeneratedAsset?.href);
+      pushMaybe(recentGeneratedAsset?.url);
+      pushMaybe(recentGeneratedAsset?.imageUrl);
+      pushMaybe(recentGeneratedAsset?.mediaUrl);
+      pushMaybe(recentGeneratedAsset?.originalUrl);
+      pushMaybe(recentGeneratedAsset?.optimizedUrl);
+      pushMaybe(recentGeneratedAsset?.mediaOptimizedUrl);
+    }
   }
 
   return Array.from(new Set(collected)).slice(0, maxCollectedReferenceInputs);

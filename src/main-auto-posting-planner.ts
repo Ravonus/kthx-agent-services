@@ -21,10 +21,15 @@ export const createAutoPostingPlanner = (
 ): ((opts: PlannerTriggerOptions) => void) => {
   type AutoPostingAction = "post_media" | "post_text" | "story";
   const AUTO_POSTING_ACTION_KEYS: Record<AutoPostingAction, readonly string[]> = {
-    post_media: ["post:post:media", "post:thread:media", "write.createPost"],
-    post_text: ["post:post:text", "post:thread:text", "write.createPost"],
-    story: ["story", "write.createStory"],
+    post_media: ["post:post:media", "post:thread:media"],
+    post_text: ["post:post:text", "post:thread:text"],
+    story: ["story"],
   };
+  const AUTO_POSTING_GRANT_SNAPSHOT_KEYS = Array.from(
+    new Set(
+      Object.values(AUTO_POSTING_ACTION_KEYS).flatMap((keys) => [...keys]),
+    ),
+  );
   const autoPostingPlannerEnabled = isEnabledEnvFlag(
     trimEnv("MG_AUTO_POSTING_PLANNER_ENABLED") ?? "1",
   );
@@ -51,7 +56,20 @@ export const createAutoPostingPlanner = (
   let autoPostingPlanInFlight: Promise<void> | null = null;
   let autoPostingPlanLastAtMs = 0;
   const autoPostingRecentPlans = new Map<string, number>();
+  const autoPostingGrantSnapshots = new Map<string, string>();
   let autoPostingFollowupTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const buildGrantSnapshotSignature = (grant: GrantState): string =>
+    AUTO_POSTING_GRANT_SNAPSHOT_KEYS.map((key) => {
+      const actionState = grant.actions.get(key);
+      if (!actionState) return `${key}:0:0`;
+      const notBeforeAtMs =
+        typeof actionState.notBeforeAtMs === "number" &&
+        Number.isFinite(actionState.notBeforeAtMs)
+          ? actionState.notBeforeAtMs
+          : grant.issuedAtMs + actionState.notBeforeSeconds * 1000;
+      return `${key}:${actionState.remainingCount}:${Math.max(0, Math.floor(notBeforeAtMs / 1000))}`;
+    }).join("|");
 
   const scheduleAutoPostingPlannerFollowup = (trigger: string): void => {
     if (!autoPostingPlannerEnabled) return;
@@ -73,6 +91,16 @@ export const createAutoPostingPlanner = (
       const permissionState = opts.permissionState ?? deps.getPermissionState();
       const grantCandidates = deps.resolveGrantCandidates(permissionState);
       if (!grantCandidates.length) return;
+      const visibleGrantIds = new Set(
+        grantCandidates
+          .map((candidate) => candidate.id.trim())
+          .filter((grantId) => grantId.length > 0),
+      );
+      for (const grantId of Array.from(autoPostingGrantSnapshots.keys())) {
+        if (!visibleGrantIds.has(grantId)) {
+          autoPostingGrantSnapshots.delete(grantId);
+        }
+      }
 
       const promotedPendingCount = await deps
         .promotePendingAutoPostingDirectives()
@@ -147,6 +175,7 @@ export const createAutoPostingPlanner = (
             action: AutoPostingAction;
             grantId: string | null;
             available: number;
+            grantSnapshot: string | null;
           }
         | null = null;
       const actionPriority: AutoPostingAction[] = ["post_media", "post_text", "story"];
@@ -161,10 +190,23 @@ export const createAutoPostingPlanner = (
         story: 0,
       };
       let cooldownBlocked = 0;
+      let grantSnapshotBlocked = 0;
       let earliestNotBeforeAtMs: number | null = null;
       for (const candidate of grantCandidates) {
         if (candidate.expiresAtMs <= now) continue;
         const grantId = candidate.id.trim().length > 0 ? candidate.id.trim() : null;
+        const grantSnapshot =
+          grantId && grantId.length > 0
+            ? buildGrantSnapshotSignature(candidate)
+            : null;
+        if (
+          grantId &&
+          grantSnapshot &&
+          autoPostingGrantSnapshots.get(grantId) === grantSnapshot
+        ) {
+          grantSnapshotBlocked += 1;
+          continue;
+        }
         for (const action of actionPriority) {
           const availability = availableForAction(candidate, AUTO_POSTING_ACTION_KEYS[action]);
           const available = availability.available;
@@ -187,6 +229,7 @@ export const createAutoPostingPlanner = (
             action,
             grantId,
             available,
+            grantSnapshot,
           };
           break;
         }
@@ -202,9 +245,11 @@ export const createAutoPostingPlanner = (
           notBeforeBlockedByAction.story;
         const reason =
           totalAvailable > 0
-            ? cooldownBlocked > 0
-              ? "cooldown"
-              : "no_plan_targets"
+            ? grantSnapshotBlocked > 0
+              ? "grant_snapshot_reused"
+              : cooldownBlocked > 0
+                ? "cooldown"
+                : "no_plan_targets"
             : totalNotBeforeBlocked > 0
               ? "not_before"
               : "no_posting_window";
@@ -216,6 +261,7 @@ export const createAutoPostingPlanner = (
           availableByAction,
           notBeforeBlockedByAction,
           cooldownBlocked,
+          grantSnapshotBlocked,
           grantCandidateCount: grantCandidates.length,
           ...(earliestNotBeforeAtMs !== null
             ? { nextReadyAt: new Date(earliestNotBeforeAtMs).toISOString() }
@@ -309,6 +355,9 @@ export const createAutoPostingPlanner = (
         ...directivePayloadBase,
         payload: payloadByAction[selected.action],
       });
+      if (selected.grantId && selected.grantSnapshot) {
+        autoPostingGrantSnapshots.set(selected.grantId, selected.grantSnapshot);
+      }
       const dedupeKey = `${selected.action}:${selected.grantId ?? "none"}`;
       autoPostingRecentPlans.set(dedupeKey, Date.now());
       const cutoff = Date.now() - autoPostingPlanCooldownMs;

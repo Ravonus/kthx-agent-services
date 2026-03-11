@@ -75,6 +75,12 @@ const createExecutor = () => {
   const uploadDataUriMutate = vi.fn(
     async (_input: Record<string, unknown>): Promise<unknown> => ({ ok: true }),
   );
+  const listProfilePersonasQuery = vi.fn(
+    async (): Promise<unknown> => ({
+      mainPersonaSlug: null,
+      items: [],
+    }),
+  );
 
   const executor = new CommandExecutor({
     config: {
@@ -100,9 +106,14 @@ const createExecutor = () => {
         generate: { mutate: noopMutate },
         uploadDataUri: { mutate: uploadDataUriMutate },
         uploadRemote: { mutate: uploadRemoteMutate },
+        listPersonas: { query: async () => [] },
+        listPersonaFrames: { query: async () => [] },
       },
       realtime: {
         ackDirective: { mutate: noopMutate },
+      },
+      user: {
+        listProfilePersonas: { query: listProfilePersonasQuery },
       },
     },
     commandSeal: {
@@ -120,7 +131,7 @@ const createExecutor = () => {
     runOpenClawPrompt: null,
   });
 
-  return { executor, uploadRemoteMutate, uploadDataUriMutate };
+  return { executor, uploadRemoteMutate, uploadDataUriMutate, listProfilePersonasQuery };
 };
 
 describe("command executor media upload fallback", () => {
@@ -230,5 +241,50 @@ describe("command executor media upload fallback", () => {
         command: baseCommand(),
       }),
     ).rejects.toThrow(/media_generation_waiting_for_output:no_media_url/iu);
+  });
+
+  it("refuses person-centered media when the external target has no complete persona frames", async () => {
+    const { executor, listProfilePersonasQuery } = createExecutor();
+    const invoker = executor as unknown as CommandExecutorInvoker;
+    listProfilePersonasQuery.mockResolvedValueOnce({
+      mainPersonaSlug: "realistic_core",
+      items: [
+        {
+          slug: "realistic_core",
+          frames: [
+            {
+              id: 801,
+              frameRole: "selfie",
+              mediaUrl: "https://cdn.example.com/persona/kael-selfie.jpg",
+              optimizedUrl: "https://cdn.example.com/persona/kael-selfie-opt.jpg",
+              updatedAt: "2026-02-24T08:30:00.000Z",
+            },
+          ],
+        },
+      ],
+    });
+    const generateAndUploadMediaFromPrompt = vi.fn(async () => ({
+      mediaUrl: "https://cdn.example.com/generated/should-not-run.png",
+      mediaOriginalUrl: "https://cdn.example.com/generated/should-not-run.png",
+      mediaOptimizedUrl: "https://cdn.example.com/generated/should-not-run.png",
+      mediaType: "image" as const,
+    }));
+    invoker.generateAndUploadMediaFromPrompt =
+      generateAndUploadMediaFromPrompt as CommandExecutorInvoker["generateAndUploadMediaFromPrompt"];
+
+    await expect(
+      invoker.resolveMediaUpload({
+        payload: {
+          targetKind: "person",
+          taggedHandles: ["kael"],
+          mediaPrompt: "Kael checking maps under the departure board.",
+        },
+        promptFallbacks: ["Kael checking maps under the departure board."],
+        command: baseCommand(),
+      }),
+    ).rejects.toThrow(/external_persona_reference_required/iu);
+
+    expect(listProfilePersonasQuery).toHaveBeenCalledWith({ handle: "kael" });
+    expect(generateAndUploadMediaFromPrompt).not.toHaveBeenCalled();
   });
 });

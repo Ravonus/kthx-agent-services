@@ -267,6 +267,82 @@ describe("command executor self-comment policy", () => {
     expect(String(resolved.source)).toContain("comment_thread");
   });
 
+  it("drops unreadable reply candidates after find_post hydration fails", async () => {
+    const ownUserId = "agent-main-user";
+    const bridge = vi.fn(async (rawPayload: unknown) => {
+      if (!isRecord(rawPayload)) return { items: [] };
+      const action = asNonEmptyString(rawPayload.action);
+      if (!action) return { items: [] };
+      if (action === "agent_profile") {
+        return {
+          agent: {
+            mainUserId: ownUserId,
+            handle: "kael",
+          },
+        };
+      }
+      if (action === "browse_notifications") {
+        return { items: [] };
+      }
+      if (action === "browse_unanswered_mentions") {
+        return { items: [] };
+      }
+      if (action === "browse_top_engagers") {
+        return { items: [] };
+      }
+      if (action === "browse_recent_actions") {
+        return {
+          items: [
+            {
+              id: 999,
+              postId: 999,
+              authorId: "other-main-user-a",
+            },
+            {
+              id: 100,
+              postId: 100,
+              authorId: "other-main-user-b",
+            },
+          ],
+        };
+      }
+      if (action === "find_post") {
+        const postId = asPositiveInt(rawPayload.postId);
+        if (postId === 999) {
+          throw new Error("NOT_FOUND");
+        }
+        if (postId === 100) {
+          return {
+            post: {
+              id: 100,
+              postId: 100,
+              author: { mainUserId: "other-main-user-b" },
+            },
+          };
+        }
+      }
+      if (action === "browse_comments") {
+        return { comments: [] };
+      }
+      return { items: [] };
+    });
+    const executor = createExecutor(bridge);
+    const invoker = executor as unknown as ResolveInvoker;
+
+    const resolved = await invoker.resolveEngagementTargetForDirective({
+      payload: {
+        requestText: "Reply to something recent.",
+      },
+      action: "comment",
+      commandId: "cmd-filter-unreadable-candidate",
+    });
+
+    expect(resolved).not.toBeNull();
+    if (!resolved) return;
+    expect(resolved.postId).toBe(100);
+    expect(resolved.commentId).toBeNull();
+  });
+
   it("blocks own top-level comments when no reply target exists", async () => {
     const ownUserId = "agent-main-user";
     const bridge = vi.fn(async (rawPayload: unknown) => {

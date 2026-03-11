@@ -7,6 +7,7 @@ import type {
   CommandOutcome,
   CuratedPostDraft,
   PersonaReferencePlan,
+  PostDraftDecision,
   PostDraftContext,
   PostVarietyMode,
   ResolvedMediaUpload,
@@ -105,6 +106,7 @@ export type ExecuteWriteCreatePostRuntime = {
     payload: Record<string, unknown>;
     selectedTaggedHandles: string[] | null;
     useTargetContext: boolean | null;
+    targetKind?: PostDraftDecision["targetKind"] | null;
   }) => Record<string, unknown>;
   resolveAutonomousTextTheme: (input: {
     commandId: string;

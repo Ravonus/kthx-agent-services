@@ -85,6 +85,8 @@ export async function executeWriteCreatePostMedia(
     curatedMediaDraft?.selectedTaggedHandles ?? null;
   let useTargetContextForMediaGeneration =
     curatedMediaDraft?.useTargetContext ?? null;
+  let targetKindForMediaGeneration =
+    curatedMediaDraft?.targetKind ?? null;
   captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
   mediaPromptForWrite = mediaPromptForWrite
     ? stripEmDashCharacters(mediaPromptForWrite)
@@ -171,6 +173,8 @@ export async function executeWriteCreatePostMedia(
         recuratedMediaDraft.selectedTaggedHandles ?? null;
       useTargetContextForMediaGeneration =
         recuratedMediaDraft.useTargetContext ?? null;
+      targetKindForMediaGeneration =
+        recuratedMediaDraft.targetKind ?? null;
       captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
       mediaPromptForWrite = mediaPromptForWrite
         ? stripEmDashCharacters(mediaPromptForWrite)
@@ -218,6 +222,7 @@ export async function executeWriteCreatePostMedia(
       payload,
       selectedTaggedHandles: selectedTaggedHandlesForMediaGeneration,
       useTargetContext: useTargetContextForMediaGeneration,
+      targetKind: targetKindForMediaGeneration,
     });
   const personaReferencePlan =
     this.resolvePersonaReferencePlan(mediaGenerationPayloadBase, null, command);

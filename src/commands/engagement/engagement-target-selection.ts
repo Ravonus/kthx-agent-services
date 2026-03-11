@@ -61,7 +61,6 @@ export async function selectEngagementTargetCandidate(input: {
     bridgeQueryFailureCount,
     trace,
     cacheKey,
-    pool,
   } = input;
   let candidatePool = [...input.candidates];
   const agentMainUserId = input.agentMainUserId;
@@ -73,40 +72,103 @@ export async function selectEngagementTargetCandidate(input: {
     byTargetKey.set(key, candidate);
   }
   const hydrationPool = [...byTargetKey.values()].slice(0, 10);
-  await pool.runLookupStep(
-    "candidate_hydration",
-    hydrationPool.map((candidate) => ({
-      source: "hydrate_find_post",
-      request: {
+  const attemptedHydrationKeys = new Set<string>();
+  const hydratedTargetKeys = new Set<string>();
+  let hydrationQueryCount = 0;
+  let hydrationCacheHits = 0;
+  for (const candidate of hydrationPool) {
+    const key = `${candidate.postId}:${candidate.commentId ?? 0}`;
+    attemptedHydrationKeys.add(key);
+    hydrationQueryCount += 1;
+    try {
+      const result = await deps.callAgentBridgeLookupCached({
         action: "find_post",
         postId: candidate.postId,
-      },
-      parser: (value: unknown): EngagementTargetCandidate[] => {
-        const postRecord = extractPostRecordForCommentCuration(value, candidate.postId);
-        if (!postRecord) return [];
-        const author = isRecord(postRecord.author) ? postRecord.author : null;
-        const authorId =
-          asNonEmptyString(author?.mainUserId) ??
-          asNonEmptyString(author?.id) ??
-          asNonEmptyString(postRecord.authorId) ??
-          candidate.authorId;
-        const postSnapshotHash = computePostSnapshotHash({
+      });
+      if (result.cacheHit) hydrationCacheHits += 1;
+      const postRecord = extractPostRecordForCommentCuration(
+        result.value,
+        candidate.postId,
+      );
+      if (!postRecord) continue;
+      const author = isRecord(postRecord.author) ? postRecord.author : null;
+      candidate.authorId =
+        asNonEmptyString(author?.mainUserId) ??
+        asNonEmptyString(author?.id) ??
+        asNonEmptyString(postRecord.authorId) ??
+        candidate.authorId ??
+        null;
+      candidate.postSnapshotHash =
+        computePostSnapshotHash({
           postId: candidate.postId,
           commentId: candidate.commentId,
           postRecord,
-        });
-        return [
-          {
-            ...candidate,
-            authorId,
-            source: candidate.source,
-            postSnapshotHash: postSnapshotHash ?? candidate.postSnapshotHash ?? null,
-          },
-        ];
-      },
-    })),
-  );
-  candidatePool = [...input.candidates];
+        }) ??
+        candidate.postSnapshotHash ??
+        null;
+      hydratedTargetKeys.add(key);
+    } catch (error: unknown) {
+      await deps.memory
+        .recordWrite({
+          type: "engagement_target_lookup_failed",
+          at: nowIso(),
+          commandId,
+          action,
+          step: "candidate_hydration",
+          source: "hydrate_find_post",
+          lookupAction: "find_post",
+          error: error instanceof Error ? error.message : String(error),
+          postId: candidate.postId,
+          commentId: candidate.commentId ?? null,
+        })
+        .catch(() => undefined);
+    }
+  }
+  trace.push({
+    step: "candidate_hydration",
+    queryCount: hydrationQueryCount,
+    cacheHits: hydrationCacheHits,
+    addedCandidates: 0,
+    totalCandidates: candidatePool.length,
+  });
+  if (attemptedHydrationKeys.size > 0) {
+    const hydratedCandidatePool = candidatePool.filter((candidate) => {
+      const key = `${candidate.postId}:${candidate.commentId ?? 0}`;
+      return !attemptedHydrationKeys.has(key) || hydratedTargetKeys.has(key);
+    });
+    if (hydratedCandidatePool.length !== candidatePool.length) {
+      await deps.memory
+        .recordWrite({
+          type: "engagement_target_filtered_missing_post_context",
+          at: nowIso(),
+          commandId,
+          action,
+          filteredCount: candidatePool.length - hydratedCandidatePool.length,
+          keptCount: hydratedCandidatePool.length,
+          query: hints.rawQuery,
+        })
+        .catch(() => undefined);
+    }
+    candidatePool = hydratedCandidatePool;
+  }
+  if (candidatePool.length === 0) {
+    await deps.memory
+      .recordWrite({
+        type: "engagement_target_resolution_failed",
+        at: nowIso(),
+        commandId,
+        action,
+        reason: "candidate_hydration_missing_post_context",
+        query: hints.rawQuery,
+        bridgeQuerySuccessCount,
+        bridgeQueryFailureCount,
+        trace,
+      })
+      .catch(() => undefined);
+    throw new Error(
+      "engagement_target_unavailable:no_targets_discovered:missing_target_post_context",
+    );
+  }
 
   // Filter & rank candidates
   if (action !== "comment") {
