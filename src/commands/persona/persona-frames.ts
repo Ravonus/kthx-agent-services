@@ -4,6 +4,7 @@ import { nowIso } from "../../lib/text.js";
 
 import {
   asNonEmptyString,
+  asPositiveInt,
   truncateText,
   inferMimeTypeFromUrl,
 } from "../helpers.js";
@@ -82,6 +83,341 @@ export type {
   MapUploadResultFn,
   TransformCustomAssetMediaFn,
 };
+
+type ExternalPersonaTargetResolution = {
+  resolution: PersonaReferenceResolution | null;
+  suppressOwnPersona: boolean;
+  source: string | null;
+};
+
+const normalizeHandle = (value: unknown): string | null => {
+  const raw = asNonEmptyString(value);
+  if (!raw) return null;
+  const normalized = raw.trim().replace(/^@+/u, "").toLowerCase();
+  return normalized.length > 0 ? normalized : null;
+};
+
+const collectHandleCandidatesFromValue = (value: unknown, max: number): string[] => {
+  if (!Array.isArray(value)) return [];
+  const collected: string[] = [];
+  for (const entry of value) {
+    const directHandle = normalizeHandle(entry);
+    if (directHandle) {
+      collected.push(directHandle);
+      if (collected.length >= max) break;
+      continue;
+    }
+    if (!isRecord(entry)) continue;
+    const nestedHandle = normalizeHandle(entry.handle);
+    if (!nestedHandle) continue;
+    collected.push(nestedHandle);
+    if (collected.length >= max) break;
+  }
+  return collected;
+};
+
+function collectTargetHandleCandidates(payload: Record<string, unknown>): string[] {
+  const context = isRecord(payload.context) ? payload.context : null;
+  const collected = new Set<string>();
+  const push = (value: unknown): void => {
+    const normalized = normalizeHandle(value);
+    if (!normalized) return;
+    collected.add(normalized);
+  };
+
+  for (const handle of collectHandleCandidatesFromValue(payload.taggedHandles, 24)) {
+    collected.add(handle);
+  }
+  for (const handle of collectHandleCandidatesFromValue(payload.taggedUsers, 24)) {
+    collected.add(handle);
+  }
+  for (const handle of collectHandleCandidatesFromValue(context?.taggedHandles, 24)) {
+    collected.add(handle);
+  }
+  for (const handle of collectHandleCandidatesFromValue(context?.taggedUsers, 24)) {
+    collected.add(handle);
+  }
+
+  push(payload.targetHandle);
+  push(payload.authorHandle);
+  push(payload.postAuthorHandle);
+  push(payload.commentAuthorHandle);
+  push(context?.targetHandle);
+  push(context?.authorHandle);
+  push(context?.postAuthorHandle);
+  push(context?.commentAuthorHandle);
+
+  return [...collected].slice(0, 24);
+}
+
+async function collectBridgeTargetHandleCandidates(
+  payload: Record<string, unknown>,
+  deps: Pick<PersonaFrameDeps, "ctx" | "callBridgeLookupCached">,
+): Promise<string[]> {
+  if (!deps.ctx.callAgentChatBridge) return [];
+  const postId =
+    asPositiveInt(payload.postId) ??
+    asPositiveInt(payload.targetPostId) ??
+    (isRecord(payload.directiveScope) && isRecord(payload.directiveScope.target)
+      ? asPositiveInt(payload.directiveScope.target.postId)
+      : null);
+  const commentId =
+    asPositiveInt(payload.commentId) ??
+    asPositiveInt(payload.targetCommentId) ??
+    (isRecord(payload.directiveScope) && isRecord(payload.directiveScope.target)
+      ? asPositiveInt(payload.directiveScope.target.commentId)
+      : null);
+
+  const handles = new Set<string>();
+  const push = (value: unknown): void => {
+    const normalized = normalizeHandle(value);
+    if (!normalized) return;
+    handles.add(normalized);
+  };
+
+  if (postId && commentId) {
+    try {
+      const commentLookup = await deps.callBridgeLookupCached({
+        action: "find_comment",
+        postId,
+        commentId,
+      });
+      const commentRoot = isRecord(commentLookup.value) ? commentLookup.value : null;
+      const commentRecord =
+        commentRoot && isRecord(commentRoot.data) ? commentRoot.data : commentLookup.value;
+      const author =
+        isRecord(commentRecord) && isRecord(commentRecord.author)
+          ? commentRecord.author
+          : null;
+      if (author) {
+        push(author.handle);
+      } else if (isRecord(commentRecord)) {
+        push(commentRecord.authorHandle);
+      }
+    } catch {
+      // best effort only
+    }
+  }
+
+  if (postId) {
+    try {
+      const postLookup = await deps.callBridgeLookupCached({
+        action: "find_post",
+        postId,
+      });
+      const postLookupRoot = isRecord(postLookup.value) ? postLookup.value : null;
+      const postRoot =
+        postLookupRoot && isRecord(postLookupRoot.data)
+          ? postLookupRoot.data
+          : postLookup.value;
+      const postRecord = isRecord(postRoot) && isRecord(postRoot.post)
+        ? postRoot.post
+        : postRoot;
+      const author =
+        isRecord(postRecord) && isRecord(postRecord.author)
+          ? postRecord.author
+          : null;
+      if (author) {
+        push(author.handle);
+      } else if (isRecord(postRecord)) {
+        push(postRecord.authorHandle);
+      }
+    } catch {
+      // best effort only
+    }
+  }
+
+  return [...handles];
+}
+
+async function resolveOwnAgentHandleFromBridge(
+  deps: Pick<PersonaFrameDeps, "ctx" | "callBridgeLookupCached">,
+): Promise<string | null> {
+  if (!deps.ctx.callAgentChatBridge) return null;
+  try {
+    const profileLookup = await deps.callBridgeLookupCached({
+      action: "agent_profile",
+    });
+    const root = isRecord(profileLookup.value) ? profileLookup.value : null;
+    const data = root && isRecord(root.data) ? root.data : profileLookup.value;
+    const agent = isRecord(data) && isRecord(data.agent) ? data.agent : null;
+    return normalizeHandle(agent?.handle);
+  } catch {
+    return null;
+  }
+}
+
+async function listProfilePersonaFramesByHandleFromServer(
+  handle: string,
+  deps: Pick<PersonaFrameDeps, "ctx" | "userQueryOptional" | "isStreamPartArtifactReference">,
+): Promise<{ personaSlug: string | null; frameReferences: string[] }> {
+  const listProfilePersonas = deps.userQueryOptional("listProfilePersonas");
+  if (!listProfilePersonas) {
+    return { personaSlug: null, frameReferences: [] };
+  }
+  try {
+    const response = await listProfilePersonas.query({ handle });
+    const root = isRecord(response) ? response : null;
+    const mainPersonaSlug = normalizePersonaSlug(root?.mainPersonaSlug);
+    const items = root && Array.isArray(root.items) ? root.items : [];
+    const parsed = items
+      .map((entry) => {
+        if (!isRecord(entry)) return null;
+        const slug = normalizePersonaSlug(entry.slug);
+        if (!slug) return null;
+        const framesRaw = Array.isArray(entry.frames) ? entry.frames : [];
+        const frames = parsePersonaFrameRecords({
+          frames: framesRaw.map((frame) =>
+            isRecord(frame)
+              ? {
+                  ...frame,
+                  personaSlug: slug,
+                }
+              : frame,
+          ),
+        }).filter((frame) => frame.personaSlug === slug);
+        const frameReferences = collectPersonaFrameReferences(
+          frames,
+          deps.isStreamPartArtifactReference,
+        );
+        return {
+          slug,
+          frameReferences,
+          frameCount: frames.length,
+        };
+      })
+      .filter(
+        (
+          entry,
+        ): entry is {
+          slug: string;
+          frameReferences: string[];
+          frameCount: number;
+        } => Boolean(entry),
+      );
+
+    const selected =
+      (mainPersonaSlug
+        ? parsed.find((entry) => entry.slug === mainPersonaSlug)
+        : null) ??
+      [...parsed].sort((left, right) => {
+        if (right.frameReferences.length !== left.frameReferences.length) {
+          return right.frameReferences.length - left.frameReferences.length;
+        }
+        return right.frameCount - left.frameCount;
+      })[0] ??
+      null;
+
+    if (!selected) {
+      return { personaSlug: null, frameReferences: [] };
+    }
+    return {
+      personaSlug: selected.slug,
+      frameReferences: selected.frameReferences,
+    };
+  } catch (error: unknown) {
+    await deps.ctx.memory
+      .recordWrite({
+        type: "persona_reference_external_lookup_failed",
+        at: nowIso(),
+        handle,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      .catch(() => undefined);
+    return { personaSlug: null, frameReferences: [] };
+  }
+}
+
+async function resolveExternalPersonaFrameReferences(
+  input: {
+    payload: Record<string, unknown>;
+    plan: PersonaReferencePlan;
+  },
+  deps: Pick<
+    PersonaFrameDeps,
+    "ctx" | "userQueryOptional" | "isStreamPartArtifactReference" | "callBridgeLookupCached"
+  >,
+): Promise<ExternalPersonaTargetResolution> {
+  const explicitPersonaSlug = input.plan.explicitPersonaSlug;
+  if (
+    input.plan.allowNewPersonaCreation ||
+    (explicitPersonaSlug && !isGenericPersonaSlug(explicitPersonaSlug))
+  ) {
+    return {
+      resolution: null,
+      suppressOwnPersona: false,
+      source: null,
+    };
+  }
+
+  const payloadHandles = collectTargetHandleCandidates(input.payload);
+  const bridgeHandles = await collectBridgeTargetHandleCandidates(input.payload, deps);
+  const ownAgentHandle = await resolveOwnAgentHandleFromBridge(deps);
+  const handles = Array.from(
+    new Set([...payloadHandles, ...bridgeHandles]),
+  )
+    .filter((handle) => handle !== ownAgentHandle)
+    .slice(0, 8);
+  if (handles.length === 0) {
+    return {
+      resolution: null,
+      suppressOwnPersona: false,
+      source: null,
+    };
+  }
+
+  const listProfilePersonas = deps.userQueryOptional("listProfilePersonas");
+  if (!listProfilePersonas) {
+    return {
+      resolution: null,
+      suppressOwnPersona: false,
+      source: null,
+    };
+  }
+
+  for (const handle of handles) {
+    const external = await listProfilePersonaFramesByHandleFromServer(handle, deps);
+    if (
+      external.personaSlug &&
+      external.frameReferences.length >= REQUIRED_PERSONA_REFERENCE_FRAME_COUNT
+    ) {
+      await deps.ctx.memory
+        .recordWrite({
+          type: "persona_reference_external_selected",
+          at: nowIso(),
+          handle,
+          personaSlug: external.personaSlug,
+          frameReferenceCount: external.frameReferences.length,
+        })
+        .catch(() => undefined);
+      return {
+        resolution: {
+          personaSlug: external.personaSlug,
+          frameReferences: external.frameReferences,
+          builtFrames: false,
+          mainPersonaSlug: external.personaSlug,
+          source: `external_handle:${handle}`,
+        },
+        suppressOwnPersona: false,
+        source: `external_handle:${handle}`,
+      };
+    }
+  }
+
+  await deps.ctx.memory
+    .recordWrite({
+      type: "persona_reference_external_missing",
+      at: nowIso(),
+      handles,
+      reason: "no_target_handle_with_complete_persona_frames",
+    })
+    .catch(() => undefined);
+  return {
+    resolution: null,
+    suppressOwnPersona: true,
+    source: "external_handle_missing_frames",
+  };
+}
 
 // ---------------------------------------------------------------------------
 // listPersonaFramesFromServer
@@ -473,6 +809,25 @@ export async function resolvePersonaFrameReferences(
     input.command,
     deps.resolveRequestedGenerateKinds,
   );
+  const externalTargetResolution = await resolveExternalPersonaFrameReferences(
+    {
+      payload: input.payload,
+      plan,
+    },
+    deps,
+  );
+  if (externalTargetResolution.resolution) {
+    return externalTargetResolution.resolution;
+  }
+  if (externalTargetResolution.suppressOwnPersona) {
+    return {
+      personaSlug: null,
+      frameReferences: [],
+      builtFrames: false,
+      mainPersonaSlug: null,
+      source: externalTargetResolution.source,
+    };
+  }
   if (!shouldUsePersonaFrameReferences(plan)) {
     return {
       personaSlug: null,

@@ -64,6 +64,8 @@ const directiveCommandWithoutSourceId = (): Command => ({
 const createExecutor = (options?: {
   personaFrames?: unknown[];
   upsertPersonaMutate?: (input: unknown) => Promise<unknown>;
+  listProfilePersonasQuery?: (input: unknown) => Promise<unknown>;
+  callAgentChatBridge?: (payload: unknown) => Promise<unknown>;
 }) => {
   const root = path.join(
     os.tmpdir(),
@@ -80,6 +82,8 @@ const createExecutor = (options?: {
 
   const noopMutate = async () => ({ ok: true });
   const listPersonaFrames = async () => options?.personaFrames ?? [];
+  const listProfilePersonas =
+    options?.listProfilePersonasQuery ?? (async () => ({ mainPersonaSlug: null, items: [] }));
 
   return new CommandExecutor({
     config: {
@@ -113,6 +117,9 @@ const createExecutor = (options?: {
       realtime: {
         ackDirective: { mutate: noopMutate },
       },
+      user: {
+        listProfilePersonas: { query: listProfilePersonas },
+      },
     },
     commandSeal: {
       runtimeCommandSessionId: "session-test",
@@ -124,7 +131,7 @@ const createExecutor = (options?: {
     queue: {
       queueStateMutation: Promise.resolve(),
     },
-    callAgentChatBridge: null,
+    callAgentChatBridge: options?.callAgentChatBridge ?? null,
     callAgentUploadChunk: null,
     runOpenClawPrompt: null,
   });
@@ -246,5 +253,235 @@ describe("command executor generate input", () => {
     );
 
     expect(upsertPersonaMutate).toHaveBeenCalledTimes(1);
+  });
+
+  it("prefers tagged agent persona frames over the local agent persona", async () => {
+    const executor = createExecutor({
+      personaFrames: [
+        {
+          id: 401,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/local-selfie.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/local-selfie-opt.jpg",
+          updatedAt: "2026-02-24T07:00:00.000Z",
+        },
+        {
+          id: 402,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/local-midshot.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/local-midshot-opt.jpg",
+          updatedAt: "2026-02-24T07:01:00.000Z",
+        },
+        {
+          id: 403,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/local-fullbody.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/local-fullbody-opt.jpg",
+          updatedAt: "2026-02-24T07:02:00.000Z",
+        },
+      ],
+      listProfilePersonasQuery: async (input) => {
+        expect(input).toEqual({ handle: "kael" });
+        return {
+          mainPersonaSlug: "realistic_core",
+          items: [
+            {
+              slug: "realistic_core",
+              frames: [
+                {
+                  id: 501,
+                  frameRole: "selfie",
+                  mediaUrl: "https://cdn.example.com/persona/kael-selfie.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-selfie-opt.jpg",
+                  updatedAt: "2026-02-24T07:10:00.000Z",
+                },
+                {
+                  id: 502,
+                  frameRole: "midshot",
+                  mediaUrl: "https://cdn.example.com/persona/kael-midshot.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-midshot-opt.jpg",
+                  updatedAt: "2026-02-24T07:11:00.000Z",
+                },
+                {
+                  id: 503,
+                  frameRole: "fullbody",
+                  mediaUrl: "https://cdn.example.com/persona/kael-fullbody.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-fullbody-opt.jpg",
+                  updatedAt: "2026-02-24T07:12:00.000Z",
+                },
+              ],
+            },
+          ],
+        };
+      },
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        taggedHandles: ["@kael"],
+        mediaPrompt: "Kael at a library table under warm reading lamps.",
+      },
+      baseCommand(),
+    );
+
+    expect(result.mediaReferenceUrls).toEqual([
+      "https://cdn.example.com/persona/kael-selfie-opt.jpg",
+      "https://cdn.example.com/persona/kael-midshot-opt.jpg",
+      "https://cdn.example.com/persona/kael-fullbody-opt.jpg",
+    ]);
+  });
+
+  it("suppresses local persona fallback when a tagged agent has no complete persona frames", async () => {
+    const executor = createExecutor({
+      personaFrames: [
+        {
+          id: 601,
+          personaSlug: "realistic_core",
+          frameRole: "selfie",
+          mediaUrl: "https://cdn.example.com/persona/local-selfie.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/local-selfie-opt.jpg",
+          updatedAt: "2026-02-24T07:20:00.000Z",
+        },
+        {
+          id: 602,
+          personaSlug: "realistic_core",
+          frameRole: "midshot",
+          mediaUrl: "https://cdn.example.com/persona/local-midshot.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/local-midshot-opt.jpg",
+          updatedAt: "2026-02-24T07:21:00.000Z",
+        },
+        {
+          id: 603,
+          personaSlug: "realistic_core",
+          frameRole: "fullbody",
+          mediaUrl: "https://cdn.example.com/persona/local-fullbody.jpg",
+          optimizedUrl: "https://cdn.example.com/persona/local-fullbody-opt.jpg",
+          updatedAt: "2026-02-24T07:22:00.000Z",
+        },
+      ],
+      listProfilePersonasQuery: async () => ({
+        mainPersonaSlug: "realistic_core",
+        items: [
+          {
+            slug: "realistic_core",
+            frames: [
+              {
+                id: 701,
+                frameRole: "selfie",
+                mediaUrl: "https://cdn.example.com/persona/kael-selfie.jpg",
+                optimizedUrl: "https://cdn.example.com/persona/kael-selfie-opt.jpg",
+                updatedAt: "2026-02-24T07:30:00.000Z",
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        taggedHandles: ["kael"],
+        mediaPrompt: "Kael opening a stack of mail in a hallway.",
+      },
+      baseCommand(),
+    );
+
+    expect(result.mediaReferenceUrls).toBeUndefined();
+  });
+
+  it("uses the target post author handle when no explicit tagged handle is present", async () => {
+    const callAgentChatBridge = vi.fn(async (payload: unknown) => {
+      if (!isRecord(payload)) return null;
+      if (payload.action === "find_post") {
+        return {
+          data: {
+            id: 42,
+            author: {
+              handle: "kael",
+            },
+          },
+        };
+      }
+      return null;
+    });
+    const executor = createExecutor({
+      listProfilePersonasQuery: async (input) => {
+        expect(input).toEqual({ handle: "kael" });
+        return {
+          mainPersonaSlug: "realistic_core",
+          items: [
+            {
+              slug: "realistic_core",
+              frames: [
+                {
+                  id: 801,
+                  frameRole: "selfie",
+                  mediaUrl: "https://cdn.example.com/persona/kael-post-selfie.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-post-selfie-opt.jpg",
+                  updatedAt: "2026-02-24T07:40:00.000Z",
+                },
+                {
+                  id: 802,
+                  frameRole: "midshot",
+                  mediaUrl: "https://cdn.example.com/persona/kael-post-midshot.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-post-midshot-opt.jpg",
+                  updatedAt: "2026-02-24T07:41:00.000Z",
+                },
+                {
+                  id: 803,
+                  frameRole: "fullbody",
+                  mediaUrl: "https://cdn.example.com/persona/kael-post-fullbody.jpg",
+                  optimizedUrl: "https://cdn.example.com/persona/kael-post-fullbody-opt.jpg",
+                  updatedAt: "2026-02-24T07:42:00.000Z",
+                },
+              ],
+            },
+          ],
+        };
+      },
+      callAgentChatBridge,
+    });
+    const invoker = executor as unknown as {
+      buildGenerateInputWithRuntimeContext(
+        payload: Record<string, unknown>,
+        command: Command,
+      ): Promise<Record<string, unknown>>;
+    };
+
+    const result = await invoker.buildGenerateInputWithRuntimeContext(
+      {
+        goal: "media",
+        postId: 42,
+        mediaPrompt: "A candid shot of the post author in a narrow bookstore aisle.",
+      },
+      baseCommand(),
+    );
+
+    expect(callAgentChatBridge).toHaveBeenCalledWith({
+      action: "find_post",
+      postId: 42,
+    });
+    expect(result.mediaReferenceUrls).toEqual([
+      "https://cdn.example.com/persona/kael-post-selfie-opt.jpg",
+      "https://cdn.example.com/persona/kael-post-midshot-opt.jpg",
+      "https://cdn.example.com/persona/kael-post-fullbody-opt.jpg",
+    ]);
   });
 });

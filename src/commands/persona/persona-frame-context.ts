@@ -92,6 +92,7 @@ export type PersonaFrameDeps = {
   ctx: CommandExecutorContext;
   agent: () => AgentRouterLike;
   agentQueryOptional: (name: string) => AgentQuery | null;
+  userQueryOptional: (name: string) => AgentQuery | null;
   agentMutatorOptional: (name: string) => AgentMutator | null;
   callBridgeLookupCached: CallBridgeLookupCachedFn;
   collectMediaReferenceInputs: CollectMediaReferenceInputsFn;

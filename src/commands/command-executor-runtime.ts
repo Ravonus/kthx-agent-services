@@ -23,7 +23,12 @@ import { executeWriteUpdateAvatar as _executeWriteUpdateAvatar, executeWriteUpda
 import type { BuildWriteRuntimeDeps } from "./write/write-runtime-builders.js";
 import { buildWriteCreatePostRuntime as _buildWriteCreatePostRuntime, buildWriteCreateStoryRuntime as _buildWriteCreateStoryRuntime, buildWriteEngagementRuntime as _buildWriteEngagementRuntime, buildWriteProfileRuntime as _buildWriteProfileRuntime, notePublishedPostVarietyMode as _notePublishedPostVarietyMode } from "./write/write-runtime-builders.js";
 import { classifyMediaGenerationDeferral as _classifyDeferral, resolveCommandSourceDirectiveId as _resolveDirectiveId, resolveCommandSourceDirectiveActionNonce as _resolveNonce } from "./directives/resolution.js";
-import { resolveAgentMutatorOptional, resolveAgentQueryOptional, resolveAgentRouter } from "./router/agent-router.js";
+import {
+  resolveAgentMutatorOptional,
+  resolveAgentQueryOptional,
+  resolveAgentRouter,
+  resolveRouterQueryOptional,
+} from "./router/agent-router.js";
 import { callAgentBridgeLookupCached as _bridgeLookupCached, buildEngagementTargetCacheKey as _buildEngagementKey, pruneEngagementTargetCache as _pruneEngagementCache } from "./cache/cache.js";
 import { executeDelegatedFollowAction as _executeDelegatedFollowAction } from "./follow/delegated-follow.js";
 import { extractEngagementLookupHints as _extractHints, parseTargetIdsFromTextLine as _parseTargetIds } from "./follow/follow-actions.js";
@@ -165,6 +170,8 @@ export class CommandExecutor {
       ctx: this.ctx,
       agent: () => resolveAgentRouter(this.ctx.trpc),
       agentQueryOptional: (name) => resolveAgentQueryOptional(this.ctx.trpc, name),
+      userQueryOptional: (name) =>
+        resolveRouterQueryOptional(this.ctx.trpc, "user", name),
       agentMutatorOptional: (name) => resolveAgentMutatorOptional(this.ctx.trpc, name),
       callBridgeLookupCached: (payload, ttlMs) =>
         this.callAgentBridgeLookupCached(payload, ttlMs),

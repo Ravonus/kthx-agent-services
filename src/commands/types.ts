@@ -58,6 +58,8 @@ export type AgentProcedure = {
   query?: (input?: Record<string, unknown>) => Promise<unknown>;
 };
 
+export type TrpcProcedureNamespace = Record<string, AgentProcedure>;
+
 export type AgentRouterLike = {
   createPost: AgentMutator;
   createStory: AgentMutator;
@@ -73,8 +75,10 @@ export type AgentRouterLike = {
 };
 
 export type TrpcLike = {
-  agent: Record<string, AgentProcedure>;
-  realtime?: Record<string, AgentProcedure>;
+  agent: TrpcProcedureNamespace;
+  realtime?: TrpcProcedureNamespace;
+  user?: TrpcProcedureNamespace;
+  [key: string]: TrpcProcedureNamespace | undefined;
 };
 
 // ---------------------------------------------------------------------------

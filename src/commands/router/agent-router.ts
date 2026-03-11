@@ -63,10 +63,14 @@ export function resolveDirectiveAckMutator(trpc: TrpcLike | null): AgentMutator 
   };
 }
 
-export function resolveAgentQueryOptional(trpc: TrpcLike | null, name: string): AgentQuery | null {
-  const router = trpc?.agent;
+export function resolveRouterQueryOptional(
+  trpc: TrpcLike | null,
+  routerName: string,
+  procedureName: string,
+): AgentQuery | null {
+  const router = trpc?.[routerName];
   if (!router) return null;
-  const candidate = router[name];
+  const candidate = router[procedureName];
   const queryFn = candidate?.query;
   if (typeof queryFn === "function") {
     return {
@@ -74,6 +78,10 @@ export function resolveAgentQueryOptional(trpc: TrpcLike | null, name: string): 
     };
   }
   return null;
+}
+
+export function resolveAgentQueryOptional(trpc: TrpcLike | null, name: string): AgentQuery | null {
+  return resolveRouterQueryOptional(trpc, "agent", name);
 }
 
 export function resolveAgentMutatorOptional(trpc: TrpcLike | null, name: string): AgentMutator | null {
