@@ -5,6 +5,7 @@ import path from "node:path";
 import { loadDotEnv } from "../config/dotenv.js";
 import { parseIntEnv, trimEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
+import { appendSupervisorControlCommand } from "../supervisor/supervisor-utils.js";
 
 import { buildMemoryEngagementDiagnostics } from "./health-web-diagnostics-memory-engagement.js";
 import { buildMemoryMapDiagnostics } from "./health-web-diagnostics-memory-map.js";
@@ -82,12 +83,80 @@ export const startHealthWebServer = async (): Promise<void> => {
     return fromHeader === privateKey;
   };
 
+  const hasControlAccess = (req: http.IncomingMessage): boolean => {
+    if (isLocalRequest(req)) return true;
+    if (!privateKey) return false;
+    const fromHeader = (
+      req.headers["x-agent-health-key"] ??
+      req.headers["x-health-key"] ??
+      ""
+    )
+      .toString()
+      .trim();
+    return fromHeader === privateKey;
+  };
+
   const handleRequest = async (
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): Promise<void> => {
-    if ((req.method ?? "GET").toUpperCase() !== "GET") { res.statusCode = 405; res.end("Method Not Allowed"); return; }
     const url = new URL(req.url ?? "/", `http://${host}:${port}`);
+    const method = (req.method ?? "GET").toUpperCase();
+
+    if (url.pathname === "/api/health/control") {
+      if (method !== "POST") {
+        res.statusCode = 405;
+        res.end("Method Not Allowed");
+        return;
+      }
+      if (!hasControlAccess(req)) {
+        json(res, 403, {
+          ok: false,
+          error: "forbidden",
+          message: "Supervisor control is only available locally or with the private health key.",
+        });
+        return;
+      }
+      const action = (url.searchParams.get("action") ?? "").trim().toLowerCase();
+      const target = (url.searchParams.get("target") ?? "all").trim().toLowerCase();
+      if (action !== "shutdown" || target !== "all") {
+        json(res, 400, {
+          ok: false,
+          error: "invalid_control_command",
+          message: "Only shutdown all is currently supported from the health page.",
+        });
+        return;
+      }
+      const queued = appendSupervisorControlCommand({
+        action,
+        target,
+        source: "health-web",
+      });
+      if (!queued.ok) {
+        json(res, 500, {
+          ok: false,
+          error: "control_queue_failed",
+          message: `Failed to append supervisor control command at ${queued.controlPath}.`,
+        });
+        return;
+      }
+      json(res, 202, {
+        ok: true,
+        queued: true,
+        action,
+        target,
+        queuedAt: queued.record.at,
+        controlPath: queued.controlPath,
+      });
+      return;
+    }
+
+    if (method !== "GET") {
+      res.statusCode = 405;
+      res.end("Method Not Allowed");
+      return;
+    }
+
     if (url.pathname === "/api/health") {
       try {
         const fresh = await buildSnapshot();

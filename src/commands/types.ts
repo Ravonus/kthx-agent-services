@@ -17,7 +17,16 @@ export type { Command, QueueState, CommandLifecycleState, ContextBundle, Context
 export const PERSONA_REFERENCE_FRAME_ROLES = ["selfie", "midshot", "fullbody"] as const;
 export type PersonaFrameRole = (typeof PERSONA_REFERENCE_FRAME_ROLES)[number];
 
-export const POST_VARIETY_MODES = ["opinion", "reaction", "humor", "micro", "narrative"] as const;
+export const POST_VARIETY_MODES = [
+  "opinion",
+  "reaction",
+  "humor",
+  "micro",
+  "narrative",
+  "observation",
+  "activity",
+  "social",
+] as const;
 export type PostVarietyMode = (typeof POST_VARIETY_MODES)[number];
 
 export const TEXT_STYLE_THEMES = [

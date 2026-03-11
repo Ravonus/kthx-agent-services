@@ -18,6 +18,7 @@ import { createStateSqliteStoreFromEnv } from "./state/sqlite-state.js";
 import { createIpcPaths, initIpc, resetExecutionArtifactsOnStart } from "./ipc/ipc-paths.js";
 import { createRealtimeClient } from "./ws/realtime-client.js";
 import { createRuntimeHashCollector } from "./lib/hash.js";
+import { readJsonFile, readJsonMaybeIncomplete } from "./lib/fs.js";
 import { RuntimeContext } from "./runtime-context.js";
 import { runBackendCall } from "./runtime.js";
 import { trimEnv } from "./lib/env-parse.js";
@@ -71,6 +72,7 @@ import { createAutoPostingPlanner } from "./main-auto-posting-planner.js";
 import { setupEnvelopeAndSubscription } from "./main-envelope-subscription.js";
 import { bootstrapAgentAuth } from "./main-auth-bootstrap.js";
 import { bootstrapRuntimeManagersAndStart } from "./main-runtime-bootstrap.js";
+import { normalizeQueueState } from "./queue/queue-state.js";
 
 // ---------------------------------------------------------------------------
 // Fatal handler
@@ -643,6 +645,99 @@ const main = async (): Promise<void> => {
     return null;
   };
 
+  const isAutoPostingPendingDirective = (value: unknown): boolean => {
+    if (!isRecord(value)) return false;
+    const directiveId =
+      typeof value.id === "string" && value.id.trim().length > 0
+        ? value.id.trim()
+        : "";
+    if (directiveId.startsWith("auto_post_")) {
+      return true;
+    }
+    const sourceDirectiveId =
+      typeof value.sourceDirectiveId === "string" &&
+      value.sourceDirectiveId.trim().length > 0
+        ? value.sourceDirectiveId.trim()
+        : "";
+    if (sourceDirectiveId.startsWith("auto_post_")) {
+      return true;
+    }
+    const intent = isRecord(value.intent) ? value.intent : null;
+    const provenance =
+      intent && typeof intent.provenance === "string"
+        ? intent.provenance.trim().toLowerCase()
+        : "";
+    return provenance === "runtime_auto_posting";
+  };
+
+  const countActiveAutoPostingDirectives = async (): Promise<number> => {
+    const activeDirectiveIds = new Set<string>();
+
+    const queueStateRaw = await readJsonFile(ipcPaths.queueStatePath).catch(() => null);
+    const queueState = normalizeQueueState(queueStateRaw);
+    for (const item of queueState.items) {
+      if (!item.directiveId.startsWith("auto_post_")) continue;
+      if (
+        item.status !== "queued" &&
+        item.status !== "scheduled" &&
+        item.status !== "running"
+      ) {
+        continue;
+      }
+      activeDirectiveIds.add(item.directiveId);
+    }
+
+    const pendingEntries = await fs.readdir(ipcPaths.pendingDir).catch(() => []);
+    for (const entry of pendingEntries) {
+      if (!entry.endsWith(".json")) continue;
+      const pendingPath = path.join(ipcPaths.pendingDir, entry);
+      const pendingRaw = await readJsonMaybeIncomplete(pendingPath).catch(() => ({
+        status: "invalid" as const,
+        value: null,
+      }));
+      if (pendingRaw.status !== "ok" || !isAutoPostingPendingDirective(pendingRaw.value)) {
+        continue;
+      }
+      const pendingDoc = pendingRaw.value;
+      const pendingStatus =
+        typeof pendingDoc.status === "string"
+          ? pendingDoc.status.trim().toLowerCase()
+          : "";
+      if (
+        pendingStatus === "completed" ||
+        pendingStatus === "permission_denied" ||
+        pendingStatus === "no_executable_draft" ||
+        pendingStatus === "max_retry_exceeded" ||
+        pendingStatus === "failed" ||
+        pendingStatus === "cancelled" ||
+        pendingStatus === "cancelled_reconnect_reset"
+      ) {
+        continue;
+      }
+      const pendingId =
+        typeof pendingDoc.id === "string" && pendingDoc.id.trim().length > 0
+          ? pendingDoc.id.trim()
+          : path.basename(entry, ".json");
+      if (pendingId.length > 0) {
+        activeDirectiveIds.add(pendingId);
+      }
+    }
+
+    return activeDirectiveIds.size;
+  };
+
+  const promotePendingAutoPostingDirectives = async (): Promise<number> => {
+    if (!ctx.directiveManager) return 0;
+    const result = await ctx.directiveManager.promoteFromPending({
+      limit: 10,
+      retryPermissionDenied: false,
+      bypassCooldown: true,
+      source: "auto_posting_planner_pending_retry",
+      directiveIdPrefix: "auto_post_",
+    });
+    return result.promoted;
+  };
+
   triggerAutoCreditPlanner = createAutoCreditPlanner({
     hasDirectiveManager: () => Boolean(ctx.directiveManager),
     isQueueRunnerEnabled: () =>
@@ -665,6 +760,8 @@ const main = async (): Promise<void> => {
     getPermissionState: () => ctx.debugSnapshot.permission,
     resolveGrantCandidates,
     resolveRuntimeAgentId: resolvePlannerRuntimeAgentId,
+    promotePendingAutoPostingDirectives,
+    countActiveAutoPostingDirectives,
     intakeDirective: async (directive) => {
       if (!ctx.directiveManager) return;
       await ctx.directiveManager.intake(directive);

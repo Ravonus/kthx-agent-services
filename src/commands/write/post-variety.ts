@@ -21,6 +21,7 @@ import {
   POST_VARIETY_HINT_PATTERNS,
 } from "../constants.js";
 
+import { isRecord } from "../../lib/guards.js";
 import { pickDeterministicIndex } from "./post-visual.js";
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,30 @@ export function parsePostVarietyMode(
     return "micro";
   }
   if (normalized === "narrative" || normalized === "story") return "narrative";
+  if (
+    normalized === "observation" ||
+    normalized === "observe" ||
+    normalized === "observational" ||
+    normalized === "detail"
+  ) {
+    return "observation";
+  }
+  if (
+    normalized === "activity" ||
+    normalized === "action" ||
+    normalized === "build" ||
+    normalized === "doing"
+  ) {
+    return "activity";
+  }
+  if (
+    normalized === "social" ||
+    normalized === "group" ||
+    normalized === "conversation" ||
+    normalized === "together"
+  ) {
+    return "social";
+  }
   return null;
 }
 
@@ -143,6 +168,10 @@ export function selectPostVarietyMode(
     .filter((value): value is string => Boolean(value))
     .join(" ");
   const signal = truncateText(normalizeCommentText(signalRaw), 900);
+  const provenance =
+    asNonEmptyString(input.payload.provenance)?.trim().toLowerCase() ?? "";
+  const isAutoPlanned =
+    provenance === "runtime_auto_posting" || isRecord(input.payload.autoPlanned);
   const availableModes = POST_VARIETY_MODES.filter(
     (mode) => !blockedModes.has(mode),
   );
@@ -180,23 +209,50 @@ export function selectPostVarietyMode(
     humor: 0,
     micro: 0,
     narrative: 0,
+    observation: 0,
+    activity: 0,
+    social: 0,
   };
   for (const hint of POST_VARIETY_HINT_PATTERNS) {
     if (!hint.pattern.test(signal)) continue;
     scores[hint.mode] += hint.weight;
   }
   if (input.context.platformSignals) {
-    scores.reaction += 2;
+    scores.reaction += isAutoPlanned ? 1 : 2;
+    scores.observation += 1;
+    scores.social += 1;
   }
   if (input.context.targetPostId !== null) {
     scores.reaction += 1;
+    scores.social += 1;
   }
   if (input.postType === "media") {
     scores.narrative += 1;
-    scores.reaction += 1;
+    scores.observation += 1;
+    scores.activity += 1;
+    scores.social += 1;
   } else {
     scores.opinion += 1;
     scores.micro += 1;
+    scores.observation += 1;
+  }
+  if (isAutoPlanned) {
+    if (input.postType === "media") {
+      scores.observation += 2;
+      scores.activity += 2;
+      scores.social += 2;
+      scores.narrative += 1;
+    } else {
+      scores.observation += 2;
+      scores.activity += 1;
+      scores.social += 1;
+      scores.opinion += 1;
+      scores.micro += 1;
+      scores.narrative += 1;
+    }
+    if (input.context.targetPostId === null) {
+      scores.reaction = Math.max(0, scores.reaction - 1);
+    }
   }
   let topScore = Number.NEGATIVE_INFINITY;
   let candidates: PostVarietyMode[] = [];
@@ -213,6 +269,29 @@ export function selectPostVarietyMode(
     topScore > 0
       ? chooseBySeed("scored", candidates)
       : chooseBySeed("fallback", POST_VARIETY_MODES);
+  if (isAutoPlanned && input.context.targetPostId === null) {
+    const autonomousPreferredModes: PostVarietyMode[] =
+      input.postType === "media"
+        ? ["observation", "activity", "social", "narrative", "humor"]
+        : ["observation", "activity", "social", "opinion", "micro", "narrative"];
+    const preferredAvailable = autonomousPreferredModes.filter(
+      (mode) => !blockedModes.has(mode),
+    );
+    const preferredTarget =
+      preferredAvailable.length > 0 ? preferredAvailable : autonomousPreferredModes;
+    const preferredScores = preferredTarget.map((mode) => scores[mode]);
+    const preferredTopScore = Math.max(...preferredScores);
+    if (Number.isFinite(preferredTopScore) && preferredTopScore > 0) {
+      const preferredCandidates = preferredTarget.filter(
+        (mode) => scores[mode] === preferredTopScore,
+      );
+      if (preferredCandidates.length > 0) {
+        selected = chooseBySeed("autonomous_preferred", preferredCandidates);
+      }
+    } else if (selected === "reaction" && preferredTarget.length > 0) {
+      selected = chooseBySeed("autonomous_fallback", preferredTarget);
+    }
+  }
   if (blockedModes.has(selected) && availableModes.length > 0) {
     selected = chooseBySeed("cooldown_swap", availableModes);
   }
@@ -303,6 +382,33 @@ export function buildPostVarietyModeRules(
       postType === "text"
         ? "textBody should be short (prefer 25-110 chars) but complete."
         : "caption should be compact (prefer 10-80 chars) with a focused mediaPrompt.",
+    ];
+  }
+  if (mode === "observation") {
+    return [
+      ...common,
+      "Focus on one specific detail, oddity, or small thing worth noticing.",
+      postType === "text"
+        ? "textBody should center on a concrete observed detail instead of a broad abstract vibe."
+        : "mediaPrompt should frame one striking detail, texture, or visual quirk as the main subject.",
+    ];
+  }
+  if (mode === "activity") {
+    return [
+      ...common,
+      "Center the post on doing, making, testing, or fixing something concrete.",
+      postType === "text"
+        ? "textBody should describe an active task, experiment, or build step."
+        : "mediaPrompt should depict the action in progress, not just the result after the fact.",
+    ];
+  }
+  if (mode === "social") {
+    return [
+      ...common,
+      "Make the post feel socially situated: another person, agent, crowd, or shared moment should matter.",
+      postType === "text"
+        ? "textBody should imply interaction, conversation, or group energy."
+        : "mediaPrompt should show social context or another participant, not a solitary generic portrait.",
     ];
   }
   return [

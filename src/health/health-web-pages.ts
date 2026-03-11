@@ -16,11 +16,14 @@ export const HTML_PAGE = `<!doctype html>
 input,select,button{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px;background:#fff;color:var(--ink)}
 button{cursor:pointer}
 button:hover{background:#f1f5f9}
+.danger{background:#b91c1c;color:#fff;border-color:#991b1b}
+.danger:hover{background:#991b1b}
+.danger:disabled{cursor:wait;opacity:.7}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 </style></head><body>
 <div class="wrap">
-<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Read-Only Health</div></div><div class="row"><a href="/pipeline" class="badge neutral" style="text-decoration:none">Pipeline</a><a href="/graphs" class="badge neutral" style="text-decoration:none">Engagement</a><a href="/map" class="badge neutral" style="text-decoration:none">Memory Map</a><a href="/metrics" class="badge neutral" style="text-decoration:none">Runtime Metrics</a><div class="muted" id="ts">refreshing...</div></div></div>
+<div class="card top"><div><div class="muted">Agent Host</div><div class="h1">Agent Health</div></div><div class="row"><a href="/pipeline" class="badge neutral" style="text-decoration:none">Pipeline</a><a href="/graphs" class="badge neutral" style="text-decoration:none">Engagement</a><a href="/map" class="badge neutral" style="text-decoration:none">Memory Map</a><a href="/metrics" class="badge neutral" style="text-decoration:none">Runtime Metrics</a><div class="muted" id="ts">refreshing...</div></div></div>
 <div class="grid">
 <div class="card"><div class="muted">Runtime</div><div id="rt"></div></div>
 <div class="card"><div class="muted">Chat Bridge</div><div id="cb"></div></div>
@@ -28,6 +31,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 <div class="card"><div class="muted">Memory</div><div id="mm"></div></div>
 <div class="card"><div class="muted">Retention</div><div id="rp"></div></div>
 <div class="card"><div class="muted">Activity</div><div id="ac"></div></div>
+<div class="card"><div class="muted">App Control</div><div class="row" style="margin-top:8px"><button id="stopApp" type="button" class="danger">Stop app</button></div><div id="ctl" class="muted" style="margin-top:8px">Queues <code>shutdown all</code> on the supervisor.</div></div>
 </div>
 <div class="card">
 <div class="muted">Retrieval Debug</div>
@@ -52,6 +56,7 @@ const kv=obj=>Object.entries(obj).map(([k,v])=>'<div class="k">'+esc(k)+'</div><
 const fmtTopicCounts=v=>{if(!v||typeof v!=='object')return'n/a';const o=v;return ['user','conversation','channel','server'].map(k=>k+':'+String(o[k]??0)).join(' · ')};
 const shellCounts=v=>{if(!v||typeof v!=='object')return'n/a';const c=v.counts; if(!c||typeof c!=='object')return'n/a'; return ['dms','agentDms','groups','servers','channels'].map(k=>k+':'+String(c[k]??0)).join(' · ')};
 const healthUrl='/api/health/private';
+const setControlStatus=text=>{document.getElementById('ctl').textContent=text};
 const render=snap=>{if(!snap)return;document.getElementById('ts').textContent='updated '+fmt(snap.generatedAt)+(snap.available===false&&snap.reason?' · '+snap.reason:'');
 const[rC,rT]=badge(snap.runtime?.wsState);document.getElementById('rt').innerHTML='<div class="badge '+esc(rC)+'">'+esc(rT)+'</div><div class="kv" style="margin-top:8px">'+kv({auth:snap.runtime?.authEffective,permission:snap.runtime?.permissionState,wsTransport:snap.runtime?.wsTransportState,lastEnvelope:fmt(snap.runtime?.lastEnvelopeAt),lastPublish:fmt(snap.runtime?.lastPublishAt),publishError:snap.runtime?.lastPublishError??'none'})+'</div>';
 const[cC,cT]=badge(snap.chatBridge?.connected===true?'ready':(snap.chatBridge?.state??'unknown'));document.getElementById('cb').innerHTML='<div class="badge '+esc(cC)+'">'+esc(cT)+'</div><div class="kv" style="margin-top:8px">'+kv({connected:String(snap.chatBridge?.connected),mode:snap.chatBridge?.subscriptionMode,topics:snap.chatBridge?.subscribedTopics,requested:fmtTopicCounts(snap.chatBridge?.requestedTopicCounts),subscribed:fmtTopicCounts(snap.chatBridge?.subscribedTopicCounts),shell:shellCounts(snap.chatBridge?.lastShellSummary),ticketFailures:snap.chatBridge?.lastTicketFailureCount,lastError:snap.chatBridge?.lastError??'none'})+'</div>';
@@ -110,9 +115,11 @@ rows.push('<div class="evt"><strong>'+esc(h.sourceType??'event')+'</strong> scor
 }
 box.innerHTML=rows.join('')||'<div class="muted">No retrieval hits.</div>';
 };
+const shutdownApp=async()=>{if(!window.confirm('Stop the agent app? This queues supervisor shutdown and the health page will go offline shortly.'))return;const button=document.getElementById('stopApp');button.disabled=true;setControlStatus('queueing shutdown...');try{const response=await fetch('/api/health/control?action=shutdown&target=all',{method:'POST',cache:'no-store',keepalive:true});const payload=await response.json();if(!response.ok||payload?.ok!==true)throw new Error(payload?.message??payload?.error??('request failed ('+response.status+')'));setControlStatus('shutdown queued. This page will stop responding once the supervisor exits.')}catch(error){button.disabled=false;setControlStatus('shutdown failed: '+String(error instanceof Error?error.message:error))}};
 const runRetrieval=async()=>{const q=(document.getElementById('rq').value??'').toString().trim();const post=(document.getElementById('rpost').value??'').toString().trim();const comment=(document.getElementById('rcomment').value??'').toString().trim();const intent=(document.getElementById('rintent').value??'chat').toString();const sp=new URLSearchParams();if(q)sp.set('q',q);if(post)sp.set('postId',post);if(comment)sp.set('commentId',comment);if(intent)sp.set('intent',intent);sp.set('limit','20');document.getElementById('rdmeta').textContent='running retrieval...';try{const r=await fetch('/api/health/retrieval?'+sp.toString(),{cache:'no-store'});renderRetrieval(await r.json())}catch(e){document.getElementById('rdmeta').textContent='retrieval failed: '+e}};
 const tick=async()=>{try{const r=await fetch(healthUrl,{cache:'no-store'});render(await r.json())}catch(e){document.getElementById('ts').textContent='refresh failed: '+e}};
 void tick();setInterval(tick,3000);
+document.getElementById('stopApp').addEventListener('click',()=>{void shutdownApp()});
 document.getElementById('rrun').addEventListener('click',()=>{void runRetrieval()});
 </script></body></html>`;
 

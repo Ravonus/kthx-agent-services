@@ -224,6 +224,32 @@ describe("command executor generate input", () => {
     expect(isRecord(result)).toBe(true);
   });
 
+  it("uses a stable variation seed for repeated retries of the same command", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as {
+      buildGenerateInput(payload: Record<string, unknown>, command: Command): Record<string, unknown>;
+    };
+    const command = baseCommand();
+
+    const first = invoker.buildGenerateInput(
+      {
+        goal: "media",
+        topic: "quiet alley portrait",
+      },
+      command,
+    );
+    const second = invoker.buildGenerateInput(
+      {
+        goal: "media",
+        topic: "quiet alley portrait",
+      },
+      command,
+    );
+
+    expect(first.variationSeed).toBe(second.variationSeed);
+    expect(first.variationSeed).toBe("nonce-test-generate-input:media");
+  });
+
   it("does not inject synthetic sourceDirectiveId for chat-origin generate input", () => {
     const executor = createExecutor();
     const invoker = executor as unknown as {

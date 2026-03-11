@@ -13,6 +13,24 @@ import type {
 } from "./generate-and-queue.js";
 import { ensureEnforcedDraftTarget } from "./generate-and-queue-enforced-target.js";
 
+const isRuntimeAutoPostingPayload = (
+  payload: Record<string, unknown>,
+): boolean => {
+  const provenance = asNonEmptyString(payload.provenance)?.trim().toLowerCase() ?? "";
+  return provenance === "runtime_auto_posting" || isRecord(payload.autoPlanned);
+};
+
+const buildAutoPostingGenerateRequeueReason = (message: string): string => {
+  const normalizedMessage = message
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "_")
+    .replace(/^_+|_+$/gu, "");
+  return `auto_post_generate_failed:${
+    normalizedMessage.length > 0 ? normalizedMessage.slice(0, 80) : "unknown"
+  }`;
+};
+
 export async function prepareGenerateAndQueue(
   this: ExecuteGenerateAndQueueRuntime,
   command: Command,
@@ -227,12 +245,27 @@ export async function prepareGenerateAndQueue(
           },
         });
       } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
         await this.recordCommandLifecycleCheckpoint({
           command,
           stage: "generated",
           status: "failed",
-          message: error instanceof Error ? error.message : String(error),
+          message,
         });
+        if (isRuntimeAutoPostingPayload(payload)) {
+          const requeueReason = buildAutoPostingGenerateRequeueReason(message);
+          await this.ctx.memory
+            .recordWrite({
+              type: "auto_post_generate_retry_scheduled",
+              at: nowIso(),
+              commandId: command.id,
+              sourceDirectiveId,
+              error: message,
+              requeueReason,
+            })
+            .catch(() => undefined);
+          throw new RequeueCommandError(requeueReason);
+        }
         throw error;
       }
     }

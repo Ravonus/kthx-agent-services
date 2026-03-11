@@ -58,6 +58,7 @@ export type PendingDirectivePromotionInput = {
   retryPermissionDenied?: boolean;
   bypassCooldown?: boolean;
   source?: string;
+  directiveIdPrefix?: string;
 };
 
 export type PendingDirectivePromotionResult = {

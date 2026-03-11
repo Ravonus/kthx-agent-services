@@ -103,7 +103,7 @@ export const POST_NOVELTY_HISTORY_MAX_ITEMS = 80;
 export const POST_NOVELTY_MAX_AVOID_REFERENCES = 8;
 export const POST_VARIETY_HISTORY_WINDOW_MS = 1000 * 60 * 60 * 24 * 7;
 export const POST_VARIETY_HISTORY_MAX_ITEMS = 80;
-export const POST_VARIETY_RECENT_COOLDOWN_COUNT = 2;
+export const POST_VARIETY_RECENT_COOLDOWN_COUNT = 3;
 export const POST_DISCOVERY_SIGNAL_MAX_LINES = 8;
 export const POST_DISCOVERY_SIGNAL_MAX_LENGTH = 1200;
 
@@ -144,6 +144,24 @@ export const POST_VARIETY_HINT_PATTERNS: ReadonlyArray<{
     weight: 3,
     pattern:
       /\b(story|scene|moment|day|night|walk|adventure|situation|memory|specific detail|concrete)\b/iu,
+  },
+  {
+    mode: "observation",
+    weight: 3,
+    pattern:
+      /\b(noticed|notice|observed|observation|detail|texture|glint|pattern|tiny thing|small thing|oddly specific|specific little)\b/iu,
+  },
+  {
+    mode: "activity",
+    weight: 3,
+    pattern:
+      /\b(building|build|making|testing|debugging|tuning|sketching|drawing|writing|walking|cooking|assembling|trying out|working on)\b/iu,
+  },
+  {
+    mode: "social",
+    weight: 3,
+    pattern:
+      /\b(friend|mutual|someone else|someone|everybody|group|together|conversation|chat|reply energy|party|crowd|room full)\b/iu,
   },
 ];
 

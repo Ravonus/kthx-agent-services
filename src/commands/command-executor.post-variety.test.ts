@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { CommandExecutor } from "./command-executor.js";
+import type { PostVarietyMode } from "./types.js";
 
 const tempDirs: string[] = [];
 
@@ -67,10 +68,12 @@ type PostVarietyInvoker = {
       payloadHint: string | null;
       memorySummary: string | null;
       platformSignals: string | null;
+      agentHandle: string | null;
+      agentName: string | null;
     };
     seedHints: string[];
   }): {
-    mode: "opinion" | "reaction" | "humor" | "micro" | "narrative";
+    mode: PostVarietyMode;
     reason: string;
     recentModes: string[];
     signal: string;
@@ -79,7 +82,7 @@ type PostVarietyInvoker = {
     commandId: string;
     postType: "text" | "media";
     targetPostId: number | null;
-    mode: "opinion" | "reaction" | "humor" | "micro" | "narrative";
+    mode: PostVarietyMode;
     signal: string;
   }): void;
   buildPostDraftCurationPrompt(input: {
@@ -95,8 +98,10 @@ type PostVarietyInvoker = {
       payloadHint: string | null;
       memorySummary: string | null;
       platformSignals: string | null;
+      agentHandle: string | null;
+      agentName: string | null;
     };
-    varietyMode: "opinion" | "reaction" | "humor" | "micro" | "narrative";
+    varietyMode: PostVarietyMode;
     seedHints: string[];
     avoidReferences: string[];
   }): string;
@@ -114,6 +119,8 @@ const blankContext = {
   payloadHint: null,
   memorySummary: null,
   platformSignals: null,
+  agentHandle: null,
+  agentName: null,
 };
 
 describe("command executor post variety", () => {
@@ -175,6 +182,30 @@ describe("command executor post variety", () => {
     expect(prompt).toContain("Variety mode: reaction.");
     expect(prompt).toContain("platformSignals:");
     expect(prompt).toContain("Anchor output to one concrete platform signal");
+  });
+
+  it("pushes auto-planned media posts into broader post archetypes", () => {
+    const executor = createExecutor();
+    const invoker = executor as unknown as PostVarietyInvoker;
+    const mode = invoker.selectPostVarietyMode({
+      commandId: "auto-post-variety-activity",
+      postType: "media",
+      payload: {
+        provenance: "runtime_auto_posting",
+        autoPlanned: {
+          trigger: "runtime_startup",
+          source: "posting_window_media",
+        },
+        caption: "fresh autonomous post",
+      },
+      context: {
+        ...blankContext,
+        platformSignals:
+          "trending: @atlas.engine: launch build thread | home: @kael: bench photo",
+      },
+      seedHints: [],
+    });
+    expect(["observation", "activity", "social"]).toContain(mode.mode);
   });
 
   it("collects compact discovery signals from bridge lookups", async () => {

@@ -10,6 +10,8 @@ export type AutoPostingPlannerDeps = {
   getPermissionState: () => unknown;
   resolveGrantCandidates: (permissionState: unknown) => GrantState[];
   resolveRuntimeAgentId: () => Promise<string | null>;
+  promotePendingAutoPostingDirectives: () => Promise<number>;
+  countActiveAutoPostingDirectives: () => Promise<number>;
   intakeDirective: (directive: Record<string, unknown>) => Promise<void>;
   recordWrite: (payload: unknown) => Promise<unknown>;
 };
@@ -71,6 +73,38 @@ export const createAutoPostingPlanner = (
       const permissionState = opts.permissionState ?? deps.getPermissionState();
       const grantCandidates = deps.resolveGrantCandidates(permissionState);
       if (!grantCandidates.length) return;
+
+      const promotedPendingCount = await deps
+        .promotePendingAutoPostingDirectives()
+        .catch(() => 0);
+      if (promotedPendingCount > 0) {
+        await deps.recordWrite({
+          type: "auto_posting_planner_skipped",
+          at: nowIso(),
+          trigger: opts.trigger,
+          reason: "pending_auto_post_retried",
+          promotedPendingCount,
+          grantCandidateCount: grantCandidates.length,
+        }).catch(() => {});
+        scheduleAutoPostingPlannerFollowup("auto_posting_pending_retry_followup");
+        return;
+      }
+
+      const activeAutoPostingCount = await deps
+        .countActiveAutoPostingDirectives()
+        .catch(() => 0);
+      if (activeAutoPostingCount > 0) {
+        await deps.recordWrite({
+          type: "auto_posting_planner_skipped",
+          at: nowIso(),
+          trigger: opts.trigger,
+          reason: "active_auto_post_in_flight",
+          activeAutoPostingCount,
+          grantCandidateCount: grantCandidates.length,
+        }).catch(() => {});
+        scheduleAutoPostingPlannerFollowup("auto_posting_active_wait");
+        return;
+      }
 
       const now = Date.now();
       const availableForAction = (

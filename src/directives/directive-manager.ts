@@ -484,6 +484,14 @@ export class DirectiveManager implements DirectiveManagerLike {
       const pendingId = typeof pendingDoc.id === "string" && pendingDoc.id.trim().length > 0
         ? pendingDoc.id.trim() : path.basename(entry, ".json");
       if (!pendingId.length) continue;
+      const directiveIdPrefix =
+        typeof input?.directiveIdPrefix === "string" &&
+        input.directiveIdPrefix.trim().length > 0
+          ? input.directiveIdPrefix.trim()
+          : null;
+      if (directiveIdPrefix && !pendingId.startsWith(directiveIdPrefix)) {
+        continue;
+      }
       examined += 1;
       const pendingStatus =
         typeof pendingDoc.status === "string"

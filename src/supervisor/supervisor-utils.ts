@@ -21,6 +21,14 @@ export type ParsedRun = {
 };
 
 export type ParsedControl = { kind: "control"; action: string; target: string };
+export type SupervisorControlRecord = {
+  at: string;
+  id: string;
+  action: string;
+  target: string;
+  pid: number;
+  source: string;
+};
 
 export type Parsed =
   | ParsedRun
@@ -436,7 +444,6 @@ export const parseArgs = (argv: string[]): Parsed => {
 
 export const runControlMode = (parsed: ParsedControl): void => {
   const stateDir = resolveStateDir();
-  const controlPath = debugPath(stateDir, "supervisor-control.jsonl");
   const statusPath = debugPath(stateDir, "supervisor-status.json");
 
   if (parsed.action === "status") {
@@ -450,22 +457,51 @@ export const runControlMode = (parsed: ParsedControl): void => {
     return;
   }
 
+  const queued = appendSupervisorControlCommand({
+    stateDir,
+    action: parsed.action,
+    target: parsed.target,
+    source: "cli",
+  });
+  if (queued.ok) {
+    console.log(`[supervisor] queued ${parsed.action} ${parsed.target}`);
+    return;
+  }
+  console.error(
+    `[supervisor] failed to append control command at ${queued.controlPath}`,
+  );
+  process.exitCode = 2;
+};
+
+export const appendSupervisorControlCommand = ({
+  stateDir = resolveStateDir(),
+  action,
+  target,
+  source,
+  pid = process.pid,
+}: {
+  stateDir?: string;
+  action: string;
+  target: string;
+  source: string;
+  pid?: number;
+}):
+  | { ok: true; controlPath: string; record: SupervisorControlRecord }
+  | { ok: false; controlPath: string } => {
+  const controlPath = debugPath(stateDir, "supervisor-control.jsonl");
   try {
     fs.mkdirSync(path.dirname(controlPath), { recursive: true });
-    const record = {
+    const record: SupervisorControlRecord = {
       at: nowIso(),
       id: `ctl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      action: parsed.action,
-      target: parsed.target,
-      pid: process.pid,
-      source: "cli",
+      action,
+      target,
+      pid,
+      source,
     };
     fs.appendFileSync(controlPath, `${JSON.stringify(record)}\n`, "utf8");
-    console.log(`[supervisor] queued ${parsed.action} ${parsed.target}`);
+    return { ok: true, controlPath, record };
   } catch {
-    console.error(
-      `[supervisor] failed to append control command at ${controlPath}`,
-    );
-    process.exitCode = 2;
+    return { ok: false, controlPath };
   }
 };

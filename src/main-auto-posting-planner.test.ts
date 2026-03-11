@@ -40,6 +40,8 @@ describe("auto posting planner", () => {
       getPermissionState: () => null,
       resolveGrantCandidates: () => [createMediaGrant()],
       resolveRuntimeAgentId: async () => "agent-auto-1",
+      promotePendingAutoPostingDirectives: async () => 0,
+      countActiveAutoPostingDirectives: async () => 0,
       intakeDirective: async (directive) => {
         resolveDirective?.(directive);
       },
@@ -58,5 +60,66 @@ describe("auto posting planner", () => {
     expect(payload.mediaPersonaLock).toBeUndefined();
     expect(payload.generatedAssetType).toBe("image");
     expect(payload.provenance).toBe("runtime_auto_posting");
+  });
+
+  it("does not enqueue a new auto-post while earlier auto-post work is still active", async () => {
+    const intakeDirective = vi.fn(async (_directive: Record<string, unknown>) => undefined);
+    const recordWrite = vi.fn(async (_payload: unknown) => undefined);
+
+    const planner = createAutoPostingPlanner({
+      hasDirectiveManager: () => true,
+      isQueueRunnerEnabled: () => true,
+      getPermissionState: () => null,
+      resolveGrantCandidates: () => [createMediaGrant()],
+      resolveRuntimeAgentId: async () => "agent-auto-1",
+      promotePendingAutoPostingDirectives: async () => 0,
+      countActiveAutoPostingDirectives: async () => 1,
+      intakeDirective,
+      recordWrite,
+    });
+
+    planner({ trigger: "test_auto_post_active_work" });
+
+    await vi.waitFor(() => {
+      expect(recordWrite).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "auto_posting_planner_skipped",
+          reason: "active_auto_post_in_flight",
+        }),
+      );
+    });
+
+    expect(intakeDirective).not.toHaveBeenCalled();
+  });
+
+  it("promotes pending auto-post work before asking for a new prompt", async () => {
+    const intakeDirective = vi.fn(async (_directive: Record<string, unknown>) => undefined);
+    const recordWrite = vi.fn(async (_payload: unknown) => undefined);
+
+    const planner = createAutoPostingPlanner({
+      hasDirectiveManager: () => true,
+      isQueueRunnerEnabled: () => true,
+      getPermissionState: () => null,
+      resolveGrantCandidates: () => [createMediaGrant()],
+      resolveRuntimeAgentId: async () => "agent-auto-1",
+      promotePendingAutoPostingDirectives: async () => 1,
+      countActiveAutoPostingDirectives: async () => 0,
+      intakeDirective,
+      recordWrite,
+    });
+
+    planner({ trigger: "test_auto_post_pending_retry" });
+
+    await vi.waitFor(() => {
+      expect(recordWrite).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "auto_posting_planner_skipped",
+          reason: "pending_auto_post_retried",
+          promotedPendingCount: 1,
+        }),
+      );
+    });
+
+    expect(intakeDirective).not.toHaveBeenCalled();
   });
 });

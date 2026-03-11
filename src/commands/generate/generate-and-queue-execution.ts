@@ -8,6 +8,57 @@ import type {
   GenerateAndQueuePreparedState,
 } from "./generate-and-queue.js";
 
+const isRuntimeAutoPostingPayload = (
+  payload: Record<string, unknown>,
+): boolean => {
+  const provenance = asNonEmptyString(payload.provenance)?.trim().toLowerCase() ?? "";
+  return provenance === "runtime_auto_posting" || isRecord(payload.autoPlanned);
+};
+
+const shouldTreatAutoPostingFailureAsPermanent = (input: {
+  reason: string;
+  code: string | null;
+}): boolean => {
+  const code = input.code?.trim().toLowerCase() ?? "";
+  if (
+    code === "post_novelty_blocked" ||
+    code === "post_novelty_rejected" ||
+    code === "no_executable_draft" ||
+    code === "no_permitted_drafts" ||
+    code === "no_permitted_generate_kind" ||
+    code === "story_chat_disabled"
+  ) {
+    return true;
+  }
+  const reason = input.reason.trim().toLowerCase();
+  return (
+    reason.includes("blocked by moderation") ||
+    reason.includes("rejected by moderation") ||
+    reason.includes("invalid payload") ||
+    reason.includes("textbody is required") ||
+    reason.includes("mediaurl is required") ||
+    (reason.includes("blocked") && reason.includes("novelty"))
+  );
+};
+
+const buildAutoPostingRequeueReason = (input: {
+  reason: string;
+  code: string | null;
+}): string => {
+  const codeToken = input.code?.trim().toLowerCase() ?? "";
+  if (codeToken.length > 0) {
+    return `auto_post_write_failed:${codeToken}`;
+  }
+  const normalizedReason = input.reason
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "_")
+    .replace(/^_+|_+$/gu, "");
+  return `auto_post_write_failed:${
+    normalizedReason.length > 0 ? normalizedReason.slice(0, 80) : "unknown"
+  }`;
+};
+
 export async function executePreparedGenerateAndQueue(
   this: ExecuteGenerateAndQueueRuntime,
   state: GenerateAndQueuePreparedState,
@@ -139,6 +190,43 @@ export async function executePreparedGenerateAndQueue(
 
   const firstFailure = failedDrafts[0] ?? null;
   if (firstFailure && executedOutcomes.filter((entry) => entry.ok).length === 0) {
+    const isAutoPostingRetryCandidate =
+      isRuntimeAutoPostingPayload(payload) &&
+      !shouldTreatAutoPostingFailureAsPermanent({
+        reason: firstFailure.reason,
+        code: firstFailure.code,
+      });
+    if (isAutoPostingRetryCandidate) {
+      const requeueReason = buildAutoPostingRequeueReason({
+        reason: firstFailure.reason,
+        code: firstFailure.code,
+      });
+      await this.recordCommandLifecycleCheckpoint({
+        command,
+        stage: "write_mutation",
+        status: "failed",
+        message: firstFailure.reason,
+        metadata: {
+          executedCount: executedOutcomes.length,
+          failedCount: failedDrafts.length,
+          requeued: true,
+          requeueReason,
+        },
+      });
+      await this.ctx.memory
+        .recordWrite({
+          type: "auto_post_write_retry_scheduled",
+          at: nowIso(),
+          commandId: command.id,
+          draftKind: firstFailure.kind,
+          reason: firstFailure.reason,
+          code: firstFailure.code,
+          requeueReason,
+          sourceDirectiveId,
+        })
+        .catch(() => undefined);
+      throw new RequeueCommandError(requeueReason);
+    }
     await this.recordCommandLifecycleCheckpoint({
       command,
       stage: "write_mutation",

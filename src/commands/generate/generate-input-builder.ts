@@ -1,7 +1,5 @@
 /** Generate input payload builder — assembles the core input record for media/content generation. */
 
-import crypto from "node:crypto";
-
 import type { Command } from "../../types/ipc.js";
 
 import {
@@ -162,23 +160,25 @@ export function buildGenerateInput(
     asNonEmptyString(context?.personaStyleHint) ??
     null;
   const explicitVariationSeed = asNonEmptyString(payload.variationSeed);
-  const directiveActionNonceSeed =
-    asNonEmptyString(payload.sourceDirectiveActionNonce) ??
-    command.actionNonce ??
-    null;
-  const variationSeed =
-    explicitVariationSeed ??
-    (directiveActionNonceSeed
-      ? `${directiveActionNonceSeed}:${Date.now().toString(36)}:${crypto
-          .randomUUID()
-          .replaceAll("-", "")
-          .slice(0, 8)}`
-      : `${Date.now().toString(36)}_${crypto.randomUUID().replaceAll("-", "").slice(0, 10)}`);
-  const provenance = normalizeAgentProvenanceValue(payload.provenance);
   const sourceDirectiveId =
     resolveCommandSourceDirectiveId({ command, payload });
   const sourceDirectiveActionNonce =
     resolveCommandSourceDirectiveActionNonce({ command, payload });
+  const directiveActionNonceSeed =
+    asNonEmptyString(payload.sourceDirectiveActionNonce) ??
+    command.actionNonce ??
+    null;
+  const stableVariationSeedBase =
+    directiveActionNonceSeed ??
+    sourceDirectiveActionNonce ??
+    sourceDirectiveId ??
+    asNonEmptyString(command.pendingDirectiveId) ??
+    asNonEmptyString(command.id) ??
+    primaryKind;
+  const variationSeed =
+    explicitVariationSeed ??
+    `${stableVariationSeedBase}:${primaryKind}`;
+  const provenance = normalizeAgentProvenanceValue(payload.provenance);
   return {
     kind: primaryKind,
     ...(resolvedKinds.length > 0 ? { kinds: resolvedKinds } : {}),
