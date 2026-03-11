@@ -100,6 +100,7 @@ export const bootstrapRuntimeManagersAndStart = async (
       recordWrite: (p: unknown) => deps.memory.recordWrite(p),
       buildContext: (request) => deps.memory.buildContext(request),
     },
+    grantManager: deps.ctx.grantManager,
     stateDb: deps.stateDb,
     trpc: deps.trpc as CommandExecutorTrpcShape,
     commandSeal: deps.ctx.commandSeal,

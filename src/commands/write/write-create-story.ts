@@ -77,6 +77,7 @@ export type ExecuteWriteCreateStoryRuntime = {
     command?: Command | null,
   ) => PersonaReferencePlan;
   shouldUsePersonaFrameReferences: (plan: PersonaReferencePlan) => boolean;
+  consumeGrantedAction: (actionKeys: string[]) => string | null;
   resolveMediaUpload: (input: {
     payload: Record<string, unknown>;
     keepOriginal?: boolean;
@@ -236,5 +237,6 @@ export async function executeWriteCreateStory(
     ...(sourceDirectiveActionNonce ? { sourceDirectiveActionNonce } : {}),
     ...(command.grantId ? { grantId: command.grantId } : {}),
   });
+  this.consumeGrantedAction(["story", "write.createStory"]);
   return this.successOutcome(command, result);
 }

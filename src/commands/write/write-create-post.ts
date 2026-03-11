@@ -187,6 +187,7 @@ export type ExecuteWriteCreatePostRuntime = {
     mode: PostVarietyMode;
     signal: string;
   }) => void;
+  consumeGrantedAction: (actionKeys: string[]) => string | null;
   resolvePersonaReferencePlan: (
     payload: Record<string, unknown>,
     mainPersonaSlugRaw?: string | null,

@@ -332,6 +332,7 @@ export class CommandExecutor {
         memory: this.ctx.memory,
         callAgentChatBridge: this.ctx.callAgentChatBridge ?? null,
         runOpenClawPrompt: this.ctx.runOpenClawPrompt ?? null,
+        grantManager: this.ctx.grantManager ?? null,
         stateDb: this.ctx.stateDb,
       },
       bridgeLookupCache: this.bridgeLookupCache,

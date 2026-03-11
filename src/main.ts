@@ -596,6 +596,10 @@ const main = async (): Promise<void> => {
         merged.set(key, candidate);
         return;
       }
+      if (activeGrant && candidate === activeGrant) {
+        merged.set(key, candidate);
+        return;
+      }
       const existingScore = scoreGrant(existing);
       const nextScore = scoreGrant(candidate);
       if (

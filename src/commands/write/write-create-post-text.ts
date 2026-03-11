@@ -404,6 +404,11 @@ export async function executeWriteCreatePostText(
           return skippedPostOutcome(slideMutation.reason);
         }
         const slideResult = slideMutation.result;
+        this.consumeGrantedAction([
+          `post:${postKind}:media`,
+          `post:${postKind}:text`,
+          "write.createPost",
+        ]);
         this.notePublishedPostForNoveltyHistory({
           postType: "media",
           caption: captionForWrite,
@@ -528,6 +533,11 @@ export async function executeWriteCreatePostText(
         return skippedPostOutcome(imageTextMutation.reason);
       }
       const imageTextResult = imageTextMutation.result;
+      this.consumeGrantedAction([
+        `post:${postKind}:media`,
+        `post:${postKind}:text`,
+        "write.createPost",
+      ]);
       this.notePublishedPostForNoveltyHistory({
         postType: "media",
         caption: captionForWrite,
@@ -589,6 +599,11 @@ export async function executeWriteCreatePostText(
     return skippedPostOutcome(textMutation.reason);
   }
   const result = textMutation.result;
+  this.consumeGrantedAction([
+    `post:${postKind}:text`,
+    `post:${postKind}:media`,
+    "write.createPost",
+  ]);
   this.notePublishedPostForNoveltyHistory({
     postType: "text",
     caption: captionForWrite,

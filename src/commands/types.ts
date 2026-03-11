@@ -102,6 +102,10 @@ export type QueueTrackingStateLike = {
   queueStateMutation: Promise<void>;
 };
 
+export type GrantActionConsumer = {
+  consumeAction(actionKey: string): boolean;
+};
+
 export type CommandExecutorContext = {
   config: {
     imageGenerateCmd: string | null;
@@ -120,6 +124,7 @@ export type CommandExecutorContext = {
     recordWrite(payload: unknown): Promise<void>;
     buildContext?: (request: ContextRequest) => Promise<ContextBundle>;
   };
+  grantManager?: GrantActionConsumer | null;
   stateDb?: StateSqliteStore | null;
   trpc: TrpcLike | null;
   commandSeal: CommandSealState;

@@ -61,6 +61,7 @@ Command,
 CommandOutcome,
 CuratedMediaPromptCacheEntry,
 CuratedPostDraftCacheEntry,
+GrantActionConsumer,
 OpenClawPromptExecutionResult,
 OwnerCapabilityCooldown,
 PersonaReferencePlan,
@@ -89,6 +90,7 @@ export type BuildWriteRuntimeDeps = {
     memory: MemoryWriter;
     callAgentChatBridge: ChatBridgeFn;
     runOpenClawPrompt: ((input: { prompt: string; purpose: string }) => Promise<OpenClawPromptExecutionResult | null>) | null;
+    grantManager?: GrantActionConsumer | null;
     stateDb: StateSqliteStore | null | undefined;
   };
   bridgeLookupCache: Map<string, { expiresAtMs: number; value: unknown }>;
@@ -235,6 +237,21 @@ export function buildWriteCreatePostRuntime(
     notePublishedPostForNoveltyHistory: (input) =>
       _noteNoveltyHistory(deps.recentPostNoveltyHistory, input),
     notePublishedPostVarietyMode: (input) => deps.notePublishedPostVarietyMode(input),
+    consumeGrantedAction: (actionKeys) => {
+      const normalizedActionKeys = Array.from(
+        new Set(
+          actionKeys
+            .map((actionKey) => actionKey.trim())
+            .filter((actionKey) => actionKey.length > 0),
+        ),
+      );
+      for (const actionKey of normalizedActionKeys) {
+        if (deps.ctx.grantManager?.consumeAction(actionKey)) {
+          return actionKey;
+        }
+      }
+      return null;
+    },
     resolvePersonaReferencePlan: (payload, mainPersonaSlugRaw, command) =>
       deps.resolvePersonaReferencePlan(payload, mainPersonaSlugRaw ?? null, command ?? null),
     shouldUsePersonaFrameReferences: (plan) => deps.shouldUsePersonaFrameReferences(plan),
@@ -266,6 +283,21 @@ export function buildWriteCreateStoryRuntime(
     resolvePersonaReferencePlan: (payload, mainPersonaSlugRaw, command) =>
       deps.resolvePersonaReferencePlan(payload, mainPersonaSlugRaw ?? null, command ?? null),
     shouldUsePersonaFrameReferences: (plan) => deps.shouldUsePersonaFrameReferences(plan),
+    consumeGrantedAction: (actionKeys) => {
+      const normalizedActionKeys = Array.from(
+        new Set(
+          actionKeys
+            .map((actionKey) => actionKey.trim())
+            .filter((actionKey) => actionKey.length > 0),
+        ),
+      );
+      for (const actionKey of normalizedActionKeys) {
+        if (deps.ctx.grantManager?.consumeAction(actionKey)) {
+          return actionKey;
+        }
+      }
+      return null;
+    },
     resolveMediaUpload: (input) => deps.resolveMediaUpload(input),
   };
 }
