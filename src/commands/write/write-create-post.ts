@@ -52,6 +52,7 @@ export type ExecuteWriteCreatePostRuntime = {
     payload: Record<string, unknown>;
   }) => Promise<PostDraftContext>;
   collectDirectiveSeedHints: (payload: Record<string, unknown>) => string[];
+  collectDirectiveTaggedHandles: (payload: Record<string, unknown>) => string[];
   selectPostVarietyMode: (input: {
     commandId: string;
     postType: "text" | "media";
@@ -74,6 +75,7 @@ export type ExecuteWriteCreatePostRuntime = {
     context: PostDraftContext;
     seedHints: string[];
     avoidReferences: string[];
+    taggedHandles: string[];
   }) => Promise<CuratedPostDraft | null>;
   snapshotRecentPostNoveltyReferences: (
     postType: "text" | "media",
@@ -99,6 +101,11 @@ export type ExecuteWriteCreatePostRuntime = {
     textBody: string | null;
     mediaPrompt: string | null;
   }) => string;
+  buildDirectiveScopedMediaGenerationPayload: (input: {
+    payload: Record<string, unknown>;
+    selectedTaggedHandles: string[] | null;
+    useTargetContext: boolean | null;
+  }) => Record<string, unknown>;
   resolveAutonomousTextTheme: (input: {
     commandId: string;
     postKind: "post" | "thread";
@@ -209,6 +216,7 @@ export type WriteCreatePostCommonInput = {
   requiresCuration: boolean;
   directiveSinglePromptMode: boolean;
   directiveSeedHints: string[];
+  directiveTaggedHandles: string[];
   postVariety: {
     mode: PostVarietyMode;
     reason: string;
@@ -266,6 +274,7 @@ export async function executeWriteCreatePost(
   const requiresCuration = sourceDirectiveId !== null ? true : isDirectiveRuntimeOrigin;
   const directiveSinglePromptMode = requiresCuration;
   const directiveSeedHints = this.collectDirectiveSeedHints(payload);
+  const directiveTaggedHandles = this.collectDirectiveTaggedHandles(payload);
   const postVariety = this.selectPostVarietyMode({
     commandId: command.id,
     postType,
@@ -299,6 +308,7 @@ export async function executeWriteCreatePost(
     requiresCuration,
     directiveSinglePromptMode,
     directiveSeedHints,
+    directiveTaggedHandles,
     postVariety,
   };
 

@@ -172,10 +172,20 @@ export type GeneratedDraft = {
   payload: Record<string, unknown>;
 };
 
+export type PostDraftDecision = {
+  focus: string;
+  targetKind: "self" | "person" | "post" | "topic" | "scene";
+  useTargetContext: boolean;
+  includeTaggedHandles: string[];
+  reason: string | null;
+};
+
 export type CuratedPostDraft = {
   caption: string | null;
   textBody: string | null;
   mediaPrompt: string | null;
+  selectedTaggedHandles: string[] | null;
+  useTargetContext: boolean | null;
 };
 
 export type CuratedPostDraftCacheEntry = {

@@ -49,16 +49,33 @@ const createExecutor = () => {
     ...(isRecord(input) ? input : {}),
   }));
   const runOpenClawPrompt = vi.fn(
-    async (_input: { prompt: string; purpose: string }) => ({
-      parsed: {
-        caption: "Directive fallback caption",
-        textBody: "Directive fallback body that passes curation checks.",
-      },
-      payloadText: "",
-      raw: "",
-      agentName: null,
-      envelope: null,
-    }),
+    async (input: { prompt: string; purpose: string }) => {
+      if (input.purpose === "post_draft_decision") {
+        return {
+          parsed: {
+            focus: "brief build-log update instead of replaying the directive literally",
+            targetKind: "topic",
+            useTargetContext: false,
+            includeTaggedHandles: [],
+            reason: "recent history should vary",
+          },
+          payloadText: "",
+          raw: "",
+          agentName: null,
+          envelope: null,
+        };
+      }
+      return {
+        parsed: {
+          caption: "Directive fallback caption",
+          textBody: "Directive fallback body that passes curation checks.",
+        },
+        payloadText: "",
+        raw: "",
+        agentName: null,
+        envelope: null,
+      };
+    },
   );
   const noopMutate = async () => ({ ok: true });
   const executor = new CommandExecutor({
@@ -136,5 +153,36 @@ describe("command executor directive source fallback for writes", () => {
     expect(isRecord(outcome)).toBe(true);
     if (!isRecord(outcome)) return;
     expect(outcome.ok).toBe(true);
+  });
+
+  it("runs directive post selection before draft curation", async () => {
+    const { executor } = createExecutor();
+    const invoker = executor as unknown as WriteCreatePostInvoker;
+
+    await invoker.executeWriteCreatePost({
+      ...directiveCommandWithoutSourceId(),
+      id: "directive-fallback-write-create-post-2",
+      payload: {
+        postType: "text",
+        kind: "post",
+        textBody: "Directive post body",
+      },
+    });
+
+    const runOpenClawPrompt = (executor as unknown as {
+      ctx: { runOpenClawPrompt: ReturnType<typeof vi.fn> | null };
+    }).ctx.runOpenClawPrompt;
+    expect(runOpenClawPrompt).not.toBeNull();
+    if (!runOpenClawPrompt) return;
+    const purposes = runOpenClawPrompt.mock.calls.map(
+      (call) =>
+        isRecord(call[0]) && typeof call[0].purpose === "string"
+          ? call[0].purpose
+          : null,
+    );
+    expect(purposes).toContain("post_draft_decision");
+    expect(purposes).toContain("post_draft_curation");
+    expect(purposes[0]).toBe("post_draft_decision");
+    expect(purposes[1]).toBe("post_draft_curation");
   });
 });

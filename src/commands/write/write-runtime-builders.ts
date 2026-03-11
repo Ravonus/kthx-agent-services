@@ -33,6 +33,8 @@ curatePostDraftWithOpenClaw as _curateDraftWithOC,
 planTextPostVisualWithOpenClaw as _planVisualWithOC,
 } from "./openclaw-curation.js";
 import {
+buildDirectiveScopedMediaGenerationPayload as _buildDirectiveMediaPayload,
+collectDirectiveTaggedHandles as _collectTaggedHandles,
 buildChatLiteralFallbackPayloadFromStory as _buildStoryFallback,
 collectDirectiveSeedHints as _collectSeedHints,
 extractTargetPostIdForPostDraft as _extractTargetPostId,
@@ -193,6 +195,7 @@ export function buildWriteCreatePostRuntime(
         input,
       ),
     collectDirectiveSeedHints: (payload) => _collectSeedHints(payload),
+    collectDirectiveTaggedHandles: (payload) => _collectTaggedHandles(payload),
     selectPostVarietyMode: (input) => deps.selectPostVarietyMode(input),
     curatePostDraftWithOpenClaw: (input) =>
       _curateDraftWithOC(
@@ -209,6 +212,8 @@ export function buildWriteCreatePostRuntime(
     validatePostDraftNovelty: (input) =>
       _validateNovelty(deps.recentPostNoveltyHistory, input),
     buildPostNoveltyCandidateText: (input) => _buildNoveltyText(input),
+    buildDirectiveScopedMediaGenerationPayload: (input) =>
+      _buildDirectiveMediaPayload(input),
     resolveAutonomousTextTheme: (input) => deps.resolveAutonomousTextTheme(input),
     resolveAutonomousCaptionPosition: (input) => _resolveCaptionPos(input),
     pickDeterministicIndex: (seed, modulo) => _pickDeterministic(seed, modulo),

@@ -24,6 +24,7 @@ export async function executeWriteCreatePostText(
     requiresCuration,
     directiveSinglePromptMode,
     directiveSeedHints,
+    directiveTaggedHandles,
     postVariety,
   } = input;
 
@@ -65,6 +66,7 @@ export async function executeWriteCreatePostText(
     context: postDraftContext,
     seedHints: directiveSeedHints,
     avoidReferences: noveltyAvoidReferences,
+    taggedHandles: directiveTaggedHandles,
   });
   if (requiresCuration && !curatedTextDraft) {
     throw new RequeueCommandError(
@@ -73,6 +75,10 @@ export async function executeWriteCreatePostText(
   }
   let captionForWrite = curatedTextDraft?.caption ?? captionInitial;
   let textBodyForWrite = curatedTextDraft?.textBody ?? textBodyInitial;
+  let selectedTaggedHandlesForMediaGeneration =
+    curatedTextDraft?.selectedTaggedHandles ?? null;
+  let useTargetContextForMediaGeneration =
+    curatedTextDraft?.useTargetContext ?? null;
   captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
   textBodyForWrite = stripEmDashCharacters(textBodyForWrite);
   if (!textBodyForWrite) {
@@ -140,6 +146,7 @@ export async function executeWriteCreatePostText(
         context: postDraftContext,
         seedHints: directiveSeedHints,
         avoidReferences: recurationReferences,
+        taggedHandles: directiveTaggedHandles,
       });
       if (!recuratedTextDraft) {
         if (requiresCuration) {
@@ -155,6 +162,10 @@ export async function executeWriteCreatePostText(
       }
       captionForWrite = recuratedTextDraft.caption ?? captionForWrite;
       textBodyForWrite = recuratedTextDraft.textBody ?? textBodyForWrite;
+      selectedTaggedHandlesForMediaGeneration =
+        recuratedTextDraft.selectedTaggedHandles ?? null;
+      useTargetContextForMediaGeneration =
+        recuratedTextDraft.useTargetContext ?? null;
       captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
       textBodyForWrite = stripEmDashCharacters(textBodyForWrite);
       noveltyValidation = this.validatePostDraftNovelty({
@@ -288,6 +299,12 @@ export async function executeWriteCreatePostText(
   const shouldAttemptSlides =
     selectedSlides.length >= 2 &&
     (visualPlan?.renderMode === "slides" || postKind === "thread");
+  const mediaGenerationPayloadBase =
+    this.buildDirectiveScopedMediaGenerationPayload({
+      payload,
+      selectedTaggedHandles: selectedTaggedHandlesForMediaGeneration,
+      useTargetContext: useTargetContextForMediaGeneration,
+    });
   const visualBackgroundPromptRaw =
     visualPlan?.backgroundImagePrompt ??
     this.buildAutonomousTextBackgroundPrompt({
@@ -310,7 +327,7 @@ export async function executeWriteCreatePostText(
       if (slidePrompt.length < 8) continue;
       const slideMedia = await this.resolveMediaUpload({
         payload: {
-          ...payload,
+          ...mediaGenerationPayloadBase,
           generatedAssetType: "image",
         },
         keepOriginal: true,
@@ -437,7 +454,7 @@ export async function executeWriteCreatePostText(
     try {
       const backgroundMedia = await this.resolveMediaUpload({
         payload: {
-          ...payload,
+          ...mediaGenerationPayloadBase,
           generatedAssetType: "image",
         },
         keepOriginal: true,

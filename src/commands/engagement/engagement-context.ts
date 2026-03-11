@@ -566,6 +566,9 @@ export async function loadPostDraftMemorySummary(
     const payloadHint = extractCommentPayloadHintFn(input.payload);
     const retrievalQuery = [
       "post draft context",
+      "latest post",
+      "recent comments, likes, and views",
+      "most engaged posts",
       typeof input.postId === "number" ? `post ${input.postId}` : "",
       payloadHint ? `hint ${payloadHint}` : "",
     ]

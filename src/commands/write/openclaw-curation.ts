@@ -5,6 +5,7 @@ import type {
   CuratedPostDraftCacheEntry,
   GeneratedAssetType,
   OpenClawPromptExecutionResult,
+  PostDraftDecision,
   PostDraftContext,
   PostVarietyMode,
   TextPostVisualPlan,
@@ -18,6 +19,8 @@ import {
 } from "./post-visual.js";
 
 import {
+  buildPostDraftDecisionPrompt,
+  extractPostDraftDecisionFromUnknown,
   buildPostDraftCurationPrompt,
   extractCuratedPostDraftFromUnknown,
 } from "./post-draft-curation.js";
@@ -47,6 +50,70 @@ type MemoryWriter = { recordWrite(entry: unknown): Promise<void> };
 
 type PostDraftCacheMap = Map<string, CuratedPostDraftCacheEntry>;
 type MediaPromptCacheMap = Map<string, { prompt: string; cachedAtMs: number }>;
+
+async function decidePostDraftWithOpenClaw(
+  deps: { runOpenClawPrompt: OpenClawPromptFn | null; memory: MemoryWriter },
+  input: {
+    commandId: string;
+    postType: "text" | "media";
+    varietyMode: PostVarietyMode;
+    context: PostDraftContext;
+    seedHints: string[];
+    avoidReferences: string[];
+    taggedHandles: string[];
+  },
+): Promise<PostDraftDecision | null> {
+  const runOpenClawPrompt = deps.runOpenClawPrompt;
+  if (!runOpenClawPrompt) return null;
+  const prompt = buildPostDraftDecisionPrompt({
+    postType: input.postType,
+    context: input.context,
+    varietyMode: input.varietyMode,
+    seedHints: input.seedHints,
+    avoidReferences: input.avoidReferences,
+    taggedHandles: input.taggedHandles,
+  });
+  try {
+    const result = await runOpenClawPrompt({
+      prompt,
+      purpose: "post_draft_decision",
+    });
+    const decision =
+      (result
+        ? extractPostDraftDecisionFromUnknown(result.parsed) ??
+          extractPostDraftDecisionFromUnknown(result.payloadText) ??
+          extractPostDraftDecisionFromUnknown(result.raw)
+        : null) ?? null;
+    if (!decision) return null;
+    await deps.memory
+      .recordWrite({
+        type: "post_draft_decided",
+        at: nowIso(),
+        commandId: input.commandId,
+        postType: input.postType,
+        varietyMode: input.varietyMode,
+        focus: decision.focus,
+        targetKind: decision.targetKind,
+        useTargetContext: decision.useTargetContext,
+        includeTaggedHandles: decision.includeTaggedHandles,
+        reason: decision.reason,
+      })
+      .catch(() => undefined);
+    return decision;
+  } catch (error: unknown) {
+    await deps.memory
+      .recordWrite({
+        type: "post_draft_decision_failed",
+        at: nowIso(),
+        commandId: input.commandId,
+        postType: input.postType,
+        varietyMode: input.varietyMode,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      .catch(() => undefined);
+    return null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // planTextPostVisualWithOpenClaw
@@ -124,6 +191,7 @@ export async function curatePostDraftWithOpenClaw(
     context: PostDraftContext;
     seedHints: string[];
     avoidReferences: string[];
+    taggedHandles: string[];
   },
 ): Promise<CuratedPostDraft | null> {
   const runOpenClawPrompt = deps.runOpenClawPrompt;
@@ -136,6 +204,7 @@ export async function curatePostDraftWithOpenClaw(
     input.mediaPrompt ?? "",
     input.seedHints.join("|"),
     input.avoidReferences.join("|"),
+    input.taggedHandles.join("|"),
   ].join("\n");
   const cacheKey = buildCuratedPostDraftCacheKey({
     commandId: input.commandId,
@@ -148,8 +217,25 @@ export async function curatePostDraftWithOpenClaw(
       caption: cached.value.caption,
       textBody: cached.value.textBody,
       mediaPrompt: cached.value.mediaPrompt,
+      selectedTaggedHandles: cached.value.selectedTaggedHandles,
+      useTargetContext: cached.value.useTargetContext,
     };
   }
+  const decision = await decidePostDraftWithOpenClaw(
+    {
+      runOpenClawPrompt: deps.runOpenClawPrompt,
+      memory: deps.memory,
+    },
+    {
+      commandId: input.commandId,
+      postType: input.postType,
+      varietyMode: input.varietyMode,
+      context: input.context,
+      seedHints: input.seedHints,
+      avoidReferences: input.avoidReferences,
+      taggedHandles: input.taggedHandles,
+    },
+  );
   const prompt = buildPostDraftCurationPrompt({
     postType: input.postType,
     varietyMode: input.varietyMode,
@@ -159,6 +245,8 @@ export async function curatePostDraftWithOpenClaw(
     context: input.context,
     seedHints: input.seedHints,
     avoidReferences: input.avoidReferences,
+    taggedHandles: input.taggedHandles,
+    decision,
   });
   try {
     const result = await runOpenClawPrompt({
@@ -185,9 +273,17 @@ export async function curatePostDraftWithOpenClaw(
         caption: curated.caption,
         textBody: curated.textBody,
         mediaPrompt: curated.mediaPrompt,
+        selectedTaggedHandles:
+          curated.selectedTaggedHandles ?? decision?.includeTaggedHandles ?? null,
+        useTargetContext:
+          curated.useTargetContext ?? decision?.useTargetContext ?? null,
       },
       cachedAtMs: Date.now(),
     });
+    const selectedTaggedHandles =
+      curated.selectedTaggedHandles ?? decision?.includeTaggedHandles ?? null;
+    const useTargetContext =
+      curated.useTargetContext ?? decision?.useTargetContext ?? null;
     await deps.memory
       .recordWrite({
           type: "post_draft_curated",
@@ -198,9 +294,17 @@ export async function curatePostDraftWithOpenClaw(
           caption: curated.caption,
           textBody: curated.textBody,
           mediaPrompt: curated.mediaPrompt,
+          selectedTaggedHandles,
+          useTargetContext,
       })
       .catch(() => undefined);
-    return curated;
+    return {
+      caption: curated.caption,
+      textBody: curated.textBody,
+      mediaPrompt: curated.mediaPrompt,
+      selectedTaggedHandles,
+      useTargetContext,
+    };
   } catch (error: unknown) {
     await deps.memory
       .recordWrite({

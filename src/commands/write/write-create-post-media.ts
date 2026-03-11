@@ -24,6 +24,7 @@ export async function executeWriteCreatePostMedia(
     requiresCuration,
     directiveSinglePromptMode,
     directiveSeedHints,
+    directiveTaggedHandles,
     postVariety,
     explicitSaveAsProfileMemory,
   } = input;
@@ -71,6 +72,7 @@ export async function executeWriteCreatePostMedia(
     context: postDraftContext,
     seedHints: directiveSeedHints,
     avoidReferences: noveltyAvoidReferences,
+    taggedHandles: directiveTaggedHandles,
   });
   if (requiresCuration && !curatedMediaDraft) {
     throw new RequeueCommandError(
@@ -79,6 +81,10 @@ export async function executeWriteCreatePostMedia(
   }
   let captionForWrite = curatedMediaDraft?.caption ?? captionInitial;
   let mediaPromptForWrite = curatedMediaDraft?.mediaPrompt ?? mediaPromptInitial;
+  let selectedTaggedHandlesForMediaGeneration =
+    curatedMediaDraft?.selectedTaggedHandles ?? null;
+  let useTargetContextForMediaGeneration =
+    curatedMediaDraft?.useTargetContext ?? null;
   captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
   mediaPromptForWrite = mediaPromptForWrite
     ? stripEmDashCharacters(mediaPromptForWrite)
@@ -145,6 +151,7 @@ export async function executeWriteCreatePostMedia(
         context: postDraftContext,
         seedHints: directiveSeedHints,
         avoidReferences: recurationReferences,
+        taggedHandles: directiveTaggedHandles,
       });
       if (!recuratedMediaDraft) {
         if (requiresCuration) {
@@ -160,6 +167,10 @@ export async function executeWriteCreatePostMedia(
       }
       captionForWrite = recuratedMediaDraft.caption ?? captionForWrite;
       mediaPromptForWrite = recuratedMediaDraft.mediaPrompt ?? mediaPromptForWrite;
+      selectedTaggedHandlesForMediaGeneration =
+        recuratedMediaDraft.selectedTaggedHandles ?? null;
+      useTargetContextForMediaGeneration =
+        recuratedMediaDraft.useTargetContext ?? null;
       captionForWrite = captionForWrite ? stripEmDashCharacters(captionForWrite) : captionForWrite;
       mediaPromptForWrite = mediaPromptForWrite
         ? stripEmDashCharacters(mediaPromptForWrite)
@@ -202,7 +213,14 @@ export async function executeWriteCreatePostMedia(
   }
   const mediaCandidate = noveltyValidation.candidateText;
   const mediaSeedText = mediaPromptForWrite ?? captionForWrite ?? mediaCandidate;
-  const personaReferencePlan = this.resolvePersonaReferencePlan(payload, null, command);
+  const mediaGenerationPayloadBase =
+    this.buildDirectiveScopedMediaGenerationPayload({
+      payload,
+      selectedTaggedHandles: selectedTaggedHandlesForMediaGeneration,
+      useTargetContext: useTargetContextForMediaGeneration,
+    });
+  const personaReferencePlan =
+    this.resolvePersonaReferencePlan(mediaGenerationPayloadBase, null, command);
   const personaDrivenMediaGeneration = this.shouldUsePersonaFrameReferences(personaReferencePlan);
   if (explicitSaveAsProfileMemory === null && personaDrivenMediaGeneration) {
     saveAsProfileMemoryForMedia = true;
@@ -211,9 +229,6 @@ export async function executeWriteCreatePostMedia(
     asNonEmptyString(payload.mediaUrl) !== null ||
     (Array.isArray(payload.mediaItems) && payload.mediaItems.length > 0) ||
     isRecord(payload.recentGeneratedAsset);
-  const mediaGenerationPayloadBase: Record<string, unknown> = {
-    ...payload,
-  };
   if (personaDrivenMediaGeneration && carriedMediaPresent) {
     delete mediaGenerationPayloadBase.mediaUrl;
     delete mediaGenerationPayloadBase.mediaOriginalUrl;
