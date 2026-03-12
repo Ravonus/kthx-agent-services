@@ -36,7 +36,10 @@ export const createAutoCreditPlanner = (
     repost: ["repost", "write.repostPost"],
   };
   const AUTO_CREDIT_ACTION_CAPS: Record<EngagementAction, number> = {
-    like: Math.max(1, Number.parseInt(trimEnv("MG_AUTO_CREDIT_MAX_LIKES_PER_PLAN") ?? "4", 10) || 4),
+    like: Math.max(
+      1,
+      Number.parseInt(trimEnv("MG_AUTO_CREDIT_MAX_LIKES_PER_PLAN") ?? "12", 10) || 12,
+    ),
     comment: Math.max(
       1,
       Number.parseInt(trimEnv("MG_AUTO_CREDIT_MAX_COMMENTS_PER_PLAN") ?? "2", 10) || 2,
