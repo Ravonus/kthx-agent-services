@@ -237,6 +237,33 @@ export const buildNaturalPresenceReply = (
     maxChars,
   );
 
+export const buildHowAreYouReply = (
+  _entry: ChatInboxEntry,
+  maxChars: number,
+): string => truncateChatReply("Doing well. What do you need?", maxChars);
+
+export const buildThanksReply = (
+  _entry: ChatInboxEntry,
+  maxChars: number,
+): string => truncateChatReply("Anytime.", maxChars);
+
+export const buildDirectMessageFallbackReply = (
+  entry: ChatInboxEntry,
+  maxChars: number,
+): string => {
+  if (!entry.conversationId) return "";
+  if (isNaturalPresenceCheckMessage(entry.body)) {
+    return buildNaturalPresenceReply(entry, maxChars);
+  }
+  if (isHowAreYouMessage(entry.body)) {
+    return buildHowAreYouReply(entry, maxChars);
+  }
+  if (isThanksMessage(entry.body)) {
+    return buildThanksReply(entry, maxChars);
+  }
+  return truncateChatReply("I'm here. Tell me what you need.", maxChars);
+};
+
 // ---------------------------------------------------------------------------
 // OpenClaw intent + reply prompt builder
 // ---------------------------------------------------------------------------

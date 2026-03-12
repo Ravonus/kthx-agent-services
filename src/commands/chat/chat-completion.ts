@@ -44,6 +44,9 @@ export function sanitizeUserFacingCommandErrorMessage(input: {
   if (lowered.includes("persona_reference_setup_required")) {
     return "Persona reference setup is incomplete (selfie, midshot, fullbody).";
   }
+  if (lowered.includes("external_persona_reference_required")) {
+    return "I need the image or sticker you want me to match. Reply to it or attach it, then ask again.";
+  }
   if (
     lowered.includes("image_generation_setup_required") ||
     lowered.includes("image_generator_unconfigured") ||

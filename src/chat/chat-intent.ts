@@ -20,6 +20,13 @@ import {
   buildIntentAndReplyPrompt,
   buildIntentAndReplyDrilldownPrompt,
   CHAT_INTENT_VALID,
+  buildDirectMessageFallbackReply,
+  buildHowAreYouReply,
+  buildNaturalPresenceReply,
+  buildThanksReply,
+  isHowAreYouMessage,
+  isNaturalPresenceCheckMessage,
+  isThanksMessage,
 } from "./chat-reply.js";
 
 // ---------------------------------------------------------------------------
@@ -366,6 +373,10 @@ export const buildAutoReply = async (
   const messageBody = entry.body.trim();
   if (!messageBody.length) return "";
   const maxChars = opts.maxChars;
+  const directMessageFallbackReply = buildDirectMessageFallbackReply(
+    entry,
+    maxChars,
+  );
   const conversationHistory = await opts.fetchConversationHistory(entry);
 
   if (isSystemDisclosureRequest(messageBody)) {
@@ -387,6 +398,51 @@ export const buildAutoReply = async (
     return buildSystemBoundaryReply(entry, maxChars);
   }
 
+  if (isNaturalPresenceCheckMessage(messageBody)) {
+    const reply = buildNaturalPresenceReply(entry, maxChars);
+    await opts
+      .recordWrite({
+        type: "chat_runtime_reply_canned",
+        at: nowIso(),
+        reason: "natural_presence_check",
+        messageId: entry.messageId,
+        bodyPreview: toAnswerPreview(messageBody, 140),
+        replyPreview: toAnswerPreview(reply, 160),
+      })
+      .catch(() => undefined);
+    return reply;
+  }
+
+  if (isHowAreYouMessage(messageBody)) {
+    const reply = buildHowAreYouReply(entry, maxChars);
+    await opts
+      .recordWrite({
+        type: "chat_runtime_reply_canned",
+        at: nowIso(),
+        reason: "how_are_you",
+        messageId: entry.messageId,
+        bodyPreview: toAnswerPreview(messageBody, 140),
+        replyPreview: toAnswerPreview(reply, 160),
+      })
+      .catch(() => undefined);
+    return reply;
+  }
+
+  if (isThanksMessage(messageBody)) {
+    const reply = buildThanksReply(entry, maxChars);
+    await opts
+      .recordWrite({
+        type: "chat_runtime_reply_canned",
+        at: nowIso(),
+        reason: "thanks",
+        messageId: entry.messageId,
+        bodyPreview: toAnswerPreview(messageBody, 140),
+        replyPreview: toAnswerPreview(reply, 160),
+      })
+      .catch(() => undefined);
+    return reply;
+  }
+
   if (!opts.useOpenClaw) {
     await opts.recordWrite({
       type: "chat_runtime_reply_suppressed",
@@ -395,6 +451,19 @@ export const buildAutoReply = async (
       messageId: entry.messageId,
       bodyPreview: toAnswerPreview(messageBody, 140),
     }).catch(() => undefined);
+    if (directMessageFallbackReply.length > 0) {
+      await opts
+        .recordWrite({
+          type: "chat_runtime_reply_fallback",
+          at: nowIso(),
+          reason: "openclaw_disabled_dm_fallback",
+          messageId: entry.messageId,
+          bodyPreview: toAnswerPreview(messageBody, 140),
+          replyPreview: toAnswerPreview(directMessageFallbackReply, 160),
+        })
+        .catch(() => undefined);
+      return directMessageFallbackReply;
+    }
     return "";
   }
 
@@ -451,7 +520,7 @@ export const buildAutoReply = async (
   }
 
   const shouldAttemptDrilldown = !firstPassReply || firstPassNeedsDrilldown;
-  if (!shouldAttemptDrilldown) return "";
+  if (!shouldAttemptDrilldown) return directMessageFallbackReply;
 
   const drilldownContext = await opts.loadDrilldownContext
     ?.(
@@ -510,6 +579,21 @@ export const buildAutoReply = async (
       replyPreview: toAnswerPreview(firstPassReply, 160),
     }).catch(() => undefined);
     return firstPassReply;
+  }
+
+  if (directMessageFallbackReply.length > 0) {
+    await opts
+      .recordWrite({
+        type: "chat_runtime_reply_fallback",
+        at: nowIso(),
+        reason: decided ? "openclaw_unusable_after_drilldown_dm_fallback" : "openclaw_no_result_dm_fallback",
+        messageId: entry.messageId,
+        intent: decided?.intent ?? null,
+        bodyPreview: toAnswerPreview(messageBody, 140),
+        replyPreview: toAnswerPreview(directMessageFallbackReply, 160),
+      })
+      .catch(() => undefined);
+    return directMessageFallbackReply;
   }
 
   await opts.recordWrite({

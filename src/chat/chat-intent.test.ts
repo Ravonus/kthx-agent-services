@@ -23,6 +23,34 @@ const entry: ChatInboxEntry = {
 };
 
 describe("buildAutoReply", () => {
+  it("uses a canned presence reply for simple DM greetings", async () => {
+    const recordWrite = vi.fn(async () => undefined);
+    const runOpenClawPrompt = vi.fn(async () => null);
+
+    const reply = await buildAutoReply(
+      {
+        ...entry,
+        body: "hey",
+      },
+      {
+        maxChars: 240,
+        useOpenClaw: true,
+        recordWrite,
+        runOpenClawPrompt,
+        fetchConversationHistory: async () => [],
+      },
+    );
+
+    expect(reply).toBe("Yep, I'm here.");
+    expect(runOpenClawPrompt).not.toHaveBeenCalled();
+    expect(recordWrite).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "chat_runtime_reply_canned",
+        reason: "natural_presence_check",
+      }),
+    );
+  });
+
   it("skips drilldown loading when the first pass is already good enough", async () => {
     const recordWrite = vi.fn(async () => undefined);
     const runOpenClawPrompt = vi.fn(async () => ({
@@ -94,6 +122,34 @@ describe("buildAutoReply", () => {
     expect(recordWrite).toHaveBeenCalledWith(
       expect.objectContaining({
         type: "chat_runtime_reply_drilldown_attempted",
+      }),
+    );
+  });
+
+  it("falls back to a direct DM reply when OpenClaw produces no usable draft", async () => {
+    const recordWrite = vi.fn(async () => undefined);
+    const runOpenClawPrompt = vi.fn(async () => null);
+
+    const reply = await buildAutoReply(
+      {
+        ...entry,
+        body: "Can you help?",
+      },
+      {
+        maxChars: 240,
+        useOpenClaw: true,
+        recordWrite,
+        runOpenClawPrompt,
+        fetchConversationHistory: async () => [],
+        loadDrilldownContext: async () => null,
+      },
+    );
+
+    expect(reply).toBe("I'm here. Tell me what you need.");
+    expect(runOpenClawPrompt).toHaveBeenCalledTimes(1);
+    expect(recordWrite).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "chat_runtime_reply_fallback",
       }),
     );
   });

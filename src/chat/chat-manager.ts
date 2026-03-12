@@ -130,6 +130,23 @@ export class ChatManager implements ChatManagerLike {
   private readonly linkedOwnerIdentityState = createLinkedOwnerIdentityState();
   constructor(ctx: ChatManagerContext) { this.ctx = ctx; }
 
+  private logChatRuntime(
+    level: "log" | "warn",
+    event: string,
+    details?: Record<string, unknown>,
+  ): void {
+    const logger = level === "warn" ? console.warn : console.log;
+    if (!details || Object.keys(details).length === 0) {
+      logger(`[agent-chat] ${event}`);
+      return;
+    }
+    try {
+      logger(`[agent-chat] ${event} ${JSON.stringify(details)}`);
+    } catch {
+      logger(`[agent-chat] ${event}`);
+    }
+  }
+
   async pollInbox(): Promise<void> {
     if (!this.ctx.config.chatRuntimeEnabled || this.ctx.chat.chatInboxPollInFlight) return;
     this.ctx.chat.chatInboxPollInFlight = true;
@@ -150,6 +167,14 @@ export class ChatManager implements ChatManagerLike {
           channelId: entry.channelId, commandKind: entry.commandKind, authorHandle: entry.authorHandle,
           bodyPreview: toAnswerPreview(entry.body, 160),
         }).catch(() => undefined);
+        this.logChatRuntime("log", "inbox_received", {
+          messageId: entry.messageId,
+          conversationId: entry.conversationId,
+          channelId: entry.channelId,
+          authorHandle: entry.authorHandle || null,
+          authorMainUserId: entry.authorMainUserId,
+          bodyPreview: toAnswerPreview(entry.body, 120),
+        });
         const mentionTokens = await this.resolveMentionTokens();
         if (!shouldReplyToChatInboxEntry(entry, { channelRequireMention: this.ctx.config.chatRuntimeChannelRequireMention, mentionTokens })) continue;
         const staleDecision = this.evaluateStaleReplyDecision(entry);
@@ -249,6 +274,13 @@ export class ChatManager implements ChatManagerLike {
                 bodyPreview: toAnswerPreview(entry.body, 140),
               })
               .catch(() => undefined);
+            this.logChatRuntime("warn", "auto_reply_suppressed", {
+              reason: "empty_llm_reply",
+              messageId: entry.messageId,
+              conversationId: entry.conversationId,
+              channelId: entry.channelId,
+              bodyPreview: toAnswerPreview(entry.body, 120),
+            });
             continue;
           }
           const nowMs = Date.now();
@@ -274,6 +306,13 @@ export class ChatManager implements ChatManagerLike {
             sourceContext: "CHAT", topic: entry.topic, replyPreview: toAnswerPreview(replyBody, 220),
             replyStreamed: Boolean(streamState), replyStreamNative: Boolean(streamState) && (streamState?.nativeDeltaChars ?? 0) > 0,
           });
+          this.logChatRuntime("log", "auto_reply_sent", {
+            messageId: entry.messageId,
+            conversationId: entry.conversationId,
+            channelId: entry.channelId,
+            replyPreview: toAnswerPreview(replyBody, 160),
+            replyStreamed: Boolean(streamState),
+          });
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : String(error);
           await this.ctx.memory.recordWrite({
@@ -285,6 +324,13 @@ export class ChatManager implements ChatManagerLike {
             channelId: entry.channelId,
             bodyPreview: toAnswerPreview(entry.body, 140),
           }).catch(() => undefined);
+          this.logChatRuntime("warn", "auto_reply_failed", {
+            messageId: entry.messageId,
+            conversationId: entry.conversationId,
+            channelId: entry.channelId,
+            error: toAnswerPreview(message, 220),
+            bodyPreview: toAnswerPreview(entry.body, 120),
+          });
           const failureReply = truncateChatReply(
             "I hit a snag handling that right now. Please try again in a moment.",
             this.ctx.config.chatRuntimeReplyMaxChars,
@@ -325,6 +371,9 @@ export class ChatManager implements ChatManagerLike {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       await this.ctx.memory.recordWrite({ type: "chat_runtime_auto_reply_failed", at: nowIso(), message });
+      this.logChatRuntime("warn", "poll_failed", {
+        error: toAnswerPreview(message, 220),
+      });
     } finally {
       this.ctx.chat.chatInboxPollInFlight = false;
     }
