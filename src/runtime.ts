@@ -653,6 +653,7 @@ export const startRuntime = async (deps: RuntimeDeps): Promise<void> => {
     await ctx.memory.flushViewState().catch(() => {});
     await ctx.memory.flushMoodState().catch(() => {});
     await ctx.memory.flushTemporalContext().catch(() => {});
+    ctx.memory.stateDb?.close();
     try {
       (ctx.wsClient as any)?.close?.();
     } catch {

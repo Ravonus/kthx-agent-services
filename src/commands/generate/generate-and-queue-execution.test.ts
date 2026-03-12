@@ -106,7 +106,7 @@ const buildRuntime = (options: {
     | "successOutcome"
   >;
 
-  return runtime as ExecuteGenerateAndQueueRuntime;
+  return runtime as unknown as ExecuteGenerateAndQueueRuntime;
 };
 
 const createPreparedState = (command: Command): GenerateAndQueuePreparedState => ({

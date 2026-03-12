@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { StateSqliteStore } from "./sqlite-state.js";
 
 import type { DatabaseSync } from "node:sqlite";
+import type { KthxRetentionConfig } from "../types/config.js";
 
 const nodeRequire = createRequire(import.meta.url);
 const sqliteModule = nodeRequire("node:sqlite") as {
@@ -132,5 +133,92 @@ describe("StateSqliteStore schema migration", () => {
     ).get() as { total: number } | undefined;
     expect(migrationCountRow?.total).toBe(1);
     reopenedDb.close();
+  });
+});
+
+describe("StateSqliteStore retention maintenance", () => {
+  it("prunes old sqlite state rows using the configured retention policy", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "state-sqlite-retain-"));
+    tmpDirs.push(tmpDir);
+    const dbPath = path.join(tmpDir, "state.sqlite");
+    const store = new StateSqliteStore({
+      enabled: true,
+      dbPath,
+      busyTimeoutMs: 50,
+      busyRetryCount: 0,
+    });
+    store.init();
+
+    const now = Date.now();
+    const fortyDaysAgo = new Date(now - 40 * 24 * 60 * 60 * 1000).toISOString();
+    const fiveDaysAgo = new Date(now - 5 * 24 * 60 * 60 * 1000).toISOString();
+
+    store.appendEvent({
+      source: "remote",
+      topic: "post",
+      eventType: "post_created",
+      visibility: "private",
+      at: fortyDaysAgo,
+      payload: { stale: true },
+    });
+    store.appendEvent({
+      source: "remote",
+      topic: "post",
+      eventType: "post_created",
+      visibility: "private",
+      at: fiveDaysAgo,
+      payload: { stale: false },
+    });
+    store.upsertCommandLifecycle({
+      commandId: "cmd-old",
+      directiveId: "dir-old",
+      action: "comment",
+      idempotencyKey: "idem-old",
+      state: "acked",
+      at: fortyDaysAgo,
+    });
+    store.upsertCommandLifecycle({
+      commandId: "cmd-new",
+      directiveId: "dir-new",
+      action: "comment",
+      idempotencyKey: "idem-new",
+      state: "acked",
+      at: fiveDaysAgo,
+    });
+
+    const retentionConfig: KthxRetentionConfig = {
+      enabled: true,
+      intervalMinutes: 180,
+      commands: { days: 30 },
+      moods: { days: 30 },
+      posts: { days: 30 },
+      interactions: { days: 30 },
+      notifications: { days: 30 },
+      system: { days: 30 },
+      longTerm: {
+        enabled: true,
+        maxCapsules: 1000,
+        maxCompactionsPerRun: 10,
+        maxEventsPerArchive: 180,
+        maxSnippetsPerArchive: 8,
+        useAgentCompression: true,
+      },
+    };
+
+    const result = store.applyRetentionPolicy(retentionConfig);
+    expect(result).toEqual({
+      stateEventsPruned: 1,
+      commandLifecyclePruned: 1,
+    });
+
+    const remainingEvents = store.getRecentEvents(10, "private");
+    expect(remainingEvents).toHaveLength(1);
+    expect(remainingEvents[0]?.payload).toEqual({ stale: false });
+
+    const remainingLifecycle = store.getRecentCommandLifecycle(10);
+    expect(remainingLifecycle).toHaveLength(1);
+    expect(remainingLifecycle[0]?.idempotencyKey).toBe("idem-new");
+
+    store.close();
   });
 });
