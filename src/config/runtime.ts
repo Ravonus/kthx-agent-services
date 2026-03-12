@@ -186,7 +186,7 @@ export const createRuntimeConfig = (): RuntimeConfig => {
   // -- chat runtime numerics ------------------------------------------------
   const chatRuntimePollMs = Math.max(
     300,
-    parseIntEnv("MG_CHAT_RUNTIME_POLL_MS", 1200),
+    parseIntEnv("MG_CHAT_RUNTIME_POLL_MS", 400),
   );
   const chatRuntimeReadChunkBytes = Math.max(
     8192,

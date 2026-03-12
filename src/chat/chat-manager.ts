@@ -184,13 +184,6 @@ export class ChatManager implements ChatManagerLike {
             })
             .catch(() => undefined);
         }
-        await this.ctx
-          .runMemoryCheckpoint({
-            force: true,
-            source: "chat_runtime_interaction",
-            allowAgentCompression: true,
-          })
-          .catch(() => undefined);
         let typingSent = false;
         try {
           await this.setTyping(entry, true).catch(() => undefined);
@@ -310,6 +303,13 @@ export class ChatManager implements ChatManagerLike {
           }
         } finally {
           if (typingSent) await this.setTyping(entry, false).catch(() => undefined);
+          void this.ctx
+            .runMemoryCheckpoint({
+              force: false,
+              source: "chat_runtime_interaction",
+              allowAgentCompression: false,
+            })
+            .catch(() => undefined);
         }
       }
       if (staleReplySkippedCount > 0) {

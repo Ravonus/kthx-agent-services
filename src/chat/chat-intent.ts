@@ -398,27 +398,12 @@ export const buildAutoReply = async (
     return "";
   }
 
-  const preloadedDrilldownContext = await opts.loadDrilldownContext
-    ?.(
-      entry,
-      conversationHistory,
-    )
-    .catch(() => null);
-  const usingPreloadedDrilldown =
-    typeof preloadedDrilldownContext === "string" &&
-    preloadedDrilldownContext.trim().length > 0;
-  const decided = usingPreloadedDrilldown
-    ? await classifyIntentAndDraftReplyWithDrilldown({
-        entry,
-        conversationHistory,
-        runOpenClawPrompt: opts.runOpenClawPrompt,
-        drilldownContext: preloadedDrilldownContext,
-      })
-    : await classifyIntentAndDraftReply(
-        entry,
-        conversationHistory,
-        opts.runOpenClawPrompt,
-      );
+  // Keep the first pass cheap; drilldown is reserved for weak or empty drafts.
+  const decided = await classifyIntentAndDraftReply(
+    entry,
+    conversationHistory,
+    opts.runOpenClawPrompt,
+  );
   let replySuppressedForSystemDisclosure = false;
   const normalizeCandidate = (
     candidate: IntentClassificationResult | null,
@@ -450,7 +435,6 @@ export const buildAutoReply = async (
 
   const firstPassReply = normalizeCandidate(decided);
   const firstPassNeedsDrilldown = Boolean(
-    !usingPreloadedDrilldown &&
     decided &&
       firstPassReply &&
       (decided.intent === null || isLowConfidenceAutoReply(
@@ -466,8 +450,7 @@ export const buildAutoReply = async (
     return firstPassReply;
   }
 
-  const shouldAttemptDrilldown =
-    !usingPreloadedDrilldown && (!firstPassReply || firstPassNeedsDrilldown);
+  const shouldAttemptDrilldown = !firstPassReply || firstPassNeedsDrilldown;
   if (!shouldAttemptDrilldown) return "";
 
   const drilldownContext = await opts.loadDrilldownContext
