@@ -14,7 +14,10 @@ import { loadDotEnv } from "./config/dotenv.js";
 import { createRuntimeConfig } from "./config/runtime.js";
 import { loadOrInitKthxConfig, normalizeKthxConfig } from "./config/kthx.js";
 import { MemoryStore } from "./memory/store.js";
-import { createStateSqliteStoreFromEnv } from "./state/sqlite-state.js";
+import {
+  createStateSqliteStoreFromEnv,
+  StateSqliteStore,
+} from "./state/sqlite-state.js";
 import { createIpcPaths, initIpc, resetExecutionArtifactsOnStart } from "./ipc/ipc-paths.js";
 import { createRealtimeClient } from "./ws/realtime-client.js";
 import { createRuntimeHashCollector } from "./lib/hash.js";
@@ -195,7 +198,25 @@ const main = async (): Promise<void> => {
     : null;
 
   // -- MemoryStore
-  const stateDb = createStateSqliteStoreFromEnv(config.stateDir);
+  let stateDb = createStateSqliteStoreFromEnv(config.stateDir);
+  try {
+    stateDb.init();
+  } catch (error) {
+    stateDb.close();
+    console.warn(
+      "[agent-runtime] state sqlite init failed; continuing without sqlite state store.",
+      {
+        dbPath: stateDb.dbPath,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    );
+    stateDb = new StateSqliteStore({
+      enabled: false,
+      dbPath: stateDb.dbPath,
+      busyTimeoutMs: stateDb.busyTimeoutMs,
+      busyRetryCount: stateDb.busyRetryCount,
+    });
+  }
   const memory = new MemoryStore({
     stateDir: config.stateDir,
     rotateBytes: config.rotateBytes,
@@ -649,7 +670,9 @@ const main = async (): Promise<void> => {
     return null;
   };
 
-  const isAutoPostingPendingDirective = (value: unknown): boolean => {
+  const isAutoPostingPendingDirective = (
+    value: unknown,
+  ): value is Record<string, unknown> => {
     if (!isRecord(value)) return false;
     const directiveId =
       typeof value.id === "string" && value.id.trim().length > 0

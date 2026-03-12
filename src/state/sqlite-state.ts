@@ -6,7 +6,12 @@ import { trimEnv } from "../lib/env-parse.js";
 import { isRecord } from "../lib/guards.js";
 import { nowIso } from "../lib/text.js";
 
-import type { DatabaseSync, StatementSync } from "node:sqlite";
+import type {
+  DatabaseSync,
+  RunResult,
+  StatementSync,
+} from "node:sqlite";
+import type { KthxRetentionConfig } from "../types/config.js";
 
 const nodeRequire = createRequire(import.meta.url);
 const sqliteModule = nodeRequire("node:sqlite") as {
@@ -104,6 +109,7 @@ type StateDbMigration = {
 };
 
 const STATE_SCHEMA_MIGRATIONS_TABLE = "state_schema_migrations";
+const DEFAULT_WAL_AUTOCHECKPOINT_PAGES = 1000;
 
 const listSqliteTableColumns = (db: DatabaseSync, tableName: string): Set<string> => {
   const normalizedTable = tableName.trim();
@@ -216,9 +222,11 @@ export class StateSqliteStore {
   private insertEventStmt: StatementSync | null;
   private getSnapshotStmt: StatementSync | null;
   private getRecentEventsStmt: StatementSync | null;
+  private deleteStateEventsOlderThanStmt: StatementSync | null;
   private upsertCommandLifecycleStmt: StatementSync | null;
   private getCommandLifecycleByKeyStmt: StatementSync | null;
   private getRecentCommandLifecycleStmt: StatementSync | null;
+  private deleteCommandLifecycleOlderThanStmt: StatementSync | null;
 
   constructor(config: StateDbConfig) {
     this.enabled = config.enabled;
@@ -232,9 +240,11 @@ export class StateSqliteStore {
     this.insertEventStmt = null;
     this.getSnapshotStmt = null;
     this.getRecentEventsStmt = null;
+    this.deleteStateEventsOlderThanStmt = null;
     this.upsertCommandLifecycleStmt = null;
     this.getCommandLifecycleByKeyStmt = null;
     this.getRecentCommandLifecycleStmt = null;
+    this.deleteCommandLifecycleOlderThanStmt = null;
   }
 
   init(): void {
@@ -247,6 +257,7 @@ export class StateSqliteStore {
       // best effort
     }
     db.exec("PRAGMA journal_mode=WAL;");
+    db.exec(`PRAGMA wal_autocheckpoint=${DEFAULT_WAL_AUTOCHECKPOINT_PAGES};`);
     db.exec("PRAGMA synchronous=NORMAL;");
     db.exec(`PRAGMA busy_timeout=${this.busyTimeoutMs};`);
     db.exec(`
@@ -327,6 +338,10 @@ export class StateSqliteStore {
       ORDER BY id DESC
       LIMIT ?
     `);
+    this.deleteStateEventsOlderThanStmt = db.prepare(`
+      DELETE FROM state_events
+      WHERE at < ?
+    `);
     this.upsertCommandLifecycleStmt = db.prepare(`
       INSERT INTO runtime_command_lifecycle (
         command_id,
@@ -405,6 +420,10 @@ export class StateSqliteStore {
       ORDER BY updated_at DESC
       LIMIT ?
     `);
+    this.deleteCommandLifecycleOlderThanStmt = db.prepare(`
+      DELETE FROM runtime_command_lifecycle
+      WHERE updated_at < ?
+    `);
     this.initialized = true;
   }
 
@@ -447,6 +466,14 @@ export class StateSqliteStore {
 
   close(): void {
     if (!this.db) return;
+    try {
+      this.checkpoint("TRUNCATE");
+    } catch (error) {
+      console.warn("[state-sqlite] checkpoint before close failed", {
+        dbPath: this.dbPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
     this.db.close();
     this.db = null;
     this.initialized = false;
@@ -454,9 +481,20 @@ export class StateSqliteStore {
     this.insertEventStmt = null;
     this.getSnapshotStmt = null;
     this.getRecentEventsStmt = null;
+    this.deleteStateEventsOlderThanStmt = null;
     this.upsertCommandLifecycleStmt = null;
     this.getCommandLifecycleByKeyStmt = null;
     this.getRecentCommandLifecycleStmt = null;
+    this.deleteCommandLifecycleOlderThanStmt = null;
+  }
+
+  checkpoint(mode: "PASSIVE" | "TRUNCATE" = "PASSIVE"): void {
+    if (!this.enabled) return;
+    this.init();
+    const normalizedMode = mode === "TRUNCATE" ? "TRUNCATE" : "PASSIVE";
+    this.runWithBusyRetry<void>("checkpoint", undefined, () => {
+      this.db?.exec(`PRAGMA wal_checkpoint(${normalizedMode});`);
+    });
   }
 
   upsertSnapshot(input: {
@@ -638,6 +676,93 @@ export class StateSqliteStore {
           ? row.payloadJson
           : null,
     }));
+  }
+
+  applyRetentionPolicy(retentionConfig: KthxRetentionConfig): {
+    stateEventsPruned: number;
+    commandLifecyclePruned: number;
+  } | null {
+    if (!this.enabled || retentionConfig.enabled !== true) return null;
+    this.init();
+    if (!this.deleteStateEventsOlderThanStmt || !this.deleteCommandLifecycleOlderThanStmt) {
+      return null;
+    }
+
+    const stateEventsDays = this.resolveStateEventsRetentionDays(retentionConfig);
+    const commandLifecycleDays =
+      this.resolveCommandLifecycleRetentionDays(retentionConfig);
+    const stateEventsCutoffIso = this.resolveCutoffIso(stateEventsDays);
+    const commandLifecycleCutoffIso = this.resolveCutoffIso(commandLifecycleDays);
+
+    const result = this.runWithBusyRetry<{
+      stateEventsPruned: number;
+      commandLifecyclePruned: number;
+    }>(
+      "applyRetentionPolicy",
+      { stateEventsPruned: 0, commandLifecyclePruned: 0 },
+      () => {
+        this.db?.exec("BEGIN");
+        try {
+          const stateEventsResult =
+            this.deleteStateEventsOlderThanStmt?.run(
+              stateEventsCutoffIso,
+            ) as RunResult | undefined;
+          const commandLifecycleResult =
+            this.deleteCommandLifecycleOlderThanStmt?.run(
+              commandLifecycleCutoffIso,
+            ) as RunResult | undefined;
+          this.db?.exec("COMMIT");
+          return {
+            stateEventsPruned: Math.max(
+              0,
+              Number(stateEventsResult?.changes ?? 0),
+            ),
+            commandLifecyclePruned: Math.max(
+              0,
+              Number(commandLifecycleResult?.changes ?? 0),
+            ),
+          };
+        } catch (error) {
+          try {
+            this.db?.exec("ROLLBACK");
+          } catch {
+            // ignore rollback failures after a failed prune attempt
+          }
+          throw error;
+        }
+      },
+    );
+
+    if (result.stateEventsPruned > 0 || result.commandLifecyclePruned > 0) {
+      this.checkpoint("PASSIVE");
+    }
+
+    return result;
+  }
+
+  private resolveCutoffIso(days: number): string {
+    const safeDays = Math.max(1, Math.floor(days));
+    return new Date(Date.now() - safeDays * 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  private resolveStateEventsRetentionDays(retentionConfig: KthxRetentionConfig): number {
+    return Math.max(
+      retentionConfig.commands.days,
+      retentionConfig.moods.days,
+      retentionConfig.posts.days,
+      retentionConfig.interactions.days,
+      retentionConfig.notifications.days,
+      retentionConfig.system.days,
+    );
+  }
+
+  private resolveCommandLifecycleRetentionDays(
+    retentionConfig: KthxRetentionConfig,
+  ): number {
+    return Math.max(
+      retentionConfig.commands.days,
+      retentionConfig.system.days,
+    );
   }
 }
 

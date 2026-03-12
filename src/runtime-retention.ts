@@ -76,6 +76,8 @@ export const startRetentionCleanupLoop = (
         retentionConfig,
         archiveCompressFn,
       });
+      const sqliteCleanup =
+        ctx.memory.stateDb?.applyRetentionPolicy(retentionConfig) ?? null;
       if (result) {
         const activePruned = result.active.reduce(
           (sum, row) => sum + (Number.isFinite(row.pruned) ? row.pruned : 0),
@@ -93,6 +95,10 @@ export const startRetentionCleanupLoop = (
           archivesRemoved,
           moodSignalsPruned: result.moodSignalsPruned,
           longTermCompactions: result.longTermCompactions,
+          sqliteStateEventsPruned:
+            sqliteCleanup?.stateEventsPruned ?? 0,
+          sqliteCommandLifecyclePruned:
+            sqliteCleanup?.commandLifecyclePruned ?? 0,
         });
       }
     } catch (error: unknown) {
