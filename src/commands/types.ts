@@ -329,6 +329,8 @@ export type PostDraftContext = {
   payloadHint: string | null;
   memorySummary: string | null;
   platformSignals: string | null;
+  personaDescription: string | null;
+  personaStyleHint: string | null;
 };
 
 export type TextPostVisualSlide = {

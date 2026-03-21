@@ -16,6 +16,8 @@ const blankContext: PostDraftContext = {
   payloadHint: "post something around kael at the library",
   memorySummary: "retrieval: preset:most_recent_post post:9 :: rooftop selfie",
   platformSignals: "home: @kael: library photo",
+  personaDescription: null,
+  personaStyleHint: null,
 };
 
 describe("command executor post draft curation helpers", () => {

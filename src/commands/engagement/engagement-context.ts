@@ -331,6 +331,21 @@ export async function loadPostDraftContext(
     payload: Record<string, unknown>;
   },
 ): Promise<PostDraftContext> {
+  const payloadContext =
+    input.payload.context != null && typeof input.payload.context === "object"
+      ? (input.payload.context as Record<string, unknown>)
+      : null;
+  const personaDescription =
+    asNonEmptyString(input.payload.personaDescription) ??
+    asNonEmptyString(payloadContext?.personaDescription) ??
+    asNonEmptyString(input.payload.description) ??
+    null;
+  const personaStyleHint =
+    asNonEmptyString(input.payload.personaStyleHint) ??
+    asNonEmptyString(input.payload.mediaPersonaStyleHint) ??
+    asNonEmptyString(payloadContext?.personaStyleHint) ??
+    asNonEmptyString(payloadContext?.mediaPersonaStyleHint) ??
+    null;
   const context: PostDraftContext = {
     targetPostId: input.postId,
     postText: null,
@@ -343,6 +358,8 @@ export async function loadPostDraftContext(
       extractCommentPayloadHint,
     ),
     platformSignals: await loadPostDraftDiscoverySignals(deps, input),
+    personaDescription,
+    personaStyleHint,
   };
   if (!input.postId) return context;
   const callAgentChatBridge = deps.callAgentChatBridge;

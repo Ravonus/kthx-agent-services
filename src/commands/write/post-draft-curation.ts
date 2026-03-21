@@ -136,6 +136,12 @@ const buildPostDraftContextLines = (
   taggedHandles: string[],
 ): string[] =>
   [
+    context.personaDescription
+      ? `agentPersona: ${context.personaDescription}`
+      : null,
+    context.personaStyleHint
+      ? `personaStyleHint: ${context.personaStyleHint}`
+      : null,
     typeof context.targetPostId === "number"
       ? `targetPostId: ${context.targetPostId}`
       : null,

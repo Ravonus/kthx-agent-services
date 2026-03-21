@@ -716,9 +716,12 @@ export async function ensurePersonaDefinitionForFrames(
     }
   }
   if (personaExists) return;
+  const payloadContext = isRecord(payload.context) ? payload.context : null;
   const styleHint =
     asNonEmptyString(payload.mediaPersonaStyleHint) ??
     asNonEmptyString(payload.personaStyleHint) ??
+    asNonEmptyString(payloadContext?.mediaPersonaStyleHint) ??
+    asNonEmptyString(payloadContext?.personaStyleHint) ??
     null;
   const displayName =
     personaSlug
@@ -760,9 +763,12 @@ export function buildPersonaReferencePrompt(input: {
   frameRole: PersonaFrameRole;
   payload: Record<string, unknown>;
 }): string {
+  const payloadContext = isRecord(input.payload.context) ? input.payload.context : null;
   const styleHint =
     asNonEmptyString(input.payload.mediaPersonaStyleHint) ??
     asNonEmptyString(input.payload.personaStyleHint) ??
+    asNonEmptyString(payloadContext?.mediaPersonaStyleHint) ??
+    asNonEmptyString(payloadContext?.personaStyleHint) ??
     null;
   const sourcePrompt =
     asNonEmptyString(input.payload.mediaPrompt) ??
@@ -1066,7 +1072,9 @@ export async function resolvePersonaFrameReferences(
   if (!shouldUsePersonaFrameReferences(plan)) {
     return {
       personaSlug: null,
-      frameReferences: input.fallbackReferenceInputs.slice(0, MAX_MEDIA_REFERENCE_INPUTS),
+      frameReferences: plan.enabled
+        ? input.fallbackReferenceInputs.slice(0, MAX_MEDIA_REFERENCE_INPUTS)
+        : [],
       builtFrames: false,
       mainPersonaSlug: null,
       source: null,
