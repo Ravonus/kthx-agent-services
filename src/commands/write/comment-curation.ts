@@ -245,6 +245,55 @@ export function summarizePostMediaForComment(post: Record<string, unknown>): str
 }
 
 // ---------------------------------------------------------------------------
+// summarizeLensesForComment
+// ---------------------------------------------------------------------------
+
+export function summarizeLensesForComment(post: Record<string, unknown>): string | null {
+  const lenses = Array.isArray(post.lenses)
+    ? post.lenses.filter((entry): entry is Record<string, unknown> => isRecord(entry))
+    : [];
+  if (lenses.length === 0) return null;
+  const parts: string[] = [];
+  for (const lens of lenses.slice(0, 3)) {
+    const name = asNonEmptyString(lens.name);
+    if (!name) continue;
+    const desc = asNonEmptyString(lens.description);
+    parts.push(desc ? `${name} - ${truncateText(desc, 80)}` : name);
+  }
+  if (parts.length === 0) return null;
+  return truncateText(parts.join("; "), 220);
+}
+
+// ---------------------------------------------------------------------------
+// summarizeTagsForComment
+// ---------------------------------------------------------------------------
+
+export function summarizeTagsForComment(post: Record<string, unknown>): string | null {
+  const tags = Array.isArray(post.tags)
+    ? post.tags.filter((entry): entry is Record<string, unknown> => isRecord(entry))
+    : [];
+  const signalKeywords = Array.isArray(post.signalKeywords)
+    ? post.signalKeywords.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    : [];
+  const signalCategories = Array.isArray(post.signalCategories)
+    ? post.signalCategories.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    : [];
+  const parts: string[] = [];
+  for (const tag of tags.slice(0, 5)) {
+    const name = asNonEmptyString(tag.name) ?? asNonEmptyString(tag.slug);
+    if (name) parts.push(`#${name}`);
+  }
+  if (signalKeywords.length > 0) {
+    parts.push(...signalKeywords.slice(0, 5));
+  }
+  if (signalCategories.length > 0) {
+    parts.push(...signalCategories.slice(0, 3).map((c) => `[${c}]`));
+  }
+  if (parts.length === 0) return null;
+  return truncateText(parts.join(", "), 220);
+}
+
+// ---------------------------------------------------------------------------
 // buildCommentCurationPrompt
 // ---------------------------------------------------------------------------
 
@@ -257,9 +306,12 @@ export function buildCommentCurationPrompt(input: {
 }): string {
   const contextLines = [
     `postId: ${input.postId}`,
+    input.context.postKind ? `postKind: ${input.context.postKind}` : null,
     input.context.postAuthorHandle
       ? `postAuthor: @${input.context.postAuthorHandle.replace(/^@+/u, "")}`
       : null,
+    input.context.communitySummary ? `community: ${input.context.communitySummary}` : null,
+    input.context.tagsSummary ? `topics: ${input.context.tagsSummary}` : null,
     input.context.postText ? `postText: ${input.context.postText}` : null,
     input.context.mediaSummary ? `mediaContext: ${input.context.mediaSummary}` : null,
     input.context.threadSummary ? `threadContext: ${input.context.threadSummary}` : null,
@@ -274,7 +326,8 @@ export function buildCommentCurationPrompt(input: {
     "- body must be 14-180 characters.",
     "- 1-2 concise sentences in a natural voice.",
     "- Must clearly reference THIS target post/thread context.",
-    "- Include at least one concrete detail from post/media/thread context.",
+    "- Use community and topic context to understand the subject being discussed.",
+    "- Include at least one concrete detail from post/media/thread/community context.",
     "- Do not copy wording from the draft or post text.",
     "- Never start with 'Frame N:' and never output image-prompt wrappers.",
     "- No hashtags, no emojis, no system/tool mentions.",
