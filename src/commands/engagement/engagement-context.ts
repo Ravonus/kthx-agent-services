@@ -21,6 +21,8 @@ import {
   extractCommentRecordForCommentCuration,
   extractCommentPayloadHint,
   summarizePostMediaForComment,
+  summarizeLensesForComment,
+  summarizeTagsForComment,
   summarizeCommentsForPostDraft,
 } from "../write/comment-curation.js";
 
@@ -424,8 +426,11 @@ export async function loadCommentCurationContext(
   const context: CommentCurationContext = {
     postAuthorHandle: null,
     postText: null,
+    postKind: null,
     mediaSummary: null,
     threadSummary: null,
+    communitySummary: null,
+    tagsSummary: null,
     payloadHint: extractCommentPayloadHint(input.payload),
     memorySummary: await loadEngagementMemorySummary(deps, {
       action: "comment",
@@ -452,6 +457,9 @@ export async function loadCommentCurationContext(
         asNonEmptyString(postRecord.caption) ??
         asNonEmptyString(postRecord.body);
       context.mediaSummary = summarizePostMediaForComment(postRecord);
+      context.postKind = asNonEmptyString(postRecord.kind) ?? null;
+      context.communitySummary = summarizeLensesForComment(postRecord);
+      context.tagsSummary = summarizeTagsForComment(postRecord);
     }
   } catch (error: unknown) {
     await deps.memory

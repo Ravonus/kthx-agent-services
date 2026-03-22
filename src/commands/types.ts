@@ -301,8 +301,11 @@ export type DraftPreviewPayload = {
 export type CommentCurationContext = {
   postAuthorHandle: string | null;
   postText: string | null;
+  postKind: string | null;
   mediaSummary: string | null;
   threadSummary: string | null;
+  communitySummary: string | null;
+  tagsSummary: string | null;
   payloadHint: string | null;
   memorySummary: string | null;
 };
