@@ -377,16 +377,19 @@ export const buildAutoReply = async (
     entry,
     maxChars,
   );
-  const conversationHistory = await opts.fetchConversationHistory(entry);
+
+  // -----------------------------------------------------------------------
+  // Security fast-path: block system disclosure requests before LLM.
+  // -----------------------------------------------------------------------
 
   if (isSystemDisclosureRequest(messageBody)) {
-    await opts
+    void opts
       .reportSystemProbe?.({
         entry,
         reason: "system_disclosure_request_blocked",
       })
       .catch(() => undefined);
-    await opts
+    void opts
       .recordWrite({
         type: "chat_runtime_reply_guarded",
         at: nowIso(),
@@ -398,53 +401,19 @@ export const buildAutoReply = async (
     return buildSystemBoundaryReply(entry, maxChars);
   }
 
-  if (isNaturalPresenceCheckMessage(messageBody)) {
-    const reply = buildNaturalPresenceReply(entry, maxChars);
-    await opts
-      .recordWrite({
-        type: "chat_runtime_reply_canned",
-        at: nowIso(),
-        reason: "natural_presence_check",
-        messageId: entry.messageId,
-        bodyPreview: toAnswerPreview(messageBody, 140),
-        replyPreview: toAnswerPreview(reply, 160),
-      })
-      .catch(() => undefined);
-    return reply;
-  }
-
-  if (isHowAreYouMessage(messageBody)) {
-    const reply = buildHowAreYouReply(entry, maxChars);
-    await opts
-      .recordWrite({
-        type: "chat_runtime_reply_canned",
-        at: nowIso(),
-        reason: "how_are_you",
-        messageId: entry.messageId,
-        bodyPreview: toAnswerPreview(messageBody, 140),
-        replyPreview: toAnswerPreview(reply, 160),
-      })
-      .catch(() => undefined);
-    return reply;
-  }
-
-  if (isThanksMessage(messageBody)) {
-    const reply = buildThanksReply(entry, maxChars);
-    await opts
-      .recordWrite({
-        type: "chat_runtime_reply_canned",
-        at: nowIso(),
-        reason: "thanks",
-        messageId: entry.messageId,
-        bodyPreview: toAnswerPreview(messageBody, 140),
-        replyPreview: toAnswerPreview(reply, 160),
-      })
-      .catch(() => undefined);
-    return reply;
-  }
-
   if (!opts.useOpenClaw) {
-    await opts.recordWrite({
+    // OpenClaw disabled — use canned replies for simple messages, otherwise
+    // return the DM fallback or suppress.
+    if (isNaturalPresenceCheckMessage(messageBody)) {
+      return buildNaturalPresenceReply(entry, maxChars);
+    }
+    if (isHowAreYouMessage(messageBody)) {
+      return buildHowAreYouReply(entry, maxChars);
+    }
+    if (isThanksMessage(messageBody)) {
+      return buildThanksReply(entry, maxChars);
+    }
+    void opts.recordWrite({
       type: "chat_runtime_reply_suppressed",
       at: nowIso(),
       reason: "openclaw_disabled",
@@ -452,7 +421,7 @@ export const buildAutoReply = async (
       bodyPreview: toAnswerPreview(messageBody, 140),
     }).catch(() => undefined);
     if (directMessageFallbackReply.length > 0) {
-      await opts
+      void opts
         .recordWrite({
           type: "chat_runtime_reply_fallback",
           at: nowIso(),
@@ -467,42 +436,132 @@ export const buildAutoReply = async (
     return "";
   }
 
+  // -----------------------------------------------------------------------
+  // LLM path: all messages go through the LLM for natural conversation.
+  // -----------------------------------------------------------------------
+  const conversationHistory = await opts.fetchConversationHistory(entry);
+
   // Keep the first pass cheap; drilldown is reserved for weak or empty drafts.
-  const decided = await classifyIntentAndDraftReply(
-    entry,
-    conversationHistory,
-    opts.runOpenClawPrompt,
-  );
+  void opts.recordWrite({
+    type: "chat_openclaw_call_started",
+    at: nowIso(),
+    messageId: entry.messageId,
+    conversationId: entry.conversationId,
+    channelId: entry.channelId,
+    pass: "first",
+  }).catch(() => undefined);
+
+  let decided: IntentClassificationResult | null = null;
+  try {
+    decided = await classifyIntentAndDraftReply(
+      entry,
+      conversationHistory,
+      opts.runOpenClawPrompt,
+    );
+  } catch (err: unknown) {
+    const reason = err instanceof Error ? err.message : String(err);
+    void opts.recordWrite({
+      type: "chat_openclaw_call_failed",
+      at: nowIso(),
+      messageId: entry.messageId,
+      conversationId: entry.conversationId,
+      channelId: entry.channelId,
+      pass: "first",
+      reason,
+    }).catch(() => undefined);
+  }
+
+  if (!decided) {
+    void opts.recordWrite({
+      type: "chat_openclaw_call_empty",
+      at: nowIso(),
+      messageId: entry.messageId,
+      conversationId: entry.conversationId,
+      channelId: entry.channelId,
+      pass: "first",
+      reason: "openclaw_returned_null",
+    }).catch(() => undefined);
+  }
   let replySuppressedForSystemDisclosure = false;
   const normalizeCandidate = (
     candidate: IntentClassificationResult | null,
+    pass: string,
   ): string | null => {
     if (!candidate) return null;
     let drafted = candidate.reply;
     if (!drafted.length && typeof candidate.rawReply === "string" && candidate.rawReply.trim().length > 0) {
       drafted = sanitizeChatOpenClawDraftReply(candidate.rawReply);
     }
-    if (!drafted.length) return null;
+    if (!drafted.length) {
+      void opts.recordWrite({
+        type: "chat_runtime_reply_filtered",
+        at: nowIso(),
+        messageId: entry.messageId,
+        pass,
+        reason: "empty_drafted_reply",
+        intent: candidate.intent,
+      }).catch(() => undefined);
+      return null;
+    }
     const normalized = truncateChatReply(drafted, maxChars);
     if (!normalized.length) return null;
     if (isSystemDisclosureReply(normalized)) {
       replySuppressedForSystemDisclosure = true;
+      void opts.recordWrite({
+        type: "chat_runtime_reply_filtered",
+        at: nowIso(),
+        messageId: entry.messageId,
+        pass,
+        reason: "system_disclosure_in_reply",
+        intent: candidate.intent,
+        replyPreview: toAnswerPreview(normalized, 120),
+      }).catch(() => undefined);
       return null;
     }
     if (isCommandLikeChatAutoReply(normalized)) {
       const cleaned = sanitizeChatOpenClawDraftReply(normalized);
       if (cleaned.length > 0 && !isCommandLikeChatAutoReply(cleaned)) {
         const refined = truncateChatReply(cleaned, maxChars);
-        if (isLowValueStallReply(refined)) return null;
+        if (isLowValueStallReply(refined)) {
+          void opts.recordWrite({
+            type: "chat_runtime_reply_filtered",
+            at: nowIso(),
+            messageId: entry.messageId,
+            pass,
+            reason: "low_value_stall_after_command_cleanup",
+            intent: candidate.intent,
+          }).catch(() => undefined);
+          return null;
+        }
         return refined;
       }
+      void opts.recordWrite({
+        type: "chat_runtime_reply_filtered",
+        at: nowIso(),
+        messageId: entry.messageId,
+        pass,
+        reason: "command_like_reply",
+        intent: candidate.intent,
+        replyPreview: toAnswerPreview(normalized, 120),
+      }).catch(() => undefined);
       return null;
     }
-    if (isLowValueStallReply(normalized)) return null;
+    if (isLowValueStallReply(normalized)) {
+      void opts.recordWrite({
+        type: "chat_runtime_reply_filtered",
+        at: nowIso(),
+        messageId: entry.messageId,
+        pass,
+        reason: "low_value_stall_reply",
+        intent: candidate.intent,
+        replyPreview: toAnswerPreview(normalized, 120),
+      }).catch(() => undefined);
+      return null;
+    }
     return normalized;
   };
 
-  const firstPassReply = normalizeCandidate(decided);
+  const firstPassReply = normalizeCandidate(decided, "first");
   const firstPassNeedsDrilldown = Boolean(
     decided &&
       firstPassReply &&
@@ -529,7 +588,7 @@ export const buildAutoReply = async (
     )
     .catch(() => null);
   if (drilldownContext && drilldownContext.trim().length > 0) {
-    await opts.recordWrite({
+    void opts.recordWrite({
       type: "chat_runtime_reply_drilldown_attempted",
       at: nowIso(),
       messageId: entry.messageId,
@@ -538,26 +597,49 @@ export const buildAutoReply = async (
       firstRawPreview: decided ? toAnswerPreview(decided.rawReply, 160) : null,
       firstPassNeedsDrilldown,
     }).catch(() => undefined);
-    const drilldown = await classifyIntentAndDraftReplyWithDrilldown({
-      entry,
-      conversationHistory,
-      runOpenClawPrompt: opts.runOpenClawPrompt,
-      drilldownContext,
-    });
-    const secondPassReply = normalizeCandidate(drilldown);
+    void opts.recordWrite({
+      type: "chat_openclaw_call_started",
+      at: nowIso(),
+      messageId: entry.messageId,
+      conversationId: entry.conversationId,
+      channelId: entry.channelId,
+      pass: "drilldown",
+    }).catch(() => undefined);
+
+    let drilldown: IntentClassificationResult | null = null;
+    try {
+      drilldown = await classifyIntentAndDraftReplyWithDrilldown({
+        entry,
+        conversationHistory,
+        runOpenClawPrompt: opts.runOpenClawPrompt,
+        drilldownContext,
+      });
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : String(err);
+      void opts.recordWrite({
+        type: "chat_openclaw_call_failed",
+        at: nowIso(),
+        messageId: entry.messageId,
+        conversationId: entry.conversationId,
+        channelId: entry.channelId,
+        pass: "drilldown",
+        reason,
+      }).catch(() => undefined);
+    }
+    const secondPassReply = normalizeCandidate(drilldown, "drilldown");
     if (secondPassReply) {
       return secondPassReply;
     }
   }
 
   if (replySuppressedForSystemDisclosure) {
-    await opts
+    void opts
       .reportSystemProbe?.({
         entry,
         reason: "system_disclosure_reply_blocked",
       })
       .catch(() => undefined);
-    await opts
+    void opts
       .recordWrite({
         type: "chat_runtime_reply_guarded",
         at: nowIso(),
@@ -570,7 +652,7 @@ export const buildAutoReply = async (
   }
 
   if (firstPassReply) {
-    await opts.recordWrite({
+    void opts.recordWrite({
       type: "chat_runtime_reply_drilldown_fallback",
       at: nowIso(),
       messageId: entry.messageId,
@@ -582,7 +664,7 @@ export const buildAutoReply = async (
   }
 
   if (directMessageFallbackReply.length > 0) {
-    await opts
+    void opts
       .recordWrite({
         type: "chat_runtime_reply_fallback",
         at: nowIso(),
@@ -596,7 +678,7 @@ export const buildAutoReply = async (
     return directMessageFallbackReply;
   }
 
-  await opts.recordWrite({
+  void opts.recordWrite({
     type: "chat_runtime_reply_suppressed",
     at: nowIso(),
     reason: decided ? "openclaw_unusable_after_drilldown" : "openclaw_no_result",

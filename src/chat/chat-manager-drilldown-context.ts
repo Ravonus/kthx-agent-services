@@ -69,38 +69,44 @@ export const loadDrilldownContext = async (
       retrievalQuery,
     });
     const audience = entry.channelId ? "chat_channel" : "chat_dm";
-    const bundle = await deps.buildContext({
-      mode: "chat",
-      audience,
-      maxRecentEvents: 120,
-      maxArchiveEvents: 30,
-      includeViewState,
-      includeKeywordRetrieval: true,
-      retrievalQuery,
-      retrievalIntent,
-      retrievalMaxItems:
-        typeof hints.postId === "number" || typeof hints.commentId === "number"
-          ? 10
-          : 6,
-      ...(includeViewState
-        ? {
-            viewStateMaxItems:
-              typeof hints.postId === "number" || typeof hints.commentId === "number"
-                ? 12
-                : 6,
-          }
-        : {}),
-      ...hints,
-    });
+    // Start independent loads in parallel with buildContext to reduce
+    // wall-clock time. systemDocContext and linkedOwnerIdentity have no
+    // dependency on the memory bundle.
+    const [bundle, systemDocContext, linkedOwnerIdentity] = await Promise.all([
+      deps.buildContext({
+        mode: "chat",
+        audience,
+        maxRecentEvents: 120,
+        maxArchiveEvents: 30,
+        includeViewState,
+        includeKeywordRetrieval: true,
+        retrievalQuery,
+        retrievalIntent,
+        retrievalMaxItems:
+          typeof hints.postId === "number" || typeof hints.commentId === "number"
+            ? 10
+            : 6,
+        ...(includeViewState
+          ? {
+              viewStateMaxItems:
+                typeof hints.postId === "number" || typeof hints.commentId === "number"
+                  ? 12
+                  : 6,
+            }
+          : {}),
+        ...hints,
+      }),
+      deps.loadSystemDocContext(),
+      deps.loadLinkedOwnerIdentity(),
+    ]);
     const summary = buildDrilldownMemorySummary(bundle);
+    // Live site lookup depends on bundle, so it runs after buildContext.
     const liveLookupLines = await deps.loadLiveSiteLookup({
       entry,
       retrievalQuery,
       hints,
       bundle,
     });
-    const systemDocContext = await deps.loadSystemDocContext();
-    const linkedOwnerIdentity = await deps.loadLinkedOwnerIdentity();
     const replyTargetLines = buildReplyTargetSummaryLines(replyTargetContext);
     const linkedOwnerLines = linkedOwnerIdentity
       ? [
