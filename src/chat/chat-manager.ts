@@ -161,7 +161,7 @@ export class ChatManager implements ChatManagerLike {
         if (!entry) continue;
         if (this.ctx.chat.chatSeenMessageIds.has(entry.messageId)) continue;
         this.rememberSeenMessageId(entry.messageId);
-        await this.ctx.memory.recordWrite({
+        void this.ctx.memory.recordWrite({
           type: entry.commandKind !== "none" ? "chat_runtime_command_received" : "chat_runtime_interaction_received",
           at: entry.receivedAt, messageId: entry.messageId, conversationId: entry.conversationId,
           channelId: entry.channelId, commandKind: entry.commandKind, authorHandle: entry.authorHandle,
@@ -176,11 +176,29 @@ export class ChatManager implements ChatManagerLike {
           bodyPreview: toAnswerPreview(entry.body, 120),
         });
         const mentionTokens = await this.resolveMentionTokens();
-        if (!shouldReplyToChatInboxEntry(entry, { channelRequireMention: this.ctx.config.chatRuntimeChannelRequireMention, mentionTokens })) continue;
+        if (!shouldReplyToChatInboxEntry(entry, { channelRequireMention: this.ctx.config.chatRuntimeChannelRequireMention, mentionTokens })) {
+          void this.ctx.memory.recordWrite({
+            type: "chat_runtime_reply_skipped",
+            at: nowIso(),
+            reason: entry.authorIsAgent ? "author_is_agent"
+              : entry.commandKind !== "none" ? "command_kind_not_none"
+              : (entry.serverIntentActionFamily && entry.serverIntentActionFamily !== "conversation") ? "server_intent_non_conversation"
+              : entry.channelId ? "channel_mention_not_matched"
+              : "should_reply_check_failed",
+            messageId: entry.messageId,
+            conversationId: entry.conversationId,
+            channelId: entry.channelId,
+            authorHandle: entry.authorHandle,
+            serverIntentActionFamily: entry.serverIntentActionFamily,
+            commandKind: entry.commandKind,
+            bodyPreview: toAnswerPreview(entry.body, 140),
+          }).catch(() => undefined);
+          continue;
+        }
         const staleDecision = this.evaluateStaleReplyDecision(entry);
         if (staleDecision.skipReply) {
           staleReplySkippedCount += 1;
-          await this.ctx.memory
+          void this.ctx.memory
             .recordWrite({
               type: "chat_runtime_stale_reply_skipped",
               at: nowIso(),
@@ -197,7 +215,7 @@ export class ChatManager implements ChatManagerLike {
           continue;
         }
         if (staleDecision.reason === "stale_important_allowed") {
-          await this.ctx.memory
+          void this.ctx.memory
             .recordWrite({
               type: "chat_runtime_stale_reply_allowed",
               at: nowIso(),
@@ -217,7 +235,7 @@ export class ChatManager implements ChatManagerLike {
           if (retentionReply) {
             await this.sendReply(entry, retentionReply).catch(() => undefined);
             this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
-            await this.ctx.memory
+            void this.ctx.memory
               .recordWrite({
                 type: "chat_runtime_retention_dialog_reply",
                 at: nowIso(),
@@ -236,7 +254,7 @@ export class ChatManager implements ChatManagerLike {
             if (deterministicRouteReply) {
               await this.sendReply(entry, deterministicRouteReply).catch(() => undefined);
               this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
-              await this.ctx.memory
+              void this.ctx.memory
                 .recordWrite({
                   type: "chat_runtime_route_action_reply_sent",
                   at: nowIso(),
@@ -263,7 +281,7 @@ export class ChatManager implements ChatManagerLike {
               this.reportSystemProbe(flaggedEntry, reason),
           });
           if (!replyBody.length) {
-            await this.ctx.memory
+            void this.ctx.memory
               .recordWrite({
                 type: "chat_runtime_auto_reply_suppressed",
                 at: nowIso(),
@@ -300,12 +318,12 @@ export class ChatManager implements ChatManagerLike {
             await this.sendReply(entry, replyBody);
           }
           this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
-          await this.ctx.memory.recordWrite({
+          void this.ctx.memory.recordWrite({
             type: "chat_runtime_auto_reply_sent", at: nowIso(), messageId: entry.messageId,
             conversationId: entry.conversationId, channelId: entry.channelId, eventType: entry.eventType,
             sourceContext: "CHAT", topic: entry.topic, replyPreview: toAnswerPreview(replyBody, 220),
             replyStreamed: Boolean(streamState), replyStreamNative: Boolean(streamState) && (streamState?.nativeDeltaChars ?? 0) > 0,
-          });
+          }).catch(() => undefined);
           this.logChatRuntime("log", "auto_reply_sent", {
             messageId: entry.messageId,
             conversationId: entry.conversationId,
@@ -315,7 +333,7 @@ export class ChatManager implements ChatManagerLike {
           });
         } catch (error: unknown) {
           const message = error instanceof Error ? error.message : String(error);
-          await this.ctx.memory.recordWrite({
+          void this.ctx.memory.recordWrite({
             type: "chat_runtime_auto_reply_failed",
             at: nowIso(),
             message,
@@ -336,9 +354,16 @@ export class ChatManager implements ChatManagerLike {
             this.ctx.config.chatRuntimeReplyMaxChars,
           );
           if (failureReply.length > 0) {
-            await this.sendReply(entry, failureReply).catch(() => undefined);
+            // Retry once after a short delay if the first attempt fails, to
+            // handle transient bridge hiccups that would otherwise leave the
+            // user with typing-then-nothing.
+            const sent = await this.sendReply(entry, failureReply).catch(() => null);
+            if (sent === null) {
+              await sleep(500);
+              await this.sendReply(entry, failureReply).catch(() => undefined);
+            }
             this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
-            await this.ctx.memory.recordWrite({
+            void this.ctx.memory.recordWrite({
               type: "chat_runtime_auto_reply_error_sent",
               at: nowIso(),
               messageId: entry.messageId,
@@ -348,7 +373,7 @@ export class ChatManager implements ChatManagerLike {
             }).catch(() => undefined);
           }
         } finally {
-          if (typingSent) await this.setTyping(entry, false).catch(() => undefined);
+          if (typingSent) void this.setTyping(entry, false).catch(() => undefined);
           void this.ctx
             .runMemoryCheckpoint({
               force: false,

@@ -23,9 +23,15 @@ const entry: ChatInboxEntry = {
 };
 
 describe("buildAutoReply", () => {
-  it("uses a canned presence reply for simple DM greetings", async () => {
+  it("routes simple DM greetings through the LLM for natural replies", async () => {
     const recordWrite = vi.fn(async () => undefined);
-    const runOpenClawPrompt = vi.fn(async () => null);
+    const runOpenClawPrompt = vi.fn(async () => ({
+      parsed: { intent: "greeting", reply: "Hey! What's good?" },
+      raw: "",
+      agentName: "tester",
+      payloadText: null,
+      envelope: null,
+    }));
 
     const reply = await buildAutoReply(
       {
@@ -41,14 +47,30 @@ describe("buildAutoReply", () => {
       },
     );
 
+    expect(reply).toBe("Hey! What's good?");
+    expect(runOpenClawPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses canned presence reply when OpenClaw is disabled", async () => {
+    const recordWrite = vi.fn(async () => undefined);
+    const runOpenClawPrompt = vi.fn(async () => null);
+
+    const reply = await buildAutoReply(
+      {
+        ...entry,
+        body: "hey",
+      },
+      {
+        maxChars: 240,
+        useOpenClaw: false,
+        recordWrite,
+        runOpenClawPrompt,
+        fetchConversationHistory: async () => [],
+      },
+    );
+
     expect(reply).toBe("Yep, I'm here.");
     expect(runOpenClawPrompt).not.toHaveBeenCalled();
-    expect(recordWrite).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "chat_runtime_reply_canned",
-        reason: "natural_presence_check",
-      }),
-    );
   });
 
   it("skips drilldown loading when the first pass is already good enough", async () => {

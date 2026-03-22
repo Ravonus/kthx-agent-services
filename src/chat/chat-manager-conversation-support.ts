@@ -6,12 +6,54 @@ export type FetchConversationHistoryDeps = {
   callAgentChatBridge: (payload: Record<string, unknown>) => Promise<unknown>;
 };
 
+// ---------------------------------------------------------------------------
+// Conversation history LRU cache — avoids redundant HTTP bridge calls when
+// multiple messages arrive in the same conversation within a short window.
+// ---------------------------------------------------------------------------
+
+interface CachedHistory {
+  items: unknown[];
+  fetchedAtMs: number;
+  limit: number;
+}
+
+const HISTORY_CACHE_TTL_MS = 15_000;
+const HISTORY_CACHE_MAX_ENTRIES = 32;
+
+const historyCache = new Map<string, CachedHistory>();
+
+const pruneHistoryCache = (): void => {
+  if (historyCache.size <= HISTORY_CACHE_MAX_ENTRIES) return;
+  // Evict oldest entries first.
+  const entries = [...historyCache.entries()].sort(
+    (a, b) => a[1].fetchedAtMs - b[1].fetchedAtMs,
+  );
+  const toRemove = entries.length - HISTORY_CACHE_MAX_ENTRIES;
+  for (let i = 0; i < toRemove; i++) {
+    historyCache.delete(entries[i]![0]);
+  }
+};
+
 export const fetchConversationHistory = async (
   deps: FetchConversationHistoryDeps,
   entry: ChatInboxEntry,
 ): Promise<unknown[]> => {
   try {
     const limit = entry.replyToMessageId ? 40 : 10;
+    const cacheKey = entry.conversationId ?? entry.channelId ?? "";
+
+    // Check cache — reuse if fresh and limit is sufficient.
+    if (cacheKey) {
+      const cached = historyCache.get(cacheKey);
+      if (
+        cached &&
+        Date.now() - cached.fetchedAtMs < HISTORY_CACHE_TTL_MS &&
+        cached.limit >= limit
+      ) {
+        return cached.items.slice(0, limit);
+      }
+    }
+
     const payload = {
       action: "list_messages",
       ...(entry.conversationId
@@ -20,10 +62,22 @@ export const fetchConversationHistory = async (
       limit,
     };
     const result = await deps.callAgentChatBridge(payload);
-    if (isRecord(result) && Array.isArray(result.items)) {
-      return (result.items as unknown[]).slice(0, limit).reverse();
+    const items =
+      isRecord(result) && Array.isArray(result.items)
+        ? (result.items as unknown[]).slice(0, limit).reverse()
+        : [];
+
+    // Cache the result.
+    if (cacheKey) {
+      historyCache.set(cacheKey, {
+        items,
+        fetchedAtMs: Date.now(),
+        limit,
+      });
+      pruneHistoryCache();
     }
-    return [];
+
+    return items;
   } catch {
     return [];
   }
