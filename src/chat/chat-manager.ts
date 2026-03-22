@@ -234,7 +234,7 @@ export class ChatManager implements ChatManagerLike {
           const retentionReply = await this.handleRetentionPolicyDialog(entry);
           if (retentionReply) {
             await this.sendReply(entry, retentionReply).catch(() => undefined);
-            this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
+            this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + this.ctx.config.chatRuntimeReplyThrottleMs;
             void this.ctx.memory
               .recordWrite({
                 type: "chat_runtime_retention_dialog_reply",
@@ -253,7 +253,7 @@ export class ChatManager implements ChatManagerLike {
               await this.handleDeterministicRouteAction(entry);
             if (deterministicRouteReply) {
               await this.sendReply(entry, deterministicRouteReply).catch(() => undefined);
-              this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
+              this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + this.ctx.config.chatRuntimeReplyThrottleMs;
               void this.ctx.memory
                 .recordWrite({
                   type: "chat_runtime_route_action_reply_sent",
@@ -317,7 +317,7 @@ export class ChatManager implements ChatManagerLike {
           } else {
             await this.sendReply(entry, replyBody);
           }
-          this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
+          this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + this.ctx.config.chatRuntimeReplyThrottleMs;
           void this.ctx.memory.recordWrite({
             type: "chat_runtime_auto_reply_sent", at: nowIso(), messageId: entry.messageId,
             conversationId: entry.conversationId, channelId: entry.channelId, eventType: entry.eventType,
@@ -362,7 +362,7 @@ export class ChatManager implements ChatManagerLike {
               await sleep(500);
               await this.sendReply(entry, failureReply).catch(() => undefined);
             }
-            this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + 650;
+            this.ctx.chat.chatReplyThrottleUntilMs = Date.now() + this.ctx.config.chatRuntimeReplyThrottleMs;
             void this.ctx.memory.recordWrite({
               type: "chat_runtime_auto_reply_error_sent",
               at: nowIso(),

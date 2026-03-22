@@ -255,6 +255,14 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     ),
   );
 
+  const chatRuntimeReplyThrottleMs = Math.max(
+    0,
+    Math.min(
+      5000,
+      parseIntEnv("MG_CHAT_RUNTIME_REPLY_THROTTLE_MS", 650),
+    ),
+  );
+
   // -- execution / queue / ws -----------------------------------------------
   const autoRetryPendingMs = Math.max(
     0,
@@ -380,6 +388,7 @@ export const createRuntimeConfig = (): RuntimeConfig => {
     chatRuntimeTextStreamUpdateMinMs,
     chatRuntimeStaleReplyMaxAgeMs,
     chatRuntimeStaleReplyMaxAgeImportantMs,
+    chatRuntimeReplyThrottleMs,
     autoRetryPendingMs,
     terminalTriggerOnly: false,
     queueRunnerDefaultEnabled,

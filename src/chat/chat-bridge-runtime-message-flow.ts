@@ -262,7 +262,9 @@ export const enrichInboxEvent = async (input: {
     : null;
 
   if (messageId && !matched) {
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    // Reduced from 600ms — message is usually available within 100ms after
+    // the realtime event fires. Long delay was adding ~600ms to agent inbox latency.
+    await new Promise((resolve) => setTimeout(resolve, 100));
     const retryResult = (await callBridge({
       action: "list_messages",
       ...context,
